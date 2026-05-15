@@ -18,8 +18,8 @@ import torch.nn as nn
 # CONFIG & CONSTANTES
 # ============================================================
 
-# 0:BUY1, 1:SELL1, 2:BUY1.8, 3:SELL1.8, 4:HOLD
-N_ACTIONS = 5
+# 0:BUY  1:SELL  2:HOLD
+N_ACTIONS = 3  # 0=BUY  1=SELL  2=HOLD
 MASK_VALUE = -1e4  # EXACTEMENT comme au training
 
 # Stats de normalisation (identiques à l'entraînement)
@@ -28,6 +28,8 @@ NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
 # Modèles pré-entraînés — best Sortino (comme dans le training)
 BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf1_long_wf1.pth"
 BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf1_short_wf1.pth"
+# Modèle unifié (entraîné avec side="both") : décide BUY/SELL/HOLD dans un seul fichier
+BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_both_wf1.pth"
 
 
 @dataclass
@@ -62,10 +64,11 @@ class LiveConfig:
     force_cpu: bool = False
 
     # mode d’agent :
-    #   "duel"  : duel long vs short (logique du backtest)
+    #   "both"  : modèle unifié duel (1 seul .pth, décide BUY/SELL/HOLD)
+    #   "duel"  : 2 modèles séparés long+short, arbitrage par max(prob)
     #   "long"  : uniquement agent LONG (pas de short)
     #   "short" : uniquement agent SHORT (pas de long)
-    side: str = "short"
+    side: str = "both"
 
     # ======= BREAK-EVEN + TRAILING (en ATR) =======
     breakeven_atr_mult: float = 1.0
@@ -326,20 +329,21 @@ def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
     """
     mask = torch.zeros(N_ACTIONS, dtype=torch.bool, device=device)
 
+    # 0=BUY  1=SELL  2=HOLD
     if pos != 0:
-        mask[4] = True
+        mask[2] = True
         return mask
 
     if side == "long":
         mask[0] = True
         mask[2] = True
-        mask[4] = True
     elif side == "short":
         mask[1] = True
-        mask[3] = True
-        mask[4] = True
-    else:
-        mask[:] = True
+        mask[2] = True
+    else:  # "both" / "duel"
+        mask[0] = True
+        mask[1] = True
+        mask[2] = True
 
     return mask
 
@@ -748,41 +752,47 @@ def live_loop(cfg: LiveConfig, should_continue):
     device = get_device(cfg)
     stats = load_norm_stats(NORM_STATS_PATH)
 
+    def _build_policy():
+        return SAINTPolicySingleHead(
+            n_features=OBS_N_FEATURES,
+            d_model=80,
+            num_blocks=2,
+            heads=4,
+            dropout=0.05,
+            ff_mult=2,
+            max_len=cfg.lookback,
+            n_actions=N_ACTIONS
+        ).to(device)
+
     policy_long = None
-    if cfg.side in ("duel", "long"):
-        policy_long = SAINTPolicySingleHead(
-            n_features=OBS_N_FEATURES,
-            d_model=80,
-            num_blocks=2,
-            heads=4,
-            dropout=0.05,
-            ff_mult=2,
-            max_len=cfg.lookback,
-            n_actions=N_ACTIONS
-        ).to(device)
-        if not os.path.exists(BEST_MODEL_LONG_PATH):
-            raise FileNotFoundError(f"Modèle LONG introuvable : {BEST_MODEL_LONG_PATH}")
-        policy_long.load_state_dict(torch.load(BEST_MODEL_LONG_PATH, map_location=device))
-        policy_long.eval()
-
     policy_short = None
-    if cfg.side in ("duel", "short"):
-        policy_short = SAINTPolicySingleHead(
-            n_features=OBS_N_FEATURES,
-            d_model=80,
-            num_blocks=2,
-            heads=4,
-            dropout=0.05,
-            ff_mult=2,
-            max_len=cfg.lookback,
-            n_actions=N_ACTIONS
-        ).to(device)
-        if not os.path.exists(BEST_MODEL_SHORT_PATH):
-            raise FileNotFoundError(f"Modèle SHORT introuvable : {BEST_MODEL_SHORT_PATH}")
-        policy_short.load_state_dict(torch.load(BEST_MODEL_SHORT_PATH, map_location=device))
-        policy_short.eval()
+    policy_duel = None
 
-    print(f"Modèles LONG/SHORT chargés, mode side='{cfg.side}'…")
+    if cfg.side == "both":
+        if not os.path.exists(BEST_MODEL_DUEL_PATH):
+            raise FileNotFoundError(f"Modèle DUEL introuvable : {BEST_MODEL_DUEL_PATH}")
+        policy_duel = _build_policy()
+        policy_duel.load_state_dict(torch.load(BEST_MODEL_DUEL_PATH, map_location=device))
+        policy_duel.eval()
+        print(f"Modèle DUEL chargé : {BEST_MODEL_DUEL_PATH}")
+    else:
+        if cfg.side in ("duel", "long"):
+            if not os.path.exists(BEST_MODEL_LONG_PATH):
+                raise FileNotFoundError(f"Modèle LONG introuvable : {BEST_MODEL_LONG_PATH}")
+            policy_long = _build_policy()
+            policy_long.load_state_dict(torch.load(BEST_MODEL_LONG_PATH, map_location=device))
+            policy_long.eval()
+            print(f"Modèle LONG chargé : {BEST_MODEL_LONG_PATH}")
+
+        if cfg.side in ("duel", "short"):
+            if not os.path.exists(BEST_MODEL_SHORT_PATH):
+                raise FileNotFoundError(f"Modèle SHORT introuvable : {BEST_MODEL_SHORT_PATH}")
+            policy_short = _build_policy()
+            policy_short.load_state_dict(torch.load(BEST_MODEL_SHORT_PATH, map_location=device))
+            policy_short.eval()
+            print(f"Modèle SHORT chargé : {BEST_MODEL_SHORT_PATH}")
+
+    print(f"Mode side='{cfg.side}'…")
 
     last_bar_time   = None
     last_risk_scale = 1.0
@@ -893,11 +903,34 @@ def live_loop(cfg: LiveConfig, should_continue):
             with torch.no_grad():
                 s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
 
-                a = 4  # default HOLD
+                a = 2  # default HOLD (index HOLD = 2 dans la convention 3-actions)
+                action_labels = ['BUY', 'SELL', 'HOLD']
 
-                if cfg.side == "duel":
+                if cfg.side == "both":
+                    if policy_duel is None:
+                        print("policy_duel non chargé alors que side='both' → HOLD.")
+                        a = 2
+                    else:
+                        logits_d, _ = policy_duel(s)
+                        logits_d = logits_d[0]
+                        mask_d = build_mask_from_pos_scalar(0, device, "both")
+                        logits_d_m = logits_d.masked_fill(~mask_d, MASK_VALUE)
+                        probs_d = torch.softmax(logits_d_m, dim=-1)
+
+                        print("Logits DUEL :", logits_d_m.cpu().numpy().round(4))
+                        print("Probas DUEL :", probs_d.cpu().numpy().round(4))
+
+                        a_duel = int(torch.argmax(probs_d, dim=-1).item())
+                        print(
+                            f"BEST DUEL : action={a_duel}, "
+                            f"prob={probs_d[a_duel].item():.3f} "
+                            f"({action_labels[a_duel]})"
+                        )
+                        a = a_duel
+
+                elif cfg.side == "duel":
                     if policy_long is None or policy_short is None:
-                        a = 4
+                        a = 2
                         print("Policies LONG/SHORT non chargées → HOLD.")
                     else:
                         logits_long, _ = policy_long(s)
@@ -917,22 +950,21 @@ def live_loop(cfg: LiveConfig, should_continue):
                         print("Logits SHORT :", logits_short_m.cpu().numpy().round(4))
                         print("Probas SHORT :", probs_short.cpu().numpy().round(4))
 
-                        max_p_long  = probs_long[:4].max().item()
-                        max_p_short = probs_short[:4].max().item()
+                        # Compare la conviction d'entrée (prob de BUY pour long vs SELL pour short)
+                        p_long_buy  = probs_long[0].item()
+                        p_short_sell = probs_short[1].item()
 
-                        if max_p_long > max_p_short:
-                            idx_long = int(torch.argmax(probs_long[:4]).item())
-                            print(f"[DUEL] Candidat LONG idx={idx_long}, max_p_long={max_p_long:.3f}")
-                            a = idx_long if idx_long in (0, 2) else 4
+                        if p_long_buy > p_short_sell:
+                            print(f"[DUEL] LONG choisi, p(BUY)={p_long_buy:.3f}")
+                            a = 0 if int(torch.argmax(probs_long).item()) == 0 else 2
                         else:
-                            idx_short = int(torch.argmax(probs_short[:4]).item())
-                            print(f"[DUEL] Candidat SHORT idx={idx_short}, max_p_short={max_p_short:.3f}")
-                            a = idx_short if idx_short in (1, 3) else 4
+                            print(f"[DUEL] SHORT choisi, p(SELL)={p_short_sell:.3f}")
+                            a = 1 if int(torch.argmax(probs_short).item()) == 1 else 2
 
                 elif cfg.side == "long":
                     if policy_long is None:
                         print("policy_long non chargé alors que side='long' → HOLD.")
-                        a = 4
+                        a = 2
                     else:
                         logits_long, _ = policy_long(s)
                         logits_long = logits_long[0]
@@ -950,7 +982,7 @@ def live_loop(cfg: LiveConfig, should_continue):
                 elif cfg.side == "short":
                     if policy_short is None:
                         print("policy_short non chargé alors que side='short' → HOLD.")
-                        a = 4
+                        a = 2
                     else:
                         logits_short, _ = policy_short(s)
                         logits_short = logits_short[0]
@@ -966,21 +998,19 @@ def live_loop(cfg: LiveConfig, should_continue):
                         a = a_short
                 else:
                     print(f"cfg.side invalide : {cfg.side}, on HOLD.")
-                    a = 4
+                    a = 2
 
 
-            print(f"Action finale (0:BUY1,1:SELL1,2:BUY1.8,3:SELL1.8,4:HOLD) : {a}")
+            print(f"Action finale (0:BUY, 1:SELL, 2:HOLD) : {a} ({action_labels[a]})")
 
-            if a == 4:
-                env_action = 2
-                risk_scale = 1.0
-            elif a in (0, 2):
+            # Espace 3 actions, risk_scale toujours 1.0
+            if a == 0:    # BUY
                 env_action = 0
-                risk_scale = 1.8 if a == 2 else 1.0
-            elif a in (1, 3):
+                risk_scale = 1.0
+            elif a == 1:  # SELL
                 env_action = 1
-                risk_scale = 1.8 if a == 3 else 1.0
-            else:
+                risk_scale = 1.0
+            else:         # HOLD ou autre
                 env_action = 2
                 risk_scale = 1.0
 

@@ -2,6 +2,7 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import math
+import time as _time
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime
@@ -13,19 +14,76 @@ import torch
 import torch.nn as nn
 
 # ============================================================
-# CONSTANTES / CONFIG
+# LOG HELPERS — couleurs ANSI + formattage uniforme
 # ============================================================
 
-# 0:BUY1, 1:SELL1, 2:BUY1.8, 3:SELL1.8, 4:HOLD
-N_ACTIONS = 5
+# Activation des codes ANSI sur Windows (PowerShell/cmd modernes les supportent)
+try:
+    import colorama
+    colorama.just_fix_windows_console()
+except ImportError:
+    pass
+
+class C:
+    RESET   = "\033[0m"
+    BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    GREEN   = "\033[32m"
+    RED     = "\033[31m"
+    YELLOW  = "\033[33m"
+    BLUE    = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN    = "\033[36m"
+    GREY    = "\033[90m"
+    WHITE   = "\033[97m"
+
+def _c(text: str, color: str) -> str:
+    return f"{color}{text}{C.RESET}"
+
+def fmt_money(x: float, width: int = 10) -> str:
+    s = f"{x:+.2f}$"
+    s = s.rjust(width)
+    return _c(s, C.GREEN if x > 0 else (C.RED if x < 0 else C.GREY))
+
+def fmt_pct(x: float, width: int = 6) -> str:
+    return f"{x*100:>{width-1}.1f}%"
+
+def fmt_time(t) -> str:
+    if isinstance(t, pd.Timestamp):
+        return t.strftime("%Y-%m-%d %H:%M")
+    return str(t)
+
+def hr(char: str = "─", n: int = 78) -> str:
+    return _c(char * n, C.GREY)
+
+def banner(title: str, color: str = C.CYAN) -> str:
+    line = "═" * 78
+    return f"{_c(line, color)}\n  {_c(title, color + C.BOLD)}\n{_c(line, color)}"
+
+# ============================================================
+# BACKTEST ALIGNÉ AVEC training.py + loup_live.py (Loup Ω)
+# ------------------------------------------------------------
+#   - Pas de filtre de confiance (pure argmax comme en live)
+#   - FEATURE_COLS / N_POS_FEATURES identiques au training
+#   - Architecture SAINTv2 identique (d_model=80, blocks=2, heads=4)
+#   - Modes side : "long" / "short" / "duel"
+# ============================================================
+
+# 0:BUY  1:SELL  2:HOLD
+N_ACTIONS = 3
 MASK_VALUE = -1e4  # même valeur que le training / live
 
 # Stats de normalisation (doit correspondre à ton training)
 NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
 
 # Modèles pré-entraînés (best PROFIT ici) — mêmes noms que ton training
+# Pattern training : f"bestprofit_{cfg.model_prefix}_{cfg.side}{suffix}.pth"
+#   model_prefix LONG  = "saintv2_loup_long"   side="long"  suffix="_wf1"
+#   model_prefix SHORT = "saintv2_loup_short"  side="short" suffix="_wf1"
 BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf1_long_wf1.pth"
 BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf1_short_wf1.pth"
+# Modèle unifié (training side="both")
+BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_both_wf1.pth"
 
 
 @dataclass
@@ -64,21 +122,25 @@ class LiveConfig:
     backtest_min_extra_points: int = 100
 
     # ======= Seuil de confiance minimal pour ouvrir un trade =======
-    min_confidence: float = 0.7
+    # 0.0 = pure argmax (comportement identique au live actuel).
+    # > 0  = ne trade que si max(prob) >= seuil — utile pour stresser
+    #        la sélectivité du modèle indépendamment du training.
+    min_confidence: float = 0.0
 
     # device
     force_cpu: bool = False
 
     # mode d’agent :
-    #   "duel"  : long vs short
-    #   "long"  : long only
-    #   "short" : short only
-    side: str = "duel"
+    #   "both"  : modèle unifié duel (1 seul .pth, décide BUY/SELL/HOLD)
+    #   "duel"  : long vs short (2 modèles séparés, arbitrage par max prob)
+    #   "long"  : long only     (utilise bestprofit_long)
+    #   "short" : short only    (utilise bestprofit_short)
+    side: str = "both"
 
     # fréquence d'affichage de progression (en nombre de bougies M1)
     progress_interval_bars: int = 1440  # ~ 1 jour
 
-    date_from: datetime = datetime(2024, 10, 1)
+    date_from: datetime = datetime(2026, 1, 1)
     date_to: Optional[datetime] = None
 
 
@@ -700,56 +762,46 @@ def update_sl_be_trailing_backtest(
     if side == 1:
         max_sl_allowed = close_bar - min_price_dist
         if candidate_sl > max_sl_allowed:
-            print(
-                f"[BT WARN] SL candidate ({candidate_sl:.2f}) trop proche du prix "
-                f"({close_bar:.2f}) pour LONG, clamp → {max_sl_allowed:.2f}"
-            )
-            candidate_sl = max_sl_allowed
+            candidate_sl = max_sl_allowed  # clamp silencieux (sinon spam)
 
         if current_sl > 0 and candidate_sl <= current_sl + 1e-8:
-            print(
-                f"[BT INFO] SL LONG non amélioré : old={current_sl:.2f}, "
-                f"candidate={candidate_sl:.2f}"
-            )
-            return
+            return  # non amélioré, silent
 
     else:
         min_sl_allowed = close_bar + min_price_dist
         if candidate_sl < min_sl_allowed:
-            print(
-                f"[BT WARN] SL candidate ({candidate_sl:.2f}) trop proche du prix "
-                f"({close_bar:.2f}) pour SHORT, clamp → {min_sl_allowed:.2f}"
-            )
             candidate_sl = min_sl_allowed
 
         if current_sl > 0 and candidate_sl >= current_sl - 1e-8:
-            print(
-                f"[BT INFO] SL SHORT non amélioré : old={current_sl:.2f}, "
-                f"candidate={candidate_sl:.2f}"
-            )
             return
 
-    print(f"Update SL ({reason}) : old={current_sl:.2f} → new={candidate_sl:.2f}")
+    # Icône selon raison
+    icon = "↗" if "TRAIL" in reason else "⊜"  # break-even = égalité
+    print(
+        f"  {_c(icon, C.YELLOW)} {_c(reason, C.YELLOW)}  "
+        f"SL {_c(f'{current_sl:>8.2f}', C.GREY)} → {_c(f'{candidate_sl:.2f}', C.WHITE)}"
+    )
     state.sl = candidate_sl
 
 
 def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
     mask = torch.zeros(N_ACTIONS, dtype=torch.bool, device=device)
 
+    # 0=BUY  1=SELL  2=HOLD
     if pos != 0:
-        mask[4] = True
+        mask[2] = True
         return mask
 
     if side == "long":
         mask[0] = True
         mask[2] = True
-        mask[4] = True
     elif side == "short":
         mask[1] = True
-        mask[3] = True
-        mask[4] = True
-    else:  # "duel"
-        mask[:] = True
+        mask[2] = True
+    else:  # "both" / "duel"
+        mask[0] = True
+        mask[1] = True
+        mask[2] = True
 
     return mask
 
@@ -759,13 +811,21 @@ def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
 # ============================================================
 
 def run_backtest(cfg: LiveConfig):
-    print("Connexion MT5 pour téléchargement des données…")
+    print(banner("🐺  LOUP Ω — BACKTEST STRESS-TEST"))
+    print(f"  {_c('Symbole', C.GREY):<20} {C.BOLD}{cfg.symbol}{C.RESET}  ({cfg.timeframe=}, HTF={cfg.htf_timeframe})")
+    print(f"  {_c('Période', C.GREY):<20} {cfg.date_from}  →  {cfg.date_to or 'maintenant'}")
+    print(f"  {_c('Mode side', C.GREY):<20} {_c(cfg.side.upper(), C.MAGENTA + C.BOLD)}")
+    print(f"  {_c('Capital initial', C.GREY):<20} {cfg.initial_capital:.2f}$  |  lot={cfg.position_size}  |  lev=x{cfg.leverage:.0f}")
+    print(f"  {_c('Min confidence', C.GREY):<20} {cfg.min_confidence:.2f}  ({'argmax pur' if cfg.min_confidence <= 0.0 else 'filtré'})")
+    print(hr())
+
+    print(f"{_c('→', C.CYAN)} Connexion MT5…")
     if not mt5.initialize():
         raise RuntimeError("Erreur MT5.initialize() pour le backtest.")
 
     info = mt5.symbol_info(cfg.symbol)
     if info is None:
-        print(f"[WARN] symbol_info({cfg.symbol}) introuvable, on utilise des valeurs par défaut.")
+        print(f"  {_c('⚠', C.YELLOW)} symbol_info({cfg.symbol}) introuvable — valeurs par défaut.")
         point = 0.01
         broker_stops_points = 0
     else:
@@ -776,18 +836,18 @@ def run_backtest(cfg: LiveConfig):
     min_price_dist = min_points * point
 
     print(
-        f"[BACKTEST] point={point:.8f}, "
-        f"trade_stops_level={broker_stops_points} pts, "
-        f"min_extra={cfg.backtest_min_extra_points} pts, "
-        f"min_price_dist={min_price_dist:.5f}"
+        f"  {_c('Broker', C.GREY):<20} point={point:.8f}  "
+        f"stops_lvl={broker_stops_points}pts  "
+        f"min_dist={min_price_dist:.5f}"
     )
 
+    print(f"{_c('→', C.CYAN)} Téléchargement OHLC M1+H1…")
     try:
         df = fetch_ohlc_with_indicators(cfg)
     finally:
         mt5.shutdown()
 
-    print(f"Données M1+H1 chargées : {len(df)} bougies M1 fusionnées.")
+    print(f"  {_c('✓', C.GREEN)} {len(df):,} bougies M1 fusionnées avec H1.")
 
     if len(df) < cfg.lookback + 10:
         raise RuntimeError("Pas assez de données pour lancer le backtest.")
@@ -795,9 +855,30 @@ def run_backtest(cfg: LiveConfig):
     device = get_device(cfg)
     stats = load_norm_stats(NORM_STATS_PATH)
 
-    # Chargement des modèles LONG / SHORT
+    # Chargement des modèles
     policy_long = None
     policy_short = None
+    policy_duel = None
+
+    def _build_policy_bt():
+        return SAINTPolicySingleHead(
+            n_features=OBS_N_FEATURES,
+            d_model=80,
+            num_blocks=2,
+            heads=4,
+            dropout=0.05,
+            ff_mult=2,
+            max_len=cfg.lookback,
+            n_actions=N_ACTIONS
+        ).to(device)
+
+    if cfg.side == "both":
+        if not os.path.exists(BEST_MODEL_DUEL_PATH):
+            raise FileNotFoundError(f"Modèle DUEL introuvable : {BEST_MODEL_DUEL_PATH}")
+        policy_duel = _build_policy_bt()
+        policy_duel.load_state_dict(torch.load(BEST_MODEL_DUEL_PATH, map_location=device))
+        policy_duel.eval()
+        print(f"  {_c('✓', C.GREEN)} Modèle DUEL  : {_c(BEST_MODEL_DUEL_PATH, C.CYAN)}")
 
     if cfg.side in ("duel", "long"):
         if not os.path.exists(BEST_MODEL_LONG_PATH):
@@ -814,6 +895,7 @@ def run_backtest(cfg: LiveConfig):
         ).to(device)
         policy_long.load_state_dict(torch.load(BEST_MODEL_LONG_PATH, map_location=device))
         policy_long.eval()
+        print(f"  {_c('✓', C.GREEN)} Modèle LONG  : {_c(BEST_MODEL_LONG_PATH, C.CYAN)}")
 
     if cfg.side in ("duel", "short"):
         if not os.path.exists(BEST_MODEL_SHORT_PATH):
@@ -830,8 +912,12 @@ def run_backtest(cfg: LiveConfig):
         ).to(device)
         policy_short.load_state_dict(torch.load(BEST_MODEL_SHORT_PATH, map_location=device))
         policy_short.eval()
+        print(f"  {_c('✓', C.GREEN)} Modèle SHORT : {_c(BEST_MODEL_SHORT_PATH, C.CYAN)}")
 
-    print(f"Modèles LONG / SHORT chargés. Mode side='{cfg.side}'.")
+    print(hr())
+    print(f"{_c('▶ DÉMARRAGE BOUCLE BACKTEST', C.CYAN + C.BOLD)}")
+    print(hr())
+    bt_t0 = _time.time()
 
     # État backtest
     state = BTState(
@@ -918,10 +1004,20 @@ def run_backtest(cfg: LiveConfig):
                 state.trades_pnl.append(realized)
                 closed_this_bar = True
 
-                side_txt = "LONG" if state.position == 1 else "SHORT"
+                side_txt = "LONG " if state.position == 1 else "SHORT"
+                side_col = C.GREEN if state.position == 1 else C.RED
+                reason_col = C.RED if exit_reason == "SL" else C.GREEN
+                # Durée du trade en barres
+                hold_bars = i - state.entry_index
                 print(
-                    f"[{time_str}] FERMETURE {side_txt} par {exit_reason} @ {exit_price:.2f} | "
-                    f"PnL={realized:.2f} | Capital={state.capital:.2f}"
+                    f"  {_c('✗', C.RED if realized < 0 else C.GREEN)} "
+                    f"{_c(fmt_time(time_i), C.GREY)}  "
+                    f"{_c(side_txt, side_col)} "
+                    f"{_c(exit_reason, reason_col)}  "
+                    f"@ {exit_price:>9.2f}  "
+                    f"PnL {fmt_money(realized)}  "
+                    f"Cap {fmt_money(state.capital, width=11)}  "
+                    f"{_c(f'({hold_bars}b)', C.GREY)}"
                 )
 
                 state.position = 0
@@ -965,50 +1061,80 @@ def run_backtest(cfg: LiveConfig):
         if obs is None:
             continue
 
-        # 4) Décision d'ENTRÉE si FLAT – même logique que le live (duel + seuil min_confidence)
+        # 4) Décision d'ENTRÉE si FLAT — pure argmax, comme loup_live.py
+        #    Le seuil min_confidence est optionnel (0.0 par défaut = comme live).
         if state.position == 0 and not closed_this_bar:
             with torch.no_grad():
                 s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                thr = cfg.min_confidence
+                thr = cfg.min_confidence  # 0.0 = pas de filtre
 
-                if cfg.side == "duel":
+                # On garde des refs externes au bloc pour le log post-ouverture
+                prob_long_open = None
+                prob_short_open = None
+                probs_long = None
+                probs_short = None
+                probs_duel = None
+
+                if cfg.side == "both":
+                    if policy_duel is None:
+                        a = 2  # HOLD
+                    else:
+                        logits_d, _ = policy_duel(s)
+                        logits_d = logits_d[0]
+                        mask_d = build_mask_from_pos_scalar(0, device, "both")
+                        logits_d_m = logits_d.masked_fill(~mask_d, MASK_VALUE)
+                        probs_duel = torch.softmax(logits_d_m, dim=-1)
+
+                        a_duel = int(torch.argmax(probs_duel).item())
+                        p_duel = float(probs_duel[a_duel].item())
+
+                        # argmax pur sur 3 actions (BUY/SELL/HOLD)
+                        if a_duel in (0, 1) and p_duel >= thr:
+                            a = a_duel
+                        else:
+                            a = 2  # HOLD
+
+                elif cfg.side == "duel":
                     if policy_long is None or policy_short is None:
-                        a = 4
+                        a = 2  # HOLD
                     else:
                         # ----- LONG -----
-                        logits_long, _ = policy_long(s)      # (1,5)
-                        logits_long = logits_long[0]         # (5,)
+                        logits_long, _ = policy_long(s)
+                        logits_long = logits_long[0]
                         mask_long = build_mask_from_pos_scalar(0, device, "long")
                         logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
-                        prob_long_open = torch.softmax(logits_long_m, dim=-1)  # (5,)
-                        max_p_long = prob_long_open[:4].max().item()
+                        prob_long_open = torch.softmax(logits_long_m, dim=-1)
 
                         # ----- SHORT -----
-                        logits_short, _ = policy_short(s)    # (1,5)
-                        logits_short = logits_short[0]       # (5,)
+                        logits_short, _ = policy_short(s)
+                        logits_short = logits_short[0]
                         mask_short = build_mask_from_pos_scalar(0, device, "short")
                         logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
-                        prob_short_open = torch.softmax(logits_short_m, dim=-1)  # (5,)
-                        max_p_short = prob_short_open[:4].max().item()
+                        prob_short_open = torch.softmax(logits_short_m, dim=-1)
 
-                        if max_p_long >= thr and max_p_long > max_p_short:
-                            idx_long = int(torch.argmax(prob_long_open[:4]).item())
-                            if idx_long in (0, 2):
-                                a = idx_long
-                            else:
-                                a = 4
-                        elif max_p_short >= thr:
-                            idx_short = int(torch.argmax(prob_short_open[:4]).item())
-                            if idx_short in (1, 3):
-                                a = idx_short
-                            else:
-                                a = 4
+                        # argmax sur les 3 actions (HOLD inclus)
+                        a_long  = int(torch.argmax(prob_long_open ).item())
+                        a_short = int(torch.argmax(prob_short_open).item())
+                        p_long  = float(prob_long_open [a_long ].item())
+                        p_short = float(prob_short_open[a_short].item())
+
+                        # On compare les deux camps. Si l'un veut HOLD, on regarde l'autre.
+                        long_wants_entry  = a_long  == 0 and p_long  >= thr
+                        short_wants_entry = a_short == 1 and p_short >= thr
+
+                        if long_wants_entry and short_wants_entry:
+                            # arbitrage : on prend le plus confiant
+                            a = a_long if p_long >= p_short else a_short
+                        elif long_wants_entry:
+                            a = a_long
+                        elif short_wants_entry:
+                            a = a_short
                         else:
-                            a = 4  # HOLD si aucun signal fort
+                            a = 2  # HOLD  # HOLD
 
                 elif cfg.side == "long":
                     if policy_long is None:
-                        a = 4
+                        a = 2  # HOLD
                     else:
                         logits_long, _ = policy_long(s)
                         logits_long = logits_long[0]
@@ -1016,18 +1142,18 @@ def run_backtest(cfg: LiveConfig):
                         logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
                         probs_long = torch.softmax(logits_long_m, dim=-1)
 
-                        p_long, a_long = torch.max(probs_long, dim=-1)
-                        a_long = int(a_long.item())
-                        p_long = float(p_long.item())
+                        a_long = int(torch.argmax(probs_long).item())
+                        p_long = float(probs_long[a_long].item())
 
-                        if a_long == 4 or p_long < thr:
-                            a = 4
-                        else:
+                        # argmax pur + filtre optionnel
+                        if a_long == 0 and p_long >= thr:
                             a = a_long
+                        else:
+                            a = 2  # HOLD  # HOLD (soit le model l'a choisi, soit thr non atteint)
 
                 elif cfg.side == "short":
                     if policy_short is None:
-                        a = 4
+                        a = 2  # HOLD
                     else:
                         logits_short, _ = policy_short(s)
                         logits_short = logits_short[0]
@@ -1035,28 +1161,24 @@ def run_backtest(cfg: LiveConfig):
                         logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
                         probs_short = torch.softmax(logits_short_m, dim=-1)
 
-                        p_short, a_short = torch.max(probs_short, dim=-1)
-                        a_short = int(a_short.item())
-                        p_short = float(p_short.item())
+                        a_short = int(torch.argmax(probs_short).item())
+                        p_short = float(probs_short[a_short].item())
 
-                        if a_short == 4 or p_short < thr:
-                            a = 4
-                        else:
+                        if a_short == 1 and p_short >= thr:
                             a = a_short
+                        else:
+                            a = 2  # HOLD
                 else:
-                    a = 4
+                    a = 2  # HOLD
 
-            # mapping vers env_action + risk_scale (comme env / live)
-            if a == 4:
-                env_action = 2
-                risk_scale = 1.0
-            elif a in (0, 2):  # BUY
+            # mapping vers env_action + risk_scale (3 actions : 0=BUY, 1=SELL, 2=HOLD)
+            if a == 0:    # BUY
                 env_action = 0
-                risk_scale = 1.8 if a == 2 else 1.0
-            elif a in (1, 3):  # SELL
+                risk_scale = 1.0
+            elif a == 1:  # SELL
                 env_action = 1
-                risk_scale = 1.8 if a == 3 else 1.0
-            else:
+                risk_scale = 1.0
+            else:         # HOLD (a == 2)
                 env_action = 2
                 risk_scale = 1.0
 
@@ -1088,51 +1210,76 @@ def run_backtest(cfg: LiveConfig):
                 state.entry_index = i
                 state.last_risk_scale = risk_scale
 
-                side_txt = "LONG" if side == 1 else "SHORT"
+                side_txt = "LONG " if side == 1 else "SHORT"
+                side_col = C.GREEN if side == 1 else C.RED
+                action_name = {0: "BUY", 1: "SELL"}.get(a, "HOLD")
 
-                # ====== LOG DES PROBABILITÉS D’ACTION ======
-                if cfg.side == "duel":
-                    print("\n--- Probabilités d’action LONG ---")
-                    print(f"BUY1    : {prob_long_open[0].item():.4f}")
-                    print(f"SELL1   : {prob_long_open[1].item():.4f}")
-                    print(f"BUY1.8  : {prob_long_open[2].item():.4f}")
-                    print(f"SELL1.8 : {prob_long_open[3].item():.4f}")
-                    print(f"HOLD    : {prob_long_open[4].item():.4f}")
+                # Probabilités compactes sur une ligne
+                def _fmt_probs(p, picked):
+                    names = ["BUY", "SELL", "HOLD"]
+                    parts = []
+                    for k, nm in enumerate(names):
+                        v = p[k].item()
+                        col = C.WHITE + C.BOLD if k == picked else C.GREY
+                        parts.append(f"{_c(nm, col)}={_c(f'{v:.2f}', col)}")
+                    return " ".join(parts)
 
-                    print("--- Probabilités d’action SHORT ---")
-                    print(f"BUY1    : {prob_short_open[0].item():.4f}")
-                    print(f"SELL1   : {prob_short_open[1].item():.4f}")
-                    print(f"BUY1.8  : {prob_short_open[2].item():.4f}")
-                    print(f"SELL1.8 : {prob_short_open[3].item():.4f}")
-                    print(f"HOLD    : {prob_short_open[4].item():.4f}\n")
+                if cfg.side == "both" and probs_duel is not None:
+                    print(f"    {_c('probas D', C.GREY)} {_fmt_probs(probs_duel, a)}")
+                elif cfg.side == "duel" and prob_long_open is not None and prob_short_open is not None:
+                    print(
+                        f"    {_c('probas L', C.GREY)} "
+                        f"{_fmt_probs(prob_long_open, a if a == 0 else -1)}"
+                    )
+                    print(
+                        f"    {_c('probas S', C.GREY)} "
+                        f"{_fmt_probs(prob_short_open, a if a == 1 else -1)}"
+                    )
+                elif cfg.side == "long" and probs_long is not None:
+                    print(f"    {_c('probas  ', C.GREY)} {_fmt_probs(probs_long, a)}")
+                elif cfg.side == "short" and probs_short is not None:
+                    print(f"    {_c('probas  ', C.GREY)} {_fmt_probs(probs_short, a)}")
 
-                elif cfg.side == "long":
-                    print("\n--- Probabilités d’action LONG ---")
-                    print(f"BUY1    : {probs_long[0].item():.4f}")
-                    print(f"SELL1   : {probs_long[1].item():.4f}")
-                    print(f"BUY1.8  : {probs_long[2].item():.4f}")
-                    print(f"SELL1.8 : {probs_long[3].item():.4f}")
-                    print(f"HOLD    : {probs_long[4].item():.4f}\n")
-
-                elif cfg.side == "short":
-                    print("\n--- Probabilités d’action SHORT ---")
-                    print(f"BUY1    : {probs_short[0].item():.4f}")
-                    print(f"SELL1   : {probs_short[1].item():.4f}")
-                    print(f"BUY1.8  : {probs_short[2].item():.4f}")
-                    print(f"SELL1.8 : {probs_short[3].item():.4f}")
-                    print(f"HOLD    : {probs_short[4].item():.4f}\n")
-
+                rs_txt = f"x{risk_scale:.1f}" if risk_scale != 1.0 else "x1.0"
                 print(
-                    f"[{time_str}] OUVERTURE {side_txt} @ {entry_price:.2f} | vol={volume:.4f} | "
-                    f"SL={sl:.2f} | TP={tp:.2f} | risk_scale={risk_scale:.2f}"
+                    f"  {_c('▶', C.CYAN)} "
+                    f"{_c(fmt_time(time_i), C.GREY)}  "
+                    f"{_c(side_txt, side_col + C.BOLD)} {_c(action_name, side_col)}  "
+                    f"@ {entry_price:>9.2f}  "
+                    f"SL {sl:>9.2f}  TP {tp:>9.2f}  "
+                    f"vol={volume:.4f} {_c(rs_txt, C.YELLOW)}"
                 )
 
         # 5) Log de progression périodique
         if ((i - (start_index + 1)) % cfg.progress_interval_bars == 0) or (i == n - 2):
             pnl_total = state.equity - cfg.initial_capital
+            nb = len(state.trades_pnl)
+            wins = sum(1 for p in state.trades_pnl if p > 0)
+            losses = nb - wins
+            wr = (wins / nb) if nb > 0 else 0.0
+            tot_w = sum(p for p in state.trades_pnl if p > 0)
+            tot_l = sum(-p for p in state.trades_pnl if p < 0)
+            pf = (tot_w / tot_l) if tot_l > 1e-8 else 0.0
+            progress = (i - start_index) / (n - start_index) * 100
+            elapsed = _time.time() - bt_t0
+
+            # Couleur DD selon gravité
+            dd_pct = max_dd * 100
+            dd_col = C.GREEN if dd_pct < 20 else (C.YELLOW if dd_pct < 50 else C.RED)
+
             print(
-                f"[{time_str}] PROGRESSION backtest | Equity={state.equity:.2f} | "
-                f"PnL={pnl_total:.2f} | DDmax={max_dd*100:.1f}% | NbTrades={len(state.trades_pnl)}"
+                f"\n{hr('·')}\n"
+                f"  {_c('⏱', C.MAGENTA)} {_c(fmt_time(time_i), C.GREY)}  "
+                f"{_c(f'[{progress:5.1f}%]', C.MAGENTA)}  "
+                f"{_c(f'{elapsed:.0f}s', C.GREY)}\n"
+                f"    {_c('Equity', C.GREY):<14} {fmt_money(state.equity, width=11)}   "
+                f"{_c('PnL', C.GREY)} {fmt_money(pnl_total, width=11)}\n"
+                f"    {_c('Trades', C.GREY):<14} {nb:<4d} ({_c(str(wins), C.GREEN)}W / "
+                f"{_c(str(losses), C.RED)}L)   "
+                f"{_c('WR', C.GREY)} {fmt_pct(wr)}   "
+                f"{_c('PF', C.GREY)} {pf:.2f}   "
+                f"{_c('DDmax', C.GREY)} {_c(f'{dd_pct:.1f}%', dd_col)}\n"
+                f"{hr('·')}"
             )
 
     # ========================================================
@@ -1140,32 +1287,73 @@ def run_backtest(cfg: LiveConfig):
     # ========================================================
     pnl_total = state.equity - cfg.initial_capital
     nb_trades = len(state.trades_pnl)
-    winrate = (
-        float(np.mean([p > 0 for p in state.trades_pnl])) if nb_trades > 0 else 0.0
-    )
+    wins = [p for p in state.trades_pnl if p > 0]
+    losses = [p for p in state.trades_pnl if p <= 0]
+    nb_wins = len(wins)
+    nb_losses = len(losses)
+    winrate = (nb_wins / nb_trades) if nb_trades > 0 else 0.0
     avg_pnl = float(np.mean(state.trades_pnl)) if nb_trades > 0 else 0.0
+    avg_win = float(np.mean(wins)) if wins else 0.0
+    avg_loss = float(np.mean(losses)) if losses else 0.0
     max_profit = max(state.trades_pnl) if nb_trades > 0 else 0.0
     max_loss = min(state.trades_pnl) if nb_trades > 0 else 0.0
+    total_w = sum(wins)
+    total_l = sum(-p for p in losses)
+    pf = (total_w / total_l) if total_l > 1e-8 else 0.0
+    roi = (pnl_total / cfg.initial_capital) * 100 if cfg.initial_capital > 0 else 0.0
+    elapsed = _time.time() - bt_t0
 
-    print("\n===================== RÉSULTATS BACKTEST =====================")
-    print(f"Mode side           : {cfg.side}")
-    print(f"Capital initial     : {cfg.initial_capital:.2f}")
-    print(f"Capital final       : {state.equity:.2f}")
-    print(f"PnL total           : {pnl_total:.2f}")
-    print(f"Nb trades           : {nb_trades}")
-    print(f"Winrate             : {winrate*100:.1f}%")
-    print(f"PnL moyen / trade   : {avg_pnl:.2f}")
-    print(f"Meilleur trade      : {max_profit:.2f}")
-    print(f"Pire trade          : {max_loss:.2f}")
-    print(f"Max drawdown (equity): {max_dd*100:.1f}%")
-    print("==============================================================")
+    # Verdict simple selon Sortino approximé : PF*WR
+    score = pf * winrate
+    if pnl_total > 0 and pf >= 1.2 and winrate >= 0.40:
+        verdict, vcol = "✓ ROBUSTE", C.GREEN
+    elif pnl_total > 0:
+        verdict, vcol = "~ ACCEPTABLE", C.YELLOW
+    else:
+        verdict, vcol = "✗ NON RENTABLE", C.RED
+
+    pnl_col = C.GREEN if pnl_total > 0 else C.RED
+    dd_col = C.GREEN if max_dd*100 < 20 else (C.YELLOW if max_dd*100 < 50 else C.RED)
+
+    print("\n" + banner("📊  RÉSULTATS BACKTEST", C.MAGENTA))
+    print(f"  {_c('Verdict', C.GREY):<28} {_c(verdict, vcol + C.BOLD)}")
+    print(f"  {_c('Mode side', C.GREY):<28} {_c(cfg.side.upper(), C.MAGENTA)}")
+    print(f"  {_c('Durée run', C.GREY):<28} {elapsed:.1f}s")
+    print(hr())
+    print(f"  {_c('Capital initial', C.GREY):<28} {cfg.initial_capital:>10.2f}$")
+    print(f"  {_c('Capital final', C.GREY):<28} {state.equity:>10.2f}$")
+    print(f"  {_c('PnL total', C.GREY):<28} {_c(f'{pnl_total:>+10.2f}$', pnl_col + C.BOLD)}  ({_c(f'{roi:+.1f}%', pnl_col)})")
+    print(f"  {_c('Max drawdown', C.GREY):<28} {_c(f'{max_dd*100:>10.1f}%', dd_col)}")
+    print(hr())
+    print(f"  {_c('Nb trades', C.GREY):<28} {nb_trades}")
+    print(f"  {_c('Wins / Losses', C.GREY):<28} {_c(str(nb_wins), C.GREEN)} / {_c(str(nb_losses), C.RED)}")
+    print(f"  {_c('Winrate', C.GREY):<28} {fmt_pct(winrate)}")
+    print(f"  {_c('Profit Factor', C.GREY):<28} {pf:.2f}")
+    print(f"  {_c('Score (PF×WR)', C.GREY):<28} {score:.3f}")
+    print(hr())
+    print(f"  {_c('PnL moyen / trade', C.GREY):<28} {fmt_money(avg_pnl)}")
+    print(f"  {_c('Avg gain (W)', C.GREY):<28} {fmt_money(avg_win)}")
+    print(f"  {_c('Avg perte (L)', C.GREY):<28} {fmt_money(avg_loss)}")
+    print(f"  {_c('Meilleur trade', C.GREY):<28} {fmt_money(max_profit)}")
+    print(f"  {_c('Pire trade', C.GREY):<28} {fmt_money(max_loss)}")
+    print(_c("═" * 78, C.MAGENTA))
 
 
 if __name__ == "__main__":
-    # Choisis "duel" / "long" / "short"
+    # ---------------------------------------------------------
+    # Backtest du modèle BESTPROFIT DUEL (par défaut)
+    # ---------------------------------------------------------
+    #   side="both"  → 1 modèle unifié (bestprofit_saintv2_loup_duel_both_wf1)
+    #   side="duel"  → 2 modèles séparés long+short
+    #   side="long"  → bestprofit_long uniquement
+    #   side="short" → bestprofit_short uniquement
+    # min_confidence=0.0 → pure argmax, comportement identique au live.
+    #     Mettre 0.5–0.9 pour stresser la sélectivité a posteriori.
     cfg = LiveConfig(
-        side="duel",
+        side="both",
+        min_confidence=0.0,
         n_bars_m1=200_000,
         n_bars_h1=50_000,
+        date_from=datetime(2025, 1, 1),
     )
     run_backtest(cfg)

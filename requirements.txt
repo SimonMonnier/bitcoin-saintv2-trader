@@ -6,3 +6,9 @@ numpy==1.26.4
 pandas==2.2.3
 MetaTrader5==5.0.4687
 gymnasium==0.29.1
+
+# GUI live
+PySide6==6.8.0
+
+# Couleurs ANSI dans la console Windows
+colorama==0.4.6

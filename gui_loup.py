@@ -91,10 +91,10 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
 
         # --- Config & Agent ---
-        self.cfg = LiveConfig(side="long")
+        self.cfg = LiveConfig(side="both")
         self.agent = TradingAgent(self.cfg)
 
-        self.setWindowTitle("Loup Ω – BTCUSD M1 Long")
+        self.setWindowTitle("Loup Ω – BTCUSD M1")
         self.setMinimumSize(900, 600)
 
         # Compteurs par niveau (affichage)
@@ -129,7 +129,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(title)
 
         subtitle = QtWidgets.QLabel(
-            "Agent RL en live sur MT5 – Mode Long, sans TP fixe (SL initial + break-even + trailing)."
+            "Agent RL en live sur MT5 – Mode duel (LONG + SHORT), SL initial + break-even + trailing."
         )
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
@@ -172,6 +172,133 @@ class MainWindow(QtWidgets.QMainWindow):
         self.equity_label = QtWidgets.QLabel("Equity : N/A | Balance : N/A | Margin : N/A")
         self.equity_label.setWordWrap(True)
         layout.addWidget(self.equity_label)
+
+        # ============ PANNEAU STATS LONG / SHORT ============
+        # Track des trades de la session courante (depuis ouverture du GUI ou Reset)
+        self.session_start = dt.datetime.now()
+        self._stats_seen_deal_tickets: set = set()
+        # {"long":{"wins":[], "losses":[]}, "short":{"wins":[], "losses":[]}}
+        self.session_stats = {
+            "long":  {"wins": [], "losses": []},
+            "short": {"wins": [], "losses": []},
+        }
+
+        stats_group = QtWidgets.QGroupBox("Stats de session (depuis ouverture)")
+        stats_group.setStyleSheet("QGroupBox { color: #ccc; font-weight: bold; }")
+        stats_v = QtWidgets.QVBoxLayout(stats_group)
+
+        # Grille L / S / TOTAL
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(20)
+        grid.setVerticalSpacing(4)
+
+        # Header
+        def _hdr(txt):
+            lbl = QtWidgets.QLabel(txt)
+            lbl.setStyleSheet("color: #888; font-size: 10px;")
+            return lbl
+
+        grid.addWidget(_hdr("Côté"),    0, 0)
+        grid.addWidget(_hdr("Trades"),  0, 1)
+        grid.addWidget(_hdr("Wins"),    0, 2)
+        grid.addWidget(_hdr("Losses"),  0, 3)
+        grid.addWidget(_hdr("Winrate"), 0, 4)
+        grid.addWidget(_hdr("PF"),      0, 5)
+        grid.addWidget(_hdr("PnL"),     0, 6)
+        grid.addWidget(_hdr("Avg W"),   0, 7)
+        grid.addWidget(_hdr("Avg L"),   0, 8)
+
+        def _stat_lbl(color="#dddddd", bold=False):
+            lbl = QtWidgets.QLabel("—")
+            w = "bold" if bold else "normal"
+            lbl.setStyleSheet(f"color: {color}; font-weight: {w}; font-family: Consolas, 'Courier New', monospace;")
+            lbl.setMinimumWidth(60)
+            return lbl
+
+        # Ligne LONG (vert)
+        long_label = QtWidgets.QLabel("● LONG")
+        long_label.setStyleSheet("color: #2ecc71; font-weight: bold;")
+        grid.addWidget(long_label, 1, 0)
+        self.long_trades_lbl = _stat_lbl()
+        self.long_wins_lbl   = _stat_lbl(color="#2ecc71")
+        self.long_losses_lbl = _stat_lbl(color="#e74c3c")
+        self.long_wr_lbl     = _stat_lbl()
+        self.long_pf_lbl     = _stat_lbl()
+        self.long_pnl_lbl    = _stat_lbl(bold=True)
+        self.long_avgw_lbl   = _stat_lbl(color="#2ecc71")
+        self.long_avgl_lbl   = _stat_lbl(color="#e74c3c")
+        grid.addWidget(self.long_trades_lbl, 1, 1)
+        grid.addWidget(self.long_wins_lbl,   1, 2)
+        grid.addWidget(self.long_losses_lbl, 1, 3)
+        grid.addWidget(self.long_wr_lbl,     1, 4)
+        grid.addWidget(self.long_pf_lbl,     1, 5)
+        grid.addWidget(self.long_pnl_lbl,    1, 6)
+        grid.addWidget(self.long_avgw_lbl,   1, 7)
+        grid.addWidget(self.long_avgl_lbl,   1, 8)
+
+        # Ligne SHORT (bleu)
+        short_label = QtWidgets.QLabel("● SHORT")
+        short_label.setStyleSheet("color: #3498db; font-weight: bold;")
+        grid.addWidget(short_label, 2, 0)
+        self.short_trades_lbl = _stat_lbl()
+        self.short_wins_lbl   = _stat_lbl(color="#2ecc71")
+        self.short_losses_lbl = _stat_lbl(color="#e74c3c")
+        self.short_wr_lbl     = _stat_lbl()
+        self.short_pf_lbl     = _stat_lbl()
+        self.short_pnl_lbl    = _stat_lbl(bold=True)
+        self.short_avgw_lbl   = _stat_lbl(color="#2ecc71")
+        self.short_avgl_lbl   = _stat_lbl(color="#e74c3c")
+        grid.addWidget(self.short_trades_lbl, 2, 1)
+        grid.addWidget(self.short_wins_lbl,   2, 2)
+        grid.addWidget(self.short_losses_lbl, 2, 3)
+        grid.addWidget(self.short_wr_lbl,     2, 4)
+        grid.addWidget(self.short_pf_lbl,     2, 5)
+        grid.addWidget(self.short_pnl_lbl,    2, 6)
+        grid.addWidget(self.short_avgw_lbl,   2, 7)
+        grid.addWidget(self.short_avgl_lbl,   2, 8)
+
+        # Séparateur
+        sep = QtWidgets.QFrame()
+        sep.setFrameShape(QtWidgets.QFrame.HLine)
+        sep.setStyleSheet("color: #444;")
+        grid.addWidget(sep, 3, 0, 1, 9)
+
+        # Ligne TOTAL
+        total_label = QtWidgets.QLabel("Σ TOTAL")
+        total_label.setStyleSheet("color: #ffffff; font-weight: bold;")
+        grid.addWidget(total_label, 4, 0)
+        self.total_trades_lbl = _stat_lbl(bold=True)
+        self.total_wins_lbl   = _stat_lbl(color="#2ecc71", bold=True)
+        self.total_losses_lbl = _stat_lbl(color="#e74c3c", bold=True)
+        self.total_wr_lbl     = _stat_lbl(bold=True)
+        self.total_pf_lbl     = _stat_lbl(bold=True)
+        self.total_pnl_lbl    = _stat_lbl(bold=True)
+        grid.addWidget(self.total_trades_lbl, 4, 1)
+        grid.addWidget(self.total_wins_lbl,   4, 2)
+        grid.addWidget(self.total_losses_lbl, 4, 3)
+        grid.addWidget(self.total_wr_lbl,     4, 4)
+        grid.addWidget(self.total_pf_lbl,     4, 5)
+        grid.addWidget(self.total_pnl_lbl,    4, 6)
+        # 2 dernières colonnes vides sur la ligne total
+        grid.addWidget(_stat_lbl(), 4, 7)
+        grid.addWidget(_stat_lbl(), 4, 8)
+
+        stats_v.addLayout(grid)
+
+        # Bouton Reset stats + info session
+        bottom = QtWidgets.QHBoxLayout()
+        self.session_info_lbl = QtWidgets.QLabel()
+        self.session_info_lbl.setStyleSheet("color: #888; font-size: 10px;")
+        bottom.addWidget(self.session_info_lbl)
+        bottom.addStretch()
+        self.reset_stats_btn = QtWidgets.QPushButton("🔄 Reset stats")
+        self.reset_stats_btn.clicked.connect(self.on_reset_stats)
+        self.reset_stats_btn.setMaximumWidth(120)
+        bottom.addWidget(self.reset_stats_btn)
+        stats_v.addLayout(bottom)
+
+        layout.addWidget(stats_group)
+        self._update_stats_display()
 
         # ============ ZONE DE LOG ============
         log_group = QtWidgets.QGroupBox("Logs en direct")
@@ -254,8 +381,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.equity_timer.timeout.connect(self.update_equity)
         self.equity_timer.start()
 
+        # Stats LONG/SHORT depuis l'historique MT5
+        self.stats_timer = QtCore.QTimer(self)
+        self.stats_timer.setInterval(5000)
+        self.stats_timer.timeout.connect(self.update_stats)
+        self.stats_timer.start()
+
         self.update_status()
         self.update_equity()
+        self.update_stats()
 
         # Petit message d'accueil
         self._append_log("Interface démarrée. En attente du lancement de l'IA…", LogLevel.INFO)
@@ -360,6 +494,138 @@ class MainWindow(QtWidgets.QMainWindow):
             text = f"État bot : ⏹️ ARRÊTÉ | side={self.cfg.side} | lot={lot:.2f}"
             self.status_label.setStyleSheet("color: #e74c3c; font-weight: bold;")
         self.status_label.setText(text)
+
+    # ====================================================
+    # Stats LONG / SHORT
+    # ====================================================
+
+    def on_reset_stats(self):
+        self.session_start = dt.datetime.now()
+        self._stats_seen_deal_tickets.clear()
+        self.session_stats = {
+            "long":  {"wins": [], "losses": []},
+            "short": {"wins": [], "losses": []},
+        }
+        self._update_stats_display()
+        self._append_log("[GUI] Stats de session remises à zéro.", LogLevel.INFO)
+
+    def update_stats(self):
+        """Récupère les deals MT5 fermés depuis session_start et agrège L/S."""
+        try:
+            mt5.initialize()
+            symbol = self.cfg.symbol if hasattr(self.cfg, "symbol") else "BTCUSD"
+            deals = mt5.history_deals_get(self.session_start, dt.datetime.now(), group=symbol)
+            if deals is None:
+                self._update_stats_display()
+                return
+
+            for d in deals:
+                # On veut uniquement les deals de SORTIE (clôture de position)
+                if d.entry != mt5.DEAL_ENTRY_OUT:
+                    continue
+                if d.ticket in self._stats_seen_deal_tickets:
+                    continue
+                self._stats_seen_deal_tickets.add(d.ticket)
+
+                # Un deal de sortie type=SELL ferme un LONG, type=BUY ferme un SHORT
+                pnl = float(d.profit) + float(d.commission) + float(d.swap)
+                if d.type == mt5.DEAL_TYPE_SELL:
+                    side = "long"
+                elif d.type == mt5.DEAL_TYPE_BUY:
+                    side = "short"
+                else:
+                    continue
+
+                if pnl > 0:
+                    self.session_stats[side]["wins"].append(pnl)
+                else:
+                    self.session_stats[side]["losses"].append(pnl)
+
+            self._update_stats_display()
+        except Exception as e:
+            self.session_info_lbl.setText(f"Erreur stats : {e}")
+
+    def _fmt_money_html(self, x: float) -> str:
+        if x > 0:
+            return f'<span style="color:#2ecc71;">+{x:.2f}$</span>'
+        if x < 0:
+            return f'<span style="color:#e74c3c;">{x:.2f}$</span>'
+        return '<span style="color:#888;">0.00$</span>'
+
+    def _update_stats_display(self):
+        def _side_stats(side):
+            w = self.session_stats[side]["wins"]
+            l = self.session_stats[side]["losses"]
+            nw, nl = len(w), len(l)
+            n = nw + nl
+            wr = (nw / n) if n > 0 else 0.0
+            tot_w = sum(w)
+            tot_l = abs(sum(l))
+            pf = (tot_w / tot_l) if tot_l > 1e-8 else 0.0
+            pnl = tot_w - tot_l
+            avg_w = (tot_w / nw) if nw > 0 else 0.0
+            avg_l = (sum(l) / nl) if nl > 0 else 0.0
+            return n, nw, nl, wr, pf, pnl, avg_w, avg_l
+
+        # LONG
+        n, nw, nl, wr, pf, pnl, aw, al = _side_stats("long")
+        self.long_trades_lbl.setText(str(n))
+        self.long_wins_lbl.setText(str(nw))
+        self.long_losses_lbl.setText(str(nl))
+        self.long_wr_lbl.setText(f"{wr*100:.1f}%" if n > 0 else "—")
+        self.long_pf_lbl.setText(f"{pf:.2f}" if n > 0 else "—")
+        self._set_money_label(self.long_pnl_lbl, pnl, bold=True)
+        self.long_avgw_lbl.setText(f"+{aw:.2f}$" if nw > 0 else "—")
+        self.long_avgl_lbl.setText(f"{al:.2f}$" if nl > 0 else "—")
+
+        # SHORT
+        n2, nw2, nl2, wr2, pf2, pnl2, aw2, al2 = _side_stats("short")
+        self.short_trades_lbl.setText(str(n2))
+        self.short_wins_lbl.setText(str(nw2))
+        self.short_losses_lbl.setText(str(nl2))
+        self.short_wr_lbl.setText(f"{wr2*100:.1f}%" if n2 > 0 else "—")
+        self.short_pf_lbl.setText(f"{pf2:.2f}" if n2 > 0 else "—")
+        self._set_money_label(self.short_pnl_lbl, pnl2, bold=True)
+        self.short_avgw_lbl.setText(f"+{aw2:.2f}$" if nw2 > 0 else "—")
+        self.short_avgl_lbl.setText(f"{al2:.2f}$" if nl2 > 0 else "—")
+
+        # TOTAL
+        tot_n = n + n2
+        tot_w = nw + nw2
+        tot_l = nl + nl2
+        tot_wr = (tot_w / tot_n) if tot_n > 0 else 0.0
+        gw = sum(self.session_stats["long"]["wins"]) + sum(self.session_stats["short"]["wins"])
+        gl = abs(sum(self.session_stats["long"]["losses"]) + sum(self.session_stats["short"]["losses"]))
+        tot_pf = (gw / gl) if gl > 1e-8 else 0.0
+        tot_pnl = pnl + pnl2
+
+        self.total_trades_lbl.setText(str(tot_n))
+        self.total_wins_lbl.setText(str(tot_w))
+        self.total_losses_lbl.setText(str(tot_l))
+        self.total_wr_lbl.setText(f"{tot_wr*100:.1f}%" if tot_n > 0 else "—")
+        self.total_pf_lbl.setText(f"{tot_pf:.2f}" if tot_n > 0 else "—")
+        self._set_money_label(self.total_pnl_lbl, tot_pnl, bold=True)
+
+        elapsed = dt.datetime.now() - self.session_start
+        h = int(elapsed.total_seconds() // 3600)
+        m = int((elapsed.total_seconds() % 3600) // 60)
+        self.session_info_lbl.setText(
+            f"Session ouverte depuis {self.session_start:%H:%M:%S}  ·  durée {h:d}h{m:02d}m"
+        )
+
+    def _set_money_label(self, lbl: QtWidgets.QLabel, x: float, bold: bool = False):
+        if x > 0:
+            color = "#2ecc71"
+        elif x < 0:
+            color = "#e74c3c"
+        else:
+            color = "#888"
+        weight = "bold" if bold else "normal"
+        sign = "+" if x > 0 else ""
+        lbl.setText(f"{sign}{x:.2f}$")
+        lbl.setStyleSheet(
+            f"color: {color}; font-weight: {weight}; font-family: Consolas, 'Courier New', monospace;"
+        )
 
     def update_equity(self):
         try:

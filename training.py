@@ -9,7 +9,8 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 
 import MetaTrader5 as mt5
@@ -28,6 +29,60 @@ torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")
 
 # ============================================================
+# LOG HELPERS — ANSI couleurs pour les prints d'entraînement
+# ============================================================
+
+try:
+    import colorama
+    colorama.just_fix_windows_console()
+except ImportError:
+    pass
+
+
+class _C:
+    RESET   = "\033[0m"
+    BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    GREEN   = "\033[32m"
+    RED     = "\033[31m"
+    YELLOW  = "\033[33m"
+    BLUE    = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN    = "\033[36m"
+    GREY    = "\033[90m"
+    WHITE   = "\033[97m"
+
+
+def _col(text: str, color: str) -> str:
+    return f"{color}{text}{_C.RESET}"
+
+
+def _money(x: float, width: int = 9) -> str:
+    """+1234.56$ ou -123.45$ coloré selon signe."""
+    s = f"{x:+.2f}$".rjust(width)
+    if x > 0:
+        return _col(s, _C.GREEN)
+    if x < 0:
+        return _col(s, _C.RED)
+    return _col(s, _C.GREY)
+
+
+def _pct(x: float, width: int = 5) -> str:
+    return f"{x*100:>{width-1}.1f}%"
+
+
+def _split_by_side(trades_pnl, trades_side):
+    """Renvoie (pnl_long, pnl_short) avec chacun (wins, losses, total_pnl)."""
+    long_w  = [p for p, s in zip(trades_pnl, trades_side) if s == 1 and p > 0]
+    long_l  = [p for p, s in zip(trades_pnl, trades_side) if s == 1 and p <= 0]
+    short_w = [p for p, s in zip(trades_pnl, trades_side) if s == -1 and p > 0]
+    short_l = [p for p, s in zip(trades_pnl, trades_side) if s == -1 and p <= 0]
+    return {
+        "long":  {"wins": long_w,  "losses": long_l,  "pnl": float(sum(long_w + long_l))},
+        "short": {"wins": short_w, "losses": short_l, "pnl": float(sum(short_w + short_l))},
+    }
+
+# ============================================================
 # SEED GLOBAL
 # ============================================================
 
@@ -40,8 +95,8 @@ torch.manual_seed(SEED)
 # CONSTANTES
 # ============================================================
 
-# 0:BUY1, 1:SELL1, 2:BUY1.8, 3:SELL1.8, 4:HOLD
-N_ACTIONS = 5
+# 0:BUY  1:SELL  2:HOLD
+N_ACTIONS = 3
 MASK_VALUE = -1e4  # valeur de masquage compatible float16
 CONF_THRESHOLD = 0.95  # seuil de confiance (exploration entraînement)
 
@@ -63,13 +118,20 @@ class PPOConfig:
     symbol: str = "BTCUSD"
     timeframe: int = mt5.TIMEFRAME_M1
     htf_timeframe: int = mt5.TIMEFRAME_H1
-    n_bars: int = 261800
+    # Fenêtre temporelle (UTC). Si date_to est None → maintenant.
+    # Les barres en-dehors de [date_from, date_to] sont ignorées.
+    # 2022-01-01 inclut bear Luna/FTX/2022 → équilibre haussier/baissier
+    date_from: datetime = field(default_factory=lambda: datetime(2022, 1, 1))
+    date_to: Optional[datetime] = None
+    # n_bars est gardé en fallback uniquement si copy_rates_range échoue.
+    # 2_500_000 bougies M1 ≈ 4.7 ans (avec weekends crypto = 24/7)
+    n_bars: int = 2_500_000
     lookback: int = 25
 
     # PPO Training
-    epochs: int = 160
-    episodes_per_epoch: int = 3
-    episode_length: int = 2333
+    epochs: int = 240               # +50% vs 160 pour cosine LR plus douce
+    episodes_per_epoch: int = 4     # +1 pour plus de diversité par epoch
+    episode_length: int = 4000      # 2333 → 4000 (~2.8j de M1) : trajectoires plus longues
     updates_per_epoch: int = 2
     tp_shrink: float = 0.7
 
@@ -80,8 +142,10 @@ class PPOConfig:
     lr: float = 3e-4
     target_kl: float = 0.03
     value_coef: float = 0.5
-    entropy_coef: float = 0.15
-    max_grad_norm: float = 1.0
+    # (B) Entropy plus fort : pousse la policy à explorer SHORT
+    entropy_coef: float = 0.25
+    # (A) Clip plus serré : empêche les gradient explosions fold 2
+    max_grad_norm: float = 0.5
 
     # SAINT
     d_model: int = 80
@@ -131,11 +195,10 @@ class PPOConfig:
     force_cpu: bool = False
     use_amp: bool = True
 
-    # Spécialisation d'agent
-    # "both"  → BUY + SELL
-    # "long"  → seulement BUY1 / BUY1.8 / HOLD
-    # "short" → seulement SELL1 / SELL1.8 / HOLD
-    # "close" → agent de clôture
+    # Spécialisation d'agent (mode "close" supprimé)
+    # "both"  → BUY + SELL + HOLD
+    # "long"  → seulement BUY1 / HOLD
+    # "short" → seulement SELL1 / HOLD
     side: str = "both"
 
     # Préfixe pour nommer les fichiers de modèle
@@ -193,24 +256,102 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # CHARGEMENT M1 + H1
 # ============================================================
 
+def _fetch_paginated(symbol: str, timeframe: int,
+                     date_from: datetime, date_to: datetime,
+                     chunk: int = 100_000) -> Optional[np.ndarray]:
+    """
+    Récupère les bougies entre date_from et date_to en paginant par chunks
+    de fin → début (copy_rates_from accepte un date_to + count).
+    MT5 limite copy_rates_range quand le cache local est trop court.
+    Cette fonction "remonte" pas à pas pour tirer l'historique manquant.
+    """
+    all_chunks = []
+    cursor = date_to
+    seen_oldest = None
+    safety_iter = 0
+    while safety_iter < 200:  # garde-fou : max 200 × chunk = 20M bougies
+        safety_iter += 1
+        rates = mt5.copy_rates_from(symbol, timeframe, cursor, chunk)
+        if rates is None or len(rates) == 0:
+            break
+
+        # Filtrer ce qui est avant date_from (fin de la pagination)
+        oldest_ts = int(rates[0]["time"])
+        oldest_dt = datetime.utcfromtimestamp(oldest_ts)
+
+        # On garde tout ce chunk pour l'instant, le filtrage final se fait après
+        all_chunks.append(rates)
+
+        # Critère d'arrêt 1 : on a dépassé date_from
+        if oldest_dt <= date_from:
+            break
+        # Critère d'arrêt 2 : on n'avance plus
+        if seen_oldest is not None and oldest_ts >= seen_oldest:
+            break
+        seen_oldest = oldest_ts
+
+        # On positionne le curseur juste AVANT la bougie la plus ancienne
+        cursor = oldest_dt - pd.Timedelta(seconds=1)
+
+    if not all_chunks:
+        return None
+
+    # Concat + dédoublon + filtre date_from
+    rates_all = np.concatenate(all_chunks)
+    rates_all = np.unique(rates_all)  # numpy structuré : trie + dédoublonne
+    ts_from = int(date_from.timestamp())
+    ts_to   = int(date_to.timestamp())
+    rates_all = rates_all[(rates_all["time"] >= ts_from) & (rates_all["time"] <= ts_to)]
+    return rates_all
+
+
 def load_mt5_data(cfg: PPOConfig) -> pd.DataFrame:
     print("Connexion MT5…")
     if not mt5.initialize():
         raise RuntimeError("Erreur MT5.init()")
 
-    rates_m1 = mt5.copy_rates_from_pos(
-        cfg.symbol, cfg.timeframe, 0, cfg.n_bars
+    date_from = cfg.date_from
+    date_to = cfg.date_to or datetime.now()
+    print(
+        f"[DATA] Plage demandée : {date_from:%Y-%m-%d %H:%M} → "
+        f"{date_to:%Y-%m-%d %H:%M}"
     )
 
-    n_h1 = max(cfg.n_bars // 5, 5000)
-    rates_h1 = mt5.copy_rates_from_pos(
-        cfg.symbol, cfg.htf_timeframe, 0, n_h1
-    )
+    # Force MT5 à charger le symbol dans le Market Watch
+    mt5.symbol_select(cfg.symbol, True)
+
+    # 1) Tentative directe avec copy_rates_range (rapide quand cache OK)
+    rates_m1 = mt5.copy_rates_range(cfg.symbol, cfg.timeframe, date_from, date_to)
+    rates_h1 = mt5.copy_rates_range(cfg.symbol, cfg.htf_timeframe, date_from, date_to)
+
+    n_m1_target = int((date_to - date_from).total_seconds() // 60 * 0.7)  # 70% (weekends, gaps)
+
+    # 2) Si insuffisant → pagination par copy_rates_from
+    if rates_m1 is None or len(rates_m1) < n_m1_target:
+        nb = 0 if rates_m1 is None else len(rates_m1)
+        print(f"[DATA] copy_rates_range M1 insuffisant ({nb:,} bougies), pagination en cours…")
+        rates_m1 = _fetch_paginated(cfg.symbol, cfg.timeframe, date_from, date_to, chunk=100_000)
+
+    if rates_h1 is None or len(rates_h1) < 100:
+        nb = 0 if rates_h1 is None else len(rates_h1)
+        print(f"[DATA] copy_rates_range H1 insuffisant ({nb:,} bougies), pagination en cours…")
+        rates_h1 = _fetch_paginated(cfg.symbol, cfg.htf_timeframe, date_from, date_to, chunk=20_000)
+
+    # 3) Dernier fallback : copy_rates_from_pos avec n_bars (peut être petit)
+    if rates_m1 is None or len(rates_m1) == 0:
+        print(f"[DATA] Pagination M1 vide, dernier fallback copy_rates_from_pos(0, {cfg.n_bars}).")
+        rates_m1 = mt5.copy_rates_from_pos(cfg.symbol, cfg.timeframe, 0, cfg.n_bars)
+    if rates_h1 is None or len(rates_h1) == 0:
+        n_h1 = max(cfg.n_bars // 5, 5000)
+        print(f"[DATA] Pagination H1 vide, dernier fallback copy_rates_from_pos(0, {n_h1}).")
+        rates_h1 = mt5.copy_rates_from_pos(cfg.symbol, cfg.htf_timeframe, 0, n_h1)
 
     mt5.shutdown()
 
     if rates_m1 is None or rates_h1 is None:
         raise RuntimeError("MT5 n'a renvoyé aucune donnée M1 ou H1")
+
+    print(f"[DATA] M1 bougies brutes : {len(rates_m1):,}  |  H1 : {len(rates_h1):,}")
 
     df_m1 = pd.DataFrame(rates_m1)
     df_m1["time"] = pd.to_datetime(df_m1["time"], unit="s")
@@ -451,6 +592,8 @@ class BTCTradingEnvDiscrete(gym.Env):
         self.last_realized_pnl = 0.0
         self.peak_capital = self.capital
         self.trades_pnl: List[float] = []
+        # Side (+1 long, -1 short) du trade fermé — index aligné avec trades_pnl
+        self.trades_side: List[int] = []
 
         self.bars_in_position = 0
         self.risk_scale = 1.0
@@ -555,31 +698,8 @@ class BTCTradingEnvDiscrete(gym.Env):
         else:
             self.bars_in_position = 0
 
-        # --------- FERMETURE MANUELLE (mode close) ---------
+        # Plus de mode "close" : fermeture uniquement par SL/TP/break-even/trailing
         manual_close = False
-        if self.cfg.side == "close" and old_pos != 0 and action == 0:
-            exit_price = self._apply_micro(price, -old_pos)
-            pnl = old_pos * (exit_price - self.entry_price) * self.current_size * self.cfg.leverage
-            fee = self.cfg.fee_rate * exit_price * self.current_size
-            realized = pnl - fee
-            realized_trade = realized
-
-            self.capital += realized
-            self.last_realized_pnl = realized
-            self.trades_pnl.append(realized)
-
-            self.position = 0
-            self.current_size = 0.0
-            self.entry_price = 0.0
-            self.sl_price = 0.0
-            self.tp_price = 0.0
-            self.entry_idx = -1
-            self.entry_atr = 0.0
-            self.risk_scale = 1.0
-            self.last_risk_scale = 1.0
-            self.break_even_done = False
-            self.trail_active    = False
-            manual_close = True
 
         # --------- OUVERTURE DIRECTE (pas de confirmation dans l'env) ---------
         # La confirmation signal→pause→re-signal est gérée dans loup_live.py uniquement.
@@ -663,6 +783,7 @@ class BTCTradingEnvDiscrete(gym.Env):
                 self.capital += realized
                 self.last_realized_pnl = realized
                 self.trades_pnl.append(realized)
+                self.trades_side.append(int(self.position))
 
                 self.position = 0
                 self.current_size = 0.0
@@ -976,32 +1097,27 @@ def compute_gae(rewards, values, dones, gamma, lam, last_value=0.0):
 
 
 def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
+    # 0=BUY  1=SELL  2=HOLD
     mask = torch.zeros(N_ACTIONS, dtype=torch.bool, device=device)
 
-    if side == "close":
-        if pos == 0:
-            mask[4] = True
-        else:
-            mask[0] = True
-            mask[4] = True
-        return mask
-
     if pos != 0:
-        mask[4] = True
+        mask[2] = True  # En position : seulement HOLD (fermeture par SL/TP/trailing)
         return mask
 
     if side == "both":
-        mask[:] = True
+        mask[0] = True   # BUY
+        mask[1] = True   # SELL
+        mask[2] = True   # HOLD
     elif side == "long":
         mask[0] = True
         mask[2] = True
-        mask[4] = True
     elif side == "short":
         mask[1] = True
-        mask[3] = True
-        mask[4] = True
+        mask[2] = True
     else:
-        mask[:] = True
+        mask[0] = True
+        mask[1] = True
+        mask[2] = True
 
     return mask
 
@@ -1014,30 +1130,25 @@ def build_action_mask_from_positions(positions: torch.Tensor, side: str) -> torc
     flat = (positions == 0)
     inpos = ~flat
 
-    if side == "close":
-        if flat.any():
-            mask[flat, 4] = True
-        if inpos.any():
-            mask[inpos, 0] = True
-            mask[inpos, 4] = True
-        return mask
-
+    # 0=BUY  1=SELL  2=HOLD
     if flat.any():
         if side == "both":
-            mask[flat] = True
+            mask[flat, 0] = True
+            mask[flat, 1] = True
+            mask[flat, 2] = True
         elif side == "long":
             mask[flat, 0] = True
             mask[flat, 2] = True
-            mask[flat, 4] = True
         elif side == "short":
             mask[flat, 1] = True
-            mask[flat, 3] = True
-            mask[flat, 4] = True
+            mask[flat, 2] = True
         else:
-            mask[flat] = True
+            mask[flat, 0] = True
+            mask[flat, 1] = True
+            mask[flat, 2] = True
 
     if inpos.any():
-        mask[inpos, 4] = True
+        mask[inpos, 2] = True  # HOLD = nouvelle index 2
 
     return mask
 
@@ -1062,86 +1173,19 @@ def map_agent_action_to_env_action(
     elif state_tensor.dim() != 3:
         raise ValueError(f"state_tensor doit être (B,T,F) ou (T,F), reçu {state_tensor.shape}")
 
-    # Mode CLOSE : utilisation des modèles gelés SI disponibles
-    if cfg.side == "close":
-        if pos == 0:
-            if policy_long is None or policy_short is None:
-                env_action = 2
-                risk_scale = 1.0
-            else:
-                with torch.no_grad():
-                    logits_long, _ = policy_long(state_tensor)
-                    logits_long = logits_long[0]
-                    mask_long = build_mask_from_pos_scalar(pos, device, "long")
-                    logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
-
-                    logits_short, _ = policy_short(state_tensor)
-                    logits_short = logits_short[0]
-                    mask_short = build_mask_from_pos_scalar(pos, device, "short")
-                    logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
-
-                    open_long_max = torch.maximum(logits_long_m[0], logits_long_m[2])
-                    score_long = (open_long_max - logits_long_m[4]).item()
-
-                    open_short_max = torch.maximum(logits_short_m[1], logits_short_m[3])
-                    score_short = (open_short_max - logits_short_m[4]).item()
-
-                    if score_long <= 0.0 and score_short <= 0.0:
-                        env_action = 2
-                        risk_scale = 1.0
-                    else:
-                        if score_long >= score_short:
-                            chosen_side = "long"
-                            chosen_logits = logits_long_m
-                        else:
-                            chosen_side = "short"
-                            chosen_logits = logits_short_m
-
-                        if chosen_side == "long":
-                            if chosen_logits[0] >= chosen_logits[2]:
-                                a_entry = 0
-                            else:
-                                a_entry = 2
-                        else:
-                            if chosen_logits[1] >= chosen_logits[3]:
-                                a_entry = 1
-                            else:
-                                a_entry = 3
-
-                        if a_entry in (0, 2):  # BUY
-                            env_action = 0
-                            risk_scale = 1.8 if a_entry == 2 else 1.0
-                        elif a_entry in (1, 3):  # SELL
-                            env_action = 1
-                            risk_scale = 1.8 if a_entry == 3 else 1.0
-                        else:
-                            env_action = 2
-                            risk_scale = 1.0
-        else:
-            if a == 0:
-                env_action = 0
-                risk_scale = 1.0
-            else:
-                env_action = 2
-                risk_scale = 1.0
-
-        if epoch <= 35:
-            risk_scale = 1.0
-
-        return env_action, risk_scale
-
-    # Modes both / long / short
+    # Mode "close" supprimé : seuls les sides "both" / "long" / "short" sont supportés.
+    # Modes both / long / short — espace agent réduit à 3 actions
+    #   a=0 → BUY     (env_action=0)
+    #   a=1 → SELL    (env_action=1)
+    #   a=2 → HOLD    (env_action=2)
     if pos == 0:
-        if a == 4:
-            env_action = 2
-            risk_scale = 1.0
-        elif a in (0, 2):  # BUY
+        if a == 0:    # BUY
             env_action = 0
-            risk_scale = 1.8 if a == 2 else 1.0
-        elif a in (1, 3):  # SELL
+            risk_scale = 1.0
+        elif a == 1:  # SELL
             env_action = 1
-            risk_scale = 1.8 if a == 3 else 1.0
-        else:
+            risk_scale = 1.0
+        else:         # HOLD ou tout autre
             env_action = 2
             risk_scale = 1.0
     else:
@@ -1177,9 +1221,15 @@ def run_training_on_split(
         "train_pnl", "train_trades", "train_win", "train_loss",
         "train_totalW", "train_totalL", "train_avgW", "train_avgL", "train_nbL",
         "train_pf", "train_dd",
+        # Split LONG / SHORT côté training
+        "train_long_w", "train_long_l", "train_long_pnl",
+        "train_short_w", "train_short_l", "train_short_pnl",
         "val_pnl", "val_trades", "val_win", "val_loss",
         "val_totalW", "val_totalL", "val_avgW", "val_avgL", "val_nbL",
         "val_pf", "val_dd",
+        # Split LONG / SHORT côté validation
+        "val_long_w", "val_long_l", "val_long_pnl",
+        "val_short_w", "val_short_l", "val_short_pnl",
         "sortino", "sortino30",
         "actor_loss", "critic_loss", "entropy", "kl",
         "buy_ratio", "sell_ratio", "hold_ratio",
@@ -1219,47 +1269,16 @@ def run_training_on_split(
         print(f"→ Chargement du modèle existant ({best_path}) pour continuation…")
         policy.load_state_dict(torch.load(best_path, map_location=device))
 
-    # Modèles gelés LONG/SHORT pour le mode "close"
+    # Mode "close" supprimé : pas de modèles gelés à charger.
     policy_long = None
     policy_short = None
-    if cfg.side == "close":
-        if os.path.exists(BEST_MODEL_LONG_PATH) and os.path.exists(BEST_MODEL_SHORT_PATH):
-            policy_long = SAINTPolicySingleHead(
-                n_features=OBS_N_FEATURES,
-                d_model=cfg.d_model,
-                num_blocks=2,
-                heads=4,
-                dropout=0.05,
-                ff_mult=2,
-                max_len=cfg.lookback,
-                n_actions=N_ACTIONS
-            ).to(device)
-            policy_long.load_state_dict(torch.load(BEST_MODEL_LONG_PATH, map_location=device))
-            policy_long.eval()
-
-            policy_short = SAINTPolicySingleHead(
-                n_features=OBS_N_FEATURES,
-                d_model=cfg.d_model,
-                num_blocks=2,
-                heads=4,
-                dropout=0.05,
-                ff_mult=2,
-                max_len=cfg.lookback,
-                n_actions=N_ACTIONS
-            ).to(device)
-            policy_short.load_state_dict(torch.load(BEST_MODEL_SHORT_PATH, map_location=device))
-            policy_short.eval()
-
-            print("[CLOSE] Modèles LONG & SHORT gelés chargés pour générer les entrées pendant l'entraînement.")
-        else:
-            print("[CLOSE] ATTENTION : modèles LONG/SHORT introuvables.")
-            print("        → le mode CLOSE restera flat quand il est en dehors d'une position (HOLD en flat).")
 
     best_val_profit = -1e9
     best_metric = -1e9
     best_state = None
     epochs_no_improve = 0
-    patience = 100
+    # patience proportionnelle au nombre d'epochs (60% du total)
+    patience = max(100, int(cfg.epochs * 0.6))
     metric_history: List[float] = []
 
     reward_normalizer = RewardNormalizer()
@@ -1279,6 +1298,7 @@ def run_training_on_split(
         epoch_pnl = []
         epoch_dd = []
         epoch_trades_pnl: List[float] = []
+        epoch_trades_side: List[int] = []  # +1 long, -1 short — index aligné avec epoch_trades_pnl
 
         action_counts_env = np.zeros(3, dtype=np.int64)
 
@@ -1326,12 +1346,18 @@ def run_training_on_split(
 
                         if np.random.rand() < force_prob:
                             force_opening = True
+                            # Plus de niveaux x1.8 : on force uniquement BUY1 (0) ou SELL1 (1)
                             if cfg.side == "long":
-                                chosen_action = 0 if np.random.rand() < 0.7 else 2
+                                chosen_action = 0
                             elif cfg.side == "short":
-                                chosen_action = 1 if np.random.rand() < 0.8 else 3
+                                chosen_action = 1
                             else:
-                                chosen_action = random.choice([0, 1, 2, 3])
+                                # (C) Biais SHORT pour contrer la dérive long-only :
+                                # marché 2022-2026 globalement haussier → les SELL forcés
+                                # perdent souvent, ce qui a fait apprendre au modèle à ne plus
+                                # shorter. On compense en sur-représentant les SELL au curriculum.
+                                #   5/7 SELL (1) / 2/7 BUY (0)
+                                chosen_action = random.choice([1, 1, 1, 1, 1, 0, 0])
                     # =======================================================
 
                     if force_opening and chosen_action is not None:
@@ -1339,11 +1365,12 @@ def run_training_on_split(
                         logprob = dist.log_prob(agent_action).squeeze()
                     else:
                         agent_action = dist.sample()
-                        # Filtre confiance 70% : entrée uniquement si prob >= seuil
-                        if pos == 0 and int(agent_action.item()) != 4:
+                        # Filtre confiance : entrée uniquement si prob >= seuil
+                        # (HOLD = action 2 dans la convention 3-actions)
+                        if pos == 0 and int(agent_action.item()) != 2:
                             probs = torch.softmax(logits_masked, dim=-1)
                             if probs[int(agent_action.item())].item() < CONF_THRESHOLD:
-                                agent_action = torch.tensor(4, device=device, dtype=torch.long)
+                                agent_action = torch.tensor(2, device=device, dtype=torch.long)
                         logprob = dist.log_prob(agent_action).squeeze()
                     a = int(agent_action.item())
 
@@ -1389,6 +1416,7 @@ def run_training_on_split(
             final_equity = env.capital + latent
             epoch_pnl.append(final_equity - cfg.initial_capital)
             epoch_trades_pnl.extend(env.trades_pnl)
+            epoch_trades_side.extend(env.trades_side)
 
             if done and info.get("done_reason") == "max_drawdown":
                 last_value = 0.0
@@ -1499,7 +1527,7 @@ def run_training_on_split(
                 epoch_kl.append(approx_kl)
 
             if np.mean(epoch_kl) > 1.5 * cfg.target_kl:
-                print(f"[PPO] Early stop KL, KL={np.mean(epoch_kl):.4f}")
+                print(f"  {_col('⚠ early-stop KL', _C.YELLOW)}  KL={np.mean(epoch_kl):.4f}")
                 break
 
         scheduler.step()
@@ -1532,6 +1560,7 @@ def run_training_on_split(
         val_pnl = []
         val_dd = []
         val_trades = []
+        val_trades_side: List[int] = []
 
         with torch.no_grad():
             for _ in range(2):
@@ -1582,6 +1611,7 @@ def run_training_on_split(
                 val_pnl.append(final_equity - cfg.initial_capital)
                 val_dd.append(info["drawdown"])
                 val_trades.extend(val_env.trades_pnl)
+                val_trades_side.extend(val_env.trades_side)
 
         val_profit = float(sum(val_pnl))
         val_max_dd = float(max(val_dd) if val_dd else 0.0)
@@ -1619,31 +1649,89 @@ def run_training_on_split(
         train_loss_rate = (1 - winrate_epoch) if num_trades_epoch > 0 else 0.0
         val_loss_rate   = (1 - val_winrate)   if val_num_trades  > 0 else 0.0
 
+        # --------- Split LONG / SHORT ---------
+        train_split = _split_by_side(epoch_trades_pnl, epoch_trades_side)
+        val_split   = _split_by_side(val_trades,       val_trades_side)
+
+        train_long_w  = len(train_split["long"]["wins"])
+        train_long_l  = len(train_split["long"]["losses"])
+        train_short_w = len(train_split["short"]["wins"])
+        train_short_l = len(train_split["short"]["losses"])
+        train_long_pnl  = train_split["long"]["pnl"]
+        train_short_pnl = train_split["short"]["pnl"]
+
+        val_long_w  = len(val_split["long"]["wins"])
+        val_long_l  = len(val_split["long"]["losses"])
+        val_short_w = len(val_split["short"]["wins"])
+        val_short_l = len(val_split["short"]["losses"])
+        val_long_pnl  = val_split["long"]["pnl"]
+        val_short_pnl = val_split["short"]["pnl"]
+
+        # --------- Couleurs / styles ---------
+        tag       = _col(f"[{cfg.side.upper()}{suffix}]", _C.MAGENTA + _C.BOLD)
+        epoch_str = _col(f"EPOCH {epoch:03d}", _C.CYAN + _C.BOLD)
+
+        # Couleur du Sortino30 selon valeur
+        s30 = recent_metric
+        if s30 >= 0.05:
+            s30_col = _C.GREEN + _C.BOLD
+        elif s30 >= 0.0:
+            s30_col = _C.GREEN
+        elif s30 >= -0.05:
+            s30_col = _C.YELLOW
+        else:
+            s30_col = _C.RED
+
+        # Couleur du DD
+        def _dd_col(d):
+            if d < 0.2:   return _C.GREEN
+            if d < 0.5:   return _C.YELLOW
+            return _C.RED
+
+        # ----- Ligne 1 : TRAIN -----
         print(
-            f"[{cfg.side.upper()}{suffix}][EPOCH {epoch:03d}] "
-            f"TrainPNL={profit_epoch:+9.2f}$  "
-            f"Trades={num_trades_epoch:4d}  "
-            f"Win={winrate_epoch:5.1%}  Loss={train_loss_rate:5.1%}  "
-            f"TotalW={total_profit_train:+8.2f}$  TotalL={total_loss_train:+8.2f}$  "
-            f"AvgW={avg_win_train:+7.3f}$  AvgL={avg_loss_train:+7.3f}$  "
-            f"NbL={num_loss_train:4d}  PF={profit_factor_train:.2f}  "
-            f"DD={max_dd_epoch:5.1%}"
+            f"{tag} {epoch_str}  "
+            f"{_col('TRAIN', _C.WHITE + _C.BOLD)}  "
+            f"PNL {_money(profit_epoch, width=10)}  "
+            f"trades={num_trades_epoch:>4d}  "
+            f"WR {_pct(winrate_epoch)}  "
+            f"PF {profit_factor_train:>4.2f}  "
+            f"DD {_col(_pct(max_dd_epoch), _dd_col(max_dd_epoch))}  "
+            f"{_col('L', _C.GREEN)}({_col(str(train_long_w), _C.GREEN)}W/"
+            f"{_col(str(train_long_l), _C.RED)}L) {_money(train_long_pnl, width=9)}  "
+            f"{_col('S', _C.BLUE)}({_col(str(train_short_w), _C.GREEN)}W/"
+            f"{_col(str(train_short_l), _C.RED)}L) {_money(train_short_pnl, width=9)}"
         )
+
+        # ----- Ligne 2 : VAL -----
         print(
-            f"[{cfg.side.upper()}{suffix}][EPOCH {epoch:03d}]  "
-            f"ValPNL={val_profit:+9.2f}$  "
-            f"ValTrades={val_num_trades:4d}  "
-            f"ValWin={val_winrate:5.1%}  ValLoss={val_loss_rate:5.1%}  "
-            f"ValTotalW={total_profit_val:+8.2f}$  ValTotalL={total_loss_val:+8.2f}$  "
-            f"ValAvgW={avg_win_val:+7.3f}$  ValAvgL={avg_loss_val:+7.3f}$  "
-            f"ValNbL={num_loss_val:4d}  ValPF={profit_factor_val:.2f}  "
-            f"ValDD={val_max_dd:5.1%}  "
-            f"Sortino={metric:6.3f}  Sortino30={recent_metric:6.3f}  "
-            f"ActorL={np.mean(epoch_actor_loss):.4f}  "
-            f"CriticL={np.mean(epoch_critic_loss):.4f}  "
-            f"Entropy={np.mean(epoch_entropy):.4f}  "
-            f"KL={np.mean(epoch_kl):.4f}  "
-            f"ENV B:{buy_ratio:4.1%} S:{sell_ratio:4.1%} H:{hold_ratio:4.1%}"
+            f"{tag} {epoch_str}  "
+            f"{_col('VAL  ', _C.WHITE + _C.BOLD)}  "
+            f"PNL {_money(val_profit, width=10)}  "
+            f"trades={val_num_trades:>4d}  "
+            f"WR {_pct(val_winrate)}  "
+            f"PF {profit_factor_val:>4.2f}  "
+            f"DD {_col(_pct(val_max_dd), _dd_col(val_max_dd))}  "
+            f"{_col('L', _C.GREEN)}({_col(str(val_long_w), _C.GREEN)}W/"
+            f"{_col(str(val_long_l), _C.RED)}L) {_money(val_long_pnl, width=9)}  "
+            f"{_col('S', _C.BLUE)}({_col(str(val_short_w), _C.GREEN)}W/"
+            f"{_col(str(val_short_l), _C.RED)}L) {_money(val_short_pnl, width=9)}"
+        )
+
+        # ----- Ligne 3 : METRICS PPO -----
+        print(
+            f"{tag} {epoch_str}  "
+            f"{_col('META ', _C.GREY + _C.BOLD)}  "
+            f"Sortino {metric:>+6.3f}  "
+            f"{_col(f'Sortino30 {s30:>+6.3f}', s30_col)}  "
+            f"AvgW {_money(avg_win_train, width=8)}  AvgL {_money(avg_loss_train, width=8)}  "
+            f"ActorL {np.mean(epoch_actor_loss):>+7.4f}  "
+            f"CriticL {np.mean(epoch_critic_loss):>7.4f}  "
+            f"H {np.mean(epoch_entropy):>5.3f}  "
+            f"KL {np.mean(epoch_kl):>+6.4f}  "
+            f"ENV [{_col(f'B {buy_ratio:>4.1%}', _C.GREEN)} "
+            f"{_col(f'S {sell_ratio:>4.1%}', _C.BLUE)} "
+            f"{_col(f'H {hold_ratio:>4.1%}', _C.GREY)}]"
         )
 
         # Écriture CSV
@@ -1661,6 +1749,12 @@ def run_training_on_split(
                 "train_nbL": num_loss_train,
                 "train_pf": round(profit_factor_train, 4),
                 "train_dd": round(max_dd_epoch, 4),
+                "train_long_w": train_long_w,
+                "train_long_l": train_long_l,
+                "train_long_pnl": round(train_long_pnl, 4),
+                "train_short_w": train_short_w,
+                "train_short_l": train_short_l,
+                "train_short_pnl": round(train_short_pnl, 4),
                 "val_pnl": round(val_profit, 4),
                 "val_trades": val_num_trades,
                 "val_win": round(val_winrate, 4),
@@ -1672,6 +1766,12 @@ def run_training_on_split(
                 "val_nbL": num_loss_val,
                 "val_pf": round(profit_factor_val, 4),
                 "val_dd": round(val_max_dd, 4),
+                "val_long_w": val_long_w,
+                "val_long_l": val_long_l,
+                "val_long_pnl": round(val_long_pnl, 4),
+                "val_short_w": val_short_w,
+                "val_short_l": val_short_l,
+                "val_short_pnl": round(val_short_pnl, 4),
                 "sortino": round(metric, 6),
                 "sortino30": round(recent_metric, 6),
                 "actor_loss": round(float(np.mean(epoch_actor_loss)), 6),
@@ -1688,7 +1788,11 @@ def run_training_on_split(
             best_val_profit = val_profit
             state_profit = policy.state_dict().copy()
             torch.save(state_profit, best_profit_path)
-            print(f"[{cfg.side.upper()}{suffix}][EPOCH {epoch:03d}] Nouveau best PROFIT (ValPNL={best_val_profit:.3f}, trades={val_num_trades}).")
+            print(
+                f"  {_col('★', _C.YELLOW + _C.BOLD)} "
+                f"{_col(f'NEW BEST PROFIT', _C.YELLOW + _C.BOLD)}  "
+                f"ValPNL={_money(best_val_profit, width=10)}  trades={val_num_trades}"
+            )
 
         # Best réel pour live : Sortino30 + min trades en validation
         if val_num_trades >= cfg.min_val_trades_save and recent_metric > best_metric:
@@ -1696,7 +1800,11 @@ def run_training_on_split(
             best_state = policy.state_dict().copy()
             torch.save(best_state, best_path)
             epochs_no_improve = 0
-            print(f"[{cfg.side.upper()}{suffix}][EPOCH {epoch:03d}] Nouveau best (Sortino30={recent_metric:.3f}, trades={val_num_trades}).")
+            print(
+                f"  {_col('★', _C.MAGENTA + _C.BOLD)} "
+                f"{_col(f'NEW BEST SORTINO30', _C.MAGENTA + _C.BOLD)}  "
+                f"Sortino30={recent_metric:+.3f}  trades={val_num_trades}"
+            )
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
@@ -1881,22 +1989,42 @@ def run_walkforward(
 if __name__ == "__main__":
     cfg_base = PPOConfig()
 
-    # LONG
+    # =======================================================
+    # PIPELINE DUEL : un seul modèle qui décide BUY ou SELL
+    # =======================================================
+    # side="both"  → le masque d'actions autorise BUY1, SELL1, BUY1.8,
+    #                SELL1.8 et HOLD quand le modèle est flat.
+    # Le curriculum force aléatoirement BUY ou SELL au tirage (équiprobable
+    # entre 0,1,2,3) pour amorcer les deux directions.
+    # Résultat : un unique fichier .pth qui remplace LONG + SHORT,
+    # exactement comme en live "duel".
+    print("\n" + "=" * 70)
+    print("  ENTRAÎNEMENT DUEL (long + short combinés)")
+    print("=" * 70)
+    cfg_duel = PPOConfig(**cfg_base.__dict__)
+    cfg_duel.side = "both"
+    cfg_duel.model_prefix = "saintv2_loup_duel"
+    run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10, max_folds=3)
+
+    print("\n" + "=" * 70)
+    print("  PIPELINE TERMINÉ : modèle duel entraîné.")
+    print("  Fichiers générés :")
+    print("    best_saintv2_loup_duel_both_wf1.pth")
+    print("    bestprofit_saintv2_loup_duel_both_wf1.pth")
+    print("=" * 70)
+
+    # ---------------------------------------------------------
+    # Alternative : entraîner LONG et SHORT séparément
+    # (à dé-commenter si tu veux des modèles spécialisés au lieu du duel)
+    # ---------------------------------------------------------
     # cfg_long = PPOConfig(**cfg_base.__dict__)
     # cfg_long.side = "long"
     # cfg_long.model_prefix = "saintv2_loup_long"
-    # # 0.55/0.15/0.10 → window=80% des données → 3 folds possibles avec step=10%
     # run_walkforward(cfg_long, train_frac=0.55, val_frac=0.15, test_frac=0.10, max_folds=3)
+    #
+    # cfg_short = PPOConfig(**cfg_base.__dict__)
+    # cfg_short.side = "short"
+    # cfg_short.model_prefix = "saintv2_loup_short"
+    # run_walkforward(cfg_short, train_frac=0.55, val_frac=0.15, test_frac=0.10, max_folds=3)
 
-    # SHORT
-    cfg_short = PPOConfig(**cfg_base.__dict__)
-    cfg_short.side = "short"
-    cfg_short.model_prefix = "saintv2_loup_short"
-    # mêmes proportions que LONG pour cohérence des comparaisons
-    run_walkforward(cfg_short, train_frac=0.55, val_frac=0.15, test_frac=0.10, max_folds=3)
-
-    # CLOSE : après entraînement LONG/SHORT
-    # cfg_close = PPOConfig(**cfg_base.__dict__)
-    # cfg_close.side = "close"
-    # cfg_close.model_prefix = "saintv2_loup_close"
-    # run_training_full(cfg_close)
+    # (Mode "close" retiré : l'agent ne ferme plus manuellement, uniquement via SL/TP/trailing)
