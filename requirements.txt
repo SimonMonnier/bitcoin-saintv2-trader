@@ -1,0 +1,8 @@
+# Pour récupérer les wheels CUDA 12.4 de PyTorch
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+torch==2.5.1+cu124
+numpy==1.26.4
+pandas==2.2.3
+MetaTrader5==5.0.4687
+gymnasium==0.29.1

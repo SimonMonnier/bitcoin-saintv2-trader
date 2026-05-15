@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Model checkpoints (gros fichiers)
+*.pth
+*.pt
+*.ckpt
+
+# Logs / données
+*.csv
+*.log
+*.npz
+
+# IDE / éditeurs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Loup logs sauvegardés depuis la GUI
+loup_log_*.txt
