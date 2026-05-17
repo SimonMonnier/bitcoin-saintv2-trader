@@ -2,11 +2,14 @@
 
 > **PPO + SAINTv2** : agent d'apprentissage par renforcement entraîné en walk-forward sur l'historique BTCUSD à la minute, déployable en live sur MetaTrader 5 via une interface graphique dédiée.
 
+> 🏆 **Dernier backtest stress-test (mai 2026, OOS 75 jours)** : **+560.9 %** de PnL (1 000 $ → 6 609 $), Profit Factor **1.85**, Winrate **58.5 %**, Max DD **4.4 %**. Cf [section Performance](#-performance--backtest-stress-test-no_be_trail--mai-2026).
+
 ---
 
 ## 📑 Table des matières
 
 1. [Vue d'ensemble](#-vue-densemble)
+   - [Performance backtest](#-performance--backtest-stress-test-no_be_trail--mai-2026)
 2. [Architecture du modèle](#-architecture-du-modèle)
 3. [Pipeline complet](#-pipeline-complet)
 4. [Méthodologie d'entraînement](#-méthodologie-dentraînement)
@@ -51,11 +54,39 @@ Le système est conçu pour fonctionner **24/7** sur cryptos (BTCUSD), avec gest
 | Algorithme RL | PPO clippé + GAE λ |
 | Backbone | SAINTv2 (RowAttn + ColAttn + GatedFFN) |
 | Espace d'action | **3 actions** : `BUY` / `SELL` / `HOLD` |
-| Période d'entraînement | 2022-01-01 → maintenant (~4 ans) |
+| Période d'entraînement | 2022-01-01 → 2026-05 (~4.4 ans, ~2.2 M bougies M1) |
 | Méthodologie | Walk-forward 3 folds (55/15/10) |
 | Backbone size | d_model=80, 2 blocks, 4 heads |
 | Features | 11 M1 + 5 H1 + 4 position = 20 |
 | Lookback | 25 bougies M1 |
+
+### 📈 Performance — Backtest stress-test (no_be_trail) — mai 2026
+
+| Métrique | Valeur |
+|----------|--------|
+| **Période backtest** | 2026-03-04 → 2026-05-17 (~75 jours, OOS récent) |
+| **Capital initial → final** | 1 000 $ → **6 609 $** |
+| **PnL total** | **+5 609 $** (**+560.9 %**) |
+| **Max drawdown** | **4.4 %** ⭐ |
+| **Verdict automatique** | ✓ **ROBUSTE** |
+| Nb trades | 1 981 |
+| Winrate | 58.5 % |
+| Profit Factor | 1.85 |
+| AvgW / AvgL | +10.58 $ / −8.07 $ |
+| Score (PF × WR) | 1.079 |
+
+**Détail LONG / SHORT** :
+| Side | Trades | WR | PnL |
+|------|--------|----|----|
+| LONG | 1 334 (67 %) | 57.4 % | +3 491 $ |
+| SHORT | 647 (33 %) | **60.6 %** | +2 119 $ |
+
+Modèle utilisé : `bestprofit_saintv2_loup_duel_wf1_both_wf1.pth` (walk-forward fold 1).
+
+> Ces chiffres sont obtenus **avec BE/trail désactivés** (cf section
+> [Backtest stress-test](#-backtest-stress-test) — variante no_be_trail).
+> Le même modèle avec BE/trail activé donne −499 $ (PF 0.98) : le BE/trail
+> ferme prématurément les gains avant que le TP soit atteint.
 
 ---
 
@@ -333,10 +364,19 @@ ne ferment qu'au SL ou TP fixe.
 
 Génère `backtest_trades_both_no_be_trail.csv` (n'écrase pas l'original).
 
-**Pourquoi cette variante** : sur le run de mai 2026 (~75 jours, 9986 trades),
-le backtest avec BE/trail finit à PnL **−499 $ / PF 0.98**, alors qu'au même
-modèle sans BE/trail on est à **+1902 $ / PF 1.70 / WR 56.6%** après 27% du run.
-Le BE/trailing actuel ferme les wins trop tôt.
+**Résultats sur la période 2026-03-04 → 2026-05-17 (75 jours OOS)** :
+
+| Variante | PnL | WR | PF | DDmax | Verdict |
+|----------|-----|----|----|-------|---------|
+| Avec BE/trail (original) | **−499 $** | 46.7 % | 0.98 | — | ✗ NON RENTABLE |
+| **Sans BE/trail** | **+5 609 $** | **58.5 %** | **1.85** | **4.4 %** | ✓ **ROBUSTE** |
+
+**Δ net de +6 109 $** rien qu'en supprimant le BE/trailing. Le signal d'entrée
+était bon, c'est le risk management qui sabotait (88.6 % de SL touchés avec
+BE/trail vs 41.5 % sans → le BE coupait les trades juste avant le TP).
+
+Le **live applique cette leçon** : `update_sl_be_trailing_live()` est commenté
+dans `loup_live.py`.
 
 ### 3. Live trading (GUI)
 
