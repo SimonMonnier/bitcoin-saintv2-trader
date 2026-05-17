@@ -880,8 +880,10 @@ def live_loop(cfg: LiveConfig, should_continue):
 
                 df_closed = df_merged_full.iloc[:-1].reset_index(drop=True)
 
-                # ⚡ Ici : trailing + BE à CHAQUE ITERATION (tick) tant qu'il y a une position.
-                update_sl_be_trailing_live(cfg, df_closed, position)
+                # BE + TRAILING DÉSACTIVÉS — signal brut SL/TP fixes uniquement.
+                # Aligné avec backtest_saintv2_no_be_trail.py qui montre que le
+                # BE/trail coupe trop tôt les wins (PF 0.98 avec → 1.70 sans).
+                # update_sl_be_trailing_live(cfg, df_closed, position)
 
                 time.sleep(cfg.poll_interval)
                 continue  # On NE prend PAS de nouvelles positions tant qu'on est déjà en trade.

@@ -321,6 +321,23 @@ Par défaut backteste `bestprofit_saintv2_loup_duel_wf1_both_wf1.pth` en mode `s
 - `side="duel"` : 2 modèles séparés en arbitrage
 - `min_confidence=0.0` (argmax pur) ou ajuster selon le calibrage du modèle
 
+### Variante `no_be_trail` (sans break-even / trailing)
+
+```powershell
+python backtest_saintv2_no_be_trail.py
+```
+
+**Fichier identique** à `backtest_saintv2_stress_test.py` mais avec l'appel à
+`update_sl_be_trailing_backtest()` **commenté** (ligne ~980). Les positions
+ne ferment qu'au SL ou TP fixe.
+
+Génère `backtest_trades_both_no_be_trail.csv` (n'écrase pas l'original).
+
+**Pourquoi cette variante** : sur le run de mai 2026 (~75 jours, 9986 trades),
+le backtest avec BE/trail finit à PnL **−499 $ / PF 0.98**, alors qu'au même
+modèle sans BE/trail on est à **+1902 $ / PF 1.70 / WR 56.6%** après 27% du run.
+Le BE/trailing actuel ferme les wins trop tôt.
+
 ### 3. Live trading (GUI)
 
 ```powershell
@@ -344,13 +361,14 @@ python loup_live.py
 
 ```
 multi-agent-btcusd/
-├── training.py                    # Entraînement PPO + SAINTv2 walk-forward
-├── loup_live.py                   # Agent live MT5 (sans GUI)
-├── gui_loup.py                    # Interface graphique PySide6
-├── backtest_saintv2_stress_test.py # Backtest institutionnel
-├── requirements.txt               # Dépendances Python
-├── .gitignore                     # Exclusions git (.pth, .csv, .npz)
-├── README.md                      # Ce fichier
+├── training.py                     # Entraînement PPO + SAINTv2 walk-forward
+├── loup_live.py                    # Agent live MT5 (sans GUI) — BE/trail off
+├── gui_loup.py                     # Interface graphique PySide6
+├── backtest_saintv2_stress_test.py # Backtest institutionnel (BE/trail on)
+├── backtest_saintv2_no_be_trail.py # Variante sans BE/trail (comparaison)
+├── requirements.txt                # Dépendances Python
+├── .gitignore                      # Exclusions git (.pth, .csv, .npz)
+├── README.md                       # Ce fichier
 │
 ├── (générés après training)
 ├── norm_stats_ohlc_indics.npz                                   # Stats Z-score globales
@@ -387,8 +405,15 @@ Le masque dépend de la **position courante** et du **mode side** :
 **Quand l'agent est en position, il ne peut que HOLD.** La fermeture est gérée par :
 - SL touché → fermeture automatique
 - TP touché → fermeture automatique
-- Break-even (≥ 1 × ATR favorable) → SL déplacé à l'entry
-- Trailing stop (≥ 1.5 × ATR favorable) → SL trailé à 1 × ATR derrière le prix
+
+> ⚠️ **Break-even et trailing stop DÉSACTIVÉS en backtest `no_be_trail` et en live**
+> (cf section [Backtest stress-test](#-backtest-stress-test)). Le backtest a montré
+> que le BE/trailing actuels (triggers 1.0 / 1.5 ATR) coupent les wins trop tôt :
+> PF 0.98 avec → **PF 1.70 sans**. Le training les utilise toujours dans l'env,
+> mais le live et le backtest "no_be_trail" laissent les positions courir
+> jusqu'au SL ou TP fixe.
+> Les fonctions `update_sl_be_trailing_*` restent définies dans le code,
+> simplement leur appel est commenté.
 
 ### Sélection avec seuil de confiance
 
@@ -438,6 +463,14 @@ Si mouvement favorable ≥ 1.5 × ATR :
    SL trailé à 1.0 × ATR derrière le prix max favorable
    (s'améliore à chaque nouveau high/low favorable)
 ```
+
+**État par contexte (mai 2026)** :
+| Contexte | BE/Trail actif ? |
+|----------|------------------|
+| Training (env) | ✅ Oui (le modèle apprend avec) |
+| Backtest stress-test original | ✅ Oui |
+| Backtest **no_be_trail** | ❌ Non — variante de comparaison |
+| **Live (loup_live.py)** | ❌ **Non** (désactivé après constat backtest no_be_trail : PF 0.98 → 1.70) |
 
 ---
 
@@ -597,8 +630,9 @@ Source : `mt5.history_deals_get(session_start, now, group="BTCUSD")` filtré sur
 | `bestprofit_saintv2_loup_duel_wfN_both_wfN.pth` | Best ValPNL (≥20 trades) | Pendant training |
 | `last_saintv2_loup_duel_wfN_both_wfN.pth` | Final epoch du fold | Fin du fold |
 | `training_log_both_wfN.csv` | 40+ colonnes : PNL, trades, WR, L/S split, losses, etc. | À chaque epoch |
-| `trades_both_wfN.csv` | **NEW** : 1 ligne par trade fermé (entry/exit/pnl/SL/TP/hold_bars/phase) | À chaque trade |
-| `backtest_trades_both.csv` | **NEW** : Trade-by-trade du backtest stress-test | Fin du backtest |
+| `trades_both_wfN.csv` | 1 ligne par trade fermé (entry/exit/pnl/SL/TP/hold_bars/phase) | À chaque trade training |
+| `backtest_trades_both.csv` | Trade-by-trade du backtest stress-test (avec BE/trail) | Fin du backtest |
+| `backtest_trades_both_no_be_trail.csv` | Trade-by-trade variante sans BE/trail | Fin du backtest no_be_trail |
 | `loup_log_YYYYMMDD_HHMMSS.txt` | Export GUI | Bouton 💾 |
 
 ### Format des poids
