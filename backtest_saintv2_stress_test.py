@@ -83,7 +83,7 @@ NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
 BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf1_long_wf1.pth"
 BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf1_short_wf1.pth"
 # Modèle unifié (training side="both")
-BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_both_wf1.pth"
+BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_wf1_both_wf1.pth"
 
 
 @dataclass
@@ -122,10 +122,9 @@ class LiveConfig:
     backtest_min_extra_points: int = 100
 
     # ======= Seuil de confiance minimal pour ouvrir un trade =======
-    # 0.0 = pure argmax (comportement identique au live actuel).
-    # > 0  = ne trade que si max(prob) >= seuil — utile pour stresser
-    #        la sélectivité du modèle indépendamment du training.
-    min_confidence: float = 0.0
+    # 0.90 = aligné avec CONF_THRESHOLD (training) et loup_live.min_confidence.
+    # Mettre 0.0 pour pure argmax si tu veux mesurer la policy brute.
+    min_confidence: float = 0.90
 
     # device
     force_cpu: bool = False
@@ -154,8 +153,10 @@ class BTState:
     sl: float = 0.0
     tp: float = 0.0
     entry_index: int = -1
+    entry_atr: float = 0.0     # ATR au moment de l'entrée (pour unrealized_atr)
     last_risk_scale: float = 1.0
     trades_pnl: List[float] = field(default_factory=list)
+    trades_meta: List[Dict] = field(default_factory=list)
     max_equity: float = 0.0
 
 
@@ -259,13 +260,13 @@ FEATURE_COLS_H1 = [
 FEATURE_COLS = FEATURE_COLS_M1 + FEATURE_COLS_H1
 N_BASE_FEATURES = len(FEATURE_COLS)
 
-# Embedding de position identique à l'env / live :
-#   - position (-1,0,1)
-#   - entry_price_scaled
-#   - current_price_scaled
+# Embedding de position IDENTIQUE training/live :
+#   - position (-1, 0, 1)
+#   - unrealized_atr  (PnL latent normalisé par l'ATR d'entrée)
+#   - bars_held_norm  (durée détention / scalping_max_holding, capée à 3)
 #   - last_risk_scale
 N_POS_FEATURES = 4
-OBS_N_FEATURES = N_BASE_FEATURES + N_POS_FEATURES  # 16 + 4 = 20
+OBS_N_FEATURES = N_BASE_FEATURES + N_POS_FEATURES
 
 
 # ============================================================
@@ -497,8 +498,15 @@ def build_live_obs(
     cfg: LiveConfig,
     pos: int,
     entry_price: float,
+    entry_atr: float,
+    bars_in_position: int,
     last_risk_scale: float,
 ) -> Optional[np.ndarray]:
+    """
+    Construit l'observation IDENTIQUE à training/loup_live :
+      base features (M1+H1 normalisés et clip ±5σ)
+      + 4 features de position : [pos, unrealized_atr, bars_held_norm, risk_scale]
+    """
     if len(df_merged) < cfg.lookback + 1:
         return None
 
@@ -507,20 +515,23 @@ def build_live_obs(
 
     base = X_norm[-cfg.lookback:]  # (T, N_BASE_FEATURES)
 
-    price_scale = 100000.0
     current_price = float(df_merged["close"].iloc[-1]) if len(df_merged) > 0 else 0.0
 
-    if pos != 0 and entry_price > 0.0:
-        entry_scaled = float(entry_price / price_scale)
+    # PnL latent en unités d'ATR (scale-invariant, typiquement [-5, 5])
+    if pos != 0 and entry_atr > 1e-8 and entry_price > 0.0:
+        unrealized_atr = float(pos * (current_price - entry_price) / entry_atr)
     else:
-        entry_scaled = 0.0
+        unrealized_atr = 0.0
 
-    current_scaled = float(current_price / price_scale) if current_price > 0.0 else 0.0
+    # Durée détention normalisée (cap 3 = overtime), max_holding aligné training (=12)
+    scalping_max_holding = 12
+    bars_held_norm = float(min(bars_in_position / max(scalping_max_holding, 1), 3.0))
+
     pos_feature = float(pos)
     risk_feature = float(last_risk_scale)
 
     extra_vec = np.array(
-        [pos_feature, entry_scaled, current_scaled, risk_feature],
+        [pos_feature, unrealized_atr, bars_held_norm, risk_feature],
         dtype=np.float32
     )
     extra_block = np.repeat(extra_vec[None, :], cfg.lookback, axis=0)
@@ -1020,12 +1031,27 @@ def run_backtest(cfg: LiveConfig):
                     f"{_c(f'({hold_bars}b)', C.GREY)}"
                 )
 
+                # Trade-by-trade meta (avant reset)
+                state.trades_meta.append({
+                    "exit_time": fmt_time(time_i),
+                    "entry_idx": int(state.entry_index),
+                    "exit_idx": int(i),
+                    "side": int(state.position),
+                    "entry_price": float(state.entry_price),
+                    "exit_price": float(exit_price),
+                    "pnl": float(realized),
+                    "hit_sl": (exit_reason == "SL"),
+                    "hit_tp": (exit_reason == "TP"),
+                    "hold_bars": int(hold_bars),
+                })
+
                 state.position = 0
                 state.volume = 0.0
                 state.entry_price = 0.0
                 state.sl = 0.0
                 state.tp = 0.0
                 state.entry_index = -1
+                state.entry_atr = 0.0
                 state.last_risk_scale = 1.0
                 # NE PLUS TOUCHER max_equity ICI
 
@@ -1052,10 +1078,13 @@ def run_backtest(cfg: LiveConfig):
 
         # 3) Obs sur df[0..i-1] (PAS de fuite sur la bougie i)
         df_closed_for_obs = df.iloc[:i].reset_index(drop=True)
+        bars_in_pos = (i - state.entry_index) if (state.position != 0 and state.entry_index >= 0) else 0
         obs = build_live_obs(
             df_closed_for_obs, stats, cfg,
             pos=state.position,
             entry_price=state.entry_price,
+            entry_atr=state.entry_atr,
+            bars_in_position=bars_in_pos,
             last_risk_scale=state.last_risk_scale
         )
         if obs is None:
@@ -1200,6 +1229,8 @@ def run_backtest(cfg: LiveConfig):
 
                 volume = cfg.position_size * (risk_scale if risk_scale > 0 else 1.0)
                 entry_atr = compute_entry_atr(df_closed_for_obs)
+                # fallback ATR si broker renvoie 0 (aligné avec env training)
+                effective_entry_atr = max(entry_atr, 0.0015 * entry_price, 1e-8)
                 sl, tp = compute_sl_tp(cfg, entry_price, side, entry_atr, stress)
 
                 state.position = side
@@ -1208,6 +1239,7 @@ def run_backtest(cfg: LiveConfig):
                 state.sl = sl
                 state.tp = tp
                 state.entry_index = i
+                state.entry_atr = float(effective_entry_atr)
                 state.last_risk_scale = risk_scale
 
                 side_txt = "LONG " if side == 1 else "SHORT"
@@ -1315,6 +1347,27 @@ def run_backtest(cfg: LiveConfig):
     pnl_col = C.GREEN if pnl_total > 0 else C.RED
     dd_col = C.GREEN if max_dd*100 < 20 else (C.YELLOW if max_dd*100 < 50 else C.RED)
 
+    # Export CSV trade-by-trade
+    import csv as _csv
+    trades_csv = f"backtest_trades_{cfg.side}.csv"
+    _fields = ["exit_time", "entry_idx", "exit_idx", "side", "entry_price",
+               "exit_price", "pnl", "hit_sl", "hit_tp", "hold_bars"]
+    with open(trades_csv, "w", newline="", encoding="utf-8") as _f:
+        _w = _csv.DictWriter(_f, fieldnames=_fields)
+        _w.writeheader()
+        for tm in state.trades_meta:
+            _w.writerow({
+                "exit_time": tm["exit_time"],
+                "entry_idx": tm["entry_idx"], "exit_idx": tm["exit_idx"],
+                "side": tm["side"],
+                "entry_price": round(tm["entry_price"], 4),
+                "exit_price": round(tm["exit_price"], 4),
+                "pnl": round(tm["pnl"], 4),
+                "hit_sl": int(tm["hit_sl"]), "hit_tp": int(tm["hit_tp"]),
+                "hold_bars": tm["hold_bars"],
+            })
+    print(f"  {_c('✓', C.GREEN)} Trade-by-trade CSV : {_c(trades_csv, C.CYAN)} ({len(state.trades_meta)} trades)")
+
     print("\n" + banner("📊  RÉSULTATS BACKTEST", C.MAGENTA))
     print(f"  {_c('Verdict', C.GREY):<28} {_c(verdict, vcol + C.BOLD)}")
     print(f"  {_c('Mode side', C.GREY):<28} {_c(cfg.side.upper(), C.MAGENTA)}")
@@ -1354,6 +1407,6 @@ if __name__ == "__main__":
         min_confidence=0.0,
         n_bars_m1=200_000,
         n_bars_h1=50_000,
-        date_from=datetime(2025, 1, 1),
+        date_from=datetime(2026, 1, 1),
     )
     run_backtest(cfg)

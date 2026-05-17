@@ -29,7 +29,7 @@ NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
 BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf1_long_wf1.pth"
 BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf1_short_wf1.pth"
 # Modèle unifié (entraîné avec side="both") : décide BUY/SELL/HOLD dans un seul fichier
-BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_both_wf1.pth"
+BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_wf1_both_wf1.pth"
 
 
 @dataclass
@@ -74,6 +74,11 @@ class LiveConfig:
     breakeven_atr_mult: float = 1.0
     trailing_start_atr_mult: float = 1.5
     trailing_dist_atr_mult: float = 1.0
+
+    # ======= Seuil de confiance pour ouvrir un trade =======
+    # 0.0 = argmax pur (pas de filtre). Le modèle actuel plafonne ~0.40-0.47,
+    # donc tout seuil > 0.50 bloque tous les trades.
+    min_confidence: float = 0.0
 
 
 # ============================================================
@@ -921,12 +926,18 @@ def live_loop(cfg: LiveConfig, should_continue):
                         print("Probas DUEL :", probs_d.cpu().numpy().round(4))
 
                         a_duel = int(torch.argmax(probs_d, dim=-1).item())
+                        p_duel = float(probs_d[a_duel].item())
                         print(
                             f"BEST DUEL : action={a_duel}, "
-                            f"prob={probs_d[a_duel].item():.3f} "
+                            f"prob={p_duel:.3f} "
                             f"({action_labels[a_duel]})"
                         )
-                        a = a_duel
+                        # Filtre confiance : entrée uniquement si prob >= seuil
+                        if a_duel in (0, 1) and p_duel < cfg.min_confidence:
+                            print(f"[CONF] prob {p_duel:.3f} < {cfg.min_confidence:.2f} → HOLD")
+                            a = 2
+                        else:
+                            a = a_duel
 
                 elif cfg.side == "duel":
                     if policy_long is None or policy_short is None:
@@ -956,10 +967,19 @@ def live_loop(cfg: LiveConfig, should_continue):
 
                         if p_long_buy > p_short_sell:
                             print(f"[DUEL] LONG choisi, p(BUY)={p_long_buy:.3f}")
-                            a = 0 if int(torch.argmax(probs_long).item()) == 0 else 2
+                            cand = 0 if int(torch.argmax(probs_long).item()) == 0 else 2
+                            p_cand = p_long_buy
                         else:
                             print(f"[DUEL] SHORT choisi, p(SELL)={p_short_sell:.3f}")
-                            a = 1 if int(torch.argmax(probs_short).item()) == 1 else 2
+                            cand = 1 if int(torch.argmax(probs_short).item()) == 1 else 2
+                            p_cand = p_short_sell
+
+                        # Filtre confiance
+                        if cand in (0, 1) and p_cand < cfg.min_confidence:
+                            print(f"[CONF] prob {p_cand:.3f} < {cfg.min_confidence:.2f} → HOLD")
+                            a = 2
+                        else:
+                            a = cand
 
                 elif cfg.side == "long":
                     if policy_long is None:
@@ -976,8 +996,13 @@ def live_loop(cfg: LiveConfig, should_continue):
                         print("Probas LONG  :", probs_long.cpu().numpy().round(4))
 
                         a_long = int(torch.argmax(probs_long, dim=-1).item())
-                        print(f"BEST LONG : action={a_long}, prob={probs_long[a_long].item():.3f}")
-                        a = a_long
+                        p_long = float(probs_long[a_long].item())
+                        print(f"BEST LONG : action={a_long}, prob={p_long:.3f}")
+                        if a_long in (0, 1) and p_long < cfg.min_confidence:
+                            print(f"[CONF] prob {p_long:.3f} < {cfg.min_confidence:.2f} → HOLD")
+                            a = 2
+                        else:
+                            a = a_long
 
                 elif cfg.side == "short":
                     if policy_short is None:
@@ -994,8 +1019,13 @@ def live_loop(cfg: LiveConfig, should_continue):
                         print("Probas SHORT :", probs_short.cpu().numpy().round(4))
 
                         a_short = int(torch.argmax(probs_short, dim=-1).item())
-                        print(f"BEST SHORT : action={a_short}, prob={probs_short[a_short].item():.3f}")
-                        a = a_short
+                        p_short = float(probs_short[a_short].item())
+                        print(f"BEST SHORT : action={a_short}, prob={p_short:.3f}")
+                        if a_short in (0, 1) and p_short < cfg.min_confidence:
+                            print(f"[CONF] prob {p_short:.3f} < {cfg.min_confidence:.2f} → HOLD")
+                            a = 2
+                        else:
+                            a = a_short
                 else:
                     print(f"cfg.side invalide : {cfg.side}, on HOLD.")
                     a = 2

@@ -98,7 +98,7 @@ torch.manual_seed(SEED)
 # 0:BUY  1:SELL  2:HOLD
 N_ACTIONS = 3
 MASK_VALUE = -1e4  # valeur de masquage compatible float16
-CONF_THRESHOLD = 0.95  # seuil de confiance (exploration entraînement)
+CONF_THRESHOLD = 0.90  # seuil de confiance (aligné avec backtest/live)
 
 # Fichier de normalisation global
 NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
@@ -142,10 +142,12 @@ class PPOConfig:
     lr: float = 3e-4
     target_kl: float = 0.03
     value_coef: float = 0.5
-    # (B) Entropy plus fort : pousse la policy à explorer SHORT
-    entropy_coef: float = 0.25
-    # (A) Clip plus serré : empêche les gradient explosions fold 2
-    max_grad_norm: float = 0.5
+    # (B) Entropy plus fort : pousse la policy à explorer SHORT.
+    # Pour 3 actions, ln(3) ≈ 1.10 = entropy max → coef agressif justifié.
+    entropy_coef: float = 0.30
+    # (A) Clip très serré : 0.5 a laissé passer des gradients qui ont explosé
+    # avec AMP (clip appliqué sur valeurs scaled). Maintenant 0.3 + unscale fix.
+    max_grad_norm: float = 0.3
 
     # SAINT
     d_model: int = 80
@@ -156,7 +158,7 @@ class PPOConfig:
     leverage: float = 6.0
     fee_rate: float = 0.0004
     min_capital_frac: float = 0.2
-    max_drawdown: float = 0.8
+    max_drawdown: float = 0.4   # 40% : force le modèle à apprendre prudent
 
     # Risk management / position sizing
     risk_per_trade: float = 0.012
@@ -415,11 +417,15 @@ def compute_and_save_global_norm_stats(df: pd.DataFrame, feature_cols: List[str]
     return stats
 
 
-def load_global_norm_stats() -> Dict[str, np.ndarray]:
+def load_global_norm_stats() -> Optional[Dict[str, np.ndarray]]:
     if not os.path.exists(NORM_STATS_PATH):
-        raise FileNotFoundError(f"Fichier de stats globales introuvable : {NORM_STATS_PATH}")
+        return None
     data = np.load(NORM_STATS_PATH)
     stats = {"mean": data["mean"], "std": data["std"]}
+    # Vérifie cohérence avec la liste FEATURE_COLS courante (sinon recompute)
+    if stats["mean"].shape[0] != len(FEATURE_COLS):
+        print(f"[NORM] Mismatch features : {stats['mean'].shape[0]} vs {len(FEATURE_COLS)} actuelles → recompute.")
+        return None
     print(f"Stats de normalisation GLOBALes chargées depuis → {NORM_STATS_PATH}")
     return stats
 
@@ -433,6 +439,8 @@ class MarketData:
             mean, std = stats["mean"], stats["std"]
             std = np.where(std < 1e-8, 1.0, std)
             X = (X - mean) / std
+            # Clip ±5σ : aligné avec safe_normalize() backtest/live → robustesse aux outliers
+            X = np.clip(X, -5.0, 5.0)
 
         self.features = X
         self.close = df["close"].values.astype(np.float32)
@@ -594,6 +602,9 @@ class BTCTradingEnvDiscrete(gym.Env):
         self.trades_pnl: List[float] = []
         # Side (+1 long, -1 short) du trade fermé — index aligné avec trades_pnl
         self.trades_side: List[int] = []
+        # Métadonnées trade-by-trade : dict par trade fermé
+        # {entry_idx, exit_idx, side, entry_price, exit_price, pnl, hit_sl, hit_tp, hold_bars}
+        self.trades_meta: List[Dict] = []
 
         self.bars_in_position = 0
         self.risk_scale = 1.0
@@ -784,6 +795,17 @@ class BTCTradingEnvDiscrete(gym.Env):
                 self.last_realized_pnl = realized
                 self.trades_pnl.append(realized)
                 self.trades_side.append(int(self.position))
+                self.trades_meta.append({
+                    "entry_idx": int(self.entry_idx),
+                    "exit_idx": int(self.idx),
+                    "side": int(self.position),
+                    "entry_price": float(self.entry_price),
+                    "exit_price": float(exit_price),
+                    "pnl": float(realized),
+                    "hit_sl": bool(hit_sl),
+                    "hit_tp": bool(hit_tp),
+                    "hold_bars": int(self.idx - self.entry_idx),
+                })
 
                 self.position = 0
                 self.current_size = 0.0
@@ -1237,6 +1259,16 @@ def run_training_on_split(
     with open(csv_path, "w", newline="", encoding="utf-8") as _f:
         _csv.DictWriter(_f, fieldnames=_csv_fields).writeheader()
 
+    # CSV trade-by-trade (TRAIN + VAL) : 1 ligne par trade fermé
+    trades_csv_path = f"trades_{cfg.side}{suffix}.csv"
+    _trades_fields = [
+        "epoch", "phase", "episode", "entry_idx", "exit_idx",
+        "side", "entry_price", "exit_price", "pnl",
+        "hit_sl", "hit_tp", "hold_bars",
+    ]
+    with open(trades_csv_path, "w", newline="", encoding="utf-8") as _ft:
+        _csv.DictWriter(_ft, fieldnames=_trades_fields).writeheader()
+
     env = BTCTradingEnvDiscrete(train_data, cfg)
     val_env = BTCTradingEnvDiscrete(val_data, cfg)
 
@@ -1352,12 +1384,10 @@ def run_training_on_split(
                             elif cfg.side == "short":
                                 chosen_action = 1
                             else:
-                                # (C) Biais SHORT pour contrer la dérive long-only :
-                                # marché 2022-2026 globalement haussier → les SELL forcés
-                                # perdent souvent, ce qui a fait apprendre au modèle à ne plus
-                                # shorter. On compense en sur-représentant les SELL au curriculum.
-                                #   5/7 SELL (1) / 2/7 BUY (0)
-                                chosen_action = random.choice([1, 1, 1, 1, 1, 0, 0])
+                                # (C) Biais SHORT plus modéré (3/5 SELL au lieu de 5/7).
+                                # Trop biaisé fait apprendre "tout SELL = perdre" → policy
+                                # collapse vers HOLD-only. 60/40 est plus équilibré.
+                                chosen_action = random.choice([1, 1, 1, 0, 0])
                     # =======================================================
 
                     if force_opening and chosen_action is not None:
@@ -1417,6 +1447,21 @@ def run_training_on_split(
             epoch_pnl.append(final_equity - cfg.initial_capital)
             epoch_trades_pnl.extend(env.trades_pnl)
             epoch_trades_side.extend(env.trades_side)
+
+            # Trade-by-trade CSV (TRAIN)
+            with open(trades_csv_path, "a", newline="", encoding="utf-8") as _ft:
+                _w = _csv.DictWriter(_ft, fieldnames=_trades_fields)
+                for tm in env.trades_meta:
+                    _w.writerow({
+                        "epoch": epoch, "phase": "train", "episode": ep + 1,
+                        "entry_idx": tm["entry_idx"], "exit_idx": tm["exit_idx"],
+                        "side": tm["side"],
+                        "entry_price": round(tm["entry_price"], 4),
+                        "exit_price": round(tm["exit_price"], 4),
+                        "pnl": round(tm["pnl"], 4),
+                        "hit_sl": int(tm["hit_sl"]), "hit_tp": int(tm["hit_tp"]),
+                        "hold_bars": tm["hold_bars"],
+                    })
 
             if done and info.get("done_reason") == "max_drawdown":
                 last_value = 0.0
@@ -1484,11 +1529,27 @@ def run_training_on_split(
                     mask_batch = build_action_mask_from_positions(pos_b, cfg.side)
                     logits_masked = logits.masked_fill(~mask_batch, MASK_VALUE)
 
+                    # ──────────────────────────────────────────────────────────
+                    # GARDE-FOU 1 : clamp des logits avant softmax pour éviter
+                    # overflow numérique → cause directe des NaN observés.
+                    # ──────────────────────────────────────────────────────────
+                    logits_masked = torch.clamp(logits_masked, min=-30.0, max=30.0)
+
+                    # GARDE-FOU 2 : si NaN/Inf détectés (ex: gradients précédents
+                    # ont corrompu les poids), skip ce batch et reset l'optimizer
+                    if torch.isnan(logits_masked).any() or torch.isinf(logits_masked).any():
+                        print(f"  {_col('⚠ NaN/Inf dans logits, skip batch', _C.RED)}")
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
+
                     dist = Categorical(logits=logits_masked)
                     new_log = dist.log_prob(ab)
                     entropy = dist.entropy().mean()
 
-                    ratio = (new_log - lb_old).exp()
+                    # GARDE-FOU 3 : ratio PPO clampé pour éviter exp() explosif
+                    log_ratio = new_log - lb_old
+                    log_ratio = torch.clamp(log_ratio, min=-10.0, max=10.0)
+                    ratio = log_ratio.exp()
                     surr1 = adv_b * ratio
                     surr2 = adv_b * torch.clamp(
                         ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps
@@ -1501,10 +1562,16 @@ def run_training_on_split(
                     clipped_loss = (v_clipped - ret_b).pow(2)
                     critic_loss = torch.max(unclipped_loss, clipped_loss).mean()
 
-                    # Décroissance linéaire de 3× → 0.3× sur 80 epochs
-                    t = min((epoch - 1) / 80.0, 1.0)
-                    entropy_coef_epoch = cfg.entropy_coef * (3.0 * (1 - t) + 0.3 * t)
+                    # GARDE-FOU 4 : entropy floor — empêche policy collapse.
+                    # Schedule : 2.0× au début → 0.8× à la fin (au lieu de 0.3×).
+                    # Garde une exploration minimale jusqu'à la fin.
+                    t = min((epoch - 1) / 120.0, 1.0)
+                    entropy_coef_epoch = cfg.entropy_coef * (2.0 * (1 - t) + 0.8 * t)
                     entropy_bonus = entropy_coef_epoch * entropy
+
+                    # Si entropy s'effondre, on booste son poids agressivement
+                    if entropy.item() < 0.1:
+                        entropy_bonus = entropy_bonus * 5.0
 
                     # Warmup critique : N premières epochs → critique seul
                     if epoch <= cfg.critic_warmup_epochs:
@@ -1512,9 +1579,31 @@ def run_training_on_split(
                     else:
                         loss = actor_loss + cfg.value_coef * critic_loss - entropy_bonus
 
-                optimizer.zero_grad()
+                # GARDE-FOU 5 : check la loss finale
+                if not torch.isfinite(loss):
+                    print(f"  {_col('⚠ Loss non-finite, skip batch', _C.RED)}")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
+                optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+
+                # ──────────────────────────────────────────────────────────
+                # FIX CRITIQUE : unscale AVANT clip_grad_norm sinon le clip
+                # opère sur des gradients ×2^16 (AMP) → inefficace
+                # ──────────────────────────────────────────────────────────
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    policy.parameters(), cfg.max_grad_norm
+                )
+
+                # GARDE-FOU 6 : si grad norm est NaN/Inf, skip la step
+                if not torch.isfinite(grad_norm):
+                    print(f"  {_col('⚠ grad_norm non-fini, skip step', _C.RED)}")
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.update()
+                    continue
+
                 scaler.step(optimizer)
                 scaler.update()
 
@@ -1563,7 +1652,7 @@ def run_training_on_split(
         val_trades_side: List[int] = []
 
         with torch.no_grad():
-            for _ in range(2):
+            for _ in range(7):  # 2 → 7 : stabilise le Sortino, moins de bruit dans la sélection BEST
                 s, info = val_env.reset()
                 done = False
                 while not done:
@@ -1612,6 +1701,21 @@ def run_training_on_split(
                 val_dd.append(info["drawdown"])
                 val_trades.extend(val_env.trades_pnl)
                 val_trades_side.extend(val_env.trades_side)
+
+                # Trade-by-trade CSV (VAL)
+                with open(trades_csv_path, "a", newline="", encoding="utf-8") as _ft:
+                    _w = _csv.DictWriter(_ft, fieldnames=_trades_fields)
+                    for tm in val_env.trades_meta:
+                        _w.writerow({
+                            "epoch": epoch, "phase": "val", "episode": 0,
+                            "entry_idx": tm["entry_idx"], "exit_idx": tm["exit_idx"],
+                            "side": tm["side"],
+                            "entry_price": round(tm["entry_price"], 4),
+                            "exit_price": round(tm["exit_price"], 4),
+                            "pnl": round(tm["pnl"], 4),
+                            "hit_sl": int(tm["hit_sl"]), "hit_tp": int(tm["hit_tp"]),
+                            "hold_bars": tm["hold_bars"],
+                        })
 
         val_profit = float(sum(val_pnl))
         val_max_dd = float(max(val_dd) if val_dd else 0.0)
@@ -1912,9 +2016,8 @@ def run_training_on_split(
 def run_training_full(cfg: PPOConfig):
     df = load_mt5_data(cfg)
 
-    if os.path.exists(NORM_STATS_PATH):
-        stats = load_global_norm_stats()
-    else:
+    stats = load_global_norm_stats()
+    if stats is None:
         stats = compute_and_save_global_norm_stats(df, FEATURE_COLS)
 
     train_data, val_data, test_data = create_datasets(df, FEATURE_COLS, stats)
@@ -1937,9 +2040,8 @@ def run_walkforward(
     df_full = load_mt5_data(cfg_base)
     n = len(df_full)
 
-    if os.path.exists(NORM_STATS_PATH):
-        stats = load_global_norm_stats()
-    else:
+    stats = load_global_norm_stats()
+    if stats is None:
         stats = compute_and_save_global_norm_stats(df_full, FEATURE_COLS)
 
     train_len = int(n * train_frac)
