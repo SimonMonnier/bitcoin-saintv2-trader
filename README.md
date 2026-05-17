@@ -172,8 +172,12 @@ Implémentation maison avec :
 2. **Cosine LR + KL early stop combinés** — empêche les mises à jour destructives en fin de training
 3. **Curriculum learning avec biais SHORT** — sur marché bullish 2022-2026, force le modèle à explorer la direction perdante au début pour ne pas converger en long-only
 4. **Critic warmup 5 epochs** — laisse le baseline V(s) se stabiliser avant d'optimiser l'actor (sinon l'actor "court après" un critic non calibré)
-5. **Gradient clipping serré (norm=0.5)** — empêche les gradient explosions observées en fold 2 du training précédent (ActorL passait à 1e+22 sans)
-6. **Reward shaping multi-composant** — combine PnL réalisé + bonus trade gagnant (×1.8) + pénalité bad entry + slippage micro
+5. **Gradient clipping serré (norm=0.3) + unscale AMP fix** — empêche les gradient explosions ; clip appliqué AVANT scaler.unscale_ pour AMP fp16 correct
+6. **Reward shaping multi-composant** — combine PnL réalisé + bonus trade gagnant + pénalité bad entry + slippage micro
+7. **Garde-fous anti-NaN** — clamp logits ±30, clamp log_ratio ±10, skip-batch si NaN/Inf détecté, entropy floor ×5 si H<0.1
+8. **Clip normalisation Z-score ±5σ** — aligne training / backtest / live → robustesse aux outliers de marché
+9. **max_drawdown=0.4** — terminaison anticipée si DD > 40% → force le modèle à apprendre la prudence
+10. **Validation 7 épisodes** (au lieu de 2) — stabilise le Sortino30 utilisé pour la sélection du best
 
 ### Hyperparamètres clés
 
@@ -182,15 +186,18 @@ Implémentation maison avec :
 | `epochs` | 240 | Plus de runway avec cosine LR |
 | `episodes_per_epoch` | 4 | Diversité par epoch |
 | `episode_length` | 4 000 | ~2.8 jours M1, trajectoires longues |
+| `val_episodes` | 7 | Augmenté de 2 → 7 pour stabiliser le Sortino |
 | `batch_size` | 256 | GPU-friendly |
 | `clip_eps` | 0.18 | Standard PPO |
 | `target_kl` | 0.03 | Early stop si dépassé |
 | `gamma` | 0.97 | Horizon court pour scalping |
 | `lambda_gae` | 0.95 | Standard |
 | `lr` | 3e-4 → 1.5e-5 (cosine) | Décroissance douce |
-| `entropy_coef` | 0.25 | Pousse l'exploration SHORT |
+| `entropy_coef` | 0.30 | Pousse l'exploration SHORT (×2.0 → ×0.8 sur 120 ep) |
 | `value_coef` | 0.5 | Standard |
-| `max_grad_norm` | 0.5 | Anti gradient-explosion |
+| `max_grad_norm` | 0.3 | Anti gradient-explosion (resserré + unscale AMP) |
+| `max_drawdown` | 0.4 | Force l'apprentissage prudent (resserré depuis 0.8) |
+| `CONF_THRESHOLD` | 0.90 | Filtre exploration training (resserré depuis 0.95) |
 | `critic_warmup_epochs` | 5 | Stabilité initiale |
 | `lookback` | 25 | ~25 minutes de contexte |
 | `position_size` | 0.06 lot | Risk-tuned BTCUSD |
@@ -308,10 +315,11 @@ Pour relancer en partant des checkpoints existants : `training.py` détecte auto
 python backtest_saintv2_stress_test.py
 ```
 
-Par défaut backteste `bestprofit_saintv2_loup_duel_both_wf1.pth` en mode `side="both"`. Modifie `LiveConfig(side="...")` à la fin du fichier pour tester :
-- `"both"` : modèle duel unifié
-- `"long"` / `"short"` : modèles spécialisés
-- `"duel"` : 2 modèles séparés en arbitrage
+Par défaut backteste `bestprofit_saintv2_loup_duel_wf1_both_wf1.pth` en mode `side="both"` avec `min_confidence=0.0` (argmax pur). Modifie `LiveConfig(...)` à la fin du fichier pour tester :
+- `side="both"` : modèle duel unifié
+- `side="long"` / `"short"` : modèles spécialisés
+- `side="duel"` : 2 modèles séparés en arbitrage
+- `min_confidence=0.0` (argmax pur) ou ajuster selon le calibrage du modèle
 
 ### 3. Live trading (GUI)
 
@@ -345,11 +353,13 @@ multi-agent-btcusd/
 ├── README.md                      # Ce fichier
 │
 ├── (générés après training)
-├── norm_stats_ohlc_indics.npz                       # Stats Z-score globales
-├── best_saintv2_loup_duel_wf{1,2,3}_both_wf{1,2,3}.pth      # Best Sortino30
-├── bestprofit_saintv2_loup_duel_both_wf{1,2,3}.pth          # Best ValPNL
-├── last_saintv2_loup_duel_wf{1,2,3}_both_wf{1,2,3}.pth      # Final epoch
-└── training_log_both_wf{1,2,3}.csv                          # Logs CSV par fold
+├── norm_stats_ohlc_indics.npz                                   # Stats Z-score globales
+├── best_saintv2_loup_duel_wf{1,2,3}_both_wf{1,2,3}.pth          # Best Sortino30
+├── bestprofit_saintv2_loup_duel_wf{1,2,3}_both_wf{1,2,3}.pth    # Best ValPNL
+├── last_saintv2_loup_duel_wf{1,2,3}_both_wf{1,2,3}.pth          # Final epoch
+├── training_log_both_wf{1,2,3}.csv                              # Logs CSV epoch-level
+├── trades_both_wf{1,2,3}.csv                                    # Trade-by-trade (NEW)
+└── backtest_trades_both.csv                                     # Trades du backtest (NEW)
 ```
 
 ---
@@ -380,11 +390,15 @@ Le masque dépend de la **position courante** et du **mode side** :
 - Break-even (≥ 1 × ATR favorable) → SL déplacé à l'entry
 - Trailing stop (≥ 1.5 × ATR favorable) → SL trailé à 1 × ATR derrière le prix
 
-### Sélection avec seuil de confiance (training uniquement)
+### Sélection avec seuil de confiance
 
-Pendant le training, l'exploration utilise un **seuil de 95 %** : l'agent n'entre que si `softmax(BUY) ≥ 0.95` (ou SELL). Sinon il bascule à HOLD. Cette contrainte force la policy à être très conviction-driven pendant l'apprentissage.
+| Contexte | Seuil | Note |
+|----------|-------|------|
+| **Training** (`CONF_THRESHOLD`) | 0.90 | Filtre exploration : HOLD si `softmax(BUY ou SELL) < 0.90` |
+| **Backtest** (`min_confidence`) | configurable | 0.0 = argmax pur (recommandé pour ce modèle) |
+| **Live** (`min_confidence`) | configurable | 0.0 par défaut (argmax pur) |
 
-En backtest et live, **pure argmax** sans seuil.
+**Note importante** : avec 3 actions équiprobables (1/3 ≈ 0.33), un modèle bien calibré plafonne souvent autour de 0.40-0.50 en max-prob. Un seuil > 0.50 peut bloquer toutes les entrées. Vérifier les logs `probas D BUY=X SELL=Y HOLD=Z` du backtest pour calibrer.
 
 ---
 
@@ -578,11 +592,13 @@ Source : `mt5.history_deals_get(session_start, now, group="BTCUSD")` filtré sur
 
 | Fichier | Contenu | Quand |
 |---------|---------|-------|
-| `norm_stats_ohlc_indics.npz` | Mean/std features pour Z-score | Au début du training |
+| `norm_stats_ohlc_indics.npz` | Mean/std features pour Z-score (auto-recompute si shape mismatch) | Au début du training |
 | `best_saintv2_loup_duel_wfN_both_wfN.pth` | Best Sortino30 (≥20 trades) | Pendant training |
-| `bestprofit_saintv2_loup_duel_both_wfN.pth` | Best ValPNL (≥20 trades) | Pendant training |
+| `bestprofit_saintv2_loup_duel_wfN_both_wfN.pth` | Best ValPNL (≥20 trades) | Pendant training |
 | `last_saintv2_loup_duel_wfN_both_wfN.pth` | Final epoch du fold | Fin du fold |
 | `training_log_both_wfN.csv` | 40+ colonnes : PNL, trades, WR, L/S split, losses, etc. | À chaque epoch |
+| `trades_both_wfN.csv` | **NEW** : 1 ligne par trade fermé (entry/exit/pnl/SL/TP/hold_bars/phase) | À chaque trade |
+| `backtest_trades_both.csv` | **NEW** : Trade-by-trade du backtest stress-test | Fin du backtest |
 | `loup_log_YYYYMMDD_HHMMSS.txt` | Export GUI | Bouton 💾 |
 
 ### Format des poids
@@ -611,6 +627,20 @@ state = torch.load("bestprofit_saintv2_loup_duel_both_wf3.pth", map_location="cp
 ### "size mismatch for actor.weight: [3, 256] vs [5, 256]"
 - Tu charges un ancien `.pth` (5 actions) avec le nouveau code (3 actions)
 - Solution : retrainer le modèle (le code actuel utilise 3 actions BUY/SELL/HOLD)
+
+### "Modèle DUEL introuvable : bestprofit_saintv2_loup_duel_*.pth"
+- Le path dans `loup_live.py` / backtest doit correspondre au pattern réel :
+  `bestprofit_saintv2_loup_duel_wfN_both_wfN.pth` (avec `_wfN_` au milieu)
+- Vérifie les `.pth` réellement présents : `ls bestprofit_*.pth`
+
+### Backtest : 0 trade pendant toute la simulation
+- Le seuil `min_confidence` est trop élevé pour ce modèle
+- Le modèle plafonne souvent vers 0.40-0.50 en max-prob → tout seuil > 0.50 bloque tout
+- Solution : `min_confidence=0.0` (argmax pur) ou inspecter les probas dans les logs
+
+### "[NORM] Mismatch features : X vs Y actuelles → recompute"
+- Normal si tu changes la liste `FEATURE_COLS` après un premier training
+- Le code recompute auto les stats Z-score ; aucune action requise
 
 ### Training trop long
 - Diminue `epochs` à 120 ou 160 (le cosine LR s'adapte automatiquement)
