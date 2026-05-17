@@ -51,8 +51,8 @@ class LiveConfig:
     position_size: float = 0.01
     leverage: float = 6.0
     fee_rate: float = 0.0004  # juste informatif ici
-    atr_sl_mult: float = 1.618033
-    atr_tp_mult: float = 2.4  # plus utilisé si pas de TP fixe
+    atr_sl_mult: float = 1.2     # aligné avec training/backtest
+    atr_tp_mult: float = 2.4     # aligné avec training/backtest (TP réactivé)
 
     spread_bps: float = 0.0
     slippage_bps: float = 0.0
@@ -428,9 +428,10 @@ def build_live_obs(
 
     current_price = float(df_merged["close"].iloc[-1]) if len(df_merged) > 0 else 0.0
 
-    # PnL latent en unités d'ATR — identique à _get_obs() du training
+    # PnL latent en unités d'ATR — IDENTIQUE training/backtest :
+    # entry_atr est FIGÉ à l'ouverture (via cache par ticket), pas recalculé.
     if pos != 0 and entry_price > 0.0:
-        entry_atr = compute_entry_atr(df_merged)
+        entry_atr = get_entry_atr_cached(cfg.symbol, df_merged)
         if entry_atr > 1e-8:
             unrealized_atr = float(pos * (current_price - entry_price) / entry_atr)
         else:
@@ -484,19 +485,57 @@ def compute_entry_atr(df_merged: pd.DataFrame) -> float:
     return max(atr, 0.0)
 
 
+# ============================================================
+# Cache entry_atr par ticket — pour figer la feature unrealized_atr
+# IDENTIQUE training/backtest (qui freezent l'ATR à l'ouverture)
+# ============================================================
+_ENTRY_ATR_CACHE: dict[int, float] = {}
+
+
+def get_position_ticket(symbol: str) -> Optional[int]:
+    positions = mt5.positions_get(symbol=symbol)
+    if positions is None or len(positions) == 0:
+        return None
+    return int(positions[0].ticket)
+
+
+def get_entry_atr_cached(symbol: str, fallback_df: pd.DataFrame) -> float:
+    """Retourne l'entry_atr mémorisé pour la position courante.
+    Si pas de position ou cache miss : fallback sur la DF actuelle (drift accepté
+    pour le 1er appel après reprise/redémarrage)."""
+    ticket = get_position_ticket(symbol)
+    if ticket is not None and ticket in _ENTRY_ATR_CACHE:
+        return _ENTRY_ATR_CACHE[ticket]
+    return compute_entry_atr(fallback_df)
+
+
+def gc_entry_atr_cache(symbol: str) -> None:
+    """Supprime du cache les tickets qui ne correspondent plus à des positions
+    ouvertes (le ticket survit en MT5 history mais on n'en a plus besoin)."""
+    positions = mt5.positions_get(symbol=symbol)
+    open_tickets = {int(p.ticket) for p in positions} if positions else set()
+    for t in list(_ENTRY_ATR_CACHE.keys()):
+        if t not in open_tickets:
+            _ENTRY_ATR_CACHE.pop(t, None)
+
+
 def compute_sl_tp(cfg: LiveConfig, entry_price: float, side: int, entry_atr: float):
+    """SL+TP IDENTIQUE training/backtest : SL=1.2×ATR, TP=2.4×ATR×0.7=1.68×ATR."""
     fallback = 0.0015 * entry_price
     eff_atr = max(entry_atr, fallback, 1e-8)
 
     sl_dist = cfg.atr_sl_mult * eff_atr
+    tp_dist = cfg.atr_tp_mult * eff_atr * cfg.tp_shrink
 
     if side == 1:
         sl = entry_price - sl_dist
+        tp = entry_price + tp_dist
     else:
         sl = entry_price + sl_dist
+        tp = entry_price - tp_dist
 
     sl = max(sl, 1e-8)
-    tp = None  # aucun TP fixe
+    tp = max(tp, 1e-8)
     return sl, tp
 
 
@@ -517,7 +556,7 @@ def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: 
     volume = cfg.position_size * (risk_scale if risk_scale > 0 else 1.0)
 
     entry_atr = compute_entry_atr(df_merged_closed)
-    sl, _ = compute_sl_tp(cfg, price, side, entry_atr)
+    sl, tp = compute_sl_tp(cfg, price, side, entry_atr)
 
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
@@ -526,10 +565,10 @@ def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: 
         "type": order_type,
         "price": price,
         "sl": sl,
-        "tp": 0.0,  # aucun TP → tout se fait au SL / trailing
+        "tp": tp,
         "deviation": 50,
         "magic": 424242,
-        "comment": "SAINTv2_Live_long_only_noTP",
+        "comment": "SAINTv2_Live_duel",
         "type_filling": mt5.ORDER_FILLING_IOC,
         "type_time": mt5.ORDER_TIME_GTC,
     }
@@ -542,7 +581,12 @@ def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: 
     if result.retcode != mt5.TRADE_RETCODE_DONE:
         print(f"Order_send échoué, retcode={result.retcode}")
     else:
-        print(f"Order exécuté : side={side}, volume={volume}, prix={price}, SL={sl}, TP=0.0 (aucun TP fixe)")
+        # Mémorise l'ATR d'entrée pour cohérence avec training/backtest
+        # (utilisé par build_live_obs → unrealized_atr)
+        positions = mt5.positions_get(symbol=symbol)
+        if positions and len(positions) > 0:
+            _ENTRY_ATR_CACHE[int(positions[0].ticket)] = float(entry_atr)
+        print(f"Order exécuté : side={side}, volume={volume}, prix={price}, SL={sl:.2f}, TP={tp:.2f}, entry_atr={entry_atr:.2f}")
 
 
 def modify_sl_tp(position, new_sl: float | None = None, new_tp: float | None = None):
@@ -805,6 +849,9 @@ def live_loop(cfg: LiveConfig, should_continue):
 
     try:
         while should_continue():
+
+            # Nettoie le cache entry_atr des tickets fermés
+            gc_entry_atr_cache(cfg.symbol)
 
             # ====================================================
             # 1) TRAILING / BREAK-EVEN TICK-BY-TICK SI POSITION OUVERTE
