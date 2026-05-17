@@ -450,16 +450,60 @@ def normalize_features(X: np.ndarray, stats: Dict[str, np.ndarray]) -> np.ndarra
 # DATA M1 + H1 POUR BACKTEST (MT5)
 # ============================================================
 
+def _fetch_paginated(symbol: str, timeframe: int,
+                     date_from: datetime, date_to: datetime,
+                     chunk: int = 100_000) -> Optional[np.ndarray]:
+    """Pagination MT5 (identique à training._fetch_paginated)."""
+    all_chunks = []
+    cursor = date_to
+    seen_oldest = None
+    safety_iter = 0
+    while safety_iter < 200:
+        safety_iter += 1
+        rates = mt5.copy_rates_from(symbol, timeframe, cursor, chunk)
+        if rates is None or len(rates) == 0:
+            break
+        oldest_ts = int(rates[0]["time"])
+        oldest_dt = datetime.utcfromtimestamp(oldest_ts)
+        all_chunks.append(rates)
+        if oldest_dt <= date_from:
+            break
+        if seen_oldest is not None and oldest_ts >= seen_oldest:
+            break
+        seen_oldest = oldest_ts
+        cursor = oldest_dt - pd.Timedelta(seconds=1)
+    if not all_chunks:
+        return None
+    rates_all = np.concatenate(all_chunks)
+    rates_all = np.unique(rates_all)
+    ts_from = int(date_from.timestamp())
+    ts_to   = int(date_to.timestamp())
+    rates_all = rates_all[(rates_all["time"] >= ts_from) & (rates_all["time"] <= ts_to)]
+    return rates_all
+
+
 def fetch_ohlc_with_indicators(cfg: LiveConfig) -> pd.DataFrame:
     utc_from = cfg.date_from
     utc_to = cfg.date_to or datetime.now()
 
-    rates_m1 = mt5.copy_rates_range(
-        cfg.symbol, cfg.timeframe, utc_from, utc_to
-    )
-    rates_h1 = mt5.copy_rates_range(
-        cfg.symbol, cfg.htf_timeframe, utc_from, utc_to
-    )
+    mt5.symbol_select(cfg.symbol, True)
+
+    print(f"  → fetch M1 {utc_from:%Y-%m-%d} → {utc_to:%Y-%m-%d}…")
+    rates_m1 = mt5.copy_rates_range(cfg.symbol, cfg.timeframe, utc_from, utc_to)
+    rates_h1 = mt5.copy_rates_range(cfg.symbol, cfg.htf_timeframe, utc_from, utc_to)
+
+    n_m1_target = int((utc_to - utc_from).total_seconds() // 60 * 0.7)
+    n_h1_target = int((utc_to - utc_from).total_seconds() // 3600 * 0.7)
+
+    if rates_m1 is None or len(rates_m1) < n_m1_target:
+        nb = 0 if rates_m1 is None else len(rates_m1)
+        print(f"  ⚠ copy_rates_range M1 insuffisant ({nb:,} / {n_m1_target:,}), pagination…")
+        rates_m1 = _fetch_paginated(cfg.symbol, cfg.timeframe, utc_from, utc_to, chunk=100_000)
+
+    if rates_h1 is None or len(rates_h1) < n_h1_target:
+        nb = 0 if rates_h1 is None else len(rates_h1)
+        print(f"  ⚠ copy_rates_range H1 insuffisant ({nb:,} / {n_h1_target:,}), pagination…")
+        rates_h1 = _fetch_paginated(cfg.symbol, cfg.htf_timeframe, utc_from, utc_to, chunk=20_000)
 
     if rates_m1 is None or rates_h1 is None:
         raise RuntimeError("MT5 n'a renvoyé aucune donnée M1 ou H1.")
