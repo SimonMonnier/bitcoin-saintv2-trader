@@ -12,6 +12,7 @@
    - [Performance backtest](#-performance--backtest-stress-test-no_be_trail--mai-2026)
 2. [Architecture du modèle](#-architecture-du-modèle)
 3. [Pipeline complet](#-pipeline-complet)
+   - [Volume dynamique](#-volume-dynamique-position-sizing)
 4. [Méthodologie d'entraînement](#-méthodologie-dentraînement)
 5. [Installation](#-installation)
 6. [Configuration de MetaTrader 5](#-configuration-de-metatrader-5)
@@ -467,6 +468,51 @@ Le masque dépend de la **position courante** et du **mode side** :
 
 ---
 
+## 📐 Volume dynamique (position sizing)
+
+Depuis mai 2026, le volume des ordres est calculé **dynamiquement** selon l'equity du compte. Le slider GUI a été remplacé par un label en lecture seule. Identique en backtest et en live :
+
+```python
+def compute_dynamic_volume(equity: float, max_lot: float = 100.0) -> float:
+    if equity <= 2000.0:
+        tier = 1
+    else:
+        tier = int((equity - 1.0) // 1000.0)
+    lot = 0.01 * tier
+    return round(min(lot, max_lot), 2)
+```
+
+### Paliers
+
+| Equity | Lot |
+|--------|-----|
+| 0 – 2 000 $ | **0.01** |
+| 2 001 – 3 000 $ | 0.02 |
+| 3 001 – 4 000 $ | 0.03 |
+| 4 001 – 5 000 $ | 0.04 |
+| … (+ 0.01 par tranche de 1 000 $) | … |
+| > 10 000 000 $ | **100.00** (cap) |
+
+### Effet boule de neige (compounding)
+
+Sur le backtest 2026-01-01 → en cours :
+- Lot fixe 0.01 (ancien) : +5 609 $ sur 75 jours
+- **Lot dynamique** : à 24 % du run, déjà **+3 550 $** avec lot 0.04 actif — projection >+25 000 $
+
+Chaque palier franchi accélère la croissance ; chaque drawdown coûte proportionnellement plus aussi.
+
+### Configuration
+
+```python
+# Dans LiveConfig (loup_live.py / backtest_*.py)
+dynamic_volume: bool = True   # True = paliers ; False = position_size fixe
+max_lot: float = 100.0        # cap absolu
+```
+
+Pour revenir au lot fixe, passer `dynamic_volume=False`.
+
+---
+
 ## 💰 Reward shaping et risk management
 
 ### Reward composite
@@ -636,10 +682,14 @@ Le backtest émet un verdict à la fin :
 L'interface graphique offre :
 
 ### Panneau de contrôle
-- **Lot size** (slider 0.01 → 1.00)
+- **Lot dynamique** (label readonly, mis à jour 1×/sec depuis l'equity)
+  - Hint affiché : `(≤2000$ : 0.01 · +0.01 par tranche de 1000$ · cap 100.00)`
 - **Démarrer / Arrêter l'IA**
-- **Statut** : EN COURS / ARRÊTÉ avec side et lot
-- **Equity bar** : Equity / Balance / P&L flottant / Margin / Free margin
+- **Statut** : EN COURS / ARRÊTÉ avec side et lot calculé
+- **Equity bar enrichie** : Equity / Balance / **P/L session** / **P/L flottant** / **P/L total** / Margin / Free
+  - `P/L session` = balance courant − balance au lancement (réalisé bot)
+  - `P/L flottant` = equity − balance (positions ouvertes)
+  - `P/L total` = session + flottant
 
 ### Stats de session
 Grille temps réel avec 3 lignes :
@@ -647,7 +697,12 @@ Grille temps réel avec 3 lignes :
 - 🔵 **SHORT** : idem
 - ⚪ **TOTAL** : agrégé
 
-Source : `mt5.history_deals_get(session_start, now, group="BTCUSD")` filtré sur les deals de sortie. **Bouton 🔄 Reset stats** pour réinitialiser.
+Source : `mt5.history_deals_get(session_start − 24h, now + 24h, group="BTCUSD")` filtré sur :
+- `d.entry ∈ {DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT, DEAL_ENTRY_OUT_BY}` (tous les types de sortie MT5)
+- `d.magic == 424242` (uniquement les trades du bot, ignore manuels)
+- Dédup par `d.ticket`
+
+La fenêtre élargie ±24h absorbe le décalage timezone local ↔ serveur MT5. **Bouton 🔄 Reset stats** pour réinitialiser.
 
 ### Zone de logs
 - **Couleurs ANSI** par catégorie (TRADE / SIGNAL / INFO / WARN / ERROR / DEBUG)

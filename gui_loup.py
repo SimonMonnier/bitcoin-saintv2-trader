@@ -134,19 +134,25 @@ class MainWindow(QtWidgets.QMainWindow):
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
 
-        # --- Ligne info + lot ---
+        # --- Ligne info lot dynamique ---
         top_layout = QtWidgets.QHBoxLayout()
-        top_layout.addWidget(QtWidgets.QLabel("Taille de position (lot BTC) :"))
+        top_layout.addWidget(QtWidgets.QLabel("Lot dynamique :"))
 
-        self.lot_spin = QtWidgets.QDoubleSpinBox()
-        self.lot_spin.setDecimals(2)
-        self.lot_spin.setMinimum(0.01)
-        self.lot_spin.setMaximum(1.00)
-        self.lot_spin.setSingleStep(0.01)
-        self.lot_spin.setValue(self.cfg.position_size)
-        self.lot_spin.setSuffix(" lot")
-        self.lot_spin.setFixedWidth(120)
-        top_layout.addWidget(self.lot_spin)
+        # Label en lecture seule qui affiche le lot calculé selon l'equity
+        # (0-2000$ → 0.01, +0.01 par tranche de 1000$, cap 100.00)
+        self.lot_label = QtWidgets.QLabel("0.01 lot (auto)")
+        self.lot_label.setStyleSheet(
+            "color: #2ecc71; font-weight: bold; font-family: Consolas, monospace; padding: 2px 8px;"
+            "background-color: #1c2833; border-radius: 4px;"
+        )
+        top_layout.addWidget(self.lot_label)
+
+        # Hint de calcul
+        hint = QtWidgets.QLabel(
+            "(≤2000$ : 0.01  ·  +0.01 par tranche de 1000$  ·  cap 100.00)"
+        )
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        top_layout.addWidget(hint)
         top_layout.addStretch()
         layout.addLayout(top_layout)
 
@@ -176,6 +182,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ============ PANNEAU STATS LONG / SHORT ============
         # Track des trades de la session courante (depuis ouverture du GUI ou Reset)
         self.session_start = dt.datetime.now()
+        self.session_balance_start: float | None = None  # capturé au 1er update_equity
         self._stats_seen_deal_tickets: set = set()
         # {"long":{"wins":[], "losses":[]}, "short":{"wins":[], "losses":[]}}
         self.session_stats = {
@@ -399,9 +406,10 @@ class MainWindow(QtWidgets.QMainWindow):
     # ====================================================
 
     def on_start(self):
-        new_lot = float(self.lot_spin.value())
-        self.cfg.position_size = new_lot
-        self._append_log(f"[GUI] Démarrage du bot avec lot={new_lot:.2f}", LogLevel.TRADE)
+        self._append_log(
+            f"[GUI] Démarrage du bot (lot dynamique selon equity)",
+            LogLevel.TRADE
+        )
         self.agent.start()
         self.update_status()
 
@@ -486,7 +494,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_status(self):
         running = self.agent._running
-        lot = self.cfg.position_size
+        # Lot affiché : si dynamique → calculé depuis equity courant
+        if getattr(self.cfg, "dynamic_volume", False):
+            try:
+                info = mt5.account_info()
+                equity = float(info.equity) if info is not None else 0.0
+                from loup_live import compute_dynamic_volume
+                lot = compute_dynamic_volume(equity, getattr(self.cfg, "max_lot", 100.0))
+            except Exception:
+                lot = 0.01
+            # Met à jour le label "Lot dynamique"
+            if hasattr(self, "lot_label"):
+                self.lot_label.setText(f"{lot:.2f} lot (auto)")
+        else:
+            lot = self.cfg.position_size
+
         if running:
             text = f"État bot : ✅ EN COURS | side={self.cfg.side} | lot={lot:.2f}"
             self.status_label.setStyleSheet("color: #2ecc71; font-weight: bold;")
@@ -501,6 +523,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_reset_stats(self):
         self.session_start = dt.datetime.now()
+        self.session_balance_start = None   # sera recapturé au prochain update_equity
         self._stats_seen_deal_tickets.clear()
         self.session_stats = {
             "long":  {"wins": [], "losses": []},
@@ -510,29 +533,48 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_log("[GUI] Stats de session remises à zéro.", LogLevel.INFO)
 
     def update_stats(self):
-        """Récupère les deals MT5 fermés depuis session_start et agrège L/S."""
+        """Récupère les deals MT5 fermés depuis session_start et agrège L/S.
+
+        Fixes :
+        - Timezone : on requête depuis session_start - 24h (buffer) pour gérer
+          le décalage local vs server MT5. La dédup par ticket évite les doublons.
+        - Filtre magic == 424242 pour ne compter QUE les trades du bot.
+        - PnL = d.profit seul (la commission est déjà incluse selon le broker ;
+          mieux vaut sous-estimer légèrement que double-compter).
+        """
         try:
-            mt5.initialize()
             symbol = self.cfg.symbol if hasattr(self.cfg, "symbol") else "BTCUSD"
-            deals = mt5.history_deals_get(self.session_start, dt.datetime.now(), group=symbol)
+            # Buffer -24h pour absorber le décalage local/server, dédup par ticket
+            since = self.session_start - dt.timedelta(hours=24)
+            until = dt.datetime.now() + dt.timedelta(hours=24)
+            deals = mt5.history_deals_get(since, until, group=symbol)
             if deals is None:
                 self._update_stats_display()
                 return
 
+            _OUT_ENTRIES = (
+                mt5.DEAL_ENTRY_OUT,       # 1 : sortie normale (SL/TP/manual)
+                mt5.DEAL_ENTRY_INOUT,     # 2 : reverse position (netting)
+                mt5.DEAL_ENTRY_OUT_BY,    # 3 : sortie par ordre opposé
+            )
+            BOT_MAGIC = 424242  # tag des ordres du bot (cf loup_live.send_order)
+
             for d in deals:
-                # On veut uniquement les deals de SORTIE (clôture de position)
-                if d.entry != mt5.DEAL_ENTRY_OUT:
+                if d.entry not in _OUT_ENTRIES:
+                    continue
+                # Filtre bot : ignore manuel et autres EAs
+                if getattr(d, "magic", 0) != BOT_MAGIC:
                     continue
                 if d.ticket in self._stats_seen_deal_tickets:
                     continue
                 self._stats_seen_deal_tickets.add(d.ticket)
 
-                # Un deal de sortie type=SELL ferme un LONG, type=BUY ferme un SHORT
-                pnl = float(d.profit) + float(d.commission) + float(d.swap)
+                # d.profit suffit : commission souvent déjà incluse côté broker.
+                pnl = float(d.profit)
                 if d.type == mt5.DEAL_TYPE_SELL:
-                    side = "long"
+                    side = "long"   # SELL OUT ferme un LONG
                 elif d.type == mt5.DEAL_TYPE_BUY:
-                    side = "short"
+                    side = "short"  # BUY OUT ferme un SHORT
                 else:
                     continue
 
@@ -540,6 +582,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.session_stats[side]["wins"].append(pnl)
                 else:
                     self.session_stats[side]["losses"].append(pnl)
+
+                # Debug : log de chaque deal accepté pour inspection
+                self._append_log(
+                    f"[STATS] deal #{d.ticket} {side.upper()} "
+                    f"{'WIN' if pnl > 0 else 'LOSS'} {pnl:+.2f}$ "
+                    f"(entry={d.entry}, magic={d.magic})",
+                    LogLevel.DEBUG
+                )
 
             self._update_stats_display()
         except Exception as e:
@@ -629,7 +679,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_equity(self):
         try:
-            mt5.initialize()
             info = mt5.account_info()
             if info is None:
                 self.equity_label.setText("Equity : N/A | Balance : N/A | Margin : N/A (MT5 non connecté)")
@@ -640,13 +689,23 @@ class MainWindow(QtWidgets.QMainWindow):
             balance = float(info.balance)
             margin  = float(info.margin)
             free    = float(info.margin_free)
-            pl      = equity - balance
+            pl_flot = equity - balance   # P/L des positions ouvertes
 
-            color = "#2ecc71" if pl >= 0 else "#e74c3c"
+            # Capture du balance de référence à la 1ère lecture (= début de session)
+            if self.session_balance_start is None:
+                self.session_balance_start = balance
+
+            # P/L session réalisé = balance courant - balance de départ
+            pl_session = balance - self.session_balance_start
+            # P/L session total = réalisé + flottant
+            pl_total   = pl_session + pl_flot
+
+            color = "#2ecc71" if pl_total >= 0 else "#e74c3c"
             self.equity_label.setStyleSheet(f"color: {color}; font-weight: bold;")
             self.equity_label.setText(
                 f"Equity : {equity:.2f}  |  Balance : {balance:.2f}  |  "
-                f"P/L flottant : {pl:+.2f}  |  Margin : {margin:.2f}  |  Free : {free:.2f}"
+                f"P/L session : {pl_session:+.2f}  |  P/L flottant : {pl_flot:+.2f}  |  "
+                f"P/L total : {pl_total:+.2f}  |  Margin : {margin:.2f}  |  Free : {free:.2f}"
             )
         except Exception as e:
             self.equity_label.setText(f"Equity : erreur ({e})")

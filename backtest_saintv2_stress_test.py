@@ -103,11 +103,15 @@ class LiveConfig:
 
     # trading
     initial_capital: float = 1000.0
-    position_size: float = 0.01
+    position_size: float = 0.01    # utilisé uniquement si dynamic_volume = False
     leverage: float = 6.0
     fee_rate: float = 0.0004
     atr_sl_mult: float = 1.2
     atr_tp_mult: float = 2.4
+
+    # Volume dynamique : aligné avec loup_live.compute_dynamic_volume
+    dynamic_volume: bool = True
+    max_lot: float = 100.0
 
     # valeurs "moyennes" utilisées comme base avant stress
     spread_bps: float = 0.0002    # 20 bps de spread "moyen"
@@ -695,6 +699,17 @@ def compute_entry_atr(df_closed: pd.DataFrame) -> float:
     return max(atr, 0.0)
 
 
+def compute_dynamic_volume(equity: float, max_lot: float = 100.0) -> float:
+    """IDENTIQUE à loup_live.compute_dynamic_volume : paliers 1000$, cap 100.00."""
+    if equity <= 2000.0:
+        tier = 1
+    else:
+        tier = int((equity - 1.0) // 1000.0)
+    lot = 0.01 * tier
+    lot = min(lot, max_lot)
+    return round(lot, 2)
+
+
 def compute_sl_tp(
     cfg: LiveConfig,
     entry_price: float,
@@ -1271,7 +1286,12 @@ def run_backtest(cfg: LiveConfig):
                     stress=stress
                 )
 
-                volume = cfg.position_size * (risk_scale if risk_scale > 0 else 1.0)
+                # Volume dynamique selon equity (aligné avec loup_live)
+                if getattr(cfg, "dynamic_volume", False):
+                    base_volume = compute_dynamic_volume(state.equity, getattr(cfg, "max_lot", 100.0))
+                else:
+                    base_volume = float(cfg.position_size)
+                volume = round(base_volume * (risk_scale if risk_scale > 0 else 1.0), 2)
                 entry_atr = compute_entry_atr(df_closed_for_obs)
                 # fallback ATR si broker renvoie 0 (aligné avec env training)
                 effective_entry_atr = max(entry_atr, 0.0015 * entry_price, 1e-8)

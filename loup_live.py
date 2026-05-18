@@ -80,6 +80,13 @@ class LiveConfig:
     # donc tout seuil > 0.50 bloque tous les trades.
     min_confidence: float = 0.0
 
+    # ======= Volume dynamique selon l'equity du compte =======
+    # True  : lot = 0.01 sous 2000$, +0.01 par tranche de 1000$ au-dessus
+    #         (cap 100.00 lot)
+    # False : utilise cfg.position_size constant (slider GUI)
+    dynamic_volume: bool = True
+    max_lot: float = 100.0
+
 
 # ============================================================
 # INDICATEURS — IDENTIQUES AU TRAINING "LOUP Ω"
@@ -539,6 +546,28 @@ def compute_sl_tp(cfg: LiveConfig, entry_price: float, side: int, entry_atr: flo
     return sl, tp
 
 
+def compute_dynamic_volume(equity: float, max_lot: float = 100.0) -> float:
+    """Volume dynamique par paliers de 1000$ à partir de 2000$.
+
+    Règle :
+      - equity ≤ 2000$       → 0.01 lot
+      - 2000 < equity ≤ 3000 → 0.02 lot
+      - 3000 < equity ≤ 4000 → 0.03 lot
+      - ... (+0.01 par tranche de 1000$)
+      - plafonné à max_lot (par défaut 100.00)
+
+    Retourne toujours un float arrondi à 2 décimales.
+    """
+    if equity <= 2000.0:
+        tier = 1
+    else:
+        # 2001 → tier=2, 3000 → tier=2, 3001 → tier=3, ...
+        tier = int((equity - 1.0) // 1000.0)
+    lot = 0.01 * tier
+    lot = min(lot, max_lot)
+    return round(lot, 2)
+
+
 def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: pd.DataFrame):
     symbol = cfg.symbol
     tick = mt5.symbol_info_tick(symbol)
@@ -553,7 +582,16 @@ def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: 
         price = tick.bid
         order_type = mt5.ORDER_TYPE_SELL
 
-    volume = cfg.position_size * (risk_scale if risk_scale > 0 else 1.0)
+    # Volume : dynamique selon equity ou statique selon cfg.position_size
+    if getattr(cfg, "dynamic_volume", False):
+        info = mt5.account_info()
+        equity = float(info.equity) if info is not None else 0.0
+        base_volume = compute_dynamic_volume(equity, getattr(cfg, "max_lot", 100.0))
+        print(f"[VOL] dynamic_volume : equity={equity:.2f}$ → lot={base_volume:.2f}")
+    else:
+        base_volume = float(cfg.position_size)
+
+    volume = round(base_volume * (risk_scale if risk_scale > 0 else 1.0), 2)
 
     entry_atr = compute_entry_atr(df_merged_closed)
     sl, tp = compute_sl_tp(cfg, price, side, entry_atr)
