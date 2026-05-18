@@ -11,6 +11,7 @@
 3. [Pipeline complet](#-pipeline-complet)
    - [Volume dynamique](#-volume-dynamique-position-sizing)
    - [Mode multi-agent](#-mode-multi-agent-wf1--wf2--wf3-en-parallèle)
+   - [Correction spread SL/TP](#-correction-spread-sur-sltp-live)
    - [Gestion de marge](#-gestion-de-marge-anti-reject-no_money)
 4. [Méthodologie d'entraînement](#-méthodologie-dentraînement)
 5. [Installation](#-installation)
@@ -523,6 +524,37 @@ Affichage par-agent dans les logs (couleur cyan/jaune/magenta) + résumé final 
 ### Equity et volume partagés
 
 Capital et equity sont **communs** aux 3 agents (un seul compte). Le volume dynamique est calculé sur l'equity courant au moment de chaque ouverture. Conséquence : si les 3 agents s'ouvrent en même temps, l'**exposition totale** = 3 × `compute_dynamic_volume(equity)`.
+
+---
+
+## 🎯 Correction spread sur SL/TP (live)
+
+MT5 déclenche le SL/TP **au prix de clôture** (BID pour un LONG, ASK pour un SHORT), pas au prix d'entrée. Sans correction, le spread fait que :
+- Le **TP rate de justesse** (le BID/ASK ne touche pas le niveau pile)
+- Le **SL se déclenche trop tôt** (le BID/ASK touche le niveau avant que le mid n'ait bougé autant que prévu)
+
+### Fix symétrique appliqué dans `compute_sl_tp()`
+
+```python
+sl_dist_eff = sl_dist + spread       # SL éloigné de spread → moins de SL prématurés
+tp_dist_eff = tp_dist - spread       # TP rapproché de spread → hits effectifs
+```
+
+Le `spread` est calculé au moment de l'ouverture : `tick.ask - tick.bid`.
+
+### Effet sur le mouvement de prix requis
+
+| Côté | Backtest (move mid) | Live SANS fix | **Live AVEC fix** |
+|------|--------------------:|--------------:|------------------:|
+| TP   | `1.68 × ATR`        | `1.68 × ATR + spread` | **`1.68 × ATR`** ✅ |
+| SL   | `1.20 × ATR - spread/2` | `1.20 × ATR - spread` | **`1.20 × ATR + spread/2`** |
+
+→ Le TP en live demande maintenant le même move qu'en backtest. Le SL est légèrement plus permissif (de spread/2) pour ne pas se faire stop-out par un wick éphémère.
+
+### Trade-off
+- **+** Plus de TP touchés (le seuil de hit aligné avec ce que le modèle a appris)
+- **+** Moins de SL prématurés (les positions survivent aux spikes spread courts)
+- **−** Coût marginal `volume × spread` quand le SL est touché (légèrement plus loin)
 
 ---
 

@@ -583,20 +583,36 @@ def gc_entry_atr_cache(symbol: str) -> None:
             _ENTRY_ATR_CACHE.pop(t, None)
 
 
-def compute_sl_tp(cfg: LiveConfig, entry_price: float, side: int, entry_atr: float):
-    """SL+TP IDENTIQUE training/backtest : SL=1.2×ATR, TP=2.4×ATR×0.7=1.68×ATR."""
+def compute_sl_tp(cfg: LiveConfig, entry_price: float, side: int, entry_atr: float,
+                  spread: float = 0.0):
+    """SL+TP aligné training/backtest : SL=1.2×ATR, TP=2.4×ATR×0.7=1.68×ATR.
+
+    Correction symétrique du spread :
+      - TP : rapproché de l'entrée de `spread` (MT5 déclenche au BID pour LONG /
+              ASK pour SHORT → sans correction, le TP rate de "spread")
+      - SL : éloigné de l'entrée de `spread` (le SL en live se déclenche aussi
+              au prix de clôture côté défavorable → sans correction, le SL est
+              "trop facile" à toucher par rapport au backtest)
+
+    Effet net : les niveaux SL/TP de MT5 sont décalés vers l'intérieur (TP) et
+    l'extérieur (SL) du même montant pour matcher le mouvement de prix attendu
+    dans le backtest.
+    """
     fallback = 0.0015 * entry_price
     eff_atr = max(entry_atr, fallback, 1e-8)
 
     sl_dist = cfg.atr_sl_mult * eff_atr
     tp_dist = cfg.atr_tp_mult * eff_atr * cfg.tp_shrink
+    # Correction spread symétrique
+    sl_dist_eff = sl_dist + spread        # SL plus loin → moins de SL prématurés
+    tp_dist_eff = max(tp_dist - spread, 1e-8)  # TP plus proche → hits effectifs
 
     if side == 1:
-        sl = entry_price - sl_dist
-        tp = entry_price + tp_dist
+        sl = entry_price - sl_dist_eff
+        tp = entry_price + tp_dist_eff
     else:
-        sl = entry_price + sl_dist
-        tp = entry_price - tp_dist
+        sl = entry_price + sl_dist_eff
+        tp = entry_price - tp_dist_eff
 
     sl = max(sl, 1e-8)
     tp = max(tp, 1e-8)
@@ -720,7 +736,10 @@ def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: 
             return  # ordre annulé pour cause de marge
 
     entry_atr = compute_entry_atr(df_merged_closed)
-    sl, tp = compute_sl_tp(cfg, price, side, entry_atr)
+    # Spread courant (ASK - BID) pour ajuster le TP (le close se fait
+    # à BID pour un LONG, à ASK pour un SHORT → le spread "mange" le TP)
+    current_spread = max(float(tick.ask) - float(tick.bid), 0.0)
+    sl, tp = compute_sl_tp(cfg, price, side, entry_atr, spread=current_spread)
 
     comment = f"SAINTv2_{agent_name}" if agent_name else "SAINTv2_Live_duel"
     request = {
