@@ -80,10 +80,12 @@ NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
 # Pattern training : f"bestprofit_{cfg.model_prefix}_{cfg.side}{suffix}.pth"
 #   model_prefix LONG  = "saintv2_loup_long"   side="long"  suffix="_wf1"
 #   model_prefix SHORT = "saintv2_loup_short"  side="short" suffix="_wf1"
-BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf1_long_wf1.pth"
-BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf1_short_wf1.pth"
+BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf2_long_wf2.pth"
+BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf2_short_wf2.pth"
 # Modèle unifié (training side="both")
-BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_wf1_both_wf1.pth"
+# bestprofit_*_wf2 mis à jour le 18-05 09:51 a cassé → fallback sur best_*_wf2
+# (Sortino30 best, intact depuis le 17-05 23:47, antérieur au crash)
+BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_wf2_both_wf2.pth"
 
 
 @dataclass
@@ -105,7 +107,7 @@ class LiveConfig:
     initial_capital: float = 1000.0
     position_size: float = 0.01    # utilisé uniquement si dynamic_volume = False
     leverage: float = 6.0
-    fee_rate: float = 0.0004
+    fee_rate: float = 0.0         # commission BTCUSD CFD ≈ 0, coût déjà dans le spread
     atr_sl_mult: float = 1.2
     atr_tp_mult: float = 2.4
 
@@ -723,17 +725,17 @@ def compute_dynamic_volume(equity: float, max_lot: float = 100.0) -> float:
     """Volume dynamique par paliers de 1000$ à partir de 2000$.
 
     IDENTIQUE à loup_live.compute_dynamic_volume :
-      - equity ≤ 2000$       → 0.01 lot
-      - 2000 < equity ≤ 3000 → 0.02 lot
-      - 3000 < equity ≤ 4000 → 0.03 lot
-      - ... (+0.01 par tranche de 1000$)
+      - equity ≤ 2000$       → 0.10 lot
+      - 2000 < equity ≤ 3000 → 0.20 lot
+      - 3000 < equity ≤ 4000 → 0.30 lot
+      - ... (+0.10 par tranche de 1000$)
       - plafonné à max_lot (par défaut 100.00)
     """
     if equity <= 2000.0:
         tier = 1
     else:
         tier = int((equity - 1.0) // 1000.0)
-    lot = 0.01 * tier
+    lot = 0.10 * tier
     lot = min(lot, max_lot)
     return round(lot, 2)
 
@@ -1087,11 +1089,12 @@ def run_backtest(cfg: LiveConfig):
                     exit_reason = "TP"
 
             if exit_price is not None:
+                # PnL aligné avec MT5 réel : (delta_price × volume × contract_size=1)
+                # Le levier n'est PAS un multiplicateur de PnL, juste de marge requise.
                 pnl = (
                     state.position *
                     (exit_price - state.entry_price) *
-                    state.volume *
-                    cfg.leverage
+                    state.volume
                 )
                 fee = cfg.fee_rate * exit_price * state.volume
                 realized = pnl - fee
@@ -1142,11 +1145,11 @@ def run_backtest(cfg: LiveConfig):
 
         # 2) Equity & drawdown (avec close "stressé")
         if state.position != 0:
+            # Latent PnL sans levier (cf fix PnL ci-dessus)
             latent = (
                 state.position *
                 (close_bar - state.entry_price) *
-                state.volume *
-                cfg.leverage
+                state.volume
             )
         else:
             latent = 0.0

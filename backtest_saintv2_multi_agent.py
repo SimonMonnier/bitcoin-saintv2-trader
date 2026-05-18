@@ -80,10 +80,21 @@ NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
 # Pattern training : f"bestprofit_{cfg.model_prefix}_{cfg.side}{suffix}.pth"
 #   model_prefix LONG  = "saintv2_loup_long"   side="long"  suffix="_wf1"
 #   model_prefix SHORT = "saintv2_loup_short"  side="short" suffix="_wf1"
-BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf1_long_wf1.pth"
-BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf1_short_wf1.pth"
-# Modèle unifié (training side="both")
-BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_wf1_both_wf1.pth"
+# ============================================================
+# MULTI-AGENT : 3 modèles WF tradent en parallèle
+# Chaque modèle voit les MÊMES données et décide indépendamment.
+# Chaque modèle peut ouvrir SA propre position simultanément aux autres.
+# Au maximum : 3 positions ouvertes en même temps (1 par modèle).
+# ============================================================
+MULTI_AGENT_PATHS: Dict[str, str] = {
+    "wf1": "bestprofit_saintv2_loup_duel_wf1_both_wf1.pth",
+    "wf2": "bestprofit_saintv2_loup_duel_wf2_both_wf2.pth",
+    "wf3": "bestprofit_saintv2_loup_duel_wf3_both_wf3.pth",
+}
+# Compat (gardés pour ne pas casser les imports / refs ailleurs)
+BEST_MODEL_LONG_PATH  = ""
+BEST_MODEL_SHORT_PATH = ""
+BEST_MODEL_DUEL_PATH  = MULTI_AGENT_PATHS["wf1"]
 
 
 @dataclass
@@ -110,6 +121,9 @@ class LiveConfig:
     atr_tp_mult: float = 2.4
 
     # Volume dynamique : aligné avec loup_live.compute_dynamic_volume
+    #   - equity ≤ 2000$ → 0.01 lot
+    #   - +0.01 par tranche de 1000$ au-dessus
+    #   - plafonné à max_lot (par défaut 100.00)
     dynamic_volume: bool = True
     max_lot: float = 100.0
 
@@ -148,16 +162,47 @@ class LiveConfig:
 
 
 @dataclass
+class AgentPosition:
+    """Position d'un agent particulier. None = agent flat."""
+    agent: str                  # "wf1" / "wf2" / "wf3"
+    side: int                   # +1 long, -1 short
+    volume: float
+    entry_price: float
+    sl: float
+    tp: float
+    entry_index: int
+    entry_atr: float
+    last_risk_scale: float = 1.0
+
+
+@dataclass
+class BTStateMulti:
+    """État partagé : capital commun, equity = capital + Σ latent PnLs.
+    Chaque agent dispose d'un slot de position (None = flat).
+    Au max : 3 positions ouvertes simultanément (1 par agent)."""
+    capital: float
+    equity: float
+    positions: Dict[str, Optional[AgentPosition]] = field(
+        default_factory=lambda: {"wf1": None, "wf2": None, "wf3": None}
+    )
+    trades_pnl: List[float] = field(default_factory=list)
+    trades_meta: List[Dict] = field(default_factory=list)
+    max_equity: float = 0.0
+
+
+# Compat avec helpers existants (build_live_obs / compute_sl_tp / etc.)
+# qui attendent un BTState à l'ancienne — non utilisé dans la boucle multi.
+@dataclass
 class BTState:
     capital: float
     equity: float
-    position: int = 0          # 0, +1, -1
+    position: int = 0
     volume: float = 0.0
     entry_price: float = 0.0
     sl: float = 0.0
     tp: float = 0.0
     entry_index: int = -1
-    entry_atr: float = 0.0     # ATR au moment de l'entrée (pour unrealized_atr)
+    entry_atr: float = 0.0
     last_risk_scale: float = 1.0
     trades_pnl: List[float] = field(default_factory=list)
     trades_meta: List[Dict] = field(default_factory=list)
@@ -457,27 +502,37 @@ def normalize_features(X: np.ndarray, stats: Dict[str, np.ndarray]) -> np.ndarra
 def _fetch_paginated(symbol: str, timeframe: int,
                      date_from: datetime, date_to: datetime,
                      chunk: int = 100_000) -> Optional[np.ndarray]:
-    """Pagination MT5 (identique à training._fetch_paginated)."""
+    """
+    Récupère les bougies entre date_from et date_to en paginant par chunks
+    de fin → début. Identique à training._fetch_paginated.
+    Contourne la limitation cache de copy_rates_range.
+    """
     all_chunks = []
     cursor = date_to
     seen_oldest = None
     safety_iter = 0
-    while safety_iter < 200:
+    while safety_iter < 200:  # garde-fou : max 200 × chunk = 20M bougies
         safety_iter += 1
         rates = mt5.copy_rates_from(symbol, timeframe, cursor, chunk)
         if rates is None or len(rates) == 0:
             break
+
         oldest_ts = int(rates[0]["time"])
         oldest_dt = datetime.utcfromtimestamp(oldest_ts)
+
         all_chunks.append(rates)
+
         if oldest_dt <= date_from:
             break
         if seen_oldest is not None and oldest_ts >= seen_oldest:
             break
         seen_oldest = oldest_ts
+
         cursor = oldest_dt - pd.Timedelta(seconds=1)
+
     if not all_chunks:
         return None
+
     rates_all = np.concatenate(all_chunks)
     rates_all = np.unique(rates_all)
     ts_from = int(date_from.timestamp())
@@ -493,17 +548,24 @@ def fetch_ohlc_with_indicators(cfg: LiveConfig) -> pd.DataFrame:
     mt5.symbol_select(cfg.symbol, True)
 
     print(f"  → fetch M1 {utc_from:%Y-%m-%d} → {utc_to:%Y-%m-%d}…")
-    rates_m1 = mt5.copy_rates_range(cfg.symbol, cfg.timeframe, utc_from, utc_to)
-    rates_h1 = mt5.copy_rates_range(cfg.symbol, cfg.htf_timeframe, utc_from, utc_to)
+    rates_m1 = mt5.copy_rates_range(
+        cfg.symbol, cfg.timeframe, utc_from, utc_to
+    )
+    rates_h1 = mt5.copy_rates_range(
+        cfg.symbol, cfg.htf_timeframe, utc_from, utc_to
+    )
 
+    # Cible : ~70 % du nb théorique (weekends/gaps tolérés)
     n_m1_target = int((utc_to - utc_from).total_seconds() // 60 * 0.7)
     n_h1_target = int((utc_to - utc_from).total_seconds() // 3600 * 0.7)
 
+    # Pagination M1 si insuffisant
     if rates_m1 is None or len(rates_m1) < n_m1_target:
         nb = 0 if rates_m1 is None else len(rates_m1)
         print(f"  ⚠ copy_rates_range M1 insuffisant ({nb:,} / {n_m1_target:,}), pagination…")
         rates_m1 = _fetch_paginated(cfg.symbol, cfg.timeframe, utc_from, utc_to, chunk=100_000)
 
+    # Pagination H1 si insuffisant
     if rates_h1 is None or len(rates_h1) < n_h1_target:
         nb = 0 if rates_h1 is None else len(rates_h1)
         print(f"  ⚠ copy_rates_range H1 insuffisant ({nb:,} / {n_h1_target:,}), pagination…")
@@ -700,7 +762,15 @@ def compute_entry_atr(df_closed: pd.DataFrame) -> float:
 
 
 def compute_dynamic_volume(equity: float, max_lot: float = 100.0) -> float:
-    """IDENTIQUE à loup_live.compute_dynamic_volume : paliers 1000$, base 0.10, cap 100.00."""
+    """Volume dynamique par paliers de 1000$ à partir de 2000$.
+
+    IDENTIQUE à loup_live.compute_dynamic_volume :
+      - equity ≤ 2000$       → 0.10 lot
+      - 2000 < equity ≤ 3000 → 0.20 lot
+      - 3000 < equity ≤ 4000 → 0.30 lot
+      - ... (+0.10 par tranche de 1000$)
+      - plafonné à max_lot (par défaut 100.00)
+    """
     if equity <= 2000.0:
         tier = 1
     else:
@@ -881,7 +951,7 @@ def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
 # ============================================================
 
 def run_backtest(cfg: LiveConfig):
-    print(banner("🐺  LOUP Ω — BACKTEST STRESS-TEST"))
+    print(banner("🐺  LOUP Ω — MULTI-AGENT BACKTEST (wf1 + wf2 + wf3 // no BE/trail)"))
     print(f"  {_c('Symbole', C.GREY):<20} {C.BOLD}{cfg.symbol}{C.RESET}  ({cfg.timeframe=}, HTF={cfg.htf_timeframe})")
     print(f"  {_c('Période', C.GREY):<20} {cfg.date_from}  →  {cfg.date_to or 'maintenant'}")
     print(f"  {_c('Mode side', C.GREY):<20} {_c(cfg.side.upper(), C.MAGENTA + C.BOLD)}")
@@ -925,11 +995,9 @@ def run_backtest(cfg: LiveConfig):
     device = get_device(cfg)
     stats = load_norm_stats(NORM_STATS_PATH)
 
-    # Chargement des modèles
-    policy_long = None
-    policy_short = None
-    policy_duel = None
-
+    # ========================================================
+    # MULTI-AGENT : chargement des 3 modèles WF en parallèle
+    # ========================================================
     def _build_policy_bt():
         return SAINTPolicySingleHead(
             n_features=OBS_N_FEATURES,
@@ -942,59 +1010,31 @@ def run_backtest(cfg: LiveConfig):
             n_actions=N_ACTIONS
         ).to(device)
 
-    if cfg.side == "both":
-        if not os.path.exists(BEST_MODEL_DUEL_PATH):
-            raise FileNotFoundError(f"Modèle DUEL introuvable : {BEST_MODEL_DUEL_PATH}")
-        policy_duel = _build_policy_bt()
-        policy_duel.load_state_dict(torch.load(BEST_MODEL_DUEL_PATH, map_location=device))
-        policy_duel.eval()
-        print(f"  {_c('✓', C.GREEN)} Modèle DUEL  : {_c(BEST_MODEL_DUEL_PATH, C.CYAN)}")
-
-    if cfg.side in ("duel", "long"):
-        if not os.path.exists(BEST_MODEL_LONG_PATH):
-            raise FileNotFoundError(f"Modèle LONG introuvable : {BEST_MODEL_LONG_PATH}")
-        policy_long = SAINTPolicySingleHead(
-            n_features=OBS_N_FEATURES,
-            d_model=80,
-            num_blocks=2,
-            heads=4,
-            dropout=0.05,
-            ff_mult=2,
-            max_len=cfg.lookback,
-            n_actions=N_ACTIONS
-        ).to(device)
-        policy_long.load_state_dict(torch.load(BEST_MODEL_LONG_PATH, map_location=device))
-        policy_long.eval()
-        print(f"  {_c('✓', C.GREEN)} Modèle LONG  : {_c(BEST_MODEL_LONG_PATH, C.CYAN)}")
-
-    if cfg.side in ("duel", "short"):
-        if not os.path.exists(BEST_MODEL_SHORT_PATH):
-            raise FileNotFoundError(f"Modèle SHORT introuvable : {BEST_MODEL_SHORT_PATH}")
-        policy_short = SAINTPolicySingleHead(
-            n_features=OBS_N_FEATURES,
-            d_model=80,
-            num_blocks=2,
-            heads=4,
-            dropout=0.05,
-            ff_mult=2,
-            max_len=cfg.lookback,
-            n_actions=N_ACTIONS
-        ).to(device)
-        policy_short.load_state_dict(torch.load(BEST_MODEL_SHORT_PATH, map_location=device))
-        policy_short.eval()
-        print(f"  {_c('✓', C.GREEN)} Modèle SHORT : {_c(BEST_MODEL_SHORT_PATH, C.CYAN)}")
+    policies: Dict[str, nn.Module] = {}
+    for agent_name, path in MULTI_AGENT_PATHS.items():
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Checkpoint manquant pour {agent_name} : {path}")
+        p = _build_policy_bt()
+        p.load_state_dict(torch.load(path, map_location=device))
+        p.eval()
+        policies[agent_name] = p
+        print(f"  {_c('✓', C.GREEN)} Modèle {agent_name.upper():3s} : {_c(path, C.CYAN)}")
 
     print(hr())
-    print(f"{_c('▶ DÉMARRAGE BOUCLE BACKTEST', C.CYAN + C.BOLD)}")
+    print(f"{_c('▶ DÉMARRAGE BOUCLE BACKTEST MULTI-AGENT', C.CYAN + C.BOLD)}")
+    print(f"  {_c('Agents actifs', C.GREY)} : {_c(' / '.join(policies.keys()).upper(), C.MAGENTA + C.BOLD)}")
+    print(f"  {_c('Règle', C.GREY)} : chaque agent peut ouvrir 1 position simultanément aux autres")
     print(hr())
     bt_t0 = _time.time()
 
-    # État backtest
-    state = BTState(
+    # État backtest MULTI-AGENT : capital commun, 3 slots de positions
+    state = BTStateMulti(
         capital=cfg.initial_capital,
         equity=cfg.initial_capital,
-        max_equity=cfg.initial_capital
+        max_equity=cfg.initial_capital,
     )
+    # Stats par agent (pour résumé final)
+    per_agent_pnl: Dict[str, List[float]] = {a: [] for a in policies.keys()}
     max_dd = 0.0
 
     n = len(df)
@@ -1004,13 +1044,14 @@ def run_backtest(cfg: LiveConfig):
     stress = StressConfig(enable=True)
     gap_hole_remaining = 0  # nb de barres à sauter (trous 1–3 minutes)
 
+    # Couleur ANSI par agent pour différencier visuellement les logs
+    AGENT_COLORS = {"wf1": C.CYAN, "wf2": C.YELLOW, "wf3": C.MAGENTA}
+
     # IMPORTANT :
     # - On démarre à lookback+1 pour pouvoir construire l'obs sur df[:i]
-    #   (i bougies, dont au moins lookback)
     for i in range(start_index + 1, n - 1):
         row = df.iloc[i]
         time_i = row["time"]
-        time_str = time_i.strftime("%Y-%m-%d %H:%M:%S") if isinstance(time_i, pd.Timestamp) else str(time_i)
 
         # Prix "bruts"
         close_raw = float(row["close"])
@@ -1023,328 +1064,182 @@ def run_backtest(cfg: LiveConfig):
             high_raw, low_raw, close_raw, prev_close, time_i, stress
         )
 
-        # Trous aléatoires de 1–3 minutes (on saute complètement la logique de cette bougie)
+        # Trous aléatoires de 1–3 minutes
         if stress.enable:
             if gap_hole_remaining > 0:
                 gap_hole_remaining -= 1
                 continue
             if np.random.rand() < stress.hole_prob:
-                gap_hole_remaining = np.random.randint(1, 4)  # 1 à 3 minutes
+                gap_hole_remaining = np.random.randint(1, 4)
                 gap_hole_remaining -= 1
                 continue
 
-        closed_this_bar = False
-
-        # 0) BREAK-EVEN + TRAILING (sur les barres < i)
-        if state.position != 0 and i > state.entry_index:
-            df_prev_closed = df.iloc[:i].reset_index(drop=True)
-            update_sl_be_trailing_backtest(cfg, df_prev_closed, state, min_price_dist)
-
-        # 1) SL / TP sur la barre i (avec prix "stressés")
-        if state.position != 0 and i > state.entry_index:
+        # ============================================================
+        # 1) Pour CHAQUE agent : check SL/TP de sa position ouverte
+        # ============================================================
+        closed_agents_this_bar = set()
+        for agent_name in policies.keys():
+            pos = state.positions[agent_name]
+            if pos is None or i <= pos.entry_index:
+                continue
             exit_price = None
             exit_reason = None
-
-            if state.position == 1:
-                if low_bar <= state.sl:
-                    exit_price = state.sl
+            if pos.side == 1:
+                if low_bar <= pos.sl:
+                    exit_price = pos.sl
                     exit_reason = "SL"
-                elif high_bar >= state.tp:
-                    exit_price = state.tp
+                elif high_bar >= pos.tp:
+                    exit_price = pos.tp
                     exit_reason = "TP"
-            elif state.position == -1:
-                if high_bar >= state.sl:
-                    exit_price = state.sl
+            else:  # SHORT
+                if high_bar >= pos.sl:
+                    exit_price = pos.sl
                     exit_reason = "SL"
-                elif low_bar <= state.tp:
-                    exit_price = state.tp
+                elif low_bar <= pos.tp:
+                    exit_price = pos.tp
                     exit_reason = "TP"
 
-            if exit_price is not None:
-                # PnL aligné MT5 réel : pas de × leverage (le levier réduit la marge, pas le PnL)
-                pnl = (
-                    state.position *
-                    (exit_price - state.entry_price) *
-                    state.volume
-                )
-                fee = cfg.fee_rate * exit_price * state.volume
-                realized = pnl - fee
+            if exit_price is None:
+                continue
 
-                state.capital += realized
-                state.trades_pnl.append(realized)
-                closed_this_bar = True
+            # PnL réaliste sans levier
+            pnl = pos.side * (exit_price - pos.entry_price) * pos.volume
+            fee = cfg.fee_rate * exit_price * pos.volume
+            realized = pnl - fee
 
-                side_txt = "LONG " if state.position == 1 else "SHORT"
-                side_col = C.GREEN if state.position == 1 else C.RED
-                reason_col = C.RED if exit_reason == "SL" else C.GREEN
-                # Durée du trade en barres
-                hold_bars = i - state.entry_index
-                print(
-                    f"  {_c('✗', C.RED if realized < 0 else C.GREEN)} "
-                    f"{_c(fmt_time(time_i), C.GREY)}  "
-                    f"{_c(side_txt, side_col)} "
-                    f"{_c(exit_reason, reason_col)}  "
-                    f"@ {exit_price:>9.2f}  "
-                    f"PnL {fmt_money(realized)}  "
-                    f"Cap {fmt_money(state.capital, width=11)}  "
-                    f"{_c(f'({hold_bars}b)', C.GREY)}"
-                )
+            state.capital += realized
+            state.trades_pnl.append(realized)
+            per_agent_pnl[agent_name].append(realized)
+            closed_agents_this_bar.add(agent_name)
 
-                # Trade-by-trade meta (avant reset)
-                state.trades_meta.append({
-                    "exit_time": fmt_time(time_i),
-                    "entry_idx": int(state.entry_index),
-                    "exit_idx": int(i),
-                    "side": int(state.position),
-                    "entry_price": float(state.entry_price),
-                    "exit_price": float(exit_price),
-                    "pnl": float(realized),
-                    "hit_sl": (exit_reason == "SL"),
-                    "hit_tp": (exit_reason == "TP"),
-                    "hold_bars": int(hold_bars),
-                })
-
-                state.position = 0
-                state.volume = 0.0
-                state.entry_price = 0.0
-                state.sl = 0.0
-                state.tp = 0.0
-                state.entry_index = -1
-                state.entry_atr = 0.0
-                state.last_risk_scale = 1.0
-                # NE PLUS TOUCHER max_equity ICI
-
-        # 2) Equity & drawdown (avec close "stressé")
-        if state.position != 0:
-            # Latent PnL sans levier (cf fix ci-dessus)
-            latent = (
-                state.position *
-                (close_bar - state.entry_price) *
-                state.volume
+            side_txt = "LONG " if pos.side == 1 else "SHORT"
+            side_col = C.GREEN if pos.side == 1 else C.RED
+            reason_col = C.RED if exit_reason == "SL" else C.GREEN
+            hold_bars = i - pos.entry_index
+            agent_col = AGENT_COLORS.get(agent_name, C.WHITE)
+            print(
+                f"  {_c('✗', C.RED if realized < 0 else C.GREEN)} "
+                f"{_c(fmt_time(time_i), C.GREY)}  "
+                f"{_c(f'[{agent_name.upper()}]', agent_col + C.BOLD)} "
+                f"{_c(side_txt, side_col)} "
+                f"{_c(exit_reason, reason_col)}  "
+                f"@ {exit_price:>9.2f}  "
+                f"PnL {fmt_money(realized)}  "
+                f"Cap {fmt_money(state.capital, width=11)}  "
+                f"{_c(f'({hold_bars}b)', C.GREY)}"
             )
-        else:
-            latent = 0.0
 
-        state.equity = state.capital + latent
+            state.trades_meta.append({
+                "exit_time": fmt_time(time_i),
+                "agent": agent_name,
+                "entry_idx": int(pos.entry_index),
+                "exit_idx": int(i),
+                "side": int(pos.side),
+                "entry_price": float(pos.entry_price),
+                "exit_price": float(exit_price),
+                "pnl": float(realized),
+                "hit_sl": (exit_reason == "SL"),
+                "hit_tp": (exit_reason == "TP"),
+                "hold_bars": int(hold_bars),
+            })
 
-        # max_equity suit les plus hauts historiques de l'equity
+            state.positions[agent_name] = None  # libère le slot
+
+        # ============================================================
+        # 2) Equity & drawdown : capital + Σ latents de toutes positions
+        # ============================================================
+        total_latent = 0.0
+        for agent_name, pos in state.positions.items():
+            if pos is None:
+                continue
+            total_latent += pos.side * (close_bar - pos.entry_price) * pos.volume
+
+        state.equity = state.capital + total_latent
         state.max_equity = max(state.max_equity, state.equity)
-
-        dd = 0.0
-        if state.max_equity > 0:
-            dd = (state.max_equity - state.equity) / state.max_equity
+        dd = (state.max_equity - state.equity) / state.max_equity if state.max_equity > 0 else 0.0
         max_dd = max(max_dd, dd)
 
-        # 3) Obs sur df[0..i-1] (PAS de fuite sur la bougie i)
+        # ============================================================
+        # 3) Pour CHAQUE agent flat : décision d'entrée indépendante
+        # ============================================================
         df_closed_for_obs = df.iloc[:i].reset_index(drop=True)
-        bars_in_pos = (i - state.entry_index) if (state.position != 0 and state.entry_index >= 0) else 0
-        obs = build_live_obs(
-            df_closed_for_obs, stats, cfg,
-            pos=state.position,
-            entry_price=state.entry_price,
-            entry_atr=state.entry_atr,
-            bars_in_position=bars_in_pos,
-            last_risk_scale=state.last_risk_scale
-        )
-        if obs is None:
-            continue
 
-        # 4) Décision d'ENTRÉE si FLAT — pure argmax, comme loup_live.py
-        #    Le seuil min_confidence est optionnel (0.0 par défaut = comme live).
-        if state.position == 0 and not closed_this_bar:
+        for agent_name, policy in policies.items():
+            if state.positions[agent_name] is not None:
+                continue  # agent déjà en position
+            if agent_name in closed_agents_this_bar:
+                continue  # vient de fermer, attendons la prochaine bougie
+
+            # Obs vue par CET agent (avec sa position courante = flat)
+            obs = build_live_obs(
+                df_closed_for_obs, stats, cfg,
+                pos=0,
+                entry_price=0.0,
+                entry_atr=0.0,
+                bars_in_position=0,
+                last_risk_scale=1.0,
+            )
+            if obs is None:
+                continue
+
             with torch.no_grad():
                 s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                thr = cfg.min_confidence  # 0.0 = pas de filtre
+                thr = cfg.min_confidence
 
-                # On garde des refs externes au bloc pour le log post-ouverture
-                prob_long_open = None
-                prob_short_open = None
-                probs_long = None
-                probs_short = None
-                probs_duel = None
+                logits_d, _ = policy(s)
+                logits_d = logits_d[0]
+                mask_d = build_mask_from_pos_scalar(0, device, "both")
+                logits_d_m = logits_d.masked_fill(~mask_d, MASK_VALUE)
+                probs_duel = torch.softmax(logits_d_m, dim=-1)
 
-                if cfg.side == "both":
-                    if policy_duel is None:
-                        a = 2  # HOLD
-                    else:
-                        logits_d, _ = policy_duel(s)
-                        logits_d = logits_d[0]
-                        mask_d = build_mask_from_pos_scalar(0, device, "both")
-                        logits_d_m = logits_d.masked_fill(~mask_d, MASK_VALUE)
-                        probs_duel = torch.softmax(logits_d_m, dim=-1)
+                a_pred = int(torch.argmax(probs_duel).item())
+                p_pred = float(probs_duel[a_pred].item())
 
-                        a_duel = int(torch.argmax(probs_duel).item())
-                        p_duel = float(probs_duel[a_duel].item())
-
-                        # argmax pur sur 3 actions (BUY/SELL/HOLD)
-                        if a_duel in (0, 1) and p_duel >= thr:
-                            a = a_duel
-                        else:
-                            a = 2  # HOLD
-
-                elif cfg.side == "duel":
-                    if policy_long is None or policy_short is None:
-                        a = 2  # HOLD
-                    else:
-                        # ----- LONG -----
-                        logits_long, _ = policy_long(s)
-                        logits_long = logits_long[0]
-                        mask_long = build_mask_from_pos_scalar(0, device, "long")
-                        logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
-                        prob_long_open = torch.softmax(logits_long_m, dim=-1)
-
-                        # ----- SHORT -----
-                        logits_short, _ = policy_short(s)
-                        logits_short = logits_short[0]
-                        mask_short = build_mask_from_pos_scalar(0, device, "short")
-                        logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
-                        prob_short_open = torch.softmax(logits_short_m, dim=-1)
-
-                        # argmax sur les 3 actions (HOLD inclus)
-                        a_long  = int(torch.argmax(prob_long_open ).item())
-                        a_short = int(torch.argmax(prob_short_open).item())
-                        p_long  = float(prob_long_open [a_long ].item())
-                        p_short = float(prob_short_open[a_short].item())
-
-                        # On compare les deux camps. Si l'un veut HOLD, on regarde l'autre.
-                        long_wants_entry  = a_long  == 0 and p_long  >= thr
-                        short_wants_entry = a_short == 1 and p_short >= thr
-
-                        if long_wants_entry and short_wants_entry:
-                            # arbitrage : on prend le plus confiant
-                            a = a_long if p_long >= p_short else a_short
-                        elif long_wants_entry:
-                            a = a_long
-                        elif short_wants_entry:
-                            a = a_short
-                        else:
-                            a = 2  # HOLD  # HOLD
-
-                elif cfg.side == "long":
-                    if policy_long is None:
-                        a = 2  # HOLD
-                    else:
-                        logits_long, _ = policy_long(s)
-                        logits_long = logits_long[0]
-                        mask_long = build_mask_from_pos_scalar(0, device, "long")
-                        logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
-                        probs_long = torch.softmax(logits_long_m, dim=-1)
-
-                        a_long = int(torch.argmax(probs_long).item())
-                        p_long = float(probs_long[a_long].item())
-
-                        # argmax pur + filtre optionnel
-                        if a_long == 0 and p_long >= thr:
-                            a = a_long
-                        else:
-                            a = 2  # HOLD  # HOLD (soit le model l'a choisi, soit thr non atteint)
-
-                elif cfg.side == "short":
-                    if policy_short is None:
-                        a = 2  # HOLD
-                    else:
-                        logits_short, _ = policy_short(s)
-                        logits_short = logits_short[0]
-                        mask_short = build_mask_from_pos_scalar(0, device, "short")
-                        logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
-                        probs_short = torch.softmax(logits_short_m, dim=-1)
-
-                        a_short = int(torch.argmax(probs_short).item())
-                        p_short = float(probs_short[a_short].item())
-
-                        if a_short == 1 and p_short >= thr:
-                            a = a_short
-                        else:
-                            a = 2  # HOLD
+                if a_pred in (0, 1) and p_pred >= thr:
+                    a = a_pred
                 else:
                     a = 2  # HOLD
 
-            # mapping vers env_action + risk_scale (3 actions : 0=BUY, 1=SELL, 2=HOLD)
-            if a == 0:    # BUY
-                env_action = 0
-                risk_scale = 1.0
-            elif a == 1:  # SELL
-                env_action = 1
-                risk_scale = 1.0
-            else:         # HOLD (a == 2)
-                env_action = 2
-                risk_scale = 1.0
+            if a not in (0, 1):
+                continue  # HOLD pour cet agent
 
-            # Sécurité explicite : on refuse toute ouverture si on n'est pas flat
-            if state.position != 0:
-                continue
+            side = 1 if a == 0 else -1
+            entry_price = compute_execution_price(
+                side=side, close_price=close_bar,
+                time_i=time_i, cfg=cfg, stress=stress,
+            )
 
-            # ouverture de position si BUY/SELL (entrée sur la bougie i, mais sans la voir dans l'obs)
-            if env_action in (0, 1):
-                side = 1 if env_action == 0 else -1
+            # Volume dynamique partagé : basé sur equity courante (commune)
+            if getattr(cfg, "dynamic_volume", False):
+                base_volume = compute_dynamic_volume(state.equity, getattr(cfg, "max_lot", 100.0))
+            else:
+                base_volume = float(cfg.position_size)
+            volume = round(base_volume, 2)
+            entry_atr = compute_entry_atr(df_closed_for_obs)
+            effective_entry_atr = max(entry_atr, 0.0015 * entry_price, 1e-8)
+            sl, tp = compute_sl_tp(cfg, entry_price, side, entry_atr, stress)
 
-                entry_price = compute_execution_price(
-                    side=side,
-                    close_price=close_bar,
-                    time_i=time_i,
-                    cfg=cfg,
-                    stress=stress
-                )
+            state.positions[agent_name] = AgentPosition(
+                agent=agent_name, side=side, volume=volume,
+                entry_price=entry_price, sl=sl, tp=tp,
+                entry_index=i, entry_atr=float(effective_entry_atr),
+                last_risk_scale=1.0,
+            )
 
-                # Volume dynamique selon equity (aligné avec loup_live)
-                if getattr(cfg, "dynamic_volume", False):
-                    base_volume = compute_dynamic_volume(state.equity, getattr(cfg, "max_lot", 100.0))
-                else:
-                    base_volume = float(cfg.position_size)
-                volume = round(base_volume * (risk_scale if risk_scale > 0 else 1.0), 2)
-                entry_atr = compute_entry_atr(df_closed_for_obs)
-                # fallback ATR si broker renvoie 0 (aligné avec env training)
-                effective_entry_atr = max(entry_atr, 0.0015 * entry_price, 1e-8)
-                sl, tp = compute_sl_tp(cfg, entry_price, side, entry_atr, stress)
-
-                state.position = side
-                state.volume = volume
-                state.entry_price = entry_price
-                state.sl = sl
-                state.tp = tp
-                state.entry_index = i
-                state.entry_atr = float(effective_entry_atr)
-                state.last_risk_scale = risk_scale
-
-                side_txt = "LONG " if side == 1 else "SHORT"
-                side_col = C.GREEN if side == 1 else C.RED
-                action_name = {0: "BUY", 1: "SELL"}.get(a, "HOLD")
-
-                # Probabilités compactes sur une ligne
-                def _fmt_probs(p, picked):
-                    names = ["BUY", "SELL", "HOLD"]
-                    parts = []
-                    for k, nm in enumerate(names):
-                        v = p[k].item()
-                        col = C.WHITE + C.BOLD if k == picked else C.GREY
-                        parts.append(f"{_c(nm, col)}={_c(f'{v:.2f}', col)}")
-                    return " ".join(parts)
-
-                if cfg.side == "both" and probs_duel is not None:
-                    print(f"    {_c('probas D', C.GREY)} {_fmt_probs(probs_duel, a)}")
-                elif cfg.side == "duel" and prob_long_open is not None and prob_short_open is not None:
-                    print(
-                        f"    {_c('probas L', C.GREY)} "
-                        f"{_fmt_probs(prob_long_open, a if a == 0 else -1)}"
-                    )
-                    print(
-                        f"    {_c('probas S', C.GREY)} "
-                        f"{_fmt_probs(prob_short_open, a if a == 1 else -1)}"
-                    )
-                elif cfg.side == "long" and probs_long is not None:
-                    print(f"    {_c('probas  ', C.GREY)} {_fmt_probs(probs_long, a)}")
-                elif cfg.side == "short" and probs_short is not None:
-                    print(f"    {_c('probas  ', C.GREY)} {_fmt_probs(probs_short, a)}")
-
-                rs_txt = f"x{risk_scale:.1f}" if risk_scale != 1.0 else "x1.0"
-                print(
-                    f"  {_c('▶', C.CYAN)} "
-                    f"{_c(fmt_time(time_i), C.GREY)}  "
-                    f"{_c(side_txt, side_col + C.BOLD)} {_c(action_name, side_col)}  "
-                    f"@ {entry_price:>9.2f}  "
-                    f"SL {sl:>9.2f}  TP {tp:>9.2f}  "
-                    f"vol={volume:.4f} {_c(rs_txt, C.YELLOW)}"
-                )
+            side_txt = "LONG " if side == 1 else "SHORT"
+            side_col = C.GREEN if side == 1 else C.RED
+            action_name = {0: "BUY", 1: "SELL"}.get(a, "HOLD")
+            agent_col = AGENT_COLORS.get(agent_name, C.WHITE)
+            print(
+                f"  {_c('▶', agent_col)} "
+                f"{_c(fmt_time(time_i), C.GREY)}  "
+                f"{_c(f'[{agent_name.upper()}]', agent_col + C.BOLD)} "
+                f"{_c(side_txt, side_col + C.BOLD)} {_c(action_name, side_col)}  "
+                f"@ {entry_price:>9.2f}  "
+                f"SL {sl:>9.2f}  TP {tp:>9.2f}  "
+                f"vol={volume:.2f}  "
+                f"p={p_pred:.2f}"
+            )
 
         # 5) Log de progression périodique
         if ((i - (start_index + 1)) % cfg.progress_interval_bars == 0) or (i == n - 2):
@@ -1359,15 +1254,22 @@ def run_backtest(cfg: LiveConfig):
             progress = (i - start_index) / (n - start_index) * 100
             elapsed = _time.time() - bt_t0
 
-            # Couleur DD selon gravité
             dd_pct = max_dd * 100
             dd_col = C.GREEN if dd_pct < 20 else (C.YELLOW if dd_pct < 50 else C.RED)
+
+            # Stats par agent + positions actives
+            open_count = sum(1 for p in state.positions.values() if p is not None)
+            agent_summary = "  ".join(
+                f"{_c(a.upper(), AGENT_COLORS.get(a, C.WHITE))}={len(per_agent_pnl[a]):d}"
+                for a in policies.keys()
+            )
 
             print(
                 f"\n{hr('·')}\n"
                 f"  {_c('⏱', C.MAGENTA)} {_c(fmt_time(time_i), C.GREY)}  "
                 f"{_c(f'[{progress:5.1f}%]', C.MAGENTA)}  "
-                f"{_c(f'{elapsed:.0f}s', C.GREY)}\n"
+                f"{_c(f'{elapsed:.0f}s', C.GREY)}  "
+                f"{_c(f'open={open_count}/3', C.YELLOW)}\n"
                 f"    {_c('Equity', C.GREY):<14} {fmt_money(state.equity, width=11)}   "
                 f"{_c('PnL', C.GREY)} {fmt_money(pnl_total, width=11)}\n"
                 f"    {_c('Trades', C.GREY):<14} {nb:<4d} ({_c(str(wins), C.GREEN)}W / "
@@ -1375,6 +1277,7 @@ def run_backtest(cfg: LiveConfig):
                 f"{_c('WR', C.GREY)} {fmt_pct(wr)}   "
                 f"{_c('PF', C.GREY)} {pf:.2f}   "
                 f"{_c('DDmax', C.GREY)} {_c(f'{dd_pct:.1f}%', dd_col)}\n"
+                f"    {_c('Par agent', C.GREY):<14} {agent_summary}\n"
                 f"{hr('·')}"
             )
 
@@ -1411,10 +1314,10 @@ def run_backtest(cfg: LiveConfig):
     pnl_col = C.GREEN if pnl_total > 0 else C.RED
     dd_col = C.GREEN if max_dd*100 < 20 else (C.YELLOW if max_dd*100 < 50 else C.RED)
 
-    # Export CSV trade-by-trade
+    # Export CSV trade-by-trade (avec colonne agent)
     import csv as _csv
-    trades_csv = f"backtest_trades_{cfg.side}.csv"
-    _fields = ["exit_time", "entry_idx", "exit_idx", "side", "entry_price",
+    trades_csv = "backtest_trades_multi_agent_no_be_trail.csv"
+    _fields = ["exit_time", "agent", "entry_idx", "exit_idx", "side", "entry_price",
                "exit_price", "pnl", "hit_sl", "hit_tp", "hold_bars"]
     with open(trades_csv, "w", newline="", encoding="utf-8") as _f:
         _w = _csv.DictWriter(_f, fieldnames=_fields)
@@ -1422,6 +1325,7 @@ def run_backtest(cfg: LiveConfig):
         for tm in state.trades_meta:
             _w.writerow({
                 "exit_time": tm["exit_time"],
+                "agent": tm.get("agent", ""),
                 "entry_idx": tm["entry_idx"], "exit_idx": tm["exit_idx"],
                 "side": tm["side"],
                 "entry_price": round(tm["entry_price"], 4),
@@ -1453,24 +1357,45 @@ def run_backtest(cfg: LiveConfig):
     print(f"  {_c('Avg perte (L)', C.GREY):<28} {fmt_money(avg_loss)}")
     print(f"  {_c('Meilleur trade', C.GREY):<28} {fmt_money(max_profit)}")
     print(f"  {_c('Pire trade', C.GREY):<28} {fmt_money(max_loss)}")
+    print(hr())
+    print(f"  {_c('Stats par agent (PnL réalisé)', C.GREY + C.BOLD)}")
+    for a in policies.keys():
+        pnls = per_agent_pnl[a]
+        n_a = len(pnls)
+        if n_a == 0:
+            print(f"    {_c(a.upper(), AGENT_COLORS.get(a, C.WHITE) + C.BOLD)}  : aucun trade fermé")
+            continue
+        n_w = sum(1 for p in pnls if p > 0)
+        n_l = n_a - n_w
+        wr_a = n_w / n_a
+        sum_w = sum(p for p in pnls if p > 0)
+        sum_l = sum(-p for p in pnls if p < 0)
+        pf_a = (sum_w / sum_l) if sum_l > 1e-8 else 0.0
+        pnl_a = sum(pnls)
+        print(
+            f"    {_c(a.upper(), AGENT_COLORS.get(a, C.WHITE) + C.BOLD)}  : "
+            f"{n_a:>4d} trades  "
+            f"WR {wr_a*100:>5.1f}%  "
+            f"PF {pf_a:>5.2f}  "
+            f"PnL {fmt_money(pnl_a, width=11)}"
+        )
     print(_c("═" * 78, C.MAGENTA))
 
 
 if __name__ == "__main__":
     # ---------------------------------------------------------
-    # Backtest du modèle BESTPROFIT DUEL (par défaut)
+    # MULTI-AGENT BACKTEST (wf1 + wf2 + wf3 en parallèle)
     # ---------------------------------------------------------
-    #   side="both"  → 1 modèle unifié (bestprofit_saintv2_loup_duel_both_wf1)
-    #   side="duel"  → 2 modèles séparés long+short
-    #   side="long"  → bestprofit_long uniquement
-    #   side="short" → bestprofit_short uniquement
-    # min_confidence=0.0 → pure argmax, comportement identique au live.
-    #     Mettre 0.5–0.9 pour stresser la sélectivité a posteriori.
+    # Chaque modèle voit les MÊMES données, prend sa décision INDÉPENDAMMENT,
+    # et peut ouvrir UNE position (max 1 par modèle).
+    # Au plus : 3 positions simultanées (1 par agent).
+    # Capital et equity COMMUNS aux 3 agents (compte unique).
+    # ---------------------------------------------------------
     cfg = LiveConfig(
-        side="both",
-        min_confidence=0.0,
-        n_bars_m1=200_000,
-        n_bars_h1=50_000,
+        side="both",           # mode duel pour tous les agents
+        min_confidence=0.0,    # argmax pur pour chacun
+        n_bars_m1=600_000,
+        n_bars_h1=15_000,
         date_from=datetime(2026, 1, 1),
     )
     run_backtest(cfg)

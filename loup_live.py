@@ -29,7 +29,22 @@ NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
 BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf1_long_wf1.pth"
 BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf1_short_wf1.pth"
 # Modèle unifié (entraîné avec side="both") : décide BUY/SELL/HOLD dans un seul fichier
-BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_wf1_both_wf1.pth"
+BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_wf2_both_wf2.pth"
+
+# ============================================================
+# MULTI-AGENT : 3 modèles WF tradent en parallèle (comme dans le backtest)
+# Chaque modèle a son propre magic MT5 pour identifier ses positions.
+# ============================================================
+MULTI_AGENT_PATHS: Dict[str, str] = {
+    "wf1": "bestprofit_saintv2_loup_duel_wf1_both_wf1.pth",
+    "wf2": "bestprofit_saintv2_loup_duel_wf2_both_wf2.pth",
+    "wf3": "bestprofit_saintv2_loup_duel_wf3_both_wf3.pth",
+}
+MULTI_AGENT_MAGICS: Dict[str, int] = {
+    "wf1": 424241,
+    "wf2": 424242,
+    "wf3": 424243,
+}
 
 
 @dataclass
@@ -86,6 +101,22 @@ class LiveConfig:
     # False : utilise cfg.position_size constant (slider GUI)
     dynamic_volume: bool = True
     max_lot: float = 100.0
+
+    # ======= MULTI-AGENT (wf1 + wf2 + wf3 en parallèle) =======
+    # True  : charge les 3 checkpoints et chaque agent peut ouvrir SA position
+    #         indépendamment (max 3 positions simultanées, 1 par agent).
+    # False : mode single-agent classique selon cfg.side
+    multi_agent: bool = True
+
+    # ======= Gestion de marge =======
+    # Fraction max de margin_free utilisée par un ordre (0.0–1.0).
+    # 0.80 = on n'utilise jamais plus de 80% de la marge libre pour un trade
+    # → laisse une marge de sécurité contre les rejects "no money"
+    margin_safety: float = 0.80
+    # Si vrai, scale down automatiquement le lot quand la marge est insuffisante
+    auto_scale_volume_to_margin: bool = True
+    # Volume minimum acceptable (sinon ordre annulé)
+    min_volume: float = 0.01
 
 
 # ============================================================
@@ -484,6 +515,32 @@ def get_current_position(symbol: str) -> Tuple[int, float]:
     return pos, entry_price
 
 
+def get_position_by_magic(symbol: str, magic: int):
+    """Retourne la première position MT5 du symbole avec ce magic (None si aucune)."""
+    positions = mt5.positions_get(symbol=symbol)
+    if positions is None:
+        return None
+    for p in positions:
+        if int(getattr(p, "magic", 0)) == magic:
+            return p
+    return None
+
+
+def get_current_position_by_magic(symbol: str, magic: int) -> Tuple[int, float, Optional[int]]:
+    """Variante multi-agent : trouve une position par magic.
+    Retour : (side ±1 / 0, entry_price, ticket ou None)."""
+    p = get_position_by_magic(symbol, magic)
+    if p is None:
+        return 0, 0.0, None
+    if p.type == mt5.POSITION_TYPE_BUY:
+        side = 1
+    elif p.type == mt5.POSITION_TYPE_SELL:
+        side = -1
+    else:
+        return 0, 0.0, None
+    return side, float(p.price_open), int(p.ticket)
+
+
 def compute_entry_atr(df_merged: pd.DataFrame) -> float:
     if "atr_14" not in df_merged.columns or len(df_merged) == 0:
         return 0.0
@@ -550,10 +607,10 @@ def compute_dynamic_volume(equity: float, max_lot: float = 100.0) -> float:
     """Volume dynamique par paliers de 1000$ à partir de 2000$.
 
     Règle :
-      - equity ≤ 2000$       → 0.01 lot
-      - 2000 < equity ≤ 3000 → 0.02 lot
-      - 3000 < equity ≤ 4000 → 0.03 lot
-      - ... (+0.01 par tranche de 1000$)
+      - equity ≤ 2000$       → 0.10 lot
+      - 2000 < equity ≤ 3000 → 0.20 lot
+      - 3000 < equity ≤ 4000 → 0.30 lot
+      - ... (+0.10 par tranche de 1000$)
       - plafonné à max_lot (par défaut 100.00)
 
     Retourne toujours un float arrondi à 2 décimales.
@@ -563,12 +620,75 @@ def compute_dynamic_volume(equity: float, max_lot: float = 100.0) -> float:
     else:
         # 2001 → tier=2, 3000 → tier=2, 3001 → tier=3, ...
         tier = int((equity - 1.0) // 1000.0)
-    lot = 0.01 * tier
+    lot = 0.10 * tier
     lot = min(lot, max_lot)
     return round(lot, 2)
 
 
-def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: pd.DataFrame):
+def adjust_volume_to_margin(cfg: LiveConfig, side: int, price: float, desired_volume: float,
+                            agent_name: str = "") -> float:
+    """Réduit le volume si la marge libre ne permet pas le notional requis.
+
+    - Utilise mt5.order_calc_margin pour obtenir la marge exacte requise par 1 lot
+    - Calcule le volume max autorisé : margin_free × safety / margin_per_lot
+    - Arrondit au pas de volume du broker (volume_step)
+    - Retourne 0.0 si même min_volume n'est pas tenable
+    """
+    symbol = cfg.symbol
+    info = mt5.account_info()
+    if info is None:
+        return desired_volume  # pas d'info, on tente
+    margin_free = float(info.margin_free)
+
+    order_type = mt5.ORDER_TYPE_BUY if side == 1 else mt5.ORDER_TYPE_SELL
+    margin_for_desired = mt5.order_calc_margin(order_type, symbol, desired_volume, price)
+    if margin_for_desired is None or margin_for_desired <= 0:
+        return desired_volume
+
+    safety = float(getattr(cfg, "margin_safety", 0.80))
+    margin_budget = margin_free * safety
+
+    if margin_for_desired <= margin_budget:
+        return desired_volume  # marge suffisante, pas de réduction
+
+    # Margin par lot (extrapolation linéaire)
+    margin_per_lot = margin_for_desired / desired_volume if desired_volume > 0 else 0.0
+    if margin_per_lot <= 0:
+        return 0.0
+
+    max_volume = margin_budget / margin_per_lot
+
+    # Arrondit au pas du broker
+    sym_info = mt5.symbol_info(symbol)
+    volume_step = float(getattr(sym_info, "volume_step", 0.01)) if sym_info else 0.01
+    volume_min  = float(getattr(sym_info, "volume_min",  0.01)) if sym_info else 0.01
+    adjusted = (max_volume // volume_step) * volume_step
+    adjusted = max(adjusted, 0.0)
+    adjusted = round(adjusted, 2)
+
+    min_acceptable = max(volume_min, float(getattr(cfg, "min_volume", 0.01)))
+    if adjusted < min_acceptable:
+        tag = f"[{agent_name}] " if agent_name else ""
+        print(
+            f"  {tag}⚠ MARGE INSUFFISANTE : margin_free={margin_free:.2f}$ × "
+            f"safety={safety:.0%} = {margin_budget:.2f}$ ; required pour {desired_volume:.2f} lot = "
+            f"{margin_for_desired:.2f}$ → adjusted={adjusted:.2f} < min={min_acceptable:.2f}, ORDRE ANNULÉ"
+        )
+        return 0.0
+
+    tag = f"[{agent_name}] " if agent_name else ""
+    print(
+        f"  {tag}↘ SCALE-DOWN volume {desired_volume:.2f} → {adjusted:.2f} "
+        f"(margin_free={margin_free:.2f}$, budget {safety:.0%}={margin_budget:.2f}$, "
+        f"margin/lot={margin_per_lot:.2f}$)"
+    )
+    return adjusted
+
+
+def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: pd.DataFrame,
+               magic: int = 424242, agent_name: str = ""):
+    """Envoie un ordre MT5. Le paramètre magic permet d'identifier l'agent
+    qui a ouvert la position (utile pour multi-agent)."""
     symbol = cfg.symbol
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
@@ -587,15 +707,22 @@ def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: 
         info = mt5.account_info()
         equity = float(info.equity) if info is not None else 0.0
         base_volume = compute_dynamic_volume(equity, getattr(cfg, "max_lot", 100.0))
-        print(f"[VOL] dynamic_volume : equity={equity:.2f}$ → lot={base_volume:.2f}")
+        print(f"[VOL{('/' + agent_name) if agent_name else ''}] equity={equity:.2f}$ → lot={base_volume:.2f}")
     else:
         base_volume = float(cfg.position_size)
 
     volume = round(base_volume * (risk_scale if risk_scale > 0 else 1.0), 2)
 
+    # Ajustement marge : réduit le lot si margin_free insuffisante (anti reject NO_MONEY)
+    if getattr(cfg, "auto_scale_volume_to_margin", True):
+        volume = adjust_volume_to_margin(cfg, side, price, volume, agent_name=agent_name)
+        if volume <= 0.0:
+            return  # ordre annulé pour cause de marge
+
     entry_atr = compute_entry_atr(df_merged_closed)
     sl, tp = compute_sl_tp(cfg, price, side, entry_atr)
 
+    comment = f"SAINTv2_{agent_name}" if agent_name else "SAINTv2_Live_duel"
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
@@ -605,8 +732,8 @@ def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: 
         "sl": sl,
         "tp": tp,
         "deviation": 50,
-        "magic": 424242,
-        "comment": "SAINTv2_Live_duel",
+        "magic": magic,
+        "comment": comment,
         "type_filling": mt5.ORDER_FILLING_IOC,
         "type_time": mt5.ORDER_TIME_GTC,
     }
@@ -616,15 +743,31 @@ def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: 
         print("Erreur order_send : None")
         return
 
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        print(f"Order_send échoué, retcode={result.retcode}")
+    # Retry "no money" : retcode 10019 → on retente avec volume divisé par 2
+    # jusqu'à atteindre min_volume (au cas où le pré-check n'avait pas suffi)
+    retry_volume = volume
+    retry_count = 0
+    while result is not None and result.retcode == 10019 and retry_count < 4:
+        retry_count += 1
+        retry_volume = round(retry_volume / 2.0, 2)
+        min_acceptable = max(0.01, float(getattr(cfg, "min_volume", 0.01)))
+        if retry_volume < min_acceptable:
+            print(f"  [{agent_name}] ⚠ NO_MONEY × {retry_count} : volume {retry_volume:.2f} < min, abandon.")
+            return
+        print(f"  [{agent_name}] ↘ NO_MONEY retry #{retry_count} : volume {volume:.2f} → {retry_volume:.2f}")
+        request["volume"] = retry_volume
+        result = mt5.order_send(request)
+        volume = retry_volume
+
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        rc = result.retcode if result is not None else "None"
+        print(f"Order_send échoué (magic={magic}), retcode={rc}")
     else:
-        # Mémorise l'ATR d'entrée pour cohérence avec training/backtest
-        # (utilisé par build_live_obs → unrealized_atr)
-        positions = mt5.positions_get(symbol=symbol)
-        if positions and len(positions) > 0:
-            _ENTRY_ATR_CACHE[int(positions[0].ticket)] = float(entry_atr)
-        print(f"Order exécuté : side={side}, volume={volume}, prix={price}, SL={sl:.2f}, TP={tp:.2f}, entry_atr={entry_atr:.2f}")
+        new_pos = get_position_by_magic(symbol, magic)
+        if new_pos is not None:
+            _ENTRY_ATR_CACHE[int(new_pos.ticket)] = float(entry_atr)
+        tag = f" [{agent_name}]" if agent_name else ""
+        print(f"Order exécuté{tag} : side={side}, vol={volume}, prix={price}, SL={sl:.2f}, TP={tp:.2f}, magic={magic}")
 
 
 def modify_sl_tp(position, new_sl: float | None = None, new_tp: float | None = None):
@@ -825,6 +968,137 @@ def update_sl_be_trailing_live(cfg: LiveConfig, df_closed: pd.DataFrame, positio
             )
             # new_tp=None → TP forcé à 0.0 dans modify_sl_tp (no TP)
             modify_sl_tp(position, new_sl, None)
+
+
+# ============================================================
+# BOUCLE LIVE MULTI-AGENT (wf1 + wf2 + wf3 en parallèle)
+# Chaque agent identifie ses positions via son magic dédié.
+# ============================================================
+
+def live_loop_multi(cfg: LiveConfig, should_continue):
+    print("Connexion MT5 (live multi-agent)…")
+    if not mt5.initialize():
+        raise RuntimeError("Erreur MT5.initialize() en live multi-agent.")
+
+    device = get_device(cfg)
+    stats = load_norm_stats(NORM_STATS_PATH)
+
+    def _build_policy():
+        return SAINTPolicySingleHead(
+            n_features=OBS_N_FEATURES,
+            d_model=80,
+            num_blocks=2,
+            heads=4,
+            dropout=0.05,
+            ff_mult=2,
+            max_len=cfg.lookback,
+            n_actions=N_ACTIONS
+        ).to(device)
+
+    # Chargement des 3 modèles
+    policies: Dict[str, nn.Module] = {}
+    for agent_name, path in MULTI_AGENT_PATHS.items():
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Checkpoint {agent_name} introuvable : {path}")
+        p = _build_policy()
+        p.load_state_dict(torch.load(path, map_location=device))
+        p.eval()
+        policies[agent_name] = p
+        magic = MULTI_AGENT_MAGICS[agent_name]
+        print(f"Modèle {agent_name.upper():3s} chargé (magic={magic}) : {path}")
+
+    action_labels = {0: "BUY", 1: "SELL", 2: "HOLD"}
+    last_bar_time = None
+
+    try:
+        while should_continue():
+            # GC du cache entry_atr (positions fermées)
+            gc_entry_atr_cache(cfg.symbol)
+
+            # Vérifie qu'au moins une bougie M1 fermée existe
+            try:
+                df_merged_full = fetch_ohlc_with_indicators(cfg)
+            except Exception as e:
+                print(f"[ERREUR MT5] {e} → pause 5s puis retry.")
+                time.sleep(5)
+                continue
+
+            if len(df_merged_full) < cfg.lookback + 3:
+                time.sleep(cfg.poll_interval)
+                continue
+
+            current_last_time = df_merged_full["time"].iloc[-1]
+
+            # On ne décide qu'une fois par nouvelle bougie M1 fermée
+            if last_bar_time is not None and current_last_time == last_bar_time:
+                time.sleep(cfg.poll_interval)
+                continue
+            last_bar_time = current_last_time
+
+            df_closed = df_merged_full.iloc[:-1].reset_index(drop=True)
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Nouvelle bougie M1 fermée à {current_last_time}")
+
+            # ========================================================
+            # Pour chaque agent : check sa position, sinon décision
+            # ========================================================
+            for agent_name, policy in policies.items():
+                magic = MULTI_AGENT_MAGICS[agent_name]
+                pos, entry_price, ticket = get_current_position_by_magic(cfg.symbol, magic)
+
+                if pos != 0:
+                    print(f"  [{agent_name.upper()}] déjà en position (ticket={ticket}, side={pos}) → SKIP")
+                    continue
+
+                # Construction de l'obs (cet agent est flat)
+                obs = build_live_obs(
+                    df_closed, stats, cfg,
+                    pos=0,
+                    entry_price=0.0,
+                    last_risk_scale=1.0,
+                    bars_in_position=0,
+                )
+                if obs is None:
+                    print(f"  [{agent_name.upper()}] obs None → SKIP")
+                    continue
+
+                with torch.no_grad():
+                    s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                    logits_d, _ = policy(s)
+                    logits_d = logits_d[0]
+                    mask_d = build_mask_from_pos_scalar(0, device, "both")
+                    logits_d_m = logits_d.masked_fill(~mask_d, MASK_VALUE)
+                    probs = torch.softmax(logits_d_m, dim=-1)
+                    a_pred = int(torch.argmax(probs, dim=-1).item())
+                    p_pred = float(probs[a_pred].item())
+
+                print(
+                    f"  [{agent_name.upper()}] probas "
+                    f"BUY={probs[0]:.2f} SELL={probs[1]:.2f} HOLD={probs[2]:.2f}  "
+                    f"→ {action_labels[a_pred]} (p={p_pred:.2f})"
+                )
+
+                # Filtre confiance
+                if a_pred in (0, 1) and p_pred < cfg.min_confidence:
+                    print(f"  [{agent_name.upper()}] prob {p_pred:.2f} < {cfg.min_confidence:.2f} → HOLD")
+                    continue
+
+                # Action finale
+                if a_pred == 0:
+                    side = 1
+                elif a_pred == 1:
+                    side = -1
+                else:
+                    continue  # HOLD
+
+                # Ouverture de la position pour cet agent
+                send_order(cfg, side, risk_scale=1.0, df_merged_closed=df_closed,
+                           magic=magic, agent_name=agent_name.upper())
+
+            time.sleep(cfg.poll_interval)
+
+    finally:
+        mt5.shutdown()
+        print("Multi-agent live_loop terminé.")
 
 
 # ============================================================
@@ -1183,7 +1457,11 @@ class TradingAgent:
 
     def _run(self):
         try:
-            live_loop(self.cfg, self._should_continue)
+            if getattr(self.cfg, "multi_agent", False):
+                print("[AGENT] Mode MULTI-AGENT (wf1 + wf2 + wf3)")
+                live_loop_multi(self.cfg, self._should_continue)
+            else:
+                live_loop(self.cfg, self._should_continue)
         except Exception as e:
             print(f"[AGENT] Erreur dans live_loop : {e}")
         finally:

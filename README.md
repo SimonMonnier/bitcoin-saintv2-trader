@@ -2,17 +2,16 @@
 
 > **PPO + SAINTv2** : agent d'apprentissage par renforcement entraîné en walk-forward sur l'historique BTCUSD à la minute, déployable en live sur MetaTrader 5 via une interface graphique dédiée.
 
-> 🏆 **Dernier backtest stress-test (mai 2026, OOS 75 jours)** : **+560.9 %** de PnL (1 000 $ → 6 609 $), Profit Factor **1.85**, Winrate **58.5 %**, Max DD **4.4 %**. Cf [section Performance](#-performance--backtest-stress-test-no_be_trail--mai-2026).
-
 ---
 
 ## 📑 Table des matières
 
 1. [Vue d'ensemble](#-vue-densemble)
-   - [Performance backtest](#-performance--backtest-stress-test-no_be_trail--mai-2026)
 2. [Architecture du modèle](#-architecture-du-modèle)
 3. [Pipeline complet](#-pipeline-complet)
    - [Volume dynamique](#-volume-dynamique-position-sizing)
+   - [Mode multi-agent](#-mode-multi-agent-wf1--wf2--wf3-en-parallèle)
+   - [Gestion de marge](#-gestion-de-marge-anti-reject-no_money)
 4. [Méthodologie d'entraînement](#-méthodologie-dentraînement)
 5. [Installation](#-installation)
 6. [Configuration de MetaTrader 5](#-configuration-de-metatrader-5)
@@ -60,34 +59,6 @@ Le système est conçu pour fonctionner **24/7** sur cryptos (BTCUSD), avec gest
 | Backbone size | d_model=80, 2 blocks, 4 heads |
 | Features | 11 M1 + 5 H1 + 4 position = 20 |
 | Lookback | 25 bougies M1 |
-
-### 📈 Performance — Backtest stress-test (no_be_trail) — mai 2026
-
-| Métrique | Valeur |
-|----------|--------|
-| **Période backtest** | 2026-03-04 → 2026-05-17 (~75 jours, OOS récent) |
-| **Capital initial → final** | 1 000 $ → **6 609 $** |
-| **PnL total** | **+5 609 $** (**+560.9 %**) |
-| **Max drawdown** | **4.4 %** ⭐ |
-| **Verdict automatique** | ✓ **ROBUSTE** |
-| Nb trades | 1 981 |
-| Winrate | 58.5 % |
-| Profit Factor | 1.85 |
-| AvgW / AvgL | +10.58 $ / −8.07 $ |
-| Score (PF × WR) | 1.079 |
-
-**Détail LONG / SHORT** :
-| Side | Trades | WR | PnL |
-|------|--------|----|----|
-| LONG | 1 334 (67 %) | 57.4 % | +3 491 $ |
-| SHORT | 647 (33 %) | **60.6 %** | +2 119 $ |
-
-Modèle utilisé : `bestprofit_saintv2_loup_duel_wf1_both_wf1.pth` (walk-forward fold 1).
-
-> Ces chiffres sont obtenus **avec BE/trail désactivés** (cf section
-> [Backtest stress-test](#-backtest-stress-test) — variante no_be_trail).
-> Le même modèle avec BE/trail activé donne −499 $ (PF 0.98) : le BE/trail
-> ferme prématurément les gains avant que le TP soit atteint.
 
 ---
 
@@ -402,14 +373,15 @@ python loup_live.py
 
 ```
 multi-agent-btcusd/
-├── training.py                     # Entraînement PPO + SAINTv2 walk-forward
-├── loup_live.py                    # Agent live MT5 (sans GUI) — BE/trail off
-├── gui_loup.py                     # Interface graphique PySide6
-├── backtest_saintv2_stress_test.py # Backtest institutionnel (BE/trail on)
-├── backtest_saintv2_no_be_trail.py # Variante sans BE/trail (comparaison)
-├── requirements.txt                # Dépendances Python
-├── .gitignore                      # Exclusions git (.pth, .csv, .npz)
-├── README.md                       # Ce fichier
+├── training.py                      # Entraînement PPO + SAINTv2 walk-forward
+├── loup_live.py                     # Agent live MT5 (single + multi-agent + marge)
+├── gui_loup.py                      # Interface graphique PySide6
+├── backtest_saintv2_stress_test.py  # Backtest institutionnel (BE/trail on)
+├── backtest_saintv2_no_be_trail.py  # Variante sans BE/trail (comparaison)
+├── backtest_saintv2_multi_agent.py  # Backtest multi-agent (wf1 + wf2 + wf3)
+├── requirements.txt                 # Dépendances Python
+├── .gitignore                       # Exclusions git (.pth, .csv, .npz)
+├── README.md                        # Ce fichier
 │
 ├── (générés après training)
 ├── norm_stats_ohlc_indics.npz                                   # Stats Z-score globales
@@ -510,6 +482,92 @@ max_lot: float = 100.0        # cap absolu
 ```
 
 Pour revenir au lot fixe, passer `dynamic_volume=False`.
+
+> ⚙️ **Paliers actuels (mai 2026)** : base **0.10** lot (au lieu de 0.01 dans la première version), +0.10 par tranche de 1 000 $. Justification : la formule de PnL du backtest a été alignée sur MT5 réel (suppression du facteur `× leverage` qui sur-estimait par ×6).
+
+---
+
+## 🤖 Mode multi-agent (wf1 + wf2 + wf3 en parallèle)
+
+Les **3 checkpoints walk-forward** peuvent désormais trader simultanément sur le même compte. Chaque agent :
+- voit les **mêmes données** d'entrée
+- prend ses **décisions indépendamment**
+- peut ouvrir **sa propre position** (max 1 par agent ⇒ jusqu'à 3 positions ouvertes en même temps)
+- est identifié par un **magic MT5 dédié** :
+
+| Agent | Magic | Checkpoint |
+|-------|-------|------------|
+| WF1 | 424241 | `bestprofit_saintv2_loup_duel_wf1_both_wf1.pth` |
+| WF2 | 424242 | `bestprofit_saintv2_loup_duel_wf2_both_wf2.pth` |
+| WF3 | 424243 | `bestprofit_saintv2_loup_duel_wf3_both_wf3.pth` |
+
+### Configuration
+
+```python
+# LiveConfig dans loup_live.py
+multi_agent: bool = True   # active le mode 3-agents
+```
+
+Le `TradingAgent` route automatiquement vers `live_loop_multi()` quand `multi_agent=True`. Le mode classique single-agent reste disponible (`multi_agent=False`).
+
+### Backtest multi-agent
+
+Un fichier dédié reproduit la même logique :
+
+```powershell
+python backtest_saintv2_multi_agent.py
+```
+
+Affichage par-agent dans les logs (couleur cyan/jaune/magenta) + résumé final qui détaille les stats de chaque agent séparément. CSV exporté : `backtest_trades_multi_agent_no_be_trail.csv` avec colonne `agent`.
+
+### Equity et volume partagés
+
+Capital et equity sont **communs** aux 3 agents (un seul compte). Le volume dynamique est calculé sur l'equity courant au moment de chaque ouverture. Conséquence : si les 3 agents s'ouvrent en même temps, l'**exposition totale** = 3 × `compute_dynamic_volume(equity)`.
+
+---
+
+## 🛡️ Gestion de marge (anti-reject NO_MONEY)
+
+Pour éviter que Vantage rejette des ordres quand la marge libre est insuffisante (notamment avec lot 50-100), le live applique 3 lignes de défense :
+
+### 1. Pré-check `adjust_volume_to_margin()`
+Avant chaque `order_send`, on compare la **marge requise** (`mt5.order_calc_margin`) avec `margin_free × safety_factor` (80 % par défaut).
+Si insuffisant : volume réduit linéairement, arrondi au `volume_step` du broker.
+
+### 2. Arrondi au `volume_step` broker
+Le volume ajusté est aligné au pas du broker (0.01 sur BTCUSD).
+
+### 3. Retry automatique sur retcode 10019 (`NO_MONEY`)
+Si MT5 rejette quand même : le volume est divisé par 2 et retry, jusqu'à 4 tentatives ou volume sous `min_volume`.
+
+### Configuration
+
+```python
+# LiveConfig
+margin_safety: float = 0.80              # n'utilise jamais > 80% margin_free
+auto_scale_volume_to_margin: bool = True # active le pré-check
+min_volume: float = 0.01                 # plancher d'ordre
+```
+
+### Logs typiques
+
+**Cas scale-down** :
+```
+[VOL/WF3] equity=50000.00$ → lot=5.00
+  [WF3] ↘ SCALE-DOWN volume 5.00 → 2.30 (margin_free=29500$, budget 80%=23600$, margin/lot=10260$)
+```
+
+**Cas marge insuffisante** :
+```
+  [WF1] ⚠ MARGE INSUFFISANTE : margin_free=300.00$ × safety=80% = 240.00$ ; required pour 5.00 lot = 51300$ → ORDRE ANNULÉ
+```
+
+**Cas retry NO_MONEY** :
+```
+  [WF1] ↘ NO_MONEY retry #1 : volume 10.00 → 5.00
+  [WF1] ↘ NO_MONEY retry #2 : volume 5.00 → 2.50
+Order exécuté [WF1] : side=1, vol=2.50, ...
+```
 
 ---
 

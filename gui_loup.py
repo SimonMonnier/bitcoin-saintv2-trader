@@ -140,7 +140,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Label en lecture seule qui affiche le lot calculé selon l'equity
         # (0-2000$ → 0.01, +0.01 par tranche de 1000$, cap 100.00)
-        self.lot_label = QtWidgets.QLabel("0.01 lot (auto)")
+        self.lot_label = QtWidgets.QLabel("0.10 lot (auto)")
         self.lot_label.setStyleSheet(
             "color: #2ecc71; font-weight: bold; font-family: Consolas, monospace; padding: 2px 8px;"
             "background-color: #1c2833; border-radius: 4px;"
@@ -149,7 +149,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Hint de calcul
         hint = QtWidgets.QLabel(
-            "(≤2000$ : 0.01  ·  +0.01 par tranche de 1000$  ·  cap 100.00)"
+            "(≤2000$ : 0.10  ·  +0.10 par tranche de 1000$  ·  cap 100.00)"
         )
         hint.setStyleSheet("color: #888; font-size: 11px;")
         top_layout.addWidget(hint)
@@ -557,13 +557,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 mt5.DEAL_ENTRY_INOUT,     # 2 : reverse position (netting)
                 mt5.DEAL_ENTRY_OUT_BY,    # 3 : sortie par ordre opposé
             )
-            BOT_MAGIC = 424242  # tag des ordres du bot (cf loup_live.send_order)
+            # Magics du bot : 424242 (single) + 424241/424243 (multi-agent wf1/wf3)
+            BOT_MAGICS = {424241, 424242, 424243}
 
             for d in deals:
                 if d.entry not in _OUT_ENTRIES:
                     continue
                 # Filtre bot : ignore manuel et autres EAs
-                if getattr(d, "magic", 0) != BOT_MAGIC:
+                if int(getattr(d, "magic", 0)) not in BOT_MAGICS:
                     continue
                 if d.ticket in self._stats_seen_deal_tickets:
                     continue
