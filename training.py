@@ -1,4 +1,4 @@
-# ======================================================================
+﻿# ======================================================================
 # PPO + SAINTv2 — SCALPING BTCUSD M1 (SINGLE-HEAD + ACTION MASK + H1)
 # Version "Loup Ω" LONG / SHORT / CLOSE
 # ======================================================================
@@ -9,6 +9,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import math
 import random
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
@@ -91,17 +92,77 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
+from saint_core import (
+    N_ACTIONS,
+    MASK_VALUE,
+    NORM_STATS_PATH,
+    FEATURE_COLS,
+    OBS_N_FEATURES,
+    merge_m1_h1,
+    ATR_PLANCHER_FRAC,
+    charge_source_externe,
+    SOURCE_EXT_NOM,
+    safe_normalize,
+    SAINTPolicySingleHead,
+    build_mask_from_pos_scalar,
+)
+
 # ============================================================
 # CONSTANTES
 # ============================================================
 
-# 0:BUY  1:SELL  2:HOLD
-N_ACTIONS = 3
-MASK_VALUE = -1e4  # valeur de masquage compatible float16
-CONF_THRESHOLD = 0.90  # seuil de confiance (aligné avec backtest/live)
+CONF_THRESHOLD = 0.40  # Ancien seuil ABSOLU de production. Conservé pour les
+                       # checkpoints antérieurs ; remplacé par une calibration
+                       # par quantile, voir SELECTIVITE ci-dessous.
 
-# Fichier de normalisation global
-NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
+# ============================================================
+# SÉLECTIVITÉ — remplace le seuil absolu
+# ============================================================
+#
+# Un seuil absolu sur p(BUY)/p(SELL) est ININTERPRÉTABLE : il suppose de
+# connaître à l'avance l'échelle de conviction du modèle. Mesuré à l'epoch 6 sur
+# deux configurations successives, la policy converge vers p ≈ (0.31, 0.31, 0.38)
+# — HOLD est l'argmax partout, et la validation renvoyait 0 trade MÊME avec un
+# seuil à zéro. Ce n'était donc pas le seuil qui mordait, mais la règle argmax.
+#
+# Or exiger p(BUY) > p(HOLD) est une contrainte inutile : ce qui décide de
+# l'ouverture n'est pas que trader soit l'action la PLUS PROBABLE, mais que son
+# espérance soit positive sur la fraction sélectionnée. Et la mesure hors
+# échantillon (barrière triple, 1.9 M bougies) situe précisément l'edge dans la
+# queue : winrate 35 % en moyenne, 44 % au top 10 %, 46.6 % au top 0.5 %.
+#
+# On raisonne donc en SÉLECTIVITÉ : « trader les q % d'instants les plus
+# favorables ». Le seuil absolu correspondant est recalculé à chaque epoch comme
+# le quantile (1−q) de max(p_BUY, p_SELL) observé sur les états flat. Il suit
+# automatiquement l'échelle du modèle, et il est stocké avec le checkpoint pour
+# que live / backtests / MQL5 appliquent exactement la même barre.
+SELECTIVITE_START = 0.50   # epoch 1 : on trade la moitié des occasions (feedback)
+SELECTIVITE_FIN = 0.05     # régime : les 5 % les plus favorables
+SELECTIVITE_RAMP_EPOCHS = 40
+
+
+def selectivite_for_epoch(epoch: int) -> float:
+    """Fraction d'occasions tradées à l'epoch donnée (décroissance linéaire).
+
+    Démarrer serré priverait l'agent de tout retour d'expérience ; finir large
+    le ferait trader hors de sa zone de compétence.
+    """
+    t = min(max(epoch - 1, 0) / float(SELECTIVITE_RAMP_EPOCHS), 1.0)
+    return SELECTIVITE_START + (SELECTIVITE_FIN - SELECTIVITE_START) * t
+
+# Rampe du seuil pendant l'entraînement.
+#
+# Sur 3 actions, une policy fraîchement initialisée est quasi uniforme :
+# p ≈ 1/3 = 0.3333 pour chaque action (mesuré : Hflat = 1.098 sur un max de
+# 1.0986). Appliquer 0.40 dès le départ convertissait donc CHAQUE BUY/SELL en
+# HOLD — d'où `val_trades = 0` sur les 148 epochs du log d'origine, et un
+# Sortino30 bloqué à 0 qui empêchait toute sélection de "best model".
+# Le train tradait quand même, mais uniquement via les ouvertures forcées du
+# curriculum, dont la probabilité tombe à 0.05 vers l'epoch 36.
+#
+# Cette rampe absolue est REMPLACÉE par la calibration par quantile décrite
+# plus haut : partir de 0.30 quand la policy uniforme vaut 0.3333 ne laissait que
+# 0.028 de marge, que la première mise à jour de l'actor consommait aussitôt.
 
 # Modèles pré-entraînés pour le mode CLOSE
 BEST_MODEL_LONG_PATH = "best_saintv2_loup_long_wf1_long_wf1.pth"
@@ -118,33 +179,85 @@ class PPOConfig:
     symbol: str = "BTCUSD"
     timeframe: int = mt5.TIMEFRAME_M1
     htf_timeframe: int = mt5.TIMEFRAME_H1
-    # Fenêtre temporelle (UTC). Si date_to est None → maintenant.
-    # Les barres en-dehors de [date_from, date_to] sont ignorées.
-    # 2022-01-01 inclut bear Luna/FTX/2022 → équilibre haussier/baissier
-    date_from: datetime = field(default_factory=lambda: datetime(2022, 1, 1))
+    # Fenetre temporelle (UTC). Si date_to est None -> maintenant.
+    #
+    # Bornee au 2022-12-15 par la disponibilite des colonnes Binance, et ce
+    # n'est pas un choix : avant cette date, taker_ratio manque 97 jours et
+    # ls_ratio_top ~260 jours sur 2022. Combler par ffill fabriquerait une
+    # constante et apprendrait au modele un regime inexistant. A partir du
+    # 2022-12-15 la couverture est de 100.000 % sur les quatre colonnes.
+    #
+    # C'est 1.6x MOINS de donnees que sur l'or (2018-09-11), et sur un probleme
+    # a signal faible le nombre d'echantillons est precisement le facteur
+    # limitant. C'est le prix des features de positionnement.
+    date_from: datetime = field(default_factory=lambda: datetime(2022, 12, 15))
     date_to: Optional[datetime] = None
-    # n_bars est gardé en fallback uniquement si copy_rates_range échoue.
-    # 2_500_000 bougies M1 ≈ 4.7 ans (avec weekends crypto = 24/7)
-    n_bars: int = 2_500_000
-    lookback: int = 25
+    # n_bars est garde en fallback uniquement si copy_rates_range echoue.
+    # BTCUSD tourne 24/7 : densite mesuree 0.971 bougie par minute calendaire
+    # (1 913 925 bougies du 2022-12-14 au 2026-09-13).
+    n_bars: int = 2_100_000
+    # 54 bougies d'historique, contre 25 auparavant.
+    #
+    # Le jeu a 10 colonnes ne contient aucun resume d'historique long : ni RSI
+    # M1, ni rang de volatilite, ni ecart a une moyenne longue — ceux-la
+    # appartenaient au jeu a 30. Le pari de ce reglage est que le modele peut
+    # les former lui-meme s'il voit assez loin, et 54 bougies lui en donnent
+    # deux fois plus qu'avant.
+    #
+    # COUT GPU : l'observation passe de 25 x 14 = 350 cases a 54 x 14 = 756,
+    # soit 2.2 fois plus. C'est comparable au jeu a 30 colonnes sur 25 bougies
+    # (850 cases), qui faisait chauffer la machine jusqu'au bridage. La ligne
+    # gpu[...] du log dira si ce reglage y retombe.
+    lookback: int = 54
 
     # PPO Training
     epochs: int = 240               # +50% vs 160 pour cosine LR plus douce
-    episodes_per_epoch: int = 4     # +1 pour plus de diversité par epoch
-    episode_length: int = 4000      # 2333 → 4000 (~2.8j de M1) : trajectoires plus longues
-    updates_per_epoch: int = 2
-    tp_shrink: float = 0.7
+    # Épisodes joués EN PARALLÈLE (un seul forward batché par pas) : le
+    # profilage montre qu'un batch 16 coûte le même temps qu'un batch 1, donc
+    # multiplier les épisodes est quasi gratuit en temps de rollout.
+    #
+    # Monté de 4 à 32 parce que l'actor n'apprend que sur les états FLAT, et
+    # qu'avec des détentions de ~5h l'agent est en position 99.9% du temps :
+    # à 4 épisodes il n'y avait qu'une quinzaine de décisions dans tout le
+    # buffer d'une epoch, soit 0.26 par minibatch de 256 — la plupart des mises
+    # à jour voyaient zéro décision et le gradient de l'actor était nul.
+    # 128 envs × 6000 bougies. Le nombre de DÉCISIONS (états flat) est le seul
+    # volume qui compte pour l'actor : il valait 113-156 par epoch, soit un
+    # unique minibatch, soit 2 pas de gradient par epoch. Le semi-MDP a rendu
+    # le rollout peu coûteux (la policy n'est plus appelée qu'aux décisions) :
+    # on convertit cette vitesse en volume. Attendu : ~1700 décisions/epoch.
+    episodes_per_epoch: int = 128
+    # Idem pour la validation : 21-32 trades donnaient un Sortino purement
+    # bruité (PF 3.10 puis 0.51 d'une epoch à l'autre), donc une sélection du
+    # "best model" au hasard.
+    val_episodes: int = 16
+    episode_length: int = 6000      # ~4.2j de M1
+    # Fraction des états EN POSITION conservée pour la mise à jour PPO.
+    # Ils sont masqués à HOLD donc sans gradient d'actor ; les garder tous
+    # faisait passer la mise à jour de 40s à 7 minutes pour rien.
+    in_position_keep_frac: float = 0.10
+    # Nombre de passes PPO sur les données collectées.
+    # Testé à 8 pour tenter de débloquer le KL (0.0004 contre un target de
+    # 0.03) : sans effet sur le KL, resté à 0.0000, et le critique a divergé
+    # (CriticL 9.6 → 1.7e6, ~500 pas d'optimisation sur le même batch).
+    # Ce n'est donc pas le nombre de passes qui bride l'actor.
+    updates_per_epoch: int = 4
+    tp_shrink: float = 1.0  # pas de shrink (formule explicite : atr_tp_mult contient déjà le facteur final)
 
-    batch_size: int = 256
+    # Batch reduit : avec ~1700 decisions par epoch, 256 ne donnait que 6
+    # minibatches. A 128 on double le nombre de pas de gradient a donnees egales.
+    batch_size: int = 128
     gamma: float = 0.97
     lambda_gae: float = 0.95
     clip_eps: float = 0.18
     lr: float = 3e-4
     target_kl: float = 0.03
     value_coef: float = 0.5
-    # (B) Entropy plus fort : pousse la policy à explorer SHORT.
-    # Pour 3 actions, ln(3) ≈ 1.10 = entropy max → coef agressif justifié.
-    entropy_coef: float = 0.30
+    # Coefficient d'entropie — plage usuelle PPO (1e-3 à 1e-2).
+    # Effectif = entropy_coef × (1.5 → 0.5) sur 120 epochs, soit 0.012 → 0.004.
+    # Relation utile pour 3 actions : Hflat = 1.0889 ⟺ p_max = 0.40, la valeur
+    # que le modèle DOIT dépasser pour franchir son propre filtre de conviction.
+    entropy_coef: float = 0.008
     # (A) Clip très serré : 0.5 a laissé passer des gradients qui ont explosé
     # avec AMP (clip appliqué sur valeurs scaled). Maintenant 0.3 + unscale fix.
     max_grad_norm: float = 0.3
@@ -155,31 +268,151 @@ class PPOConfig:
     # Trading
     initial_capital: float = 1000.0
     position_size: float = 0.06
-    leverage: float = 6.0
+    # Levier = contrainte de MARGE uniquement, jamais un multiplicateur de PnL.
+    # MT5 calcule le PnL = delta_price × volume × contract_size.
+    # 6.0 était un héritage du Bitcoin. Sur l'or il rendait la taille par le
+    # risque IMPOSSIBLE : risquer 1.2 % de 1000 $ avec un stop à 5xATR (2.50 $)
+    # demande 4.8 onces, soit 11 520 $ de notionnel — donc 1 920 $ de marge à
+    # levier 6, au-dessus du capital. Le plafond de marge aurait rogné la
+    # position d'un facteur 5.5 et annulé silencieusement la correction
+    # d'échelle. Les courtiers offrent 100 à 500 sur XAUUSD ; à 100 la marge
+    # requise tombe à 115 $, soit 11.5 % du capital, sous le plafond de 35 %.
+    # Le levier ne multiplie toujours PAS le PnL : il borne le notionnel.
+    leverage: float = 100.0
     fee_rate: float = 0.0004
-    min_capital_frac: float = 0.2
-    max_drawdown: float = 0.4   # 40% : force le modèle à apprendre prudent
+    min_capital_frac: float = 0.20  # garde-fou capital : épisode terminé si capital < 20%
+                                     # config validée +135 EUR MT5 tester
+    max_drawdown: float = 0.40  # garde-fou DD : épisode terminé si drawdown > 40%
+                                 # config validée +135 EUR MT5 tester
 
     # Risk management / position sizing
     risk_per_trade: float = 0.012
-    max_position_frac: float = 0.35
+    # max_position_frac : SUPPRIME. Il ne servait qu au plafond de notionnel,
+    # qui est desormais exprime directement par max_notional_mult. Le laisser
+    # aurait laisse croire a un reglage actif alors que plus rien ne le lisait.
+    # Notionnel maximum, en multiples du capital. Independant du levier : voir
+    # PPOEnv._compute_dynamic_size.
+    max_notional_mult: float = 30.0
     position_vol_penalty: float = 1e-3
 
-    # StopLoss / TakeProfit ATR
-    atr_sl_mult: float = 1.2
-    atr_tp_mult: float = 2.4
+    # StopLoss / TakeProfit — SL=10×ATR, TP=14×ATR (R:R 1:1.4 conservé).
+    #
+    # Choisi sur mesure, pas au jugé. Un test supervisé hors RL (régression
+    # logistique sur les 16 features) donne, pour la course TP/SL :
+    #   SL  2×ATR (≈62$)  : AUC 0.5043, friction = 46.9% du gain visé
+    #   SL  5×ATR (≈156$) : AUC 0.5213, friction = 18.8%
+    #   SL 10×ATR (≈311$) : AUC 0.5292, friction =  9.4%   ← retenu
+    #   SL 20×ATR (≈623$) : AUC 0.5338, friction =  4.7%
+    # Le signal directionnel de ces features vit à 1-4h (AUC 0.529 à 1h, 0.535
+    # à 4h). Un stop à 2×ATR(M1) est touché par le bruit bien avant que cette
+    # tendance ne se réalise : la structure du trade détruisait l'information.
+    # 10×ATR est le compromis — friction maîtrisée et détention ~5h, donc assez
+    # de trades par épisode pour apprendre (≈13 contre ≈3 à 20×ATR).
+    #
+    # RECALIBRE POUR L'OR. La mesure precedente (3xATR / R:R 1.4) venait de
+    # BTCUSD ; le cout relatif de l'or est different (0.250 x ATR contre 0.416)
+    # et son optimum se deplace. Mesure sur 1.32 M bougies, PnL par trade en
+    # unites d'ATR, non-resolus CLOTURES AU MARCHE (jamais jetes) :
+    #
+    #   SL | RR0.7   RR1.0   RR1.4   RR2.0    resolution
+    #  1.0x| -0.021  -0.016  -0.013  +0.069     100.0%
+    #  2.0x| +0.021  +0.053  +0.044  -0.034      99.9%
+    #  3.0x| +0.009  +0.085  -0.013  +0.008      99.0%
+    #  5.0x| +0.132  +0.027  +0.093  +0.317      92.3%   <- retenu
+    # 10.0x| -0.268  -0.081  -0.220  -0.471      63.2%   <- rejete
+    #
+    # On ne retient PAS la case maximale : avec ~790 trades selectionnes et un
+    # ecart-type de PnL d'environ 6 ATR, l'erreur type vaut +/-0.21 et le +0.317
+    # n'est qu'a 1.5 sigma. Ce qui fait preuve, c'est que la ligne 5xATR est
+    # positive sur SES QUATRE ratios — une ligne entiere du bon cote vaut bien
+    # mieux qu'une case isolee. C'est l'erreur commise sur BTCUSD, ou le 10xATR
+    # paraissait le meilleur avant que la clotures des non-resolus ne le rende
+    # perdant.
+    #
+    # Le 10xATR est elimine sans ambiguite : negatif partout et seulement 63 %
+    # de resolution — l'or n'a pas assez d'amplitude pour atteindre des
+    # barrieres aussi lointaines en 240 min.
+    # MESURE sur BTCUSD, plancher d'ATR corrige, friction complete, 28 653
+    # candidats de validation, non-resolus clotures au marche, esperance par
+    # unite de risque apres selection du meilleur 1 % :
+    #
+    #     SL   R:R    WR     requis    E[R]      t
+    #     2.0  1.4   50.0%   47.3%   +0.1536   +3.0   <- retenu
+    #     2.0  2.0   40.9%   39.0%   +0.1523   +2.5
+    #     3.0  1.4   49.5%   45.6%   +0.1322   +2.7
+    #     5.0  2.0   47.2%   35.7%   +0.0516   +1.1
+    #
+    # La derniere ligne dit pourquoi il ne faut PAS choisir sur l'ecart au
+    # seuil d'equilibre : +11.5 points d'ecart, et presque rien au bout, parce
+    # qu'a stop large la plupart des « gains » sont des sorties au temps
+    # minuscules. L'esperance par unite de risque est le seul critere.
+    #
+    # Les trois premieres lignes sont a portee de bruit l'une de l'autre : le
+    # choix du couple exact est moins solide que le choix du jeu de features,
+    # dont les six premieres places du classement etaient toutes occupees par
+    # les jeux larges.
+    atr_sl_mult: float = 2.0
+    atr_tp_mult: float = 2.8      # R:R 1:1.4
 
-    # Microstructure
-    spread_bps: float = 0.0
-    slippage_bps: float = 0.0  # non utilisé dans la version déterministe
+    # Microstructure — v2 (palier intermédiaire validé, 2026-05-20)
+    # v3 stress était trop dur : modèle convergeait vers HOLD-always (degenerate).
+    # v2 = friction réaliste qui permet l'apprentissage tout en restant exigeant.
+    # MESURE sur 1 913 925 bougies BTCUSD (2022-12-14 -> 2026-09-13) :
+    #   moyenne   2.607 bps  = 14.33 $ a un prix median de 66 583 $
+    #   mediane   2.169 bps
+    #   p90       4.437 bps
+    #   p99       7.385 bps
+    # BTCUSD coute donc 3.6x le spread de l'or (0.72 bps). C'est le handicap
+    # structurel de ce symbole, et il pese directement sur le choix du SL :
+    # aller-retour = 28.65 $, soit 27.7 % d'un stop a 3xATR et 8.3 % d'un stop
+    # a 10xATR.
+    spread_bps: float = 2.61
+    slippage_bps: float = 2.0    # sortie
+
+    # Distribution bimodale du spread. Le facteur vient du rapport p99/moyenne
+    # mesure ci-dessus (7.385 / 2.607 = 2.83), et non d'un choix : a 5.0 il
+    # aurait simule un spread large de 13 bps, jamais observe.
+    spread_wide_prob: float = 0.30
+    spread_bps_wide_factor: float = 2.83
+
+    entry_slippage_bps: float = 1.0  # entree
+    # Extension bar.high/low pour capturer les wicks intra-minute.
+    # PLAFOND CRITIQUE : doit rester tres en-dessous de atr_sl_mult x ATR, sinon
+    # le bruit synthetique declenche le SL avant tout mouvement de marche reel.
+    #
+    # BTCUSD : ATR(14) M1 mesure = 34.46 $ a un prix median de 66 583 $, soit
+    # 5.18 bps — nettement plus large, en relatif, que les 2.9 bps de l'or. Un
+    # SL a 5xATR vaut donc 25.9 bps et un bruit moyen de 0.6 bps n'en represente
+    # que 2.3 %, contre 4.2 % sur l'or. La valeur en bps est conservee telle
+    # quelle : c'est deja une unite relative.
+    tick_noise_bps: float = 1.2
 
     # Scalp
-    scalping_max_holding: int = 12
-    scalping_holding_penalty = 1e-6
-    scalping_flat_penalty    = 3.5e-5
-    scalping_flat_bonus      = 8e-5
+    # Detention de reference pour normaliser bars_held_norm — doit rester egale
+    # a saint_core.SCALPING_MAX_HOLDING. A SL 5xATR / R:R 2.0, 92.3 % des trades
+    # se resolvent dans les 240 min ; le deplacement etant diffusif, atteindre
+    # 5 ATR demande ~25 min et 10 ATR une centaine. On prend 120 pour que la
+    # feature garde de la dynamique jusqu'au plafond sans saturer.
+    scalping_max_holding: int = 120
 
-    # Break-even & trailing stop (identique au live)
+    # SORTIE PAR LE TEMPS — indispensable a la coherence mesure/environnement.
+    #
+    # Sans plafond, une position a SL 5xATR / TP 10xATR peut courir des milliers
+    # de bougies sur l'or. Mesure a l'epoch 1 : l'agent passait 99.9 % du temps
+    # en position et n'obtenait que 574 decisions par epoch, contre ~9500 sur
+    # BTCUSD — seize fois moins d'occasions d'apprendre. Le critic explosait en
+    # consequence (loss 65 352 contre 46), les recompenses s'accumulant sur des
+    # centaines de bougies avant cloture.
+    #
+    # Surtout, TOUTE la mesure qui a choisi ce SL/TP supposait une sortie forcee
+    # a 240 min avec cloture au marche : les 92.3 % de resolution et le
+    # +0.317 ATR/trade en dependent. Sans ce plafond, l'environnement simulerait
+    # une strategie jamais evaluee.
+    max_holding_bars: int = 240
+
+    # Break-even & trailing stop — DÉSACTIVÉ pour aligner sur le backtest no_be_trail
+    # et sur le MQL5 (SaintV2_WF3 sans BE/trail).
+    use_be_trail: bool    = False  # mettre à True pour réactiver
     atr_be_mult: float    = 1.0   # gain en ATR pour déclencher le break-even
     atr_trail_mult: float = 1.5   # gain en ATR pour déclencher le trailing
     atr_trail_dist: float = 1.0   # distance du trailing (en ATR)
@@ -190,11 +423,28 @@ class PPOConfig:
     # Seuil minimum de trades en val pour sauvegarder le meilleur modèle
     min_val_trades_save: int = 20
 
+    # Amplitude minimale (p99 − p01) de max(p_BUY, p_SELL) en dessous de laquelle
+    # le filtrage par quantile est désactivé. C'est LE diagnostic à surveiller :
+    # si cette étendue ne dépasse jamais ce seuil, le modèle est incapable de
+    # distinguer un instant favorable d'un autre, et aucune barre de conviction
+    # n'y changera quoi que ce soit.
+    pbs_etendue_min: float = 0.01
+
     # Curriculum vol
     use_vol_curriculum: bool = True
 
+    # Cache disque du dataframe fusionné (évite ~15 min de recalcul d'indicateurs
+    # à chaque lancement). Invalidé si le cache accuse plus de N heures de retard.
+    use_data_cache: bool = True
+    data_cache_max_lag_hours: float = 48.0
+
     # Device
     force_cpu: bool = False
+    # AMP réactivé. Je l'avais coupé en soupçonnant la fp16 d'écraser le
+    # gradient de l'actor : l'écart venait en réalité du warmup critique, qui
+    # exclut volontairement actor_loss de la loss pendant 5 epochs. Mesuré
+    # après warmup : gActor passe de 2.45e-04 à 5.36e-01, soit la valeur
+    # théorique attendue. La fp16 n'y était pour rien.
     use_amp: bool = True
 
     # Spécialisation d'agent (mode "close" supprimé)
@@ -206,52 +456,6 @@ class PPOConfig:
     # Préfixe pour nommer les fichiers de modèle
     model_prefix: str = "saintv2_singlehead_scalping_ohlc_indics_h1_loup"
 
-
-# ============================================================
-# INDICATEURS (M1 & H1) — RSI + VOL + MOMENTUM
-# ============================================================
-
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    o = df["open"]
-    h = df["high"]
-    l = df["low"]
-    c = df["close"]
-
-    # ---------- RSI ----------
-    def rsi(series: pd.Series, period: int) -> pd.Series:
-        delta = series.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.rolling(period).mean()
-        avg_loss = loss.rolling(period).mean()
-        rs = avg_gain / (avg_loss + 1e-8)
-        return 100 - 100 / (1 + rs)
-
-    df["rsi_14"] = rsi(c, 14)
-
-    # ---------- ATR ----------
-    prev_close = c.shift(1)
-    tr1 = h - l
-    tr2 = (h - prev_close).abs()
-    tr3 = (l - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df["atr_14"] = tr.rolling(14).mean()
-
-    # ---------- Vol / range ----------
-    df["returns"] = c.pct_change()
-    df["vol_20"] = df["returns"].rolling(20).std()
-    df["range_norm"] = (h - l) / (c + 1e-8)
-
-    # ==================================================================
-    # BONUS SURPRISE : Momentum-Confirmed Entry Filter (M1 & H1)
-    # ==================================================================
-    df["mom_5"] = df["close"] > df["close"].shift(5)           # True si prix > close d’il y a 5 barres
-    df["rsi_ok"] = (df["rsi_14"] > 28) & (df["rsi_14"] < 72)   # zone "saine" du RSI
-    # Volatilité relative du jour (rolling 1440 = 24h en M1)
-    df["vol_rank"] = df["vol_20"].rolling(1440).rank(pct=True)
-    df["high_vol_regime"] = df["vol_rank"] > 0.65              # top 35% de vol
-
-    return df
 
 
 # ============================================================
@@ -307,13 +511,83 @@ def _fetch_paginated(symbol: str, timeframe: int,
     return rates_all
 
 
+def _data_cache_path(cfg: PPOConfig) -> str:
+    return f"data_cache_{cfg.symbol}_{cfg.date_from:%Y%m%d}.pkl"
+
+
+def _try_load_data_cache(cfg: PPOConfig, date_to: datetime) -> Optional[pd.DataFrame]:
+    """Relit le dataframe fusionné mis en cache si sa couverture est suffisante.
+
+    Le calcul des indicateurs coûte ~15 min sur 2.3M bougies, dominé par le
+    rang glissant `vol_20.rolling(1440).rank(pct=True)` (≈3.4 milliards d'ops).
+    Comme `date_to` vaut `now()` à chaque lancement, on ne compare pas les dates
+    à l'identique : un cache qui s'arrête quelques heures avant la fin demandée
+    reste valable pour un entraînement sur 4+ ans.
+    """
+    path = _data_cache_path(cfg)
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_pickle(path)
+    except Exception as e:
+        print(f"[CACHE] Illisible ({e}) → rechargement depuis MT5.")
+        return None
+
+    if "time" not in df.columns or len(df) == 0:
+        return None
+    manquantes = set(FEATURE_COLS) - set(df.columns)
+    if manquantes:
+        print(f"[CACHE] Features absentes ({', '.join(sorted(manquantes))}) → "
+              f"rechargement depuis MT5.")
+        return None
+
+    last = pd.to_datetime(df["time"].iloc[-1])
+    retard_h = (date_to - last).total_seconds() / 3600.0
+    if retard_h > cfg.data_cache_max_lag_hours:
+        print(f"[CACHE] Trop ancien ({retard_h:.1f}h de retard) → rechargement depuis MT5.")
+        return None
+
+    # DROPNA APRES RELECTURE — indispensable, et son absence a coute un crash.
+    #
+    # Le cache est ecrit avec un dropna portant sur le FEATURE_COLS du moment.
+    # Elargir ensuite le jeu de features ne change ni le nom des colonnes (donc
+    # le controle ci-dessus passe) ni la date (donc celui du retard passe), mais
+    # les lignes ou les NOUVELLES colonnes sont NaN sont toujours la. Elles
+    # traversent la normalisation, arrivent au reseau, et ressortent en
+    # probabilites NaN : « ValueError: probabilities contain NaN », a mille
+    # lieues de sa cause.
+    #
+    # Exemple vecu : vol_rank_h1 n'est couvert qu'a 95.47 % (glissant de 1440
+    # bougies H1, soit 60 jours d'amorcage). Le cache construit pour 10 features
+    # relu pour 30 en contenait 4.5 % de lignes empoisonnees.
+    avant = len(df)
+    df = df.dropna(subset=[c for c in FEATURE_COLS if c in df.columns] + ["atr_14"])
+    if len(df) < avant:
+        print(f"[CACHE] {avant - len(df):,} lignes retirees "
+              f"({100*(avant-len(df))/avant:.2f} %) : NaN sur des features que le "
+              f"cache ne filtrait pas.")
+    if len(df) == 0:
+        print("[CACHE] Vide apres filtrage → rechargement depuis MT5.")
+        return None
+
+    print(f"[CACHE] {len(df):,} bougies relues depuis {path} "
+          f"(retard {retard_h:.1f}h) — chargement MT5 évité.")
+    return df.reset_index(drop=True)
+
+
 def load_mt5_data(cfg: PPOConfig) -> pd.DataFrame:
+    date_to_req = cfg.date_to or datetime.now()
+    if cfg.use_data_cache:
+        cached = _try_load_data_cache(cfg, date_to_req)
+        if cached is not None:
+            return cached
+
     print("Connexion MT5…")
     if not mt5.initialize():
         raise RuntimeError("Erreur MT5.init()")
 
     date_from = cfg.date_from
-    date_to = cfg.date_to or datetime.now()
+    date_to = date_to_req
     print(
         f"[DATA] Plage demandée : {date_from:%Y-%m-%d %H:%M} → "
         f"{date_to:%Y-%m-%d %H:%M}"
@@ -326,7 +600,12 @@ def load_mt5_data(cfg: PPOConfig) -> pd.DataFrame:
     rates_m1 = mt5.copy_rates_range(cfg.symbol, cfg.timeframe, date_from, date_to)
     rates_h1 = mt5.copy_rates_range(cfg.symbol, cfg.htf_timeframe, date_from, date_to)
 
-    n_m1_target = int((date_to - date_from).total_seconds() // 60 * 0.7)  # 70% (weekends, gaps)
+    # Fraction des minutes CALENDAIRES qu'on s'attend a trouver. Le seuil de
+    # 0.7 etait cale sur BTCUSD, qui cote 24h/24 et 7j/7. L'or ferme le week-end
+    # et fait une pause quotidienne : son maximum atteignable est de
+    # (5/7) x (23/24) = 68.5 %, donc 0.7 declenchait une pagination inutile sur
+    # un historique pourtant complet (2.82 M bougies recuperees d'un coup).
+    n_m1_target = int((date_to - date_from).total_seconds() // 60 * 0.95)
 
     # 2) Si insuffisant → pagination par copy_rates_from
     if rates_m1 is None or len(rates_m1) < n_m1_target:
@@ -348,6 +627,16 @@ def load_mt5_data(cfg: PPOConfig) -> pd.DataFrame:
         print(f"[DATA] Pagination H1 vide, dernier fallback copy_rates_from_pos(0, {n_h1}).")
         rates_h1 = mt5.copy_rates_from_pos(cfg.symbol, cfg.htf_timeframe, 0, n_h1)
 
+    # Les features Binance viennent d'un FICHIER, pas de MT5 : elles sont
+    # construites hors ligne par build_binance_features.py, qui detecte le
+    # decalage horaire du broker empiriquement. Le fichier est deja exprime
+    # en heure broker, donc la jointure est exacte a la minute.
+    feats_ext = charge_source_externe(date_from, date_to)
+    # `point` sert à convertir le spread des bougies (en POINTS) vers le prix,
+    # pour que spread_rel ait la même unité qu'en live où il vaut ask − bid.
+    _si = mt5.symbol_info(cfg.symbol)
+    point = float(_si.point) if _si is not None else 1.0
+
     mt5.shutdown()
 
     if rates_m1 is None or rates_h1 is None:
@@ -355,32 +644,36 @@ def load_mt5_data(cfg: PPOConfig) -> pd.DataFrame:
 
     print(f"[DATA] M1 bougies brutes : {len(rates_m1):,}  |  H1 : {len(rates_h1):,}")
 
-    df_m1 = pd.DataFrame(rates_m1)
-    df_m1["time"] = pd.to_datetime(df_m1["time"], unit="s")
-    df_m1.set_index("time", inplace=True)
-    df_m1 = df_m1[["open", "high", "low", "close", "tick_volume"]]
-    df_m1 = add_indicators(df_m1)
+    if feats_ext is None or len(feats_ext) == 0:
+        raise RuntimeError(
+            f"Source externe absente : {SOURCE_EXT_NOM}.\n"
+            f"Deux des dix features en dépendent. Lancer "
+            f"build_binance_features.py d'abord."
+        )
+    print(f"[{SOURCE_EXT_NOM}] {len(feats_ext):,} minutes")
 
-    df_h1 = pd.DataFrame(rates_h1)
-    df_h1["time"] = pd.to_datetime(df_h1["time"], unit="s")
-    df_h1.set_index("time", inplace=True)
-    df_h1 = df_h1[["open", "high", "low", "close", "tick_volume"]]
-    df_h1 = add_indicators(df_h1)
-    df_h1 = df_h1.add_suffix("_h1")
+    # dropna_subset EXPLICITE. Sans lui, merge_m1_h1 fait un dropna() sur TOUTES
+    # les colonnes — y compris vol_rank_h1 et high_vol_regime_h1, qui reposent
+    # sur un glissant de 1440 bougies H1, soit 60 JOURS d'amorcage. Aucune des
+    # deux n'est dans FEATURE_COLS : on jetait donc deux mois de donnees a cause
+    # de colonnes que le modele ne voit jamais. Sur une fenetre de 3.75 ans deja
+    # bornee par la couverture Binance, c'est 4.6 % du jeu.
+    # Les backtests passaient deja ce sous-ensemble ; l'entrainement, non.
+    merged = merge_m1_h1(rates_m1, rates_h1, feats_ext=feats_ext, point=point,
+                         dropna_subset=FEATURE_COLS + ["atr_14"])
+    print(f"{len(merged)} bougies M1 alignées avec H1 + {SOURCE_EXT_NOM} "
+          f"après indicateurs.")
 
-    df_m1_reset = df_m1.reset_index()
-    df_h1_reset = df_h1.reset_index()
-    df_h1_reset = df_h1_reset.rename(columns={"time_h1": "time"})
+    if cfg.use_data_cache:
+        path = _data_cache_path(cfg)
+        try:
+            merged.to_pickle(path)
+            print(f"[CACHE] Sauvegardé → {path} "
+                  f"({os.path.getsize(path) / 1e6:.0f} Mo) : les prochains lancements "
+                  f"sauteront le calcul des indicateurs.")
+        except Exception as e:
+            print(f"[CACHE] Écriture impossible ({e}) — sans conséquence.")
 
-    merged = pd.merge_asof(
-        df_m1_reset.sort_values("time"),
-        df_h1_reset.sort_values("time"),
-        on="time",
-        direction="backward"
-    )
-
-    merged = merged.dropna().reset_index(drop=True)
-    print(f"{len(merged)} bougies M1 alignées avec H1 après indicateurs.")
     return merged
 
 
@@ -388,31 +681,36 @@ def load_mt5_data(cfg: PPOConfig) -> pd.DataFrame:
 # FEATURES / NORMALISATION
 # ============================================================
 
-FEATURE_COLS_M1 = [
-    "open", "high", "low", "close",
-    "rsi_14",
-    "returns", "vol_20", "range_norm",
-    "mom_5", "rsi_ok", "high_vol_regime",   # 3 features momentum / régime
-]
-
-FEATURE_COLS_H1 = [
-    "close_h1",
-    "rsi_14_h1",
-    "returns_h1", "vol_20_h1", "range_norm_h1",
-]
-
-FEATURE_COLS = FEATURE_COLS_M1 + FEATURE_COLS_H1
-
-N_BASE_FEATURES = len(FEATURE_COLS)
-N_POS_FEATURES = 4
-OBS_N_FEATURES = N_BASE_FEATURES + N_POS_FEATURES
 
 
 def compute_and_save_global_norm_stats(df: pd.DataFrame, feature_cols: List[str]) -> Dict[str, np.ndarray]:
     X = df[feature_cols].values.astype(np.float32)
     mean, std = X.mean(0), X.std(0)
+
+    # GARDE-FOU : une seule valeur non finie dans une colonne suffit a rendre sa
+    # moyenne et son ecart-type NaN, et la normalisation empoisonne alors
+    # TOUTES les lignes de cette colonne — pas seulement celles qui etaient
+    # mauvaises. Le symptome final est « probabilities contain NaN » au tirage
+    # de l'action, sans rapport visible avec la cause.
+    #
+    # Ecrire un fichier de stats NaN est le pire cas : il est relu ensuite sans
+    # broncher a chaque lancement. On refuse de l'ecrire.
+    mauvais = [feature_cols[k] for k in range(len(feature_cols))
+               if not (np.isfinite(mean[k]) and np.isfinite(std[k]))]
+    if mauvais:
+        raise ValueError(
+            f"Statistiques non finies pour : {', '.join(mauvais)}. Le dataframe "
+            f"contient des NaN sur ces colonnes — il n'a pas ete filtre sur le "
+            f"jeu de features courant. Refus d'ecrire {NORM_STATS_PATH}, qui "
+            f"serait relu en silence a chaque lancement."
+        )
+
     stats = {"mean": mean, "std": std}
-    np.savez(NORM_STATS_PATH, mean=mean, std=std)
+    # Les NOMS sont stockés avec les stats : ne vérifier que leur nombre laissait
+    # passer un changement de définition à cardinalité constante (remplacer les
+    # prix bruts par des ratios, par exemple) — le fichier obsolète était alors
+    # rechargé en silence et normalisait avec des mean/std sans rapport.
+    np.savez(NORM_STATS_PATH, mean=mean, std=std, features=np.array(feature_cols))
     print(f"Stats de normalisation GLOBALes sauvegardées → {NORM_STATS_PATH}")
     return stats
 
@@ -420,12 +718,24 @@ def compute_and_save_global_norm_stats(df: pd.DataFrame, feature_cols: List[str]
 def load_global_norm_stats() -> Optional[Dict[str, np.ndarray]]:
     if not os.path.exists(NORM_STATS_PATH):
         return None
-    data = np.load(NORM_STATS_PATH)
+    data = np.load(NORM_STATS_PATH, allow_pickle=True)
     stats = {"mean": data["mean"], "std": data["std"]}
-    # Vérifie cohérence avec la liste FEATURE_COLS courante (sinon recompute)
+
     if stats["mean"].shape[0] != len(FEATURE_COLS):
-        print(f"[NORM] Mismatch features : {stats['mean'].shape[0]} vs {len(FEATURE_COLS)} actuelles → recompute.")
+        print(f"[NORM] Mismatch cardinalité : {stats['mean'].shape[0]} vs "
+              f"{len(FEATURE_COLS)} actuelles → recompute.")
         return None
+
+    if "features" not in data:
+        print("[NORM] Fichier sans noms de features (format antérieur) → recompute.")
+        return None
+
+    cached = [str(x) for x in data["features"]]
+    if cached != list(FEATURE_COLS):
+        changed = set(cached) ^ set(FEATURE_COLS)
+        print(f"[NORM] Features modifiées ({', '.join(sorted(changed))}) → recompute.")
+        return None
+
     print(f"Stats de normalisation GLOBALes chargées depuis → {NORM_STATS_PATH}")
     return stats
 
@@ -436,11 +746,23 @@ class MarketData:
         X = df[feature_cols].values.astype(np.float32)
 
         if stats is not None:
-            mean, std = stats["mean"], stats["std"]
-            std = np.where(std < 1e-8, 1.0, std)
-            X = (X - mean) / std
-            # Clip ±5σ : aligné avec safe_normalize() backtest/live → robustesse aux outliers
-            X = np.clip(X, -5.0, 5.0)
+            # Passe par le noyau : diviser par (std + 1e-8) plutôt que par un std
+            # corrigé donnait un écart de ~2e-5 sur l'obs entre training et live.
+            X = safe_normalize(X, stats)
+
+        # GARDE-FOU : un NaN ici traverse le reseau sans bruit et ne se
+        # manifeste qu'au tirage de l'action, sous la forme
+        # « ValueError: probabilities contain NaN » — un message qui ne dit ni
+        # quelle colonne ni quelle ligne. On echoue ici, en nommant le coupable.
+        if not np.isfinite(X).all():
+            mauvais = np.where(~np.isfinite(X).all(axis=0))[0]
+            noms = ", ".join(f"{feature_cols[k]} ({int((~np.isfinite(X[:, k])).sum())} lignes)"
+                             for k in mauvais)
+            raise ValueError(
+                f"Valeurs non finies dans les features apres normalisation : {noms}. "
+                f"Le dataframe n'a pas ete filtre sur le jeu de features courant "
+                f"— cache obsolete, ou dropna_subset incomplet."
+            )
 
         self.features = X
         self.close = df["close"].values.astype(np.float32)
@@ -596,6 +918,9 @@ class BTCTradingEnvDiscrete(gym.Env):
         self.tp_price = 0.0
         self.entry_idx = -1
         self.entry_atr = 0.0
+        self.risk_amount = 0.0
+        # Spread du trade en cours — réé-échantillonné à chaque ouverture
+        self.current_trade_spread_bps = float(self.cfg.spread_bps)
 
         self.last_realized_pnl = 0.0
         self.peak_capital = self.capital
@@ -659,31 +984,108 @@ class BTCTradingEnvDiscrete(gym.Env):
         return obs
 
     def _apply_micro(self, price: float, side: int, is_entry: bool = True) -> float:
-        spread = self.cfg.spread_bps / 10_000.0
-        if is_entry:
-            price *= (1 + side * spread * 0.5)
-        else:
-            price *= (1 - side * spread * 0.5)
+        """Paie le half-spread à chaque transaction (entrée OU sortie).
+        `side` = direction de l'exécution actuelle :
+          +1 = BUY  → paie ASK = mid + half_spread (price augmente)
+          -1 = SELL → reçoit BID = mid - half_spread (price diminue)
+        Le caller passe `side = self.position` à l'entrée et `side = -self.position`
+        à la sortie (direction du trade de fermeture).
+        À l'entrée, on ajoute aussi un slippage stochastique (delay 118ms MT5)
+        toujours défavorable au trader.
+        """
+        spread = self.current_trade_spread_bps / 10_000.0
+        price *= (1 + side * spread * 0.5)
+        if is_entry and self.cfg.entry_slippage_bps > 0:
+            extra = np.random.uniform(0.0, self.cfg.entry_slippage_bps) / 10_000.0
+            price *= (1 + side * extra)
         return price
 
+    def _sample_trade_spread_bps(self) -> float:
+        """Échantillonne le spread pour le trade qui démarre.
+
+        Distribution bimodale calibrée sur les logs MT5 Vantage BTCUSD :
+          - (1 - wide_prob) % : spread tight ≈ valeur centrale ±2% (session active)
+                                 ex : 2.45-2.55 bps (16.7-17.3$ sur BTC 68k)
+          - wide_prob %        : spread élargi 1.2× à wide_factor× (overnight / news)
+                                 ex : 3.0-7.5 bps (20-50$ sur BTC 68k)
+        """
+        base = float(self.cfg.spread_bps)
+        if base <= 0.0:
+            return 0.0
+        if np.random.rand() < self.cfg.spread_wide_prob:
+            low  = base * 1.2
+            high = base * self.cfg.spread_bps_wide_factor
+            return float(np.random.uniform(low, high))
+        else:
+            return float(np.random.uniform(base * 0.98, base * 1.02))
+
     def _compute_dynamic_size(self, price: float) -> float:
-        base = float(self.cfg.position_size)
+        """Taille dictée par le RISQUE, jamais par une constante absolue.
+
+        L'ancienne version renvoyait `position_size` (0.06, moitié pendant 40
+        epochs) quels que soient le prix et l'ATR. Une constante en unités de
+        l'instrument ne veut rien dire d'un symbole à l'autre :
+
+          BTC, SL 3xATR ~= 270 $  -> perte de 8.100 $ = 0.8100 % du capital
+          OR,  SL 5xATR ~= 2.50 $ -> perte de 0.075 $ = 0.0075 % du capital
+
+        soit un facteur 108 pour un risque économique censé être IDENTIQUE. Sur
+        l'or le modèle jouait donc une position si petite que le terme de PnL
+        réalisé de la récompense valait 0.007 : noyé sous le bruit de marquage
+        au marché, et incapable de faire déclencher le moindre garde-fou de
+        drawdown. `risk_per_trade = 1.2 %` était dans la config depuis le début
+        mais n'était lu nulle part.
+
+        On le lit. size = risque_voulu / distance_de_stop : une perte au stop
+        coûte exactement `risk_per_trade` du capital, sur n'importe quel
+        symbole, à n'importe quel prix, sous n'importe quelle volatilité.
+        """
         scale = float(max(self.risk_scale, 0.0))
         if scale <= 0.0:
             scale = 1.0
 
-        # Taille réduite pendant les 40 premières epochs
-        if hasattr(self.cfg, "current_epoch") and self.cfg.current_epoch <= 40:
-            size = base * scale * 0.5
-        else:
-            size = base * scale
+        # MEME ATR que celui qui posera le stop quelques lignes plus bas : s'ils
+        # divergeaient, la perte au stop ne vaudrait plus le risque visé et
+        # toute l'échelle de récompense repartirait à la dérive.
+        atr_raw = float(self.data.atr14[self.idx - 1]) if self.idx - 1 >= 0 else 0.0
+        atr = max(atr_raw, ATR_PLANCHER_FRAC * price, 1e-8)
+        sl_dist = self.cfg.atr_sl_mult * atr
+        if not np.isfinite(sl_dist) or sl_dist <= 0.0:
+            return 0.0
 
-        return float(size)
+        size = (self.capital * self.cfg.risk_per_trade * scale) / sl_dist
+
+        # Plafond de NOTIONNEL, exprime directement en multiples du capital.
+        #
+        # Il valait `capital x max_position_frac x leverage`. Faire dependre un
+        # garde-fou du levier est un piege : en portant le levier de 6 a 100
+        # pour rendre la taille par le risque possible, le plafond est passe de
+        # 2.1x a 35x le capital SANS QUE RIEN NE LE SIGNALE. Un plafond ne doit
+        # dependre que de lui-meme.
+        #
+        # 30x est haut, et c'est assume : un stop a 5xATR sur l'or vaut 0.073 %
+        # du prix, donc risquer 1.2 % demande ~16x de notionnel. C'est le prix
+        # d'un stop serre, et le stop borne la perte. Le plafond ne sert qu'a
+        # bloquer le cas degenere ou l'ATR s'effondre et ou la taille partirait
+        # a l'infini.
+        notion_max = self.capital * self.cfg.max_notional_mult
+        size = min(size, notion_max / max(price, 1e-8))
+
+        return float(max(size, 0.0))
 
     def step(self, action: int):
         price = self.data.close[self.idx]
         high_bar = self.data.high[self.idx]
         low_bar = self.data.low[self.idx]
+
+        # Tick noise : étend bar.high vers le haut / bar.low vers le bas
+        # pour simuler les wicks intra-minute non capturés par l'agrégation M1.
+        # MT5 tester real ticks voit ces extrêmes, le training pas → mismatch.
+        if self.cfg.tick_noise_bps > 0:
+            noise_h = np.random.uniform(0.0, self.cfg.tick_noise_bps) / 10_000.0
+            noise_l = np.random.uniform(0.0, self.cfg.tick_noise_bps) / 10_000.0
+            high_bar = high_bar * (1.0 + noise_h)
+            low_bar  = low_bar  * (1.0 - noise_l)
 
         old_pos = self.position
         prev_capital = self.capital
@@ -697,12 +1099,12 @@ class BTCTradingEnvDiscrete(gym.Env):
                 prev_price_worst = self.data.low[self.idx - 1] if old_pos == 1 else self.data.high[self.idx - 1]
             else:
                 prev_price_worst = price
-            prev_latent = old_pos * (prev_price_worst - self.entry_price) * self.current_size * self.cfg.leverage
+            prev_latent = old_pos * (prev_price_worst - self.entry_price) * self.current_size
         prev_equity = prev_capital + prev_latent
 
         realized = 0.0
         realized_trade = 0.0
-        hit_sl = hit_tp = False
+        hit_sl = hit_tp = hit_temps = False
 
         if old_pos != 0:
             self.bars_in_position += 1
@@ -721,16 +1123,25 @@ class BTCTradingEnvDiscrete(gym.Env):
             if size > 0.0:
                 self.current_size = size
                 self.position = side
+                # Échantillonne le spread pour ce trade (variabilité réaliste)
+                self.current_trade_spread_bps = self._sample_trade_spread_bps()
                 exec_price = self._apply_micro(price, side, is_entry=True)
                 self.entry_price = exec_price
                 self.entry_idx = self.idx
 
                 atr_raw = float(self.data.atr14[self.idx - 1]) if self.idx - 1 >= 0 else 0.0
-                fallback = 0.0015 * exec_price
+                # MEME plancher que saint_core.effective_atr — le dupliquer ici
+                # avec une autre valeur ferait diverger l'entrainement du live.
+                fallback = ATR_PLANCHER_FRAC * exec_price
                 self.entry_atr = max(atr_raw, fallback, 1e-8)
 
                 sl_dist = self.cfg.atr_sl_mult * self.entry_atr
                 tp_dist = self.cfg.atr_tp_mult * self.entry_atr * self.cfg.tp_shrink
+
+                # Montant réellement en jeu si le stop est touché. C'est l'unité
+                # dans laquelle la récompense du trade sera exprimée : un stop
+                # vaut -1, une cible à R:R 2 vaut +2, partout et toujours.
+                self.risk_amount = float(sl_dist * self.current_size)
 
                 if side == 1:
                     self.sl_price = max(1e-8, exec_price - sl_dist)
@@ -743,7 +1154,10 @@ class BTCTradingEnvDiscrete(gym.Env):
                 self.trail_active    = False
 
         # --------- BREAK-EVEN + TRAILING STOP ---------
-        if (not manual_close and self.position != 0
+        # Désactivé par défaut (cfg.use_be_trail=False) pour aligner sur le
+        # backtest "no_be_trail" et sur le MQL5 SaintV2_WF3 (sans BE/trail).
+        # Permet d'isoler la qualité du signal d'entrée pur (SL/TP fixes uniquement).
+        if (self.cfg.use_be_trail and not manual_close and self.position != 0
                 and self.current_size > 0 and self.entry_atr > 1e-8
                 and self.idx > self.entry_idx):
             fav_price = high_bar if self.position == 1 else low_bar
@@ -767,26 +1181,58 @@ class BTCTradingEnvDiscrete(gym.Env):
                 self.trail_active = True
 
         # --------- SL/TP AUTO ---------
+        # Trigger asymétrique BID/ASK aligné sur MT5 réel :
+        #   - bar.high / bar.low représentent les extrêmes du BID
+        #   - LONG  exit  : SELL au BID → SL triggers quand BID <= sl + s, TP quand BID >= tp + s
+        #   - SHORT exit  : BUY  à l'ASK → SL triggers quand ASK >= sl, soit BID >= sl - s
+        #                                   TP triggers quand ASK <= tp, soit BID <= tp - s
+        # Quand spread_bps = 0, c'est équivalent à la version sans compensation.
         if not manual_close and self.position != 0 and self.current_size > 0 and self.entry_price > 0 and self.idx > self.entry_idx:
             exit_price = None
-            if self.position == 1:
-                if self.sl_price > 0 and low_bar <= self.sl_price:
+            # Spread du trade en cours en $ (échantillonné à l'entrée)
+            s = self.entry_price * (self.current_trade_spread_bps / 10_000.0)
+
+            if self.position == 1:  # LONG
+                if self.sl_price > 0 and low_bar <= self.sl_price + s:
                     exit_price = self.sl_price
                     hit_sl = True
-                elif self.tp_price > 0 and high_bar >= self.tp_price:
+                elif self.tp_price > 0 and high_bar >= self.tp_price + s:
                     exit_price = self.tp_price
                     hit_tp = True
-            else:
-                if self.sl_price > 0 and high_bar >= self.sl_price:
+            else:                    # SHORT
+                if self.sl_price > 0 and high_bar + s >= self.sl_price:
                     exit_price = self.sl_price
                     hit_sl = True
-                elif self.tp_price > 0 and low_bar <= self.tp_price:
+                elif self.tp_price > 0 and low_bar + s <= self.tp_price:
                     exit_price = self.tp_price
                     hit_tp = True
 
+            # Ni SL ni TP : on cloture AU MARCHE au plafond de detention, comme
+            # le faisait la mesure qui a choisi ce SL/TP.
+            if (exit_price is None and self.cfg.max_holding_bars > 0
+                    and self.bars_in_position >= self.cfg.max_holding_bars):
+                exit_price = price
+                hit_temps = True
+
             if exit_price is not None:
+                # Slippage asymétrique (118ms delay MT5) :
+                #   - SL : marché continue contre nous → fill PIRE que sl (loss++)
+                #   - TP : momentum continue avec nous → fill MIEUX que tp (profit++)
+                slip_max = self.cfg.slippage_bps / 10_000.0
+                if slip_max > 0:
+                    slip_amount = exit_price * np.random.uniform(0.0, slip_max)
+                    # Une sortie au marche (temps ecoule) traverse le spread :
+                    # elle est DEFAVORABLE comme un SL, jamais favorable comme
+                    # un TP ou le momentum joue pour nous.
+                    contre = hit_sl or hit_temps
+                    if self.position == 1:   # LONG
+                        exit_price += (-slip_amount if contre else slip_amount)
+                    else:                     # SHORT
+                        exit_price += (slip_amount if contre else -slip_amount)
+
+                # Spread cost à la sortie (half_spread payé en fermant le trade)
                 exit_price = self._apply_micro(exit_price, -self.position, is_entry=False)
-                pnl = self.position * (exit_price - self.entry_price) * self.current_size * self.cfg.leverage
+                pnl = self.position * (exit_price - self.entry_price) * self.current_size
                 fee = self.cfg.fee_rate * exit_price * self.current_size
                 realized = pnl - fee
                 realized_trade = realized
@@ -804,6 +1250,7 @@ class BTCTradingEnvDiscrete(gym.Env):
                     "pnl": float(realized),
                     "hit_sl": bool(hit_sl),
                     "hit_tp": bool(hit_tp),
+                    "hit_temps": bool(hit_temps),
                     "hold_bars": int(self.idx - self.entry_idx),
                 })
 
@@ -825,64 +1272,75 @@ class BTCTradingEnvDiscrete(gym.Env):
         latent = 0.0
         if self.position != 0 and self.current_size > 0 and self.entry_price > 0:
             price_for_pnl = low_bar if self.position == 1 else high_bar
-            latent = self.position * (price_for_pnl - self.entry_price) * self.current_size * self.cfg.leverage
+            latent = self.position * (price_for_pnl - self.entry_price) * self.current_size
 
         equity = self.capital + latent
         equity_clamped = max(equity, 1e-8)
         prev_equity_clamped = max(prev_equity, 1e-8)
         log_ret = math.log(equity_clamped / prev_equity_clamped)
 
-        # Base reward plus fort maintenant que le modèle devient plus mature
+        # BORNE PAR BOUGIE. Le terme de marquage au marche n'est qu'un shaping :
+        # il densifie le signal entre l'entree et la sortie. Une seule bougie ne
+        # doit jamais pouvoir peser plus que le resultat du trade lui-meme.
+        #
+        # Sans borne, il le peut : l'equity est ecretee a 1e-8 quand une position
+        # a fort notionnel est balayee, et log(1e-8 / 950) = -25.3 produit une
+        # recompense de -253. Mesure a l'epoch 1 : |R| 338, advStd 28168, et
+        # surtout quasi0 100 % — les avantages etant normalises par leur
+        # ecart-type, une poignee de valeurs geantes ecrase TOUS les autres sous
+        # 0.05 et l'acteur ne recoit plus aucun gradient (g[actor 1.5e-04]).
+        log_ret = max(min(log_ret, 0.05), -0.05)
+
+        # ==================================================================
+        # REWARD ALIGNÉ SUR LA RENTABILITÉ RÉELLE
+        #
+        # L'ancien shaping additionnait quatre termes qui récompensaient le fait
+        # d'ÊTRE EN POSITION indépendamment du résultat :
+        #   hit_tp +1.0 / hit_sl -0.5   → un gain valait 2× une perte
+        #   +0.4 si trade gagnant        → bonus sans contrepartie
+        #   -move × 2.5 si flat          → punissait le fait d'attendre
+        #   +|unrealized| × 2.8          → gain latent payé, perte latente non
+        # Avec WR 31% et avgW/avgL ≈ 1.0 (mesurés), l'espérance en reward valait
+        # 0.31 × 1.4 - 0.69 × 0.5 = +0.089 : le modèle était donc RÉCOMPENSÉ
+        # pour une stratégie perdante. Il a appris exactement ça — en position
+        # 97% du temps, PnL de validation plat sur 75 epochs.
+        #
+        # On ne garde que ce qui correspond à de l'argent réel, symétriquement.
+        # ==================================================================
         reward = log_ret * 10.0
 
-        # TP / SL
-        if hit_tp:
-            reward += 1.0
-        if hit_sl:
-            reward -= 0.5
+        # Shaping sur trade réalisé : proportionnel au PnL et SYMÉTRIQUE, pour
+        # densifier le signal sans réintroduire de biais directionnel.
+        # Échelle : ±1% du capital initial sature le terme.
+        if realized_trade != 0.0:
+            # Exprimé en R : le montant risqué sur CE trade sert d'unité. Un
+            # stop touché vaut -1, la cible (R:R 2.0) vaut +2, une sortie au
+            # temps vaut ce qu'elle vaut entre les deux. Diviser par une
+            # constante en dollars, comme avant, rendait ce terme dépendant du
+            # prix du symbole : 0.81 sur Bitcoin, 0.007 sur l'or.
+            reward += float(np.clip(
+                realized_trade / max(getattr(self, "risk_amount", 0.0), 1e-8),
+                -3.0, 3.0
+            ))
 
-        # Bonus réalisé gagnant
-        if realized_trade > 0:
-            reward += 0.4 + realized_trade * 0.3
+        # Le "Momentum-Confirmed Entry Bonus" (+1.8 à l'ouverture quand mom_5 /
+        # rsi_ok / high_vol_regime s'alignent) est retiré : il payait le fait
+        # d'OUVRIR, sans jamais regarder le résultat du trade. C'était un a
+        # priori codé en dur qui poussait au sur-trading, et sa magnitude (1.8)
+        # écrasait le terme de PnL réel. Si ces conditions ont de la valeur, le
+        # modèle peut la retrouver — elles sont dans ses features d'entrée.
 
-        # Malus flat très léger
-        move = abs(price - self.data.close[self.idx - 1]) / price
-        if self.position == 0 and move > 0.00015:
-            reward -= move * 2.5
-
-        # Bonus latent doux
-        if self.position != 0 and self.entry_price > 0:
-            unrealized = self.position * (price - self.entry_price) / self.entry_price
-            if unrealized * self.position > 0:
-                reward += abs(unrealized) * 2.8
-
-        # ------------------------------------------------------------------
-        # Momentum-Confirmed Entry Bonus (LONG + SHORT)
-        # ------------------------------------------------------------------
-        if self.idx >= 10:
-            # features normalisées à t-1
-            mom_5_val    = self.data.features[self.idx - 1, FEATURE_COLS.index("mom_5")]
-            rsi_ok_val   = self.data.features[self.idx - 1, FEATURE_COLS.index("rsi_ok")]
-            high_vol_val = self.data.features[self.idx - 1, FEATURE_COLS.index("high_vol_regime")]
-
-            just_opened_long  = (self.position == 1 and old_pos == 0)
-            just_opened_short = (self.position == -1 and old_pos == 0)
-
-            # LONG : momentum haussier + RSI sain + haut régime de vol
-            if just_opened_long and mom_5_val > 0.5 and rsi_ok_val > 0.5 and high_vol_val > 0.5:
-                reward += 1.8
-
-            # SHORT : momentum baissier + RSI sain + haut régime de vol
-            if just_opened_short and mom_5_val < 0.5 and rsi_ok_val > 0.5 and high_vol_val > 0.5:
-                reward += 1.8
-
-        # Holding penalty plus tôt et progressive
-        if self.bars_in_position > 9:
-            reward -= 1e-4 * (self.bars_in_position - 9) ** 1.5
-
-        # Clip final
+        # Clip SYMÉTRIQUE. L'ancien [-0.7, +1.4] signalait qu'un gain vaut deux
+        # fois une perte, alors que le winrate d'équilibre mesuré est de 49.6% —
+        # soit un rapport de 1:1. Cette asymétrie à elle seule rendait une
+        # stratégie perdante attractive.
+        # Borne de sécurité contre les valeurs aberrantes (gap, ATR dégénéré),
+        # PAS un rabot sur le résultat des trades : à +-1 elle ramènerait une
+        # cible à +2 R au niveau d'un stop à -1 R, c'est-a-dire qu'elle
+        # enseignerait un R:R de 1.0 alors que la configuration en vise 2.0 —
+        # et ferait passer le winrate d'équilibre de 33 % à 50 %.
         if hasattr(self.cfg, "current_epoch") and self.cfg.current_epoch >= 10:
-            reward = float(np.clip(reward, -0.7, 1.4))
+            reward = float(np.clip(reward, -3.5, 3.5))
 
         # ==================================================================
         # Finalisation
@@ -891,14 +1349,16 @@ class BTCTradingEnvDiscrete(gym.Env):
         dd = (self.peak_capital - equity) / (self.peak_capital + 1e-8)
         self.max_dd = max(self.max_dd, dd)
 
+        # Pénalité DD réactivée (max_drawdown=0.40) — punit les trajectoires catastrophiques
         if dd > self.cfg.max_drawdown:
-            reward -= 2.0
+            reward -= 0.2
 
         self.idx += 1
         done = (self.idx >= self.end_idx)
         done_reason = "episode_end" if done else None
 
-        # Terminaison anticipée : max drawdown ou capital insuffisant
+        # Terminaisons anticipées RÉACTIVÉES (max_drawdown=0.40, min_capital_frac=0.20)
+        # Config validée +135 EUR MT5 tester.
         if not done:
             if dd > self.cfg.max_drawdown:
                 done = True
@@ -917,159 +1377,38 @@ class BTCTradingEnvDiscrete(gym.Env):
         }
 
 
-# ======================================================================
-# SAINT v2 — SINGLE-HEAD (ACTOR + CRITIC)
-# ======================================================================
-
-class GatedFFN(nn.Module):
-    def __init__(self, d: int, mult: int = 2, dropout: float = 0.05):
-        super().__init__()
-        inner = d * mult
-        self.lin1 = nn.Linear(d, inner * 2)
-        self.lin2 = nn.Linear(inner, d)
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(d)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.norm(x)
-        a, gate = self.lin1(h).chunk(2, dim=-1)
-        h = a * torch.sigmoid(gate)
-        h = self.lin2(self.dropout(h))
-        return x + h
-
-
-class ColumnAttention(nn.Module):
-    def __init__(self, d: int, heads: int, dropout: float):
-        super().__init__()
-        self.norm = nn.LayerNorm(d)
-        self.attn = nn.MultiheadAttention(
-            d, heads, dropout=dropout, batch_first=True
-        )
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, F, D = x.shape
-        h = x.reshape(B * T, F, D)
-        h2 = self.norm(h)
-        out, _ = self.attn(h2, h2, h2)
-        h = h + self.drop(out)
-        return h.reshape(B, T, F, D)
-
-
-class RowAttention(nn.Module):
-    def __init__(self, d: int, heads: int, dropout: float):
-        super().__init__()
-        self.norm = nn.LayerNorm(d)
-        self.attn = nn.MultiheadAttention(
-            d, heads, dropout=dropout, batch_first=True
-        )
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, F, D = x.shape
-        h = x.permute(0, 2, 1, 3).reshape(B * F, T, D)
-        h2 = self.norm(h)
-        out, _ = self.attn(h2, h2, h2)
-        h = h + self.drop(out)
-        h = h.reshape(B, F, T, D).permute(0, 2, 1, 3)
-        return h
-
-
-class SAINTv2Block(nn.Module):
-    def __init__(self, d: int, heads: int, dropout: float, mult: int):
-        super().__init__()
-        self.ra1 = RowAttention(d, heads, dropout)
-        self.ff1 = GatedFFN(d, mult, dropout)
-
-        self.ra2 = RowAttention(d, heads, dropout)
-        self.ff2 = GatedFFN(d, mult, dropout)
-
-        self.ca = ColumnAttention(d, heads, dropout)
-        self.ff3 = GatedFFN(d, mult, dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.ra1(x)
-        x = self.ff1(x)
-        x = self.ra2(x)
-        x = self.ff2(x)
-        x = self.ca(x)
-        x = self.ff3(x)
-        return x
-
-
-class SAINTPolicySingleHead(nn.Module):
-    def __init__(
-        self,
-        n_features: int = OBS_N_FEATURES,
-        d_model: int = 80,
-        num_blocks: int = 2,
-        heads: int = 4,
-        dropout: float = 0.05,
-        ff_mult: int = 2,
-        max_len: int = 64,
-        n_actions: int = N_ACTIONS,
-    ):
-        super().__init__()
-        self.n_features = n_features
-        self.d_model = d_model
-        self.n_actions = n_actions
-
-        self.input_proj = nn.Linear(1, d_model)
-        self.scale = math.sqrt(d_model)
-        self.row_emb = nn.Embedding(max_len, d_model)
-        self.col_emb = nn.Embedding(n_features, d_model)
-
-        self.blocks = nn.ModuleList([
-            SAINTv2Block(d_model, heads, dropout, ff_mult)
-            for _ in range(num_blocks)
-        ])
-
-        self.norm = nn.LayerNorm(d_model)
-
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, 256),
-            nn.ReLU(),
-            nn.Dropout(0.05),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-        )
-
-        self.actor = nn.Linear(256, n_actions)
-        self.critic = nn.Linear(256, 1)
-
-    def forward(self, x: torch.Tensor):
-        assert x.dim() == 3, f"Input x must be (B,T,F), got {x.shape}"
-        B, T, F = x.shape
-
-        tok = self.input_proj(x.unsqueeze(-1)) * self.scale
-
-        rows = torch.arange(T, device=x.device).view(1, T, 1).expand(B, T, F)
-        cols = torch.arange(F, device=x.device).view(1, 1, F).expand(B, T, F)
-
-        tok = tok + self.row_emb(rows) + self.col_emb(cols)
-
-        for blk in self.blocks:
-            tok = blk(tok)
-
-        h_time = tok.mean(dim=1)
-        h_feat = tok.mean(dim=2)
-
-        cls_time = h_time.mean(dim=1)
-        cls_feat = h_feat.mean(dim=1)
-
-        h = cls_time + cls_feat
-        h = self.norm(h)
-        h = self.mlp(h)
-
-        logits = self.actor(h)
-        value = self.critic(h).squeeze(-1)
-
-        return logits, value
-
 
 # ======================================================================
 # PPO UTILITAIRES
 # ======================================================================
+
+def etat_gpu() -> str:
+    """Temperature et frequence du GPU, pour le log d'epoch.
+
+    POURQUOI CETTE LIGNE EXISTE. Les epochs ralentissaient regulierement — 36 s,
+    50 s, 92 s, 112 s — et toutes les phases ensemble. On a d'abord cherche une
+    liste qui s'allonge, puis une inefficacite d'architecture. La cause etait
+    ailleurs : mesure en cours de run, GPU a 90 degres, frequence tombee a
+    210 MHz sur un maximum de 2100, raison de bridage 0x20 = SwThermalSlowdown.
+    La machine se bride a 10 % de sa vitesse, et rien dans le log ne le disait.
+
+    Un ralentissement thermique ressemble a un probleme de code tant qu'on ne
+    regarde pas la frequence. Maintenant on la regarde.
+    """
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=temperature.gpu,clocks.sm,clocks.max.sm",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3)
+        t, sm, mx = [int(x.strip()) for x in r.stdout.strip().split(",")]
+        pct = 100 * sm / max(mx, 1)
+        alerte = "  BRIDE" if pct < 70 else ""
+        return f"gpu[{t}C {sm}/{mx}MHz {pct:.0f}%{alerte}]"
+    except Exception:
+        return "gpu[?]"
+
 
 def get_device(cfg: PPOConfig):
     if cfg.force_cpu:
@@ -1118,30 +1457,27 @@ def compute_gae(rewards, values, dones, gamma, lam, last_value=0.0):
     return adv, returns
 
 
-def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
-    # 0=BUY  1=SELL  2=HOLD
-    mask = torch.zeros(N_ACTIONS, dtype=torch.bool, device=device)
+def compute_gae_semi_mdp(rewards, values, dones, dts, gamma, lam, last_value=0.0):
+    """GAE pour des actions de DURÉE VARIABLE.
 
-    if pos != 0:
-        mask[2] = True  # En position : seulement HOLD (fermeture par SL/TP/trailing)
-        return mask
+    Chaque transition k va d'une décision à la suivante et couvre Δt bougies :
+    `rewards[k]` est déjà la somme actualisée Σ γ^i r_i sur cette durée. Le
+    bootstrap doit donc être escompté de γ^Δt et non de γ, sinon une position
+    tenue 1000 bougies serait valorisée comme une attente d'une seule bougie.
+    """
+    values = list(values) + [last_value]
+    gae = 0.0
+    adv = []
 
-    if side == "both":
-        mask[0] = True   # BUY
-        mask[1] = True   # SELL
-        mask[2] = True   # HOLD
-    elif side == "long":
-        mask[0] = True
-        mask[2] = True
-    elif side == "short":
-        mask[1] = True
-        mask[2] = True
-    else:
-        mask[0] = True
-        mask[1] = True
-        mask[2] = True
+    for t in reversed(range(len(rewards))):
+        mask = 1 - int(dones[t])
+        g_dt = gamma ** max(int(dts[t]), 1)
+        delta = rewards[t] + g_dt * values[t + 1] * mask - values[t]
+        gae = delta + g_dt * lam * mask * gae
+        adv.insert(0, gae)
 
-    return mask
+    returns = [adv[i] + values[i] for i in range(len(adv))]
+    return adv, returns
 
 
 def build_action_mask_from_positions(positions: torch.Tensor, side: str) -> torch.Tensor:
@@ -1253,7 +1589,7 @@ def run_training_on_split(
         "val_long_w", "val_long_l", "val_long_pnl",
         "val_short_w", "val_short_l", "val_short_pnl",
         "sortino", "sortino30",
-        "actor_loss", "critic_loss", "entropy", "kl",
+        "actor_loss", "critic_loss", "entropy", "entropy_flat", "kl", "grad_norm",
         "buy_ratio", "sell_ratio", "hold_ratio",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as _f:
@@ -1269,8 +1605,30 @@ def run_training_on_split(
     with open(trades_csv_path, "w", newline="", encoding="utf-8") as _ft:
         _csv.DictWriter(_ft, fieldnames=_trades_fields).writeheader()
 
-    env = BTCTradingEnvDiscrete(train_data, cfg)
-    val_env = BTCTradingEnvDiscrete(val_data, cfg)
+    def _param_grad_norm(params) -> float:
+        total = 0.0
+        for p in params:
+            if p.grad is not None:
+                total += float(p.grad.detach().norm(2).item()) ** 2
+        return total ** 0.5
+
+    # Lignes de masque précalculées en numpy, dérivées de l'unique source de
+    # vérité (build_mask_from_pos_scalar) pour rester cohérentes avec le live.
+    # Seul le masque FLAT sert désormais : depuis la réécriture semi-MDP, la
+    # policy n'est jamais interrogée en position (l'action y est forcée).
+    MASK_FLAT = build_mask_from_pos_scalar(0, torch.device("cpu"), cfg.side).numpy()
+
+    # Pools d'environnements créés UNE SEULE FOIS : le constructeur calcule les
+    # quantiles de volatilité du curriculum sur tout le split (np.quantile sur
+    # ~1.2M lignes), donc les instancier à chaque epoch coûterait plusieurs
+    # minutes par fold pour rien. Ils sont simplement reset() à chaque epoch.
+    # Tous partagent le même objet cfg, donc cfg.current_epoch les pilote tous.
+    train_envs = [
+        BTCTradingEnvDiscrete(train_data, cfg) for _ in range(cfg.episodes_per_epoch)
+    ]
+    val_envs = [
+        BTCTradingEnvDiscrete(val_data, cfg) for _ in range(cfg.val_episodes)
+    ]
 
     policy = SAINTPolicySingleHead(
         n_features=OBS_N_FEATURES,
@@ -1284,6 +1642,14 @@ def run_training_on_split(
     ).to(device)
 
     optimizer = optim.Adam(policy.parameters(), lr=cfg.lr, eps=1e-8)
+
+    # Groupes de paramètres pour diagnostiquer d'où vient le gradient.
+    actor_head_params = [p for n, p in policy.named_parameters() if n.startswith("actor.")]
+    critic_head_params = [p for n, p in policy.named_parameters() if n.startswith("critic.")]
+    trunk_params = [
+        p for n, p in policy.named_parameters()
+        if not n.startswith(("actor.", "critic."))
+    ]
 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.epochs, eta_min=cfg.lr * 0.05
@@ -1315,6 +1681,28 @@ def run_training_on_split(
 
     reward_normalizer = RewardNormalizer()
 
+    # Seuil absolu réalisant la sélectivité visée, recalibré à chaque epoch sur
+    # la distribution de max(p_BUY, p_SELL). 0.0 à l'epoch 1 = aucun filtre :
+    # inventer une valeur avant d'avoir mesuré la moindre conviction n'aurait
+    # aucun sens.
+    calib_thr_courant = 0.0
+
+    # Seuil appliqué EN VALIDATION, calibré sur la distribution de conviction de
+    # la fenêtre de validation elle-même (celle de l'epoch précédente).
+    #
+    # Calibrer sur le train et appliquer au val ne marche pas : mesuré à
+    # l'epoch 8, le quantile train montait à 0.417 alors que toute la
+    # distribution val restait en dessous — 0 trade. La conviction du modèle
+    # dépend du régime, donc « trader les q % des meilleurs instants » doit se
+    # calibrer sur la fenêtre où l'on trade.
+    # UNE BARRE PAR CÔTÉ. Une barre unique sur max(p_BUY, p_SELL) dégénère :
+    # un écart de l'ordre du millième entre les deux côtés — du bruit — suffit à
+    # verrouiller la sélection sur un seul, et le côté verrouillé change à chaque
+    # epoch (mesuré : epoch 4 tout LONG, epoch 7 tout SHORT, zéro trade de
+    # l'autre côté dans les deux cas). Calibrer chaque côté sur SA propre
+    # distribution rend les deux accessibles quel que soit un biais constant.
+    calib_thr_val = [0.0, 0.0]      # [BUY, SELL]
+
     for epoch in range(1, cfg.epochs + 1):
         cfg.current_epoch = epoch
 
@@ -1334,126 +1722,233 @@ def run_training_on_split(
 
         action_counts_env = np.zeros(3, dtype=np.int64)
 
-        policy.train()
+        # eval() pour TOUTE l'epoch — collecte ET mise à jour.
+        #
+        # En train(), le dropout (p=0.05) était actif pendant la collecte : les
+        # log-probs stockés venaient d'un réseau échantillonné au hasard. Pire,
+        # la mise à jour tirait d'autres masques de dropout, donc le ratio PPO
+        # exp(new_log - old_log) ne valait pas 1 au premier pas alors qu'il le
+        # devrait par construction — le clipping s'appliquait à du bruit.
+        #
+        # Ne désactiver le dropout que sur la collecte aurait déplacé le biais
+        # sans le supprimer : il faut que π_old et π_new soient la MÊME fonction.
+        # eval() ne touche pas à autograd, les gradients circulent normalement.
+        policy.eval()
 
-        # --------- collecte expériences ---------
-        for ep in range(cfg.episodes_per_epoch):
-            state, info = env.reset()
-            done = False
+        # CHRONOMETRAGE PAR PHASE. Sans lui, on extrapole le cout d'une epoch a
+        # partir de micro-bancs d'essai — et un micro-banc lance PENDANT
+        # l'entrainement mesure la contention GPU, pas le code. C'est l'erreur
+        # qui m'a fait attribuer 11 minutes aux forwards alors qu'ils en valent
+        # 2. On mesure donc les phases la ou elles s'executent.
+        _t_phase = time.time()
+        _chrono = {}
 
-            ep_states = []
-            ep_actions = []
-            ep_logprobs = []
-            ep_rewards = []
-            ep_values = []
-            ep_dones = []
-            ep_positions = []
+        # --------- collecte expériences (épisodes VECTORISÉS) ---------
+        # Les épisodes avancent en lockstep : un seul forward batché par pas au
+        # lieu d'un forward batch-1 par épisode. Le profilage donne 6.56 ms pour
+        # un forward batch 1 contre 0.028 ms pour env.step() — 99.6% du coût est
+        # du lancement de kernels à vide, et un batch 16 coûte le même temps
+        # qu'un batch 1. Batcher les épisodes divise donc le temps par ~N.
+        envs = train_envs
+        n_envs = len(envs)
 
-            while not done:
-                pos = info.get("position", 0)
-                ep_positions.append(pos)
+        states: List[np.ndarray] = []
+        infos: List[Dict] = []
+        for e in envs:
+            s0, i0 = e.reset()
+            states.append(s0)
+            infos.append(i0)
 
-                s_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
+        ep_buf = [
+            {"states": [], "actions": [], "logprobs": [], "rewards": [],
+             "values": [], "dones": [], "positions": [], "dts": []}
+            for _ in range(n_envs)
+        ]
+        last_reason = [None] * n_envs
+        active = list(range(n_envs))
+
+        # Sélectivité visée cette epoch, et seuil absolu qui la réalise.
+        # Le seuil vient du quantile mesuré à l'epoch PRÉCÉDENTE : à l'epoch 1 il
+        # n'existe pas encore, on laisse alors passer toutes les décisions plutôt
+        # que d'inventer une valeur.
+        selectivite = selectivite_for_epoch(epoch)
+        conf_thr = calib_thr_courant
+        pbs_epoch: List[float] = []   # max(p_BUY, p_SELL) sur les états flat
+
+        # Probabilité d'ouverture forcée (curriculum), constante sur l'epoch
+        if epoch <= 15:
+            force_prob = max(0.15, 0.92 - epoch * 0.05)
+        elif epoch <= 35:
+            force_prob = 0.25
+        else:
+            force_prob = 0.05
+
+        # ============ ROLLOUT SEMI-MDP ============
+        # Une DÉCISION n'existe que lorsque l'agent est flat : en position le
+        # masque ne laisse que HOLD, donc appeler le réseau y est inutile — son
+        # résultat est jeté. Avec des stops à 10×ATR une position dure ~1140
+        # bougies, donc 98.5% des forwards ne servaient à rien.
+        #
+        # Ici on ne sollicite la policy QUE sur les envs flat. Les envs en
+        # position avancent d'un simple env.step(HOLD) à 0.028 ms, et leurs
+        # récompenses s'accumulent (actualisées) dans la décision qui a ouvert
+        # la position. Chaque transition devient donc :
+        #     (état de décision, action, R = Σ γ^i r_i, Δt = durée)
+        # ce qui est la formulation semi-MDP standard pour des actions de durée
+        # variable. Le GAE en tient compte via γ^Δt.
+        pending: List[Optional[Dict]] = [None] * n_envs
+
+        def _cloture(k: int, done_flag: bool) -> None:
+            """Ferme la décision en cours de l'env k et la verse au buffer."""
+            p = pending[k]
+            if p is None:
+                return
+            buf = ep_buf[k]
+            buf["positions"].append(0)          # une décision est toujours flat
+            buf["states"].append(p["state"])
+            buf["actions"].append(p["action"])
+            buf["logprobs"].append(p["logprob"])
+            buf["rewards"].append(p["R"])
+            buf["values"].append(p["value"])
+            buf["dones"].append(done_flag)
+            buf["dts"].append(max(p["dt"], 1))
+            pending[k] = None
+
+        while active:
+            # 1) Les positions qui viennent de se clore terminent leur décision.
+            for k in active:
+                if pending[k] is not None and infos[k].get("position", 0) == 0:
+                    _cloture(k, False)
+
+            # 2) Nouvelle décision pour les envs sans décision en cours.
+            #    Ce sont les seuls à nécessiter un forward.
+            deciding = [k for k in active if pending[k] is None]
+            actions_env = {k: 2 for k in active}
+
+            if deciding:
+                batch_np = np.stack([states[k] for k in deciding], axis=0)
+                s_tensor = torch.as_tensor(batch_np, dtype=torch.float32, device=device)
+                # Tous ces envs sont flat : un seul masque suffit.
+                masks_b = torch.from_numpy(
+                    np.repeat(MASK_FLAT[None, :], len(deciding), axis=0)
+                ).to(device)
 
                 with torch.no_grad():
-                    logits, value = policy(s_tensor)
-                    logits = logits[0]
+                    logits_b, values_b = policy(s_tensor)
+                    logits_mb = logits_b.masked_fill(~masks_b, MASK_VALUE)
+                    logp_b = torch.log_softmax(logits_mb, dim=-1)
+                    packed = torch.cat(
+                        [logp_b, values_b.reshape(-1, 1)], dim=1
+                    ).cpu().numpy()
 
-                    mask = build_mask_from_pos_scalar(pos, device, cfg.side)
-                    logits_masked = logits.masked_fill(~mask, MASK_VALUE)
+                logp_np = packed[:, :N_ACTIONS]
+                vals_np = packed[:, N_ACTIONS]
+                probs_np = np.exp(logp_np)
 
-                    dist = Categorical(logits=logits_masked)
-
-                    # ============ CURRICULUM D'OUVERTURE FORCÉE V2 ============
-                    force_opening = False
-                    chosen_action = None
-
-                    if pos == 0:
-                        if epoch <= 15:
-                            force_prob = max(0.15, 0.92 - epoch * 0.05)
-                        elif epoch <= 35:
-                            force_prob = 0.25
+                for bi, k in enumerate(deciding):
+                    # ---- CURRICULUM D'OUVERTURE FORCÉE ----
+                    a = None
+                    if np.random.rand() < force_prob:
+                        if cfg.side == "long":
+                            a = 0
+                        elif cfg.side == "short":
+                            a = 1
                         else:
-                            force_prob = 0.05
+                            # Équilibré : biaiser vers SELL sur un sous-jacent
+                            # passé de 25k$ à 89k$ revenait à nourrir le modèle
+                            # d'exemples perdants.
+                            a = random.choice([0, 1])
 
-                        if np.random.rand() < force_prob:
-                            force_opening = True
-                            # Plus de niveaux x1.8 : on force uniquement BUY1 (0) ou SELL1 (1)
-                            if cfg.side == "long":
-                                chosen_action = 0
-                            elif cfg.side == "short":
-                                chosen_action = 1
-                            else:
-                                # (C) Biais SHORT plus modéré (3/5 SELL au lieu de 5/7).
-                                # Trop biaisé fait apprendre "tout SELL = perdre" → policy
-                                # collapse vers HOLD-only. 60/40 est plus équilibré.
-                                chosen_action = random.choice([1, 1, 1, 0, 0])
-                    # =======================================================
+                    # Conviction de trade sur cet état, quelle que soit l'action
+                    # finalement prise : c'est la distribution de ces valeurs qui
+                    # calibre le seuil, elle doit donc être collectée sur TOUS
+                    # les états flat, y compris ceux ouverts de force.
+                    pbs_epoch.append(float(max(probs_np[bi, 0], probs_np[bi, 1])))
 
-                    if force_opening and chosen_action is not None:
-                        agent_action = torch.tensor(chosen_action, device=device, dtype=torch.long)
-                        logprob = dist.log_prob(agent_action).squeeze()
-                    else:
-                        agent_action = dist.sample()
-                        # Filtre confiance : entrée uniquement si prob >= seuil
-                        # (HOLD = action 2 dans la convention 3-actions)
-                        if pos == 0 and int(agent_action.item()) != 2:
-                            probs = torch.softmax(logits_masked, dim=-1)
-                            if probs[int(agent_action.item())].item() < CONF_THRESHOLD:
-                                agent_action = torch.tensor(2, device=device, dtype=torch.long)
-                        logprob = dist.log_prob(agent_action).squeeze()
-                    a = int(agent_action.item())
+                    if a is None:
+                        p = probs_np[bi]
+                        a = int(np.random.choice(N_ACTIONS, p=p / p.sum()))
+                        if a != 2 and p[a] < conf_thr:
+                            a = 2  # conviction insuffisante → attendre
 
-                    env_action, risk_scale = map_agent_action_to_env_action(
-                        a=a,
-                        pos=pos,
-                        cfg=cfg,
-                        device=device,
-                        state_tensor=s_tensor,
-                        policy_long=policy_long,
-                        policy_short=policy_short,
-                        epoch=epoch,
-                    )
+                    pending[k] = {
+                        "state": states[k],
+                        "action": a,
+                        "logprob": float(logp_np[bi, a]),
+                        "value": float(vals_np[bi]),
+                        "R": 0.0,
+                        "dt": 0,
+                    }
+                    actions_env[k] = a
 
-                env.set_risk_scale(risk_scale)
+            # 3) Un pas pour tous les envs actifs.
+            still_active = []
+            for k in active:
+                env_k = envs[k]
+                env_action = actions_env[k]
+                env_k.set_risk_scale(1.0)
                 action_counts_env[env_action] += 1
 
-                ns, reward, done, _, info = env.step(env_action)
+                ns, reward, done, _, info = env_k.step(env_action)
                 total_reward_epoch += reward
-                reward_normalizer.update(reward)
-                reward = reward_normalizer.normalize(reward)
+                # NORMALISATION DE RECOMPENSE RETIREE.
+                #
+                # Elle divisait par un ecart-type glissant, ce qui n'avait de
+                # sens que tant que la recompense etait libellee en dollars et
+                # donc d'echelle arbitraire. Elle est maintenant en unites de
+                # RISQUE (un stop = -1, la cible = +2) : bornee, comparable d'un
+                # symbole a l'autre, et deja a la bonne echelle.
+                #
+                # La conserver nuisait deux fois. D'abord son initialisation est
+                # fausse : _var part a 1.0 puis tombe a 0.0 des le premier
+                # echantillon, donc std = 1e-8 et les premieres recompenses sont
+                # multipliees par 1e8. Ensuite, sur une recompense creuse (99 %
+                # des pas a zero), diviser par l'ecart-type revient a multiplier
+                # les rares evenements par 1/sqrt(densite) — une amplification
+                # qui n'apporte aucune information et deplace la cible du
+                # critique a chaque epoch.
+                reward_normalizer.update(reward)   # garde la statistique pour le log
 
-                ep_rewards.append(reward)
-                ep_states.append(state)
-                ep_actions.append(a)
-                ep_logprobs.append(logprob.detach())
-                ep_values.append(value.item())
-                ep_dones.append(done)
+                p = pending[k]
+                if p is not None:
+                    p["R"] += (cfg.gamma ** p["dt"]) * reward
+                    p["dt"] += 1
 
-                state = ns
+                states[k] = ns
+                infos[k] = info
 
-            epoch_dd.append(info["drawdown"])
+                if done:
+                    last_reason[k] = info.get("done_reason")
+                    _cloture(k, True)
+                else:
+                    still_active.append(k)
 
-            final_close = env.data.close[env.idx - 1]
+            active = still_active
+
+        # --------- clôture des épisodes ---------
+        for k, env_k in enumerate(envs):
+            info_k = infos[k]
+            epoch_dd.append(info_k["drawdown"])
+
+            final_close = env_k.data.close[env_k.idx - 1]
             latent = 0.0
-            if env.position != 0 and env.current_size > 0 and env.entry_price > 0:
+            if env_k.position != 0 and env_k.current_size > 0 and env_k.entry_price > 0:
                 latent = (
-                    env.position *
-                    (final_close - env.entry_price) *
-                    env.current_size *
-                    env.cfg.leverage
+                    env_k.position *
+                    (final_close - env_k.entry_price) *
+                    env_k.current_size
                 )
-            final_equity = env.capital + latent
+            final_equity = env_k.capital + latent
             epoch_pnl.append(final_equity - cfg.initial_capital)
-            epoch_trades_pnl.extend(env.trades_pnl)
-            epoch_trades_side.extend(env.trades_side)
+            epoch_trades_pnl.extend(env_k.trades_pnl)
+            epoch_trades_side.extend(env_k.trades_side)
 
             # Trade-by-trade CSV (TRAIN)
             with open(trades_csv_path, "a", newline="", encoding="utf-8") as _ft:
                 _w = _csv.DictWriter(_ft, fieldnames=_trades_fields)
-                for tm in env.trades_meta:
+                for tm in env_k.trades_meta:
                     _w.writerow({
-                        "epoch": epoch, "phase": "train", "episode": ep + 1,
+                        "epoch": epoch, "phase": "train", "episode": k + 1,
                         "entry_idx": tm["entry_idx"], "exit_idx": tm["exit_idx"],
                         "side": tm["side"],
                         "entry_price": round(tm["entry_price"], 4),
@@ -1463,33 +1958,75 @@ def run_training_on_split(
                         "hold_bars": tm["hold_bars"],
                     })
 
-            if done and info.get("done_reason") == "max_drawdown":
+            if last_reason[k] == "max_drawdown":
                 last_value = 0.0
             else:
                 with torch.no_grad():
-                    s_last = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
+                    s_last = torch.as_tensor(
+                        states[k], dtype=torch.float32, device=device
+                    ).unsqueeze(0)
                     _, v_last = policy(s_last)
-                    last_value = v_last.item()
+                    last_value = float(v_last.reshape(-1)[0].item())
 
-            adv, ret = compute_gae(
-                ep_rewards, ep_values, ep_dones,
+            buf = ep_buf[k]
+            adv, ret = compute_gae_semi_mdp(
+                buf["rewards"], buf["values"], buf["dones"], buf["dts"],
                 cfg.gamma, cfg.lambda_gae, last_value
             )
 
-            batch_states.extend(ep_states)
-            batch_actions.extend(ep_actions)
-            batch_oldlog.extend(ep_logprobs)
+            batch_states.extend(buf["states"])
+            batch_actions.extend(buf["actions"])
+            batch_oldlog.extend(buf["logprobs"])
             batch_adv.extend(adv)
             batch_returns.extend(ret)
-            batch_values.extend(ep_values)
-            batch_positions.extend(ep_positions)
+            batch_values.extend(buf["values"])
+            batch_positions.extend(buf["positions"])
+
+        # --------- sous-échantillonnage des états SANS décision ---------
+        # Avec un stop à 10×ATR l'agent tient ~300 bougies, donc ~99% des états
+        # collectés sont "en position" : masqués à HOLD, ils ne portent aucun
+        # gradient d'actor. On collectait 128 000 états pour ~120 décisions.
+        # Les avantages GAE sont déjà calculés sur les trajectoires COMPLÈTES,
+        # donc en retirer une partie ici ne fausse rien : on garde tous les
+        # états flat (le signal de l'actor) et un échantillon des autres, assez
+        # pour que le critique reste calibré.
+        _pos_arr = np.asarray(batch_positions)
+        _flat_mask = _pos_arr == 0
+        _keep = _flat_mask.copy()
+        if cfg.in_position_keep_frac < 1.0:
+            _tirage = np.random.rand(len(_pos_arr)) < cfg.in_position_keep_frac
+            _keep |= (~_flat_mask) & _tirage
+        else:
+            _keep[:] = True
+        if _keep.sum() < cfg.batch_size:      # garde-fou : jamais moins d'un batch
+            _keep[:] = True
+        _sel = np.flatnonzero(_keep)
+
+        # Diagnostic : la normalisation des avantages mélange-t-elle des
+        # échelles incompatibles ? Une décision de trade accumule sa récompense
+        # sur ~450 bougies, une attente sur 1 seule. Si l'écart-type est dicté
+        # par les trades, les attentes tombent à ~0 après normalisation et ne
+        # portent plus de gradient.
+        _adv_np = np.asarray(batch_adv, dtype=np.float64)
+        _adv_std_raw = float(_adv_np.std()) if len(_adv_np) else 0.0
+        _adv_norm = (_adv_np - _adv_np.mean()) / (_adv_std_raw + 1e-8) * 1.5
+        _frac_clip = float(np.mean(np.abs(_adv_norm) >= 15.0 - 1e-6)) if len(_adv_np) else 0.0
+        _frac_nul = float(np.mean(np.abs(_adv_norm) < 0.05)) if len(_adv_np) else 0.0
+
+        batch_states = [batch_states[i] for i in _sel]
+        batch_actions = [batch_actions[i] for i in _sel]
+        batch_oldlog = [batch_oldlog[i] for i in _sel]
+        batch_adv = [batch_adv[i] for i in _sel]
+        batch_returns = [batch_returns[i] for i in _sel]
+        batch_values = [batch_values[i] for i in _sel]
+        batch_positions = [batch_positions[i] for i in _sel]
 
         # --------- tenseurs batch ---------
         states_np = np.stack(batch_states, axis=0)
         states = torch.tensor(states_np, dtype=torch.float32, device=device)
 
         actions = torch.tensor(batch_actions, dtype=torch.long, device=device)
-        oldlog = torch.stack(batch_oldlog).to(device).view(-1)
+        oldlog = torch.tensor(batch_oldlog, dtype=torch.float32, device=device).view(-1)
         advantages = torch.tensor(batch_adv, dtype=torch.float32, device=device)
         returns = torch.tensor(batch_returns, dtype=torch.float32, device=device)
         values_old = torch.tensor(batch_values, dtype=torch.float32, device=device)
@@ -1497,17 +2034,41 @@ def run_training_on_split(
 
         assert states.size(0) == oldlog.size(0) == actions.size(0) == values_old.size(0) == positions.size(0)
 
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # Normalisation des avantages sur les seuls états FLAT.
+        #
+        # ~97.5% du batch est constitué d'états en position, où le masque ne
+        # laisse qu'une action légale : log π(HOLD) = 0 exactement, donc
+        # ∇log π = 0 — ils ne portent aucun gradient de politique. Calculer
+        # moyenne et écart-type sur l'ensemble laissait ces 97.5% dicter la
+        # calibration des 2.5% qui décident réellement.
+        # (Mesuré via l'identité H = fraction_flat × Hflat, l'entropie des
+        #  états en position étant nulle par construction.)
+        _flat_all = (positions == 0)
+        if bool(_flat_all.any()):
+            _adv_ref = advantages[_flat_all]
+            advantages = (advantages - _adv_ref.mean()) / (_adv_ref.std() + 1e-8)
+        else:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         advantages = advantages.clamp(-10, 10)
         advantages = advantages * 1.5
 
         epoch_actor_loss = []
         epoch_critic_loss = []
         epoch_entropy = []
+        epoch_entropy_flat = []
+        epoch_grad_norm = []
+        epoch_flat_frac = []
+        g_actor_hist = []
+        g_critic_hist = []
+        g_trunk_hist = []
+        logratio_hist = []
+        clipfrac_hist = []
         epoch_kl = []
 
         n_samples = states.size(0)
         idx = np.arange(n_samples)
+
+        _chrono["collecte"] = time.time() - _t_phase; _t_phase = time.time()
 
         for upd in range(cfg.updates_per_epoch):
             np.random.shuffle(idx)
@@ -1544,7 +2105,20 @@ def run_training_on_split(
 
                     dist = Categorical(logits=logits_masked)
                     new_log = dist.log_prob(ab)
-                    entropy = dist.entropy().mean()
+                    entropy_per_state = dist.entropy()
+                    entropy = entropy_per_state.mean()
+
+                    # Entropie restreinte aux états FLAT. En position, 2 actions
+                    # sur 3 sont masquées à -1e4 donc l'entropie y vaut 0 par
+                    # construction et tire la moyenne vers le bas : `entropy`
+                    # seul ne permet pas de distinguer « policy saturée » de
+                    # « beaucoup d'états en position ». H_flat le dit sans
+                    # ambiguïté — max = ln(3) = 1.0986.
+                    _flat_b = (pos_b == 0)
+                    entropy_flat = (
+                        entropy_per_state[_flat_b].mean()
+                        if bool(_flat_b.any()) else entropy
+                    )
 
                     # GARDE-FOU 3 : ratio PPO clampé pour éviter exp() explosif
                     log_ratio = new_log - lb_old
@@ -1554,7 +2128,18 @@ def run_training_on_split(
                     surr2 = adv_b * torch.clamp(
                         ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps
                     )
-                    actor_loss = -torch.min(surr1, surr2).mean()
+                    # Objectif de l'actor restreint aux états FLAT : seuls ceux-là
+                    # portent une décision. En position le masque ne laisse que
+                    # HOLD, donc ratio = 1 et gradient nul — les inclure dans la
+                    # moyenne divisait le gradient de politique par ~40 (97.5%
+                    # du batch) sans rien y ajouter.
+                    # Le critique, lui, garde TOUT le batch : un état en position
+                    # porte bien de l'information de valeur.
+                    _surr = torch.min(surr1, surr2)
+                    actor_loss = (
+                        -_surr[_flat_b].mean() if bool(_flat_b.any())
+                        else -_surr.mean() * 0.0
+                    )
 
                     value_pred = value.squeeze(-1)
                     v_clipped = val_old + (value_pred - val_old).clamp(-0.2, 0.2)
@@ -1562,20 +2147,47 @@ def run_training_on_split(
                     clipped_loss = (v_clipped - ret_b).pow(2)
                     critic_loss = torch.max(unclipped_loss, clipped_loss).mean()
 
-                    # GARDE-FOU 4 : entropy floor — empêche policy collapse.
-                    # Schedule : 2.0× au début → 0.8× à la fin (au lieu de 0.3×).
-                    # Garde une exploration minimale jusqu'à la fin.
+                    # Régularisation d'entropie : maintient l'exploration sans
+                    # empêcher la conviction.
+                    #
+                    # L'ancien réglage (coef 0.30 × 2.0 = 0.57 effectif) clouait
+                    # Hflat à ~1.09, soit p_max ≈ 0.395 — juste SOUS le seuil de
+                    # production de 0.40. Le modèle ne pouvait structurellement
+                    # pas passer son propre filtre de conviction. Ce coefficient
+                    # avait été monté à 0.30 pour compenser un gradient d'actor
+                    # cassé (dilué par les 97% d'états sans décision) ; ce
+                    # problème étant corrigé, on revient dans la plage usuelle
+                    # des implémentations PPO (1e-3 à 1e-2).
                     t = min((epoch - 1) / 120.0, 1.0)
-                    entropy_coef_epoch = cfg.entropy_coef * (2.0 * (1 - t) + 0.8 * t)
-                    entropy_bonus = entropy_coef_epoch * entropy
+                    entropy_coef_epoch = cfg.entropy_coef * (1.5 * (1 - t) + 0.5 * t)
+                    # La régularisation porte sur entropy_FLAT, pas sur la
+                    # moyenne masquée : en position 2 actions sur 3 sont
+                    # masquées, donc ces états ont une entropie nulle par
+                    # construction et écrasent la moyenne (H=0.046 alors que
+                    # Hflat=1.0986, soit le maximum exact de ln(3)).
+                    #
+                    # Avec `entropy`, le garde-fou anti-collapse ci-dessous se
+                    # déclenchait en permanence sur cet artefact : coefficient
+                    # effectif 0.30 × 1.99 × 5 = 2.99 contre un actor_loss de
+                    # l'ordre de 1e-4. La policy restait clouée à l'uniforme,
+                    # donc plafonnée à p = 1/3 = 0.333 — condamnée à repasser
+                    # sous le seuil de conviction dès que la rampe atteint 0.40.
+                    entropy_bonus = entropy_coef_epoch * entropy_flat
 
-                    # Si entropy s'effondre, on booste son poids agressivement
-                    if entropy.item() < 0.1:
+                    # Sur un maximum de ln(3) = 1.0986, passer sous 0.1 est un
+                    # vrai effondrement de la policy.
+                    if entropy_flat.item() < 0.1:
                         entropy_bonus = entropy_bonus * 5.0
 
-                    # Warmup critique : N premières epochs → critique seul
+                    # Warmup critique : N premières epochs → pas d'actor_loss.
+                    # Le bonus d'entropie est CONSERVÉ : actor et critic partagent
+                    # tout le tronc (input_proj → blocks → norm → mlp), donc
+                    # optimiser critic_loss seul déforme aussi les logits de
+                    # l'actor. Sans ce terme, la policy passait de H=1.0986
+                    # (uniforme) à H≈0.05 (déterministe) dès l'epoch 1, et PPO
+                    # ne pouvait plus la rouvrir avec clip_eps=0.18.
                     if epoch <= cfg.critic_warmup_epochs:
-                        loss = cfg.value_coef * critic_loss
+                        loss = cfg.value_coef * critic_loss - entropy_bonus
                     else:
                         loss = actor_loss + cfg.value_coef * critic_loss - entropy_bonus
 
@@ -1593,6 +2205,27 @@ def run_training_on_split(
                 # opère sur des gradients ×2^16 (AMP) → inefficace
                 # ──────────────────────────────────────────────────────────
                 scaler.unscale_(optimizer)
+
+                # Décomposition du gradient par tête, une fois par epoch, avant
+                # clipping. Répond à : l'actor reçoit-il seulement un gradient ?
+                # (KL bloqué à 0.0000 alors que le critique, lui, apprend.)
+                # Mesure sur CHAQUE pas et non sur le premier seulement : un
+                # unique minibatch n'est pas representatif, et c'est justement
+                # ce qu'il faut ecarter avant de conclure sur le gradient.
+                _ga = _param_grad_norm(actor_head_params)
+                _gc = _param_grad_norm(critic_head_params)
+                _gt = _param_grad_norm(trunk_params)
+                if all(math.isfinite(v) for v in (_ga, _gc, _gt)):
+                    g_actor_hist.append(_ga)
+                    g_critic_hist.append(_gc)
+                    g_trunk_hist.append(_gt)
+                    _lr = float(log_ratio.abs().mean().item())
+                    _clipped = float(
+                        (log_ratio.abs() > math.log1p(cfg.clip_eps)).float().mean().item()
+                    )
+                    logratio_hist.append(_lr)
+                    clipfrac_hist.append(_clipped)
+
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     policy.parameters(), cfg.max_grad_norm
                 )
@@ -1608,18 +2241,58 @@ def run_training_on_split(
                 scaler.update()
 
                 with torch.no_grad():
-                    approx_kl = (lb_old - new_log).mean().item()
+                    # KL mesuré sur les états FLAT également : en position le
+                    # ratio vaut exactement 1 donc la KL y est nulle. Moyennée
+                    # sur tout le batch, elle était divisée par ~40, ce qui
+                    # rendait l'early-stop (target_kl=0.03) inatteignable :
+                    # il aurait fallu une KL réelle de 1.2 pour le déclencher.
+                    _kl_all = lb_old - new_log
+                    approx_kl = (
+                        _kl_all[_flat_b].mean().item() if bool(_flat_b.any())
+                        else 0.0
+                    )
+                    epoch_flat_frac.append(float(_flat_b.float().mean().item()))
 
                 epoch_actor_loss.append(actor_loss.item())
                 epoch_critic_loss.append(critic_loss.item())
                 epoch_entropy.append(entropy.item())
+                epoch_entropy_flat.append(entropy_flat.item())
                 epoch_kl.append(approx_kl)
+                # Norme du gradient AVANT clipping (clip_grad_norm_ la retourne).
+                # Le rapport gnorm / max_grad_norm donne le facteur exact par
+                # lequel la mise à jour est réduite : si gnorm=15 pour un clip
+                # à 0.3, tout le pas est divisé par 50, actor compris.
+                epoch_grad_norm.append(float(grad_norm))
 
             if np.mean(epoch_kl) > 1.5 * cfg.target_kl:
                 print(f"  {_col('⚠ early-stop KL', _C.YELLOW)}  KL={np.mean(epoch_kl):.4f}")
                 break
 
         scheduler.step()
+
+        # ---- Recalibration du seuil sur la conviction réellement observée ----
+        # Le quantile (1 − sélectivité) de max(p_BUY, p_SELL) est, par
+        # construction, la barre que franchissent exactement les `sélectivité` %
+        # d'instants les plus favorables. Il suit donc l'échelle du modèle au
+        # lieu de la supposer — c'est tout l'intérêt par rapport à un seuil fixe.
+        # GARDE-FOU sur l'étendue. Mesuré à l'epoch 1 : la policy initiale donne
+        # med 0.352 / max 0.354, soit 0.002 d'amplitude. Sur une distribution
+        # aussi plate, un quantile est un pile ou face — le seuil calculé sur le
+        # train tombait au-dessus de TOUTES les valeurs du val, d'où 0 trade.
+        # Tant que le modèle ne différencie pas les instants, filtrer n'a aucun
+        # sens : on laisse tout passer pour disposer d'une mesure de référence.
+        if pbs_epoch:
+            pbs_med = float(np.median(pbs_epoch))
+            pbs_max = float(np.max(pbs_epoch))
+            pbs_etendue = float(np.quantile(pbs_epoch, 0.99)
+                                - np.quantile(pbs_epoch, 0.01))
+            if pbs_etendue < cfg.pbs_etendue_min:
+                calib_thr_courant = 0.0
+            else:
+                calib_thr_courant = float(
+                    np.quantile(pbs_epoch, 1.0 - selectivite))
+        else:
+            pbs_med = pbs_max = pbs_etendue = 0.0
 
         profit_epoch = float(sum(epoch_pnl))
         num_trades_epoch = len(epoch_trades_pnl)
@@ -1646,77 +2319,204 @@ def run_training_on_split(
 
         # --------- validation (greedy) ---------
         policy.eval()
+        pbs_val: List[List[float]] = [[], []]   # convictions BUY / SELL sur le val
         val_pnl = []
         val_dd = []
         val_trades = []
         val_trades_side: List[int] = []
 
+        # Épisodes de validation VECTORISÉS : même principe que le rollout de
+        # train. La val pesait 64% du coût (7 × 4000 pas contre 4 × 4000), et
+        # elle ne termine jamais en avance puisqu'elle ne déclenche pas le
+        # garde-fou DD. La batcher la rend ~7× moins chère, ce qui permet de
+        # garder val_episodes=7 (nécessaire à la stabilité du Sortino30).
+        n_val = len(val_envs)
+
+        _chrono["maj PPO"] = time.time() - _t_phase; _t_phase = time.time()
+
+        # ---------- PASSE 1 : calibration sur la policy COURANTE ----------
+        # Calibrer sur l'epoch précédente ne marche pas : la policy bouge trop
+        # vite (KL ~0.04, clipfrac ~9 %). Mesuré à l'epoch 7, la distribution de
+        # p_BUY est passée de 0.338 à 0.283 d'une epoch à l'autre — la barre
+        # héritée se retrouvait AU-DESSUS de toute la distribution courante, et
+        # plus aucun BUY ne passait. D'où zéro trade long, deux runs de suite.
+        #
+        # On parcourt donc la fenêtre de validation une première fois en forçant
+        # HOLD : l'agent reste flat du début à la fin, ce qui donne la
+        # distribution complète des occasions sous la policy du moment. Les
+        # barres en découlent, puis la passe 2 valide réellement.
+        #
+        # L'état du générateur est figé et restauré pour que les deux passes
+        # portent sur EXACTEMENT les mêmes fenêtres.
+        etat_rng = np.random.get_state()
+        v_states = []
+        v_infos = []
+        for e in val_envs:
+            s0, i0 = e.reset()
+            v_states.append(s0)
+            v_infos.append(i0)
+        cal_active = list(range(n_val))
+        # PAS DE CALIBRATION — un quantile n'a pas besoin de chaque bougie.
+        #
+        # Cette passe ne sert qu'a estimer deux quantiles de la distribution de
+        # conviction. Mesure du cout : un forward vaut ~39 ms quel que soit le
+        # contenu en dessous de batch 16, et une epoch en lancait 18 000, dont
+        # 12 000 pour les DEUX passes de validation — les deux tiers du budget
+        # pour un huitieme des donnees. A raison d'une bougie sur cinq, cette
+        # passe tombe de 6 000 a 1 200 forwards.
+        #
+        # L'environnement, lui, avance a CHAQUE bougie : sauter des pas de
+        # marche fausserait la traversee. Seul le forward est espace, et il n'a
+        # aucun effet sur la trajectoire puisque l'action est forcee a HOLD.
+        # test_fenetre_vierge.py calibre deja ainsi, au meme pas.
+        PAS_CALIB = 5
+        pas_courant = 0
         with torch.no_grad():
-            for _ in range(7):  # 2 → 7 : stabilise le Sortino, moins de bruit dans la sélection BEST
-                s, info = val_env.reset()
-                done = False
-                while not done:
-                    pos = info.get("position", 0)
-                    st = torch.tensor(s, dtype=torch.float32).unsqueeze(0).to(device)
-                    logits, _ = policy(st)
-                    logits = logits[0]
-                    mask = build_mask_from_pos_scalar(pos, device, cfg.side)
-                    logits_masked = logits.masked_fill(~mask, MASK_VALUE)
+            while cal_active:
+                if pas_courant % PAS_CALIB == 0:
+                    vb = np.stack([v_states[k] for k in cal_active], axis=0)
+                    st = torch.as_tensor(vb, dtype=torch.float32, device=device)
+                    masks_b = torch.from_numpy(
+                        np.repeat(MASK_FLAT[None, :], len(cal_active), axis=0)
+                    ).to(device)
+                    logits_b, _ = policy(st)
+                    probs_np = torch.softmax(
+                        logits_b.masked_fill(~masks_b, MASK_VALUE), dim=-1
+                    ).cpu().numpy()
+                    for bi, k in enumerate(cal_active):
+                        pbs_val[0].append(float(probs_np[bi, 0]))
+                        pbs_val[1].append(float(probs_np[bi, 1]))
+                pas_courant += 1
+                suite = []
+                for bi, k in enumerate(cal_active):
+                    val_envs[k].set_risk_scale(1.0)
+                    ns, _r, done, _, info = val_envs[k].step(2)   # HOLD forcé
+                    v_states[k] = ns
+                    v_infos[k] = info
+                    if not done:
+                        suite.append(k)
+                cal_active = suite
 
-                    a = int(logits_masked.argmax(dim=-1).item())
-                    # Pas de filtre 70% en validation : on mesure la policy brute
-                    # pour la sélection du meilleur modèle (le filtre est dans loup_live.py)
+        # Barres issues de CETTE distribution, une par côté, budget partagé.
+        #
+        # GARDE-FOU GLOBAL, et non par côté. Mesuré à l'epoch 6 : quand la barre
+        # d'un seul côté est désactivée, la règle compare (pb − 0) ≈ 0.33 à
+        # (ps − 0.360) ≈ quelques millièmes — le côté libre gagne toujours, d'où
+        # 732 longs et zéro short. Mélanger un côté filtré et un côté libre rend
+        # la comparaison des écarts incohérente : soit les deux sont filtrés,
+        # soit aucun.
+        q_cote = 1.0 - selectivite / 2.0
+        etendues = [float(np.quantile(pbs_val[c], 0.99)
+                          - np.quantile(pbs_val[c], 0.01)) for c in (0, 1)]
+        if min(etendues) < cfg.pbs_etendue_min:
+            calib_thr_val[0] = calib_thr_val[1] = 0.0
+        else:
+            for c in (0, 1):
+                calib_thr_val[c] = float(np.quantile(pbs_val[c], q_cote))
+        val_etendue = float(min(etendues))
 
-                    env_action, risk_scale = map_agent_action_to_env_action(
-                        a=a,
-                        pos=pos,
-                        cfg=cfg,
-                        device=device,
-                        state_tensor=st,
-                        policy_long=policy_long,
-                        policy_short=policy_short,
-                        epoch=epoch,
-                    )
-                    val_env.set_risk_scale(risk_scale)
+        _chrono["calibration"] = time.time() - _t_phase; _t_phase = time.time()
 
-                    ns, r, done, _, info = val_env.step(env_action)
-                    s = ns
+        # ---------- PASSE 2 : validation réelle ----------
+        np.random.set_state(etat_rng)
+        v_states = []
+        v_infos = []
+        for e in val_envs:
+            s0, i0 = e.reset()
+            v_states.append(s0)
+            v_infos.append(i0)
 
-                if val_env.idx > 0:
-                    final_close = val_env.data.close[val_env.idx - 1]
-                else:
-                    final_close = val_env.data.close[-1]
+        v_active = list(range(n_val))
 
-                latent = 0.0
-                if val_env.position != 0 and val_env.current_size > 0 and val_env.entry_price > 0:
-                    latent = (
-                        val_env.position *
-                        (final_close - val_env.entry_price) *
-                        val_env.current_size *
-                        val_env.cfg.leverage
-                    )
+        # Même principe qu'au rollout : la policy n'est sollicitée que sur les
+        # envs flat. En position l'action est forcée, le forward serait jeté.
+        with torch.no_grad():
+            while v_active:
+                deciding = [k for k in v_active if v_infos[k].get("position", 0) == 0]
+                v_actions = {k: 2 for k in v_active}
 
-                final_equity = val_env.capital + latent
-                val_pnl.append(final_equity - cfg.initial_capital)
-                val_dd.append(info["drawdown"])
-                val_trades.extend(val_env.trades_pnl)
-                val_trades_side.extend(val_env.trades_side)
+                if deciding:
+                    vb = np.stack([v_states[k] for k in deciding], axis=0)
+                    st = torch.as_tensor(vb, dtype=torch.float32, device=device)
+                    masks_b = torch.from_numpy(
+                        np.repeat(MASK_FLAT[None, :], len(deciding), axis=0)
+                    ).to(device)
 
-                # Trade-by-trade CSV (VAL)
-                with open(trades_csv_path, "a", newline="", encoding="utf-8") as _ft:
-                    _w = _csv.DictWriter(_ft, fieldnames=_trades_fields)
-                    for tm in val_env.trades_meta:
-                        _w.writerow({
-                            "epoch": epoch, "phase": "val", "episode": 0,
-                            "entry_idx": tm["entry_idx"], "exit_idx": tm["exit_idx"],
-                            "side": tm["side"],
-                            "entry_price": round(tm["entry_price"], 4),
-                            "exit_price": round(tm["exit_price"], 4),
-                            "pnl": round(tm["pnl"], 4),
-                            "hit_sl": int(tm["hit_sl"]), "hit_tp": int(tm["hit_tp"]),
-                            "hold_bars": tm["hold_bars"],
-                        })
+                    logits_b, _ = policy(st)
+                    logits_mb = logits_b.masked_fill(~masks_b, MASK_VALUE)
+                    probs_np = torch.softmax(logits_mb, dim=-1).cpu().numpy()
 
+                    for bi, k in enumerate(deciding):
+                        # On retient le MEILLEUR CÔTÉ, puis on exige seulement
+                        # que sa conviction franchisse la barre calibrée.
+                        #
+                        # L'ancienne règle passait par argmax sur les 3 actions,
+                        # donc exigeait implicitement p(BUY) > p(HOLD). Mesuré :
+                        # la policy converge vers p ≈ (0.31, 0.31, 0.38), HOLD
+                        # est l'argmax partout, et la validation renvoyait 0
+                        # trade même avec un seuil nul. Ce n'est pas ce qu'on
+                        # veut mesurer : une stratégie qui ne trade que 5 % du
+                        # temps a forcément p(HOLD) majoritaire en moyenne.
+                        pb, ps = float(probs_np[bi, 0]), float(probs_np[bi, 1])
+                        # Chaque côté est jugé sur SA barre. Si les deux passent,
+                        # on retient le plus net par rapport à la sienne, pas le
+                        # plus probable dans l'absolu.
+                        ok_b = pb >= calib_thr_val[0]
+                        ok_s = ps >= calib_thr_val[1]
+                        if ok_b and ok_s:
+                            a = 0 if (pb - calib_thr_val[0]) >= (ps - calib_thr_val[1]) else 1
+                        elif ok_b:
+                            a = 0
+                        elif ok_s:
+                            a = 1
+                        else:
+                            a = 2
+                        v_actions[k] = a
+
+                still = []
+                for k in v_active:
+                    val_envs[k].set_risk_scale(1.0)
+                    ns, _r, done, _, info = val_envs[k].step(v_actions[k])
+                    v_states[k] = ns
+                    v_infos[k] = info
+                    if not done:
+                        still.append(k)
+                v_active = still
+
+        for k, ve in enumerate(val_envs):
+            final_close = ve.data.close[ve.idx - 1] if ve.idx > 0 else ve.data.close[-1]
+
+            latent = 0.0
+            if ve.position != 0 and ve.current_size > 0 and ve.entry_price > 0:
+                latent = (
+                    ve.position *
+                    (final_close - ve.entry_price) *
+                    ve.current_size
+                )
+
+            final_equity = ve.capital + latent
+            val_pnl.append(final_equity - cfg.initial_capital)
+            val_dd.append(v_infos[k]["drawdown"])
+            val_trades.extend(ve.trades_pnl)
+            val_trades_side.extend(ve.trades_side)
+
+            # Trade-by-trade CSV (VAL)
+            with open(trades_csv_path, "a", newline="", encoding="utf-8") as _ft:
+                _w = _csv.DictWriter(_ft, fieldnames=_trades_fields)
+                for tm in ve.trades_meta:
+                    _w.writerow({
+                        "epoch": epoch, "phase": "val", "episode": 0,
+                        "entry_idx": tm["entry_idx"], "exit_idx": tm["exit_idx"],
+                        "side": tm["side"],
+                        "entry_price": round(tm["entry_price"], 4),
+                        "exit_price": round(tm["exit_price"], 4),
+                        "pnl": round(tm["pnl"], 4),
+                        "hit_sl": int(tm["hit_sl"]), "hit_tp": int(tm["hit_tp"]),
+                        "hold_bars": tm["hold_bars"],
+                    })
+
+        # Recalibration pour l'epoch SUIVANTE, sur la fenêtre de validation.
+        # Même garde-fou : filtrer une distribution plate revient à tirer au sort.
         val_profit = float(sum(val_pnl))
         val_max_dd = float(max(val_dd) if val_dd else 0.0)
         val_num_trades = len(val_trades)
@@ -1823,6 +2623,7 @@ def run_training_on_split(
         )
 
         # ----- Ligne 3 : METRICS PPO -----
+        _chrono["validation"] = time.time() - _t_phase
         print(
             f"{tag} {epoch_str}  "
             f"{_col('META ', _C.GREY + _C.BOLD)}  "
@@ -1832,7 +2633,25 @@ def run_training_on_split(
             f"ActorL {np.mean(epoch_actor_loss):>+7.4f}  "
             f"CriticL {np.mean(epoch_critic_loss):>7.4f}  "
             f"H {np.mean(epoch_entropy):>5.3f}  "
+            f"Hflat {np.mean(epoch_entropy_flat):>5.3f}/1.099  "
+            f"sel {100*selectivite:>4.1f}% "
+            f"thr[tr {calib_thr_courant:.3f} "
+            f"valB {calib_thr_val[0]:.3f} valS {calib_thr_val[1]:.3f}] "
+            f"etendue[tr {pbs_etendue:.4f} val {val_etendue:.4f}]  "
             f"KL {np.mean(epoch_kl):>+6.4f}  "
+            f"dec {n_samples:>5d}  "
+            f"|R| {np.mean(np.abs(batch_adv)) if batch_adv else 0.0:>6.3f}  "
+            f"advStd {_adv_std_raw:>7.2f}  "
+            f"clip {100*_frac_clip:>4.1f}%  quasi0 {100*_frac_nul:>4.1f}%  "
+            f"gnorm {np.mean(epoch_grad_norm) if epoch_grad_norm else 0.0:>7.3f}  "
+            f"g[actor {np.mean(g_actor_hist) if g_actor_hist else 0.0:.2e} "
+            f"critic {np.mean(g_critic_hist) if g_critic_hist else 0.0:.2e} "
+            f"tronc {np.mean(g_trunk_hist) if g_trunk_hist else 0.0:.2e}]  "
+            f"lratio {np.mean(logratio_hist) if logratio_hist else 0.0:.4f} "
+            f"clipfrac {100*np.mean(clipfrac_hist) if clipfrac_hist else 0.0:.1f}%  "
+            f"temps[{' '.join(f'{k} {v:.0f}s' for k, v in _chrono.items())}]  "
+            f"{etat_gpu()}  "
+            f"flat {100*np.mean(epoch_flat_frac) if epoch_flat_frac else 0.0:>4.1f}%  "
             f"ENV [{_col(f'B {buy_ratio:>4.1%}', _C.GREEN)} "
             f"{_col(f'S {sell_ratio:>4.1%}', _C.BLUE)} "
             f"{_col(f'H {hold_ratio:>4.1%}', _C.GREY)}]"
@@ -1881,17 +2700,43 @@ def run_training_on_split(
                 "actor_loss": round(float(np.mean(epoch_actor_loss)), 6),
                 "critic_loss": round(float(np.mean(epoch_critic_loss)), 6),
                 "entropy": round(float(np.mean(epoch_entropy)), 6),
+                "entropy_flat": round(float(np.mean(epoch_entropy_flat)), 6),
+                "grad_norm": round(float(np.mean(epoch_grad_norm)) if epoch_grad_norm else 0.0, 6),
                 "kl": round(float(np.mean(epoch_kl)), 6),
                 "buy_ratio": round(buy_ratio, 4),
                 "sell_ratio": round(sell_ratio, 4),
                 "hold_ratio": round(hold_ratio, 4),
             })
 
+        def _sauve_seuil(chemin_pth: str) -> None:
+            """Écrit le seuil calibré à côté du checkpoint.
+
+            Sans ce fichier, live / backtests / MQL5 appliqueraient une barre
+            différente de celle sur laquelle le modèle a été sélectionné — le
+            checkpoint et son seuil ne veulent rien dire l'un sans l'autre.
+            """
+            import json
+            with open(chemin_pth.replace(".pth", "_calib.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({
+                    "calib_thr_buy": round(calib_thr_val[0], 6),
+                    "calib_thr_sell": round(calib_thr_val[1], 6),
+                    "calib_thr": round(max(calib_thr_val), 6),
+                    "calib_thr_train": round(calib_thr_courant, 6),
+                    "selectivite": round(selectivite, 6),
+                    "etendue_val": round(val_etendue, 6),
+                    "epoch": epoch,
+                    "val_trades": val_num_trades,
+                    "regle": "meilleur cote (BUY/SELL) puis p >= calib_thr ; "
+                             "PAS d'argmax sur les 3 actions",
+                }, f, indent=2)
+
         # Best sur PNL (pour info) — nécessite un minimum de trades
         if val_num_trades >= cfg.min_val_trades_save and val_profit > best_val_profit:
             best_val_profit = val_profit
             state_profit = policy.state_dict().copy()
             torch.save(state_profit, best_profit_path)
+            _sauve_seuil(best_profit_path)
             print(
                 f"  {_col('★', _C.YELLOW + _C.BOLD)} "
                 f"{_col(f'NEW BEST PROFIT', _C.YELLOW + _C.BOLD)}  "
@@ -1903,6 +2748,7 @@ def run_training_on_split(
             best_metric = recent_metric
             best_state = policy.state_dict().copy()
             torch.save(best_state, best_path)
+            _sauve_seuil(best_path)
             epochs_no_improve = 0
             print(
                 f"  {_col('★', _C.MAGENTA + _C.BOLD)} "
@@ -1923,41 +2769,71 @@ def run_training_on_split(
         policy.load_state_dict(best_state)
     policy.eval()
 
-    test_env = BTCTradingEnvDiscrete(test_data, cfg)
+    # 5 épisodes de test joués en parallèle, même schéma que train/val.
+    n_test = 5
+    test_envs = [BTCTradingEnvDiscrete(test_data, cfg) for _ in range(n_test)]
     all_trades = []
     all_dd = []
     all_equity = []
 
+    t_states: List[np.ndarray] = []
+    t_infos: List[Dict] = []
+    for e in test_envs:
+        s0, i0 = e.reset()
+        t_states.append(s0)
+        t_infos.append(i0)
+    t_active = list(range(n_test))
+
     with torch.no_grad():
-        for ep in range(5):
-            s, info = test_env.reset()
-            done = False
-            while not done:
-                pos = info.get("position", 0)
-                st = torch.tensor(s, dtype=torch.float32).unsqueeze(0).to(device)
-                logits, _ = policy(st)
-                logits = logits[0]
-                mask = build_mask_from_pos_scalar(pos, device, cfg.side)
-                logits_masked = logits.masked_fill(~mask, MASK_VALUE)
+        while t_active:
+            deciding = [k for k in t_active if t_infos[k].get("position", 0) == 0]
+            t_actions = {k: 2 for k in t_active}
 
-                a = int(logits_masked.argmax(dim=-1).item())
-                # Pas de filtre 70% en test : évaluation policy brute (filtre dans loup_live.py)
+            if deciding:
+                tb = np.stack([t_states[k] for k in deciding], axis=0)
+                st = torch.as_tensor(tb, dtype=torch.float32, device=device)
+                masks_b = torch.from_numpy(
+                    np.repeat(MASK_FLAT[None, :], len(deciding), axis=0)
+                ).to(device)
 
-                env_action, risk_scale = map_agent_action_to_env_action(
-                    a=a,
-                    pos=pos,
-                    cfg=cfg,
-                    device=device,
-                    state_tensor=st,
-                    policy_long=policy_long,
-                    policy_short=policy_short,
-                    epoch=epoch,
-                )
-                test_env.set_risk_scale(risk_scale)
+                logits_b, _ = policy(st)
+                logits_mb = logits_b.masked_fill(~masks_b, MASK_VALUE)
+                probs_np = torch.softmax(logits_mb, dim=-1).cpu().numpy()
+                for bi, k in enumerate(deciding):
+                    # MÊME règle qu'en validation et qu'en production : meilleur
+                    # côté, puis barre calibrée. Utiliser ici le seuil absolu
+                    # historique ferait mesurer le TEST sur une autre politique
+                    # que celle qu'on déploierait.
+                    # MÊME règle qu'en validation : une barre par côté, toutes
+                    # deux calibrées sur la VALIDATION et jamais sur le test —
+                    # les recalibrer ici reviendrait à régler un paramètre sur
+                    # les données censées mesurer la généralisation.
+                    pb, ps = float(probs_np[bi, 0]), float(probs_np[bi, 1])
+                    ok_b = pb >= calib_thr_val[0]
+                    ok_s = ps >= calib_thr_val[1]
+                    if ok_b and ok_s:
+                        a = 0 if (pb - calib_thr_val[0]) >= (ps - calib_thr_val[1]) else 1
+                    elif ok_b:
+                        a = 0
+                    elif ok_s:
+                        a = 1
+                    else:
+                        a = 2  # HOLD
+                    t_actions[k] = a
 
-                ns, r, done, _, info = test_env.step(env_action)
-                s = ns
+            still = []
+            for k in t_active:
+                test_envs[k].set_risk_scale(1.0)
+                ns, _r, done, _, info = test_envs[k].step(t_actions[k])
+                t_states[k] = ns
+                t_infos[k] = info
+                if not done:
+                    still.append(k)
+            t_active = still
 
+    with torch.no_grad():
+        for ep, test_env in enumerate(test_envs):
+            info = t_infos[ep]
             if test_env.idx > 0:
                 final_close = test_env.data.close[test_env.idx - 1]
             else:
@@ -1968,8 +2844,7 @@ def run_training_on_split(
                 latent = (
                     test_env.position *
                     (final_close - test_env.entry_price) *
-                    test_env.current_size *
-                    test_env.cfg.leverage
+                    test_env.current_size
                 )
 
             final_equity = test_env.capital + latent
@@ -2033,8 +2908,23 @@ def run_walkforward(
     train_frac: float = 0.6,
     val_frac: float = 0.2,
     test_frac: float = 0.2,
-    max_folds: int = 1
+    max_folds: int = 1,
+    start_fold: int = 1,
+    bootstrap_from_path: Optional[str] = None,
+    auto_chain: bool = True,
 ):
+    """Walk-forward training avec contrôle du fold de départ et bootstrap chain.
+
+    Paramètres :
+      start_fold : N° du fold à partir duquel on entraîne (1=tous, 2=skip wf1, etc.)
+      bootstrap_from_path : chemin .pth à copier vers best_*_wf{start_fold}.pth
+                            avant le training (init du premier fold à entraîner).
+                            Si None et start_fold > 1 : tente d'auto-trouver
+                            bestprofit_*_wf{start_fold-1}.pth comme bootstrap.
+      auto_chain : à la fin de chaque fold N, copie bestprofit_*_wfN.pth vers
+                    best_*_wf{N+1}.pth pour bootstrap le fold suivant.
+    """
+    import shutil
     assert train_frac + val_frac + test_frac <= 1.0 + 1e-6, "Les fractions ne peuvent pas dépasser 1.0"
 
     df_full = load_mt5_data(cfg_base)
@@ -2058,11 +2948,39 @@ def run_walkforward(
     print(f"Total bars={n}, window_len={window_len}, "
           f"train={train_len}, val={val_len}, test={test_len}, step={step}")
 
-    fold = 0
-    start = 0
+    # Skip les folds avant start_fold
+    fold = start_fold - 1
+    start = (start_fold - 1) * step
+    if start_fold > 1:
+        print(f"[SKIP] Folds 1 → {start_fold - 1} sautés (start_fold={start_fold})")
+
+    first_fold_in_loop = True
     while start + window_len <= n and fold < max_folds:
         fold += 1
         print(f"\n--- Fold {fold} : indices [{start} : {start + window_len}) ---")
+
+        # Bootstrap : copie le checkpoint d'init vers best_*_wf{fold}.pth
+        target_best = f"best_{cfg_base.model_prefix}_wf{fold}_{cfg_base.side}_wf{fold}.pth"
+        if first_fold_in_loop:
+            # Bootstrap explicite OU auto-détection
+            src_path = bootstrap_from_path
+            if src_path is None and fold > 1:
+                # Auto : cherche le bestprofit du fold précédent
+                candidate = f"bestprofit_{cfg_base.model_prefix}_wf{fold-1}_{cfg_base.side}_wf{fold-1}.pth"
+                if os.path.exists(candidate):
+                    src_path = candidate
+            if src_path is not None and os.path.exists(src_path):
+                print(f"[BOOTSTRAP] Copie {src_path} → {target_best}")
+                shutil.copy(src_path, target_best)
+            elif fold > 1:
+                print(f"[BOOTSTRAP] ⚠ Aucun checkpoint d'init trouvé pour wf{fold}, training from scratch")
+        elif auto_chain and fold > 1:
+            # Bootstrap chain : copie bestprofit du fold précédent → best du fold courant
+            prev_bestprofit = f"bestprofit_{cfg_base.model_prefix}_wf{fold-1}_{cfg_base.side}_wf{fold-1}.pth"
+            if os.path.exists(prev_bestprofit):
+                print(f"[AUTO-CHAIN] Copie {prev_bestprofit} → {target_best}")
+                shutil.copy(prev_bestprofit, target_best)
+        first_fold_in_loop = False
 
         train_data, val_data, test_data = create_datasets_from_slices(
             df_full, FEATURE_COLS,
@@ -2081,7 +2999,7 @@ def run_walkforward(
 
         start += step
 
-    print(f"\n=== FIN WALK-FORWARD {cfg_base.side.upper()} (folds={fold}) ===")
+    print(f"\n=== FIN WALK-FORWARD {cfg_base.side.upper()} (folds entraînés : {start_fold} → {fold}) ===")
 
 
 # ======================================================================
@@ -2106,13 +3024,61 @@ if __name__ == "__main__":
     cfg_duel = PPOConfig(**cfg_base.__dict__)
     cfg_duel.side = "both"
     cfg_duel.model_prefix = "saintv2_loup_duel"
-    run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10, max_folds=3)
+
+    # =======================================================
+    # PIPELINE BAZOOKA (2026-05-19) :
+    #   WF1 → WF2 (init depuis bestprofit WF1)
+    #        → WF3 (init depuis bestprofit WF2)
+    #   PUIS retrain WF1 (init depuis bestprofit WF3) — boucle fermée
+    #
+    # Le auto_chain dans run_walkforward fait déjà WF1→WF2→WF3 avec bootstrap
+    # automatique. Le 2e appel re-train WF1 en partant du meilleur WF3.
+    # =======================================================
+
+    # Phase 1 : chaîne forward WF1 → WF2 → WF3
+    #
+    # Pas de warm start : le jeu de features est passé de 21 à 10 colonnes, donc
+    # la première couche du réseau n'a plus la même dimension d'entrée. Les
+    # anciens checkpoints sont archivés dans _archive_21features/ et ne peuvent
+    # pas — et ne doivent pas — être rechargés. On repart de zéro.
+    print("\n" + "=" * 70)
+    print("  PHASE 1 : WF1 → WF2 → WF3 (auto-chain, depuis zéro)")
+    print("=" * 70)
+    run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10,
+                    max_folds=3, start_fold=1,
+                    bootstrap_from_path=None,
+                    auto_chain=True)
+
+    # ---------------------------------------------------------------------
+    # Phase 2 (DÉSACTIVÉE) : retrain WF1 depuis bestprofit WF3 — « closed loop »
+    #
+    # Ce 2e passage réinitialisait WF1 avec les poids de WF3, dont la fenêtre
+    # de validation va jusqu'à la date du jour. Le WF1 qui en sortait avait donc
+    # vu — indirectement — le futur de sa propre fenêtre de train (2022-2024),
+    # ce qui casse l'indépendance du walk-forward : ce checkpoint ne peut plus
+    # servir de mesure hors-échantillon, alors que c'est sa seule raison d'être.
+    #
+    # La Phase 1 va, elle, dans le sens du temps (WF1 → WF2 → WF3), donc chaque
+    # bootstrap n'utilise que du passé : elle reste saine.
+    #
+    # Ne réactiver que pour produire un modèle de production « toutes données »,
+    # jamais pour évaluer une performance.
+    # ---------------------------------------------------------------------
+    # print("\n" + "=" * 70)
+    # print("  PHASE 2 : retrain WF1 depuis bestprofit WF3 (closed loop)")
+    # print("=" * 70)
+    # wf3_best = "bestprofit_saintv2_loup_duel_wf3_both_wf3.pth"
+    # run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10,
+    #                 max_folds=1, start_fold=1,
+    #                 bootstrap_from_path=wf3_best,
+    #                 auto_chain=False)
 
     print("\n" + "=" * 70)
-    print("  PIPELINE TERMINÉ : modèle duel entraîné.")
+    print("  WALK-FORWARD TERMINÉ : 3 folds entraînés, indépendance préservée.")
     print("  Fichiers générés :")
-    print("    best_saintv2_loup_duel_both_wf1.pth")
-    print("    bestprofit_saintv2_loup_duel_both_wf1.pth")
+    print("    bestprofit_saintv2_loup_duel_wf1_both_wf1.pth")
+    print("    bestprofit_saintv2_loup_duel_wf2_both_wf2.pth")
+    print("    bestprofit_saintv2_loup_duel_wf3_both_wf3.pth")
     print("=" * 70)
 
     # ---------------------------------------------------------

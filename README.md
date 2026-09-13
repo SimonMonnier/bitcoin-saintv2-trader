@@ -4,6 +4,21 @@
 
 ---
 
+## ⚠️ État actuel — les checkpoints doivent être réentraînés
+
+Un audit a mis au jour quatre défauts qui invalident les poids entraînés avant cette révision. Ils sont corrigés dans le code, mais **aucun `.pth` produit avant la correction n'est exploitable** :
+
+| Défaut | Effet | Correctif |
+|--------|-------|-----------|
+| `tick_noise_bps = 12` étendait les bougies de ±71 $ alors que le SL est à ~54 $ | 83 % de SL touchés, 40 % en une bougie ; policy effondrée à 96 % HOLD | ramené à `3.0` |
+| `× leverage` appliqué au PnL du seul `training.py` | économie d'entraînement 6× fausse, garde-fous DD/capital déclenchés 6× trop tôt | supprimé (le levier ne concerne que la marge) |
+| `merge_asof` H1 renvoyait le bar en formation | jusqu'à 59 min de futur en training/backtest, valeurs partielles en live | `df_h1.shift(1)` — seul le dernier H1 clos est utilisé |
+| Bonus momentum testé sur des features z-scorées | `rsi_ok` plafonne à z = +0.48 < 0.5 → bonus jamais distribué | flags lus en brut (0/1) |
+
+Les mesures ayant motivé ces correctifs figurent dans `training_log_both_wf1.csv` (PnL bloqué à −1578 $ sur 148 epochs, PF 0.25) et `trades_both_wf1.csv` (25 174 trades, WR 17 %).
+
+---
+
 ## 📑 Table des matières
 
 1. [Vue d'ensemble](#-vue-densemble)
@@ -11,7 +26,7 @@
 3. [Pipeline complet](#-pipeline-complet)
    - [Volume dynamique](#-volume-dynamique-position-sizing)
    - [Mode multi-agent](#-mode-multi-agent-wf1--wf2--wf3-en-parallèle)
-   - [Correction spread SL/TP](#-correction-spread-sur-sltp-live)
+   - [Spread et déclenchement SL/TP](#-spread-et-déclenchement-sltp)
    - [Gestion de marge](#-gestion-de-marge-anti-reject-no_money)
 4. [Méthodologie d'entraînement](#-méthodologie-dentraînement)
 5. [Installation](#-installation)
@@ -125,13 +140,64 @@ Implémentation maison avec :
 
 ---
 
+## 🧬 Jeu de features — 10 colonnes, choisies sur mesure
+
+Le vecteur d'entrée a été reconstruit à partir d'une mesure d'apport marginal
+hors échantillon (régression logistique, cible = direction à 1 h, moyenne sur
+5 découpages temporels), et non d'une intuition :
+
+| Jeu | AUC | Commentaire |
+|-----|-----|-------------|
+| 21 features (prix + ticks) | 0.5263 | jeu précédent |
+| 8 features de prix élaguées | 0.5313 | **l'élagage seul a gagné +0.0050** |
+| **+ `taker_ratio` + `ls_ratio_top`** | **0.5442** | jeu retenu |
+| + 4 autres colonnes Binance | 0.5432 | rejeté : perd sur 5/5 découpages |
+
+**Retirées** : `open_rel` (corrélée 0.99 à `returns` — mécaniquement la même
+colonne), `high_rel`/`low_rel` (0.72 avec `range_norm`), `vol_20`, `vol_20_h1`,
+`range_norm_h1` (AUC 0.501 = aucune information), `rsi_ok`, `rsi_14` (apport
+**négatif** : −0.0017), et les 5 features de ticks (apport mesuré : 0.0000).
+
+**Ajoutées** — flux Binance BTCUSDT perpétuel, seule classe d'information
+absente d'un flux CFD. `taker_ratio` (déséquilibre du volume *agressif*) atteint
+à lui seul une AUC de 0.5266, soit plus que les 21 anciennes features réunies.
+
+Le **carnet d'ordres a été écarté après mesure** : les archives `bookDepth` ne
+descendent pas sous le palier ±1 %, alors que l'endpoint live `/fapi/v1/depth`
+(plafonné à `limit=1000`) ne porte que jusqu'à ±0.17 % du mid. Aucun
+recouvrement — la feature serait entraînable mais incalculable en live.
+
+L'historique d'entraînement démarre au **2022-12-15**, borne où la couverture
+Binance atteint 100 % sur toutes les colonnes (avant, `ls_ratio_top` a ~260
+jours de trous en 2022). Coût : 2.28 M → 1.97 M bougies.
+
+> ⏰ **Alignement horaire** — Binance horodate en UTC, le serveur MT5 tourne en
+> UTC+2/+3 selon l'heure d'été, avec le calendrier DST **américain**. Le
+> décalage est mesuré empiriquement (corrélation des rendements M1 : 0.99 au bon
+> décalage, 0.00 partout ailleurs) puis confronté au calendrier — accord 239/239.
+> Un offset fixe aurait décalé un tiers de l'historique d'une heure entière,
+> sans la moindre erreur visible.
+
+---
+
 ## 🔄 Pipeline complet
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
+│           0. DONNÉES BINANCE (build_binance_features.py)         │
+│                                                                  │
+│  data.binance.vision `metrics` + REST /fundingRate  →            │
+│  détection du décalage broker/UTC  →  grille M1 heure broker     │
+│                                                                  │
+│  Génère : binance_features_BTCUSD.pkl  (lu par training et       │
+│           les 3 backtests ; cache brut dans .cache_binance/)     │
+└──────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────┐
 │                    1. TRAINING (training.py)                     │
 │                                                                  │
-│  MT5 (BTCUSD M1+H1)  →  Indicateurs (RSI, ATR, vol, momentum) →  │
+│  MT5 (BTCUSD M1+H1) + Binance  →  Indicateurs  →                 │
 │  Normalisation Z-score globale  →  Walk-forward 3 folds  →       │
 │  PPO + SAINTv2 240 epochs  →  Best checkpoints sauvegardés       │
 │                                                                  │
@@ -201,14 +267,15 @@ Implémentation maison avec :
 | `value_coef` | 0.5 | Standard |
 | `max_grad_norm` | 0.3 | Anti gradient-explosion (resserré + unscale AMP) |
 | `max_drawdown` | 0.4 | Force l'apprentissage prudent (resserré depuis 0.8) |
-| `CONF_THRESHOLD` | 0.90 | Filtre exploration training (resserré depuis 0.95) |
+| `CONF_THRESHOLD` | 0.40 | Filtre exploration training — aligné live/backtest/MQL5 |
 | `critic_warmup_epochs` | 5 | Stabilité initiale |
 | `lookback` | 25 | ~25 minutes de contexte |
 | `position_size` | 0.06 lot | Risk-tuned BTCUSD |
-| `leverage` | 6× | Leverage modéré |
+| `leverage` | 6× | **Marge uniquement** — jamais un multiplicateur de PnL |
 | `atr_sl_mult` | 1.2 | SL = 1.2 × ATR(14) |
-| `atr_tp_mult` | 2.4 | TP = 2.4 × ATR (R:R initial = 2:1) |
-| `tp_shrink` | 0.7 | TP final = 2.4 × 0.7 = 1.68 × ATR |
+| `atr_tp_mult` | 1.68 | TP = 1.68 × ATR (R:R 1:1.4) |
+| `tp_shrink` | 1.0 | Pas de shrink : `atr_tp_mult` contient le facteur final |
+| `tick_noise_bps` | 3.0 | Extension des wicks. **Doit rester ≪ `atr_sl_mult` × ATR** (≈ 8.8 bps sur BTCUSD M1), sinon le bruit déclenche le SL avant le marché |
 
 ---
 
@@ -337,16 +404,24 @@ ne ferment qu'au SL ou TP fixe.
 
 Génère `backtest_trades_both_no_be_trail.csv` (n'écrase pas l'original).
 
-**Résultats sur la période 2026-03-04 → 2026-05-17 (75 jours OOS)** :
+> ⚠️ **Résultats historiques invalidés.** Les chiffres ci-dessous ont été produits
+> avant la correction de la fuite H1 : le modèle disposait alors du rendement
+> complet de l'heure en cours, directement exploitable sur un TP à 1.68 × ATR(M1).
+> Ils sont conservés pour mémoire, pas comme référence.
 
-| Variante | PnL | WR | PF | DDmax | Verdict |
-|----------|-----|----|----|-------|---------|
-| Avec BE/trail (original) | **−499 $** | 46.7 % | 0.98 | — | ✗ NON RENTABLE |
-| **Sans BE/trail** | **+5 609 $** | **58.5 %** | **1.85** | **4.4 %** | ✓ **ROBUSTE** |
+| Variante | PnL | WR | PF | DDmax | Verdict annoncé |
+|----------|-----|----|----|-------|-----------------|
+| Avec BE/trail | −499 $ | 46.7 % | 0.98 | — | ✗ NON RENTABLE |
+| Sans BE/trail | +5 609 $ | 58.5 % | 1.85 | 4.4 % | ✓ ROBUSTE |
 
-**Δ net de +6 109 $** rien qu'en supprimant le BE/trailing. Le signal d'entrée
-était bon, c'est le risk management qui sabotait (88.6 % de SL touchés avec
-BE/trail vs 41.5 % sans → le BE coupait les trades juste avant le TP).
+Le constat qualitatif sur le BE/trailing (il coupait les gagnants avant le TP)
+reste plausible et le live comme le MQL5 s'en passent. En revanche l'écart chiffré
+doit être remesuré après réentraînement.
+
+Deux autres réserves méthodologiques sur ces chiffres :
+- la fenêtre configurée dans le code est de **27 jours** (2026-03-04 → 03-31), pas 75 ;
+- les checkpoints WF portent l'empreinte de WF3 via le bootstrap `auto_chain` du
+  `__main__`, ce qui affaiblit l'indépendance walk-forward revendiquée.
 
 Le **live applique cette leçon** : `update_sl_be_trailing_live()` est commenté
 dans `loup_live.py`.
@@ -368,21 +443,73 @@ python gui_loup.py
 python loup_live.py
 ```
 
+### 5. Export vers MT5 Strategy Tester (MQL5)
+
+```powershell
+python export_to_onnx.py
+python export_binance_for_mql5.py
+```
+
+`AGENT` en tête du premier script pilote **à la fois** le checkpoint lu et le nom
+du `.onnx` produit (`wf1` → `bestprofit_..._wf1_both_wf1.pth` → `saintv2_wf1.onnx`).
+Ne jamais dissocier les deux : une version antérieure exportait les poids WF2
+sous le nom `saintv2_wf3.onnx`, et l'EA « WF3 » tournait donc sur le mauvais modèle.
+
+Copier ensuite dans `<MT5 Common>\Files\` : `saintv2_wf1.onnx`,
+`norm_stats_mean.bin`, `norm_stats_std.bin`, puis régler `ModelFile` et `Magic`
+dans les inputs de l'EA. Le quatrième fichier, `binance_BTCUSD.bin`, est déposé
+directement au bon endroit par `export_binance_for_mql5.py`.
+
+> 🌐 **Pourquoi Binance passe par un fichier et non par `WebRequest()`**
+> `WebRequest()` est **totalement désactivé dans le Strategy Tester** : l'EA ne
+> peut pas interroger Binance pendant un backtest. Les deux features sont donc
+> pré-exportées dans un binaire (grille strictement minute en heure broker →
+> indexation en O(1)), relu en tester **comme en live**, pour que le
+> comportement soit identique dans les deux cas. L'EA refuse de démarrer si le
+> fichier est absent ou si son nombre de colonnes ne correspond pas à celui
+> qu'il attend — deux des dix features en dépendent.
+
+> L'alignement H1 de l'EA est **volontairement décalé d'un bar** : `closes_h1[]`
+> est rempli depuis `CopyClose(..., shift=1, ...)` tandis que `iBarShift()` compte
+> depuis le bar courant. Le résultat correspond exactement au `df_h1.shift(1)`
+> côté Python. Ne pas « corriger » cet écart apparent.
+
 ---
 
 ## 📁 Structure du projet
 
 ```
 multi-agent-btcusd/
+├── saint_core.py                    # ⭐ Noyau partagé : modèle, features, normalisation,
+│                                    #    fusion M1/H1, masque, SL/TP, volume dynamique.
+│                                    #    Ne JAMAIS redupliquer ces fonctions ailleurs :
+│                                    #    c'est la duplication qui avait laissé diverger
+│                                    #    l'alignement H1, le bruit et le levier.
+├── build_binance_features.py        # ⭐ Récupère Binance + résout l'alignement
+│                                    #    horaire broker/UTC (DST américain).
+│                                    #    À lancer AVANT le training.
+├── export_binance_for_mql5.py       # .pkl → binaire lu par l'EA (WebRequest est
+│                                    #    désactivé dans le Strategy Tester)
 ├── training.py                      # Entraînement PPO + SAINTv2 walk-forward
 ├── loup_live.py                     # Agent live MT5 (single + multi-agent + marge)
 ├── gui_loup.py                      # Interface graphique PySide6
 ├── backtest_saintv2_stress_test.py  # Backtest institutionnel (BE/trail on)
 ├── backtest_saintv2_no_be_trail.py  # Variante sans BE/trail (comparaison)
 ├── backtest_saintv2_multi_agent.py  # Backtest multi-agent (wf1 + wf2 + wf3)
+├── export_to_onnx.py                # .pth → .onnx + stats binaires pour MT5
+├── SaintV2_WF3.mq5                  # EA MQL5 pour le Strategy Tester
 ├── requirements.txt                 # Dépendances Python
 ├── .gitignore                       # Exclusions git (.pth, .csv, .npz)
 ├── README.md                        # Ce fichier
+│
+├── _archive_21features/             # Ancien pipeline (21 features + ticks) :
+│                                    #    checkpoints, caches et build_tick_features.py.
+│                                    #    Conservé pour traçabilité, plus alimenté.
+│
+├── (générés avant training)
+├── binance_features_BTCUSD.pkl                                   # Features Binance, heure broker
+├── .cache_binance/                                              # Archives brutes UTC (re-alignement
+│                                                                #    sans retéléchargement)
 │
 ├── (générés après training)
 ├── norm_stats_ohlc_indics.npz                                   # Stats Z-score globales
@@ -433,9 +560,10 @@ Le masque dépend de la **position courante** et du **mode side** :
 
 | Contexte | Seuil | Note |
 |----------|-------|------|
-| **Training** (`CONF_THRESHOLD`) | 0.90 | Filtre exploration : HOLD si `softmax(BUY ou SELL) < 0.90` |
-| **Backtest** (`min_confidence`) | configurable | 0.0 = argmax pur (recommandé pour ce modèle) |
-| **Live** (`min_confidence`) | configurable | 0.0 par défaut (argmax pur) |
+| **Training** (`CONF_THRESHOLD`) | 0.40 | Filtre exploration : HOLD si `softmax(BUY ou SELL) < 0.40` |
+| **Backtest** (`min_confidence`) | 0.40 | 0.0 = argmax pur si tu veux mesurer la policy brute |
+| **Live** (`min_confidence`) | 0.40 | Idem |
+| **MQL5** (`MinConfidence`) | 0.40 | Input de l'EA |
 
 **Note importante** : avec 3 actions équiprobables (1/3 ≈ 0.33), un modèle bien calibré plafonne souvent autour de 0.40-0.50 en max-prob. Un seuil > 0.50 peut bloquer toutes les entrées. Vérifier les logs `probas D BUY=X SELL=Y HOLD=Z` du backtest pour calibrer.
 
@@ -527,34 +655,30 @@ Capital et equity sont **communs** aux 3 agents (un seul compte). Le volume dyna
 
 ---
 
-## 🎯 Correction spread sur SL/TP (live)
+## 🎯 Spread et déclenchement SL/TP
 
-MT5 déclenche le SL/TP **au prix de clôture** (BID pour un LONG, ASK pour un SHORT), pas au prix d'entrée. Sans correction, le spread fait que :
-- Le **TP rate de justesse** (le BID/ASK ne touche pas le niveau pile)
-- Le **SL se déclenche trop tôt** (le BID/ASK touche le niveau avant que le mid n'ait bougé autant que prévu)
+MT5 déclenche le SL/TP **au prix de clôture** (BID pour un LONG, ASK pour un SHORT), pas au prix d'entrée. Le spread fait donc que le TP demande un peu plus de mouvement et le SL un peu moins.
 
-### Fix symétrique appliqué dans `compute_sl_tp()`
+### Choix retenu : ne PAS décaler les niveaux
 
-```python
-sl_dist_eff = sl_dist + spread       # SL éloigné de spread → moins de SL prématurés
-tp_dist_eff = tp_dist - spread       # TP rapproché de spread → hits effectifs
-```
+`saint_core.compute_sl_tp()` pose les niveaux purs (`1.2 × ATR` / `1.68 × ATR`), sans compensation de spread — identique en training, backtest, live et MQL5.
 
-Le `spread` est calculé au moment de l'ouverture : `tick.ask - tick.bid`.
+L'asymétrie BID/ASK est modélisée **au déclenchement**, là où elle se produit réellement : la boucle de backtest teste `low <= sl + s` / `high >= tp + s` (`s` = spread échantillonné à l'entrée). Décaler les niveaux eux-mêmes aurait fait diverger le mouvement de prix requis entre ce que le modèle apprend et ce qu'il rencontre à l'exécution.
 
-### Effet sur le mouvement de prix requis
+Une version antérieure appliquait `sl_dist + spread` / `tp_dist - spread` dans le seul `loup_live.py` ; elle a été retirée pour cette raison. Le paramètre `spread` a disparu de la signature.
 
-| Côté | Backtest (move mid) | Live SANS fix | **Live AVEC fix** |
-|------|--------------------:|--------------:|------------------:|
-| TP   | `1.68 × ATR`        | `1.68 × ATR + spread` | **`1.68 × ATR`** ✅ |
-| SL   | `1.20 × ATR - spread/2` | `1.20 × ATR - spread` | **`1.20 × ATR + spread/2`** |
+### Poids réel du spread
 
-→ Le TP en live demande maintenant le même move qu'en backtest. Le SL est légèrement plus permissif (de spread/2) pour ne pas se faire stop-out par un wick éphémère.
+Mesuré sur entrées aléatoires (SL = 1.2 × ATR ≈ 54 $ pour un ATR médian de 45 $) :
 
-### Trade-off
-- **+** Plus de TP touchés (le seuil de hit aligné avec ce que le modèle a appris)
-- **+** Moins de SL prématurés (les positions survivent aux spikes spread courts)
-- **−** Coût marginal `volume × spread` quand le SL est touché (légèrement plus loin)
+| Friction active | % SL touchés | % morts en ≤ 1 bougie |
+|-----------------|-------------:|----------------------:|
+| Tout (bruit 3 bps + slippage + spread) | 74.7 % | 25.3 % |
+| Sans slippage d'entrée | 69.6 % | 14.1 % |
+| Sans spread | 55.3 % | 2.4 % |
+| Sans aucune friction | 52.8 % | 0.0 % |
+
+Baseline théorique d'une entrée aléatoire : ~58 % de SL. Le spread bimodal (`spread_wide_prob=0.30`, `spread_bps_wide_factor=5.0`) est donc désormais la friction dominante — à recalibrer sur les spreads réellement observés chez le broker si les trades meurent encore trop vite.
 
 ---
 
@@ -622,11 +746,11 @@ Tout ça est ensuite **normalisé via Welford online** avant d'être utilisé pa
 ### SL / TP dynamiques
 
 ```
-ATR(14) → calculé sur les 14 dernières bougies M1
-SL = entry_price ∓ 1.2 × ATR     (signe selon LONG/SHORT)
-TP = entry_price ± 2.4 × ATR × 0.7   (tp_shrink réaliste)
+ATR(14) → dernier ATR clôturé, plancher à 0.15% du prix
+SL = entry_price ∓ 1.20 × ATR    (signe selon LONG/SHORT)
+TP = entry_price ± 1.68 × ATR    (atr_tp_mult × tp_shrink, tp_shrink = 1.0)
 
-→ R:R brut = 2.0, effectif = 1.4 (après tp_shrink)
+→ R:R = 1:1.4  ⇒  winrate d'équilibre ≈ 42%
 ```
 
 ### Break-even + Trailing
@@ -640,13 +764,14 @@ Si mouvement favorable ≥ 1.5 × ATR :
    (s'améliore à chaque nouveau high/low favorable)
 ```
 
-**État par contexte (mai 2026)** :
+**État par contexte** :
 | Contexte | BE/Trail actif ? |
 |----------|------------------|
-| Training (env) | ✅ Oui (le modèle apprend avec) |
-| Backtest stress-test original | ✅ Oui |
+| Training (env) | ❌ Non — `PPOConfig.use_be_trail = False` |
+| Backtest stress-test | ✅ Oui |
 | Backtest **no_be_trail** | ❌ Non — variante de comparaison |
-| **Live (loup_live.py)** | ❌ **Non** (désactivé après constat backtest no_be_trail : PF 0.98 → 1.70) |
+| **Live (loup_live.py)** | ❌ **Non** |
+| MQL5 `SaintV2_WF3.mq5` | ❌ Non |
 
 ---
 
@@ -677,19 +802,27 @@ Fold 3 (décalé de +20%) :
 
 ### Garanties
 
-- **Aucun data leak** : VAL et TEST sont toujours dans le futur du TRAIN du même fold
+- **Pas de fuite temporelle intra-barre** : les features H1 sont décalées d'un bar (`df_h1.shift(1)` dans `saint_core.merge_m1_h1`), donc seul le dernier H1 **clôturé** entre dans l'observation. Sans ce décalage, `merge_asof(backward)` renvoyait le bar H1 en formation, dont les valeurs historiques sont déjà finalisées — jusqu'à 59 minutes de futur.
+- **Découpage temporel** : VAL et TEST sont toujours dans le futur du TRAIN du même fold
 - **Couverture 100%** : l'union des 3 folds couvre toute la data
 - **Régimes diversifiés** : chaque fold contient un mix bull/bear/sideways différent
 - **Test du wf3 ≈ test out-of-sample récent** : wf3 termine en 2026-05, le plus pertinent pour le live
 
 ### Sélection du modèle live
 
-Pour le live, recommandation par ordre de priorité :
-1. **`bestprofit_*_wf3`** : train le plus récent, le plus proche du marché actuel
-2. **`bestprofit_*_wf2`** : intermédiaire
-3. **`bestprofit_*_wf1`** : train le plus ancien, le moins pertinent en live
+`LiveConfig.active_agents` liste les agents à charger. **N'y mettre que des agents
+dont le `.pth` existe** : le chargement lève volontairement une `FileNotFoundError`
+plutôt que de tourner à vide.
 
-Ou bien : exécuter les 3 en parallèle dans 3 instances MT5 et faire de l'ensembling.
+```python
+active_agents = ["wf1"]            # défaut actuel — seul checkpoint présent
+active_agents = ["wf1", "wf3"]     # ensembling 2 agents
+active_agents = None               # les 3 (exige les 3 fichiers)
+```
+
+Une fois les 3 folds réentraînés, préférer le plus récent (`wf3`), dont la fenêtre
+de train est la plus proche du marché courant, ou exécuter plusieurs agents en
+parallèle : chacun a son magic MT5 (424241 / 424242 / 424243) et sa propre position.
 
 ---
 

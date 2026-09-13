@@ -1,17 +1,15 @@
-import os
+﻿import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-import math
 import time as _time
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import MetaTrader5 as mt5
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 
 # ============================================================
 # LOG HELPERS — couleurs ANSI + formattage uniforme
@@ -69,28 +67,42 @@ def banner(title: str, color: str = C.CYAN) -> str:
 #   - Modes side : "long" / "short" / "duel"
 # ============================================================
 
-# 0:BUY  1:SELL  2:HOLD
-N_ACTIONS = 3
-MASK_VALUE = -1e4  # même valeur que le training / live
-
-# Stats de normalisation (doit correspondre à ton training)
-NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
+from saint_core import (
+    MASK_VALUE,
+    NORM_STATS_PATH,
+    FEATURE_COLS,
+    SCALPING_MAX_HOLDING,
+    merge_m1_h1,
+    load_calib_thresholds,
+    decide_avec_barres,
+    charge_source_externe,
+    SOURCE_EXT_NOM,
+    safe_normalize,
+    load_norm_stats,
+    build_policy,
+    get_device,
+    build_mask_from_pos_scalar,
+    compute_dynamic_volume,
+    compute_entry_atr,
+    effective_atr,
+    ATR_PLANCHER_FRAC,
+)
 
 # Modèles pré-entraînés (best PROFIT ici) — mêmes noms que ton training
 # Pattern training : f"bestprofit_{cfg.model_prefix}_{cfg.side}{suffix}.pth"
 #   model_prefix LONG  = "saintv2_loup_long"   side="long"  suffix="_wf1"
 #   model_prefix SHORT = "saintv2_loup_short"  side="short" suffix="_wf1"
-BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf2_long_wf2.pth"
-BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf2_short_wf2.pth"
+BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf1_long_wf1.pth"
+BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf1_short_wf1.pth"
 # Modèle unifié (training side="both")
 # bestprofit_*_wf2 mis à jour le 18-05 09:51 a cassé → fallback sur best_*_wf2
 # (Sortino30 best, intact depuis le 17-05 23:47, antérieur au crash)
-BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_wf2_both_wf2.pth"
+BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_wf1_both_wf1.pth"
 
 
 @dataclass
 class LiveConfig:
-    symbol: str = "BTCUSD"
+    symbol: str = "XAUUSD"
     timeframe: int = mt5.TIMEFRAME_M1
     htf_timeframe: int = mt5.TIMEFRAME_H1  # identique au training / live
 
@@ -100,16 +112,21 @@ class LiveConfig:
     n_bars_m1: int = 800_000
     n_bars_h1: int = 200_000
 
-    # même params que l'env / live
-    tp_shrink: float = 0.7
+    # config training originale (R:R 1:1.4)
+    tp_shrink: float = 1.0  # pas de shrink (formule explicite : atr_tp_mult contient déjà le facteur final)
 
     # trading
     initial_capital: float = 1000.0
     position_size: float = 0.01    # utilisé uniquement si dynamic_volume = False
+    # Taille par le RISQUE (prioritaire). Meme valeur que
+    # training.PPOConfig.risk_per_trade et loup_live.LiveConfig.risk_per_trade.
+    risk_volume: bool = True
+    risk_per_trade: float = 0.012
+    max_notional_mult: float = 30.0
     leverage: float = 6.0
     fee_rate: float = 0.0         # commission BTCUSD CFD ≈ 0, coût déjà dans le spread
-    atr_sl_mult: float = 1.2
-    atr_tp_mult: float = 2.4
+    atr_sl_mult: float = 5.0     # SL = 5 x ATR  (optimum mesure sur l'or)
+    atr_tp_mult: float = 10.0    # TP = 10 x ATR (R:R 1:2.0)
 
     # Volume dynamique : aligné avec loup_live.compute_dynamic_volume
     #   - equity ≤ 2000$ → 0.01 lot
@@ -164,6 +181,7 @@ class BTState:
     entry_index: int = -1
     entry_atr: float = 0.0     # ATR au moment de l'entrée (pour unrealized_atr)
     last_risk_scale: float = 1.0
+    spread: float = 0.0        # spread en unités de prix au moment de l'entrée (pour trigger SL/TP asymétrique)
     trades_pnl: List[float] = field(default_factory=list)
     trades_meta: List[Dict] = field(default_factory=list)
     max_equity: float = 0.0
@@ -177,11 +195,13 @@ class BTState:
 class StressConfig:
     enable: bool = True
 
-    # slippage random ±20 bps
-    max_slippage_bps: float = 0.0002
+    # slippage random — v2 (palier validé)
+    max_slippage_bps: float = 0.0006  # 6 bps = ~41$ slip max sur BTC 68k
 
-    # bruit des ticks (gaussien, appliqué sur OHLC)
-    tick_noise_std: float = 0.00005  # 5 bps std
+    # bruit des ticks (gaussien, appliqué sur OHLC) — v2
+    # Calibré pour égaler le training : abs(N(0,σ))×1.5 a une moyenne de σ×1.197,
+    # soit 1.5 bps pour σ=0.000125 — identique à uniform(0, tick_noise_bps=3)/1e4.
+    tick_noise_std: float = 0.000125
 
     # distorsion de l’ATR (erreur d’estimation)
     atr_distortion: float = 0.10  # ±10 %
@@ -189,270 +209,22 @@ class StressConfig:
     # randomisation TP/SL ±10 %
     tp_sl_random: float = 0.10
 
-    # micro-gaps (saut de prix sur une bougie)
+    # micro-gaps (saut de prix sur une bougie) — v2
     micro_gap_prob: float = 0.0005
     micro_gap_jump_std: float = 0.0005  # ~5 bps de gap moyen
 
-    # news spikes simulés (élargissement brutal de la range)
+    # news spikes simulés (élargissement brutal de la range) — v2
     news_spike_prob: float = 0.0005
 
     # trous aléatoires de 1–3 minutes (on saute complètement des barres)
     hole_prob: float = 0.0005
 
-
-def safe_normalize(X, stats, clip_sigma=5.0):
-    z = (X - stats["mean"]) / (stats["std"] + 1e-8)
-    # On clip tout à ±5σ → le modèle reste dans sa zone de confort
-    z = np.clip(z, -clip_sigma, clip_sigma)
-    return z
-
-# ============================================================
-# INDICATEURS — IDENTIQUES TRAINING / LIVE ("Loup Ω")
-# ============================================================
-
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    o = df["open"]
-    h = df["high"]
-    l = df["low"]
-    c = df["close"]
-
-    # ---------- RSI ----------
-    def rsi(series: pd.Series, period: int) -> pd.Series:
-        delta = series.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.rolling(period).mean()
-        avg_loss = loss.rolling(period).mean()
-        rs = avg_gain / (avg_loss + 1e-8)
-        return 100 - 100 / (1 + rs)
-
-    df["rsi_14"] = rsi(c, 14)
-
-    # ---------- ATR ----------
-    prev_close = c.shift(1)
-    tr1 = h - l
-    tr2 = (h - prev_close).abs()
-    tr3 = (l - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df["atr_14"] = tr.rolling(14).mean()
-
-    # ---------- Vol / range ----------
-    df["returns"] = c.pct_change()
-    df["vol_20"] = df["returns"].rolling(20).std()
-    df["range_norm"] = (h - l) / (c + 1e-8)
-
-    # ==================================================================
-    # BONUS SURPRISE : Momentum-Confirmed Entry Filter (M1 & H1)
-    # ==================================================================
-    df["mom_5"] = df["close"] > df["close"].shift(5)           # True si prix > close d’il y a 5 barres
-    df["rsi_ok"] = (df["rsi_14"] > 28) & (df["rsi_14"] < 72)   # zone "saine" du RSI
-    # Volatilité relative du jour (rolling 1440 = 24h en M1)
-    df["vol_rank"] = df["vol_20"].rolling(1440).rank(pct=True)
-    df["high_vol_regime"] = df["vol_rank"] > 0.65              # top 35% de vol
-
-    return df
+    # Distribution bimodale du spread (mirror training) — v2
+    spread_wide_prob: float = 0.30       # 30% des trades en wide spread
+    spread_bps_wide_factor: float = 5.0  # wide max = base × 5 = 12.5 bps
 
 
-FEATURE_COLS_M1 = [
-    "open", "high", "low", "close",
-    "rsi_14",
-    "returns", "vol_20", "range_norm",
-    "mom_5", "rsi_ok", "high_vol_regime",
-]
 
-FEATURE_COLS_H1 = [
-    "close_h1",
-    "rsi_14_h1",
-    "returns_h1", "vol_20_h1", "range_norm_h1",
-]
-
-FEATURE_COLS = FEATURE_COLS_M1 + FEATURE_COLS_H1
-N_BASE_FEATURES = len(FEATURE_COLS)
-
-# Embedding de position IDENTIQUE training/live :
-#   - position (-1, 0, 1)
-#   - unrealized_atr  (PnL latent normalisé par l'ATR d'entrée)
-#   - bars_held_norm  (durée détention / scalping_max_holding, capée à 3)
-#   - last_risk_scale
-N_POS_FEATURES = 4
-OBS_N_FEATURES = N_BASE_FEATURES + N_POS_FEATURES
-
-
-# ============================================================
-# MODELE SAINTv2 — IDENTIQUE TRAINING / LIVE
-# ============================================================
-
-class GatedFFN(nn.Module):
-    def __init__(self, d: int, mult: int = 2, dropout: float = 0.05):
-        super().__init__()
-        inner = d * mult
-        self.lin1 = nn.Linear(d, inner * 2)
-        self.lin2 = nn.Linear(inner, d)
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(d)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.norm(x)
-        a, gate = self.lin1(h).chunk(2, dim=-1)
-        h = a * torch.sigmoid(gate)
-        h = self.lin2(self.dropout(h))
-        return x + h
-
-
-class ColumnAttention(nn.Module):
-    def __init__(self, d: int, heads: int, dropout: float):
-        super().__init__()
-        self.norm = nn.LayerNorm(d)
-        self.attn = nn.MultiheadAttention(
-            d, heads, dropout=dropout, batch_first=True
-        )
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, F, D = x.shape
-        h = x.reshape(B * T, F, D)
-        h2 = self.norm(h)
-        out, _ = self.attn(h2, h2, h2)
-        h = h + self.drop(out)
-        return h.reshape(B, T, F, D)
-
-
-class RowAttention(nn.Module):
-    def __init__(self, d: int, heads: int, dropout: float):
-        super().__init__()
-        self.norm = nn.LayerNorm(d)
-        self.attn = nn.MultiheadAttention(
-            d, heads, dropout=dropout, batch_first=True
-        )
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, F, D = x.shape
-        h = x.permute(0, 2, 1, 3).reshape(B * F, T, D)
-        h2 = self.norm(h)
-        out, _ = self.attn(h2, h2, h2)
-        h = h + self.drop(out)
-        h = h.reshape(B, F, T, D).permute(0, 2, 1, 3)
-        return h
-
-
-class SAINTv2Block(nn.Module):
-    def __init__(self, d: int, heads: int, dropout: float, mult: int):
-        super().__init__()
-        self.ra1 = RowAttention(d, heads, dropout)
-        self.ff1 = GatedFFN(d, mult, dropout)
-
-        self.ra2 = RowAttention(d, heads, dropout)
-        self.ff2 = GatedFFN(d, mult, dropout)
-
-        self.ca = ColumnAttention(d, heads, dropout)
-        self.ff3 = GatedFFN(d, mult, dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.ra1(x)
-        x = self.ff1(x)
-        x = self.ra2(x)
-        x = self.ff2(x)
-        x = self.ca(x)
-        x = self.ff3(x)
-        return x
-
-
-class SAINTPolicySingleHead(nn.Module):
-    def __init__(
-        self,
-        n_features: int = OBS_N_FEATURES,
-        d_model: int = 80,
-        num_blocks: int = 2,
-        heads: int = 4,
-        dropout: float = 0.05,
-        ff_mult: int = 2,
-        max_len: int = 64,
-        n_actions: int = N_ACTIONS,
-    ):
-        super().__init__()
-        self.n_features = n_features
-        self.d_model = d_model
-        self.n_actions = n_actions
-
-        self.input_proj = nn.Linear(1, d_model)
-        self.scale = math.sqrt(d_model)
-        self.row_emb = nn.Embedding(max_len, d_model)
-        self.col_emb = nn.Embedding(n_features, d_model)
-
-        self.blocks = nn.ModuleList([
-            SAINTv2Block(d_model, heads, dropout, ff_mult)
-            for _ in range(num_blocks)
-        ])
-
-        self.norm = nn.LayerNorm(d_model)
-
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, 256),
-            nn.ReLU(),
-            nn.Dropout(0.05),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-        )
-
-        self.actor = nn.Linear(256, n_actions)
-        self.critic = nn.Linear(256, 1)
-
-    def forward(self, x: torch.Tensor):
-        assert x.dim() == 3, f"Input x must be (B,T,F), got {x.shape}"
-        B, T, F = x.shape
-
-        tok = self.input_proj(x.unsqueeze(-1)) * self.scale
-
-        rows = torch.arange(T, device=x.device).view(1, T, 1).expand(B, T, F)
-        cols = torch.arange(F, device=x.device).view(1, 1, F).expand(B, T, F)
-
-        tok = tok + self.row_emb(rows) + self.col_emb(cols)
-
-        for blk in self.blocks:
-            tok = blk(tok)
-
-        h_time = tok.mean(dim=1)
-        h_feat = tok.mean(dim=2)
-
-        cls_time = h_time.mean(dim=1)
-        cls_feat = h_feat.mean(dim=1)
-
-        h = cls_time + cls_feat
-        h = self.norm(h)
-        h = self.mlp(h)
-
-        logits = self.actor(h)
-        value = self.critic(h).squeeze(-1)
-
-        return logits, value
-
-
-# ============================================================
-# UTILS NORMA / DEVICE
-# ============================================================
-
-def get_device(cfg: LiveConfig):
-    if cfg.force_cpu:
-        return torch.device("cpu")
-    if torch.cuda.is_available():
-        print("CUDA détecté — utilisation GPU.")
-        return torch.device("cuda")
-    print("Pas de CUDA — utilisation CPU.")
-    return torch.device("cpu")
-
-
-def load_norm_stats(path: str) -> Dict[str, np.ndarray]:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Stats de normalisation introuvables : {path}")
-    data = np.load(path)
-    return {"mean": data["mean"], "std": data["std"]}
-
-
-def normalize_features(X: np.ndarray, stats: Dict[str, np.ndarray]) -> np.ndarray:
-    mean, std = stats["mean"], stats["std"]
-    std = np.where(std < 1e-8, 1.0, std)
-    return (X - mean) / std
 
 
 # ============================================================
@@ -502,12 +274,14 @@ def _fetch_paginated(symbol: str, timeframe: int,
 
 
 def fetch_ohlc_with_indicators(cfg: LiveConfig) -> pd.DataFrame:
-    utc_from = cfg.date_from
+    # Warmup pour les indicateurs : vol_rank=1440 bars (1 jour), H1 ~30 bars (~30h).
+    # On télécharge 5 jours en amont de date_from, puis on filtrera après calcul.
+    utc_from = cfg.date_from - timedelta(days=5)
     utc_to = cfg.date_to or datetime.now()
 
     mt5.symbol_select(cfg.symbol, True)
 
-    print(f"  → fetch M1 {utc_from:%Y-%m-%d} → {utc_to:%Y-%m-%d}…")
+    print(f"  → fetch M1 {utc_from:%Y-%m-%d} → {utc_to:%Y-%m-%d} (warmup inclus)…")
     rates_m1 = mt5.copy_rates_range(
         cfg.symbol, cfg.timeframe, utc_from, utc_to
     )
@@ -534,32 +308,26 @@ def fetch_ohlc_with_indicators(cfg: LiveConfig) -> pd.DataFrame:
     if rates_m1 is None or rates_h1 is None:
         raise RuntimeError("MT5 n'a renvoyé aucune donnée M1 ou H1.")
 
-    df_m1 = pd.DataFrame(rates_m1)
-    df_m1["time"] = pd.to_datetime(df_m1["time"], unit="s")
-    df_m1.set_index("time", inplace=True)
-    df_m1 = df_m1[["open", "high", "low", "close", "tick_volume"]]
-    df_m1 = add_indicators(df_m1)
-
-    df_h1 = pd.DataFrame(rates_h1)
-    df_h1["time"] = pd.to_datetime(df_h1["time"], unit="s")
-    df_h1.set_index("time", inplace=True)
-    df_h1 = df_h1[["open", "high", "low", "close", "tick_volume"]]
-    df_h1 = add_indicators(df_h1)
-    df_h1 = df_h1.add_suffix("_h1")
-
-    df_m1_reset = df_m1.reset_index()
-    df_h1_reset = df_h1.reset_index()
-    df_h1_reset = df_h1_reset.rename(columns={"time_h1": "time"})
-
-    merged = pd.merge_asof(
-        df_m1_reset.sort_values("time"),
-        df_h1_reset.sort_values("time"),
-        on="time",
-        direction="backward"
-    )
-
-    merged = merged.dropna().reset_index(drop=True)
-    return merged
+    # dropna restreint aux colonnes effectivement utilisées par le modèle.
+    # Les colonnes auxiliaires (vol_rank_h1, etc.) peuvent rester NaN si on n'a
+    # pas assez d'historique H1 — ce n'est pas un problème puisqu'elles ne sont
+    # ni dans FEATURE_COLS ni dans la logique de décision.
+    # Features Binance : on relit le MEME cache que le training, deja aligne en
+    # heure broker. Surtout pas les endpoints REST du live, qui ne conservent
+    # que 30 jours : un backtest plus ancien tournerait sur des colonnes vides.
+    # Les features Binance viennent d'un FICHIER construit hors ligne par
+    # build_binance_features.py, deja exprime en heure broker.
+    feats_ext = charge_source_externe(utc_from, utc_to)
+    if feats_ext is None or len(feats_ext) == 0:
+        raise RuntimeError(
+            f"Source externe absente : {SOURCE_EXT_NOM}. Deux des dix "
+            f"features en dependent — lancer build_binance_features.py."
+        )
+    print(f"  -> {len(feats_ext):,} minutes {SOURCE_EXT_NOM}")
+    _si = mt5.symbol_info(cfg.symbol)
+    point = float(_si.point) if _si is not None else 1.0
+    return merge_m1_h1(rates_m1, rates_h1, feats_ext=feats_ext, point=point,
+                       dropna_subset=FEATURE_COLS + ["atr_14"])
 
 
 def build_live_obs(
@@ -594,8 +362,7 @@ def build_live_obs(
         unrealized_atr = 0.0
 
     # Durée détention normalisée (cap 3 = overtime), max_holding aligné training (=12)
-    scalping_max_holding = 12
-    bars_held_norm = float(min(bars_in_position / max(scalping_max_holding, 1), 3.0))
+    bars_held_norm = float(min(bars_in_position / max(SCALPING_MAX_HOLDING, 1), 3.0))
 
     pos_feature = float(pos)
     risk_feature = float(last_risk_scale)
@@ -632,12 +399,20 @@ def apply_price_stress_to_bar(
     if not stress.enable:
         return high, low, close
 
-    # 1) bruit de ticks (gaussien, même facteur sur OHLC)
+    # 1) bruit de ticks (gaussien, même facteur sur OHLC) — shift global
     noise = np.random.normal(0.0, stress.tick_noise_std)
     factor = 1.0 + noise
     high *= factor
     low *= factor
     close *= factor
+
+    # 1b) Expansion asymétrique du range — simule les wicks intra-minute
+    # que MT5 tester voit en real ticks mais que les bars M1 agrégées ratent.
+    # Aligné avec training (tick_noise_bps=3 → moyenne 1.5 bps de chaque côté).
+    noise_h = abs(np.random.normal(0.0, stress.tick_noise_std)) * 1.5
+    noise_l = abs(np.random.normal(0.0, stress.tick_noise_std)) * 1.5
+    high *= (1.0 + noise_h)
+    low  *= (1.0 - noise_l)
 
     # 2) micro-gap (petit saut de prix)
     if np.random.rand() < stress.micro_gap_prob and prev_close is not None:
@@ -714,32 +489,6 @@ def compute_execution_price(
 # LOGIQUE SL/TP + BREAK-EVEN / TRAILING + ACTION MASK
 # ============================================================
 
-def compute_entry_atr(df_closed: pd.DataFrame) -> float:
-    if "atr_14" not in df_closed.columns or len(df_closed) == 0:
-        return 0.0
-    atr = float(df_closed["atr_14"].iloc[-1])
-    return max(atr, 0.0)
-
-
-def compute_dynamic_volume(equity: float, max_lot: float = 100.0) -> float:
-    """Volume dynamique par paliers de 1000$ à partir de 2000$.
-
-    IDENTIQUE à loup_live.compute_dynamic_volume :
-      - equity ≤ 2000$       → 0.10 lot
-      - 2000 < equity ≤ 3000 → 0.20 lot
-      - 3000 < equity ≤ 4000 → 0.30 lot
-      - ... (+0.10 par tranche de 1000$)
-      - plafonné à max_lot (par défaut 100.00)
-    """
-    if equity <= 2000.0:
-        tier = 1
-    else:
-        tier = int((equity - 1.0) // 1000.0)
-    lot = 0.10 * tier
-    lot = min(lot, max_lot)
-    return round(lot, 2)
-
-
 def compute_sl_tp(
     cfg: LiveConfig,
     entry_price: float,
@@ -747,8 +496,7 @@ def compute_sl_tp(
     entry_atr: float,
     stress: Optional[StressConfig] = None
 ):
-    fallback = 0.0015 * entry_price
-    eff_atr = max(entry_atr, fallback, 1e-8)
+    eff_atr = effective_atr(entry_price, entry_atr)
 
     # distorsion ATR (erreur d'estimation)
     if stress is not None and stress.enable:
@@ -884,28 +632,6 @@ def update_sl_be_trailing_backtest(
     state.sl = candidate_sl
 
 
-def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
-    mask = torch.zeros(N_ACTIONS, dtype=torch.bool, device=device)
-
-    # 0=BUY  1=SELL  2=HOLD
-    if pos != 0:
-        mask[2] = True
-        return mask
-
-    if side == "long":
-        mask[0] = True
-        mask[2] = True
-    elif side == "short":
-        mask[1] = True
-        mask[2] = True
-    else:  # "both" / "duel"
-        mask[0] = True
-        mask[1] = True
-        mask[2] = True
-
-    return mask
-
-
 # ============================================================
 # BACKTEST PRINCIPAL
 # ============================================================
@@ -961,16 +687,7 @@ def run_backtest(cfg: LiveConfig):
     policy_duel = None
 
     def _build_policy_bt():
-        return SAINTPolicySingleHead(
-            n_features=OBS_N_FEATURES,
-            d_model=80,
-            num_blocks=2,
-            heads=4,
-            dropout=0.05,
-            ff_mult=2,
-            max_len=cfg.lookback,
-            n_actions=N_ACTIONS
-        ).to(device)
+        return build_policy(device, lookback=cfg.lookback)
 
     if cfg.side == "both":
         if not os.path.exists(BEST_MODEL_DUEL_PATH):
@@ -983,16 +700,7 @@ def run_backtest(cfg: LiveConfig):
     if cfg.side in ("duel", "long"):
         if not os.path.exists(BEST_MODEL_LONG_PATH):
             raise FileNotFoundError(f"Modèle LONG introuvable : {BEST_MODEL_LONG_PATH}")
-        policy_long = SAINTPolicySingleHead(
-            n_features=OBS_N_FEATURES,
-            d_model=80,
-            num_blocks=2,
-            heads=4,
-            dropout=0.05,
-            ff_mult=2,
-            max_len=cfg.lookback,
-            n_actions=N_ACTIONS
-        ).to(device)
+        policy_long = build_policy(device, lookback=cfg.lookback)
         policy_long.load_state_dict(torch.load(BEST_MODEL_LONG_PATH, map_location=device))
         policy_long.eval()
         print(f"  {_c('✓', C.GREEN)} Modèle LONG  : {_c(BEST_MODEL_LONG_PATH, C.CYAN)}")
@@ -1000,16 +708,7 @@ def run_backtest(cfg: LiveConfig):
     if cfg.side in ("duel", "short"):
         if not os.path.exists(BEST_MODEL_SHORT_PATH):
             raise FileNotFoundError(f"Modèle SHORT introuvable : {BEST_MODEL_SHORT_PATH}")
-        policy_short = SAINTPolicySingleHead(
-            n_features=OBS_N_FEATURES,
-            d_model=80,
-            num_blocks=2,
-            heads=4,
-            dropout=0.05,
-            ff_mult=2,
-            max_len=cfg.lookback,
-            n_actions=N_ACTIONS
-        ).to(device)
+        policy_short = build_policy(device, lookback=cfg.lookback)
         policy_short.load_state_dict(torch.load(BEST_MODEL_SHORT_PATH, map_location=device))
         policy_short.eval()
         print(f"  {_c('✓', C.GREEN)} Modèle SHORT : {_c(BEST_MODEL_SHORT_PATH, C.CYAN)}")
@@ -1037,9 +736,13 @@ def run_backtest(cfg: LiveConfig):
     # IMPORTANT :
     # - On démarre à lookback+1 pour pouvoir construire l'obs sur df[:i]
     #   (i bougies, dont au moins lookback)
+    # - On télécharge un buffer de warmup en amont de cfg.date_from (cf. fetch_ohlc_with_indicators)
+    #   mais on ne trade pas sur ce buffer : skip jusqu'à time_i >= cfg.date_from.
     for i in range(start_index + 1, n - 1):
         row = df.iloc[i]
         time_i = row["time"]
+        if isinstance(time_i, pd.Timestamp) and time_i < pd.Timestamp(cfg.date_from):
+            continue
         time_str = time_i.strftime("%Y-%m-%d %H:%M:%S") if isinstance(time_i, pd.Timestamp) else str(time_i)
 
         # Prix "bruts"
@@ -1069,26 +772,56 @@ def run_backtest(cfg: LiveConfig):
         # (variante "no_be_trail" : isole la qualité du signal d'entrée)
 
         # 1) SL / TP sur la barre i (avec prix "stressés")
+        # Modélisation asymétrique BID/ASK alignée sur MT5 réel :
+        #   - bar_low/bar_high représentent les extrêmes du BID
+        #   - LONG  : entrée à ASK, sortie à BID → SL hit s plus tôt, TP hit s plus tard
+        #   - SHORT : entrée à BID, sortie à ASK → SL hit s plus tôt, TP hit s plus tard
+        #     (en termes de mouvement du BID requis)
+        # Quand state.spread = 0 (cfg.spread_bps = 0), le comportement est identique
+        # à la version sans compensation.
         if state.position != 0 and i > state.entry_index:
             exit_price = None
             exit_reason = None
+            s = state.spread
 
-            if state.position == 1:
-                if low_bar <= state.sl:
+            if state.position == 1:  # LONG
+                # SL : MT5 ferme quand BID <= sl. Asymétrie : MT5 sl est s plus haut → looser
+                if low_bar <= state.sl + s:
                     exit_price = state.sl
                     exit_reason = "SL"
-                elif high_bar >= state.tp:
+                # TP : MT5 ferme quand BID >= tp. Asymétrie : MT5 tp est s plus haut → stricter
+                elif high_bar >= state.tp + s:
                     exit_price = state.tp
                     exit_reason = "TP"
-            elif state.position == -1:
-                if high_bar >= state.sl:
+            elif state.position == -1:  # SHORT
+                # SL : MT5 ferme quand ASK >= sl → BID >= sl - s → looser
+                if high_bar + s >= state.sl:
                     exit_price = state.sl
                     exit_reason = "SL"
-                elif low_bar <= state.tp:
+                # TP : MT5 ferme quand ASK <= tp → BID <= tp - s → stricter
+                elif low_bar + s <= state.tp:
                     exit_price = state.tp
                     exit_reason = "TP"
 
             if exit_price is not None:
+                # Slippage à la sortie (asymétrique) — modélise le 118ms de delay MT5 :
+                #   - SL : le marché continue contre nous → fill PIRE que sl (loss++)
+                #   - TP : le momentum continue avec nous → fill MIEUX que tp (profit++)
+                # Magnitude : uniforme [0, max_slippage_bps] appliqué sur exit_price.
+                if stress.enable:
+                    slip_bps = np.random.uniform(0.0, stress.max_slippage_bps)
+                    slip_amount = exit_price * slip_bps
+                    if state.position == 1:  # LONG
+                        if exit_reason == "SL":
+                            exit_price -= slip_amount  # fill plus bas que sl
+                        else:                          # TP
+                            exit_price += slip_amount  # fill plus haut que tp
+                    else:  # SHORT
+                        if exit_reason == "SL":
+                            exit_price += slip_amount  # fill plus haut que sl
+                        else:                          # TP
+                            exit_price -= slip_amount  # fill plus bas que tp
+
                 # PnL aligné avec MT5 réel : (delta_price × volume × contract_size=1)
                 # Le levier n'est PAS un multiplicateur de PnL, juste de marge requise.
                 pnl = (
@@ -1183,7 +916,11 @@ def run_backtest(cfg: LiveConfig):
         if state.position == 0 and not closed_this_bar:
             with torch.no_grad():
                 s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                thr = cfg.min_confidence  # 0.0 = pas de filtre
+                barres = load_calib_thresholds(BEST_MODEL_DUEL_PATH,
+                                               cfg.min_confidence)
+                # Les modes long/short séparés n'ont qu'un côté : une barre
+                # unique suffit, on prend la plus exigeante des deux.
+                thr = max(barres)
 
                 # On garde des refs externes au bloc pour le log post-ouverture
                 prob_long_open = None
@@ -1202,14 +939,12 @@ def run_backtest(cfg: LiveConfig):
                         logits_d_m = logits_d.masked_fill(~mask_d, MASK_VALUE)
                         probs_duel = torch.softmax(logits_d_m, dim=-1)
 
-                        a_duel = int(torch.argmax(probs_duel).item())
-                        p_duel = float(probs_duel[a_duel].item())
-
-                        # argmax pur sur 3 actions (BUY/SELL/HOLD)
-                        if a_duel in (0, 1) and p_duel >= thr:
-                            a = a_duel
-                        else:
-                            a = 2  # HOLD
+                        # Meilleur COTE puis barre calibree — MEME regle que
+                        # training, loup_live et l'EA MQL5. Un argmax sur les
+                        # 3 actions exigerait p(BUY) > p(HOLD), ce qu'une
+                        # strategie selective ne verifie presque jamais.
+                        a = decide_avec_barres(float(probs_duel[0]),
+                                               float(probs_duel[1]), barres)
 
                 elif cfg.side == "duel":
                     if policy_long is None or policy_short is None:
@@ -1315,15 +1050,50 @@ def run_backtest(cfg: LiveConfig):
                     stress=stress
                 )
 
-                # Volume dynamique selon equity (aligné avec loup_live)
-                if getattr(cfg, "dynamic_volume", False):
+                entry_atr = compute_entry_atr(df_closed_for_obs)
+                # Plancher d'ATR pris dans saint_core, jamais recopie : la
+                # valeur locale 0.0015 (0.15 % du prix) etait celle d'AVANT
+                # correction. Sur l'or elle l'emporte sur l'ATR reel dans
+                # 99.4 % des cas, avec un rapport median de 5.71x. Elle
+                # faussait `unrealized_atr`, qui est une des quatre features
+                # de position donnees au modele : le backtest nourrissait
+                # donc le reseau d'une colonne differente de celle vue a
+                # l'entrainement.
+                effective_entry_atr = effective_atr(entry_price, entry_atr)
+
+                # Volume par le RISQUE — MEME regle que training.py
+                # (PPOEnv._compute_dynamic_size) et loup_live.py. Un backtest qui
+                # dimensionne autrement que l'entrainement ne mesure pas la strategie
+                # entrainee : l'ancienne regle etait un escalier sur l'equity, qui ne
+                # regardait ni le prix ni la volatilite, si bien que le risque reel
+                # suivait l'ATR au lieu d'etre borne.
+                #
+                # Ici volume est en UNITES du sous-jacent (contract_size = 1 dans le
+                # calcul de PnL plus bas), pas en lots — mais comme les deux cotes
+                # dimensionnent desormais par la FRACTION DE CAPITAL RISQUEE, les
+                # resultats restent comparables.
+                if getattr(cfg, "risk_volume", True):
+                    sl_dist = cfg.atr_sl_mult * effective_entry_atr
+                    base_volume = ((state.equity * getattr(cfg, "risk_per_trade", 0.012))
+                                   / max(sl_dist, 1e-8))
+                    notion_max = state.equity * getattr(cfg, "max_notional_mult", 30.0)
+                    base_volume = min(base_volume, notion_max / max(entry_price, 1e-8))
+                elif getattr(cfg, "dynamic_volume", False):
                     base_volume = compute_dynamic_volume(state.equity, getattr(cfg, "max_lot", 100.0))
                 else:
                     base_volume = float(cfg.position_size)
-                volume = round(base_volume * (risk_scale if risk_scale > 0 else 1.0), 2)
-                entry_atr = compute_entry_atr(df_closed_for_obs)
-                # fallback ATR si broker renvoie 0 (aligné avec env training)
-                effective_entry_atr = max(entry_atr, 0.0015 * entry_price, 1e-8)
+                volume = base_volume * (risk_scale if risk_scale > 0 else 1.0)
+
+                fallback_atr = ATR_PLANCHER_FRAC * entry_price
+                fb_active = "FALLBACK" if entry_atr < fallback_atr else "ATR_REEL"
+                print(
+                    f"    {_c('[ATR_DBG]', C.YELLOW)} "
+                    f"time={time_i}  entry={entry_price:.2f}  "
+                    f"atr_raw={entry_atr:.2f}  "
+                    f"plancher(0.01%)={fallback_atr:.2f}  "
+                    f"eff_atr={effective_entry_atr:.2f}  "
+                    f"[{fb_active}]"
+                )
                 sl, tp = compute_sl_tp(cfg, entry_price, side, entry_atr, stress)
 
                 state.position = side
@@ -1334,6 +1104,15 @@ def run_backtest(cfg: LiveConfig):
                 state.entry_index = i
                 state.entry_atr = float(effective_entry_atr)
                 state.last_risk_scale = risk_scale
+                # Spread en unités de prix au moment de l'entrée — sert à modéliser
+                # l'asymétrie BID/ASK dans le trigger SL/TP (alignement avec MT5 réel).
+                # Distribution bimodale (mirror training) : 80% session tight, 20% wide.
+                if stress.enable and np.random.rand() < stress.spread_wide_prob:
+                    spread_mult = np.random.uniform(1.2, stress.spread_bps_wide_factor)
+                    state.spread = float(entry_price * cfg.spread_bps * spread_mult)
+                else:
+                    spread_mult = np.random.uniform(0.98, 1.02)
+                    state.spread = float(entry_price * cfg.spread_bps * spread_mult)
 
                 side_txt = "LONG " if side == 1 else "SHORT"
                 side_col = C.GREEN if side == 1 else C.RED
@@ -1497,9 +1276,16 @@ if __name__ == "__main__":
     #     Mettre 0.5–0.9 pour stresser la sélectivité a posteriori.
     cfg = LiveConfig(
         side="both",
-        min_confidence=0.0,
+        min_confidence=0.40,  # aligné avec CONF_THRESHOLD=0.40 du training (config +135 EUR MT5)
         n_bars_m1=600_000,    # legacy (non utilisé : pagination via date_from)
         n_bars_h1=15_000,
-        date_from=datetime(2026, 1, 1),   # 1 an de backtest, pagination active
+        date_from=datetime(2026, 3, 4),
+        date_to=datetime(2026, 3, 31),
+        # Spread réaliste BTCUSD ~17$ sur 68k = 0.00025 = 2.5 pips de fraction.
+        # Sert à modéliser :
+        #   - coût d'entrée (half_spread payé dans compute_exec_price)
+        #   - asymétrie BID/ASK dans le trigger SL/TP (cf. boucle principale)
+        # Mets à 0.0 pour neutraliser (mode "frictionless" historique).
+        spread_bps=0.00025,
     )
     run_backtest(cfg)

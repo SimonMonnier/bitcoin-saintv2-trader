@@ -1,12 +1,11 @@
-import os
+﻿import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import time
-import math
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import MetaTrader5 as mt5
 import numpy as np
@@ -14,22 +13,36 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
+from saint_core import (
+    MASK_VALUE,
+    NORM_STATS_PATH,
+    FEATURE_COLS,
+    SCALPING_MAX_HOLDING,
+    merge_m1_h1,
+    load_calib_thresholds,
+    decide_avec_barres,
+    charge_source_externe,
+    SOURCE_EXT_NOM,
+    safe_normalize,
+    load_norm_stats,
+    build_policy,
+    get_device,
+    build_mask_from_pos_scalar,
+    compute_dynamic_volume,
+    compute_risk_volume,
+    compute_sl_tp,
+    compute_entry_atr,
+)
+
 # ============================================================
 # CONFIG & CONSTANTES
 # ============================================================
-
-# 0:BUY  1:SELL  2:HOLD
-N_ACTIONS = 3  # 0=BUY  1=SELL  2=HOLD
-MASK_VALUE = -1e4  # EXACTEMENT comme au training
-
-# Stats de normalisation (identiques à l'entraînement)
-NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
 
 # Modèles pré-entraînés — best Sortino (comme dans le training)
 BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf1_long_wf1.pth"
 BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf1_short_wf1.pth"
 # Modèle unifié (entraîné avec side="both") : décide BUY/SELL/HOLD dans un seul fichier
-BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_wf2_both_wf2.pth"
+BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_wf1_both_wf1.pth"
 
 # ============================================================
 # MULTI-AGENT : 3 modèles WF tradent en parallèle (comme dans le backtest)
@@ -49,7 +62,7 @@ MULTI_AGENT_MAGICS: Dict[str, int] = {
 
 @dataclass
 class LiveConfig:
-    symbol: str = "BTCUSD"
+    symbol: str = "XAUUSD"
     timeframe: int = mt5.TIMEFRAME_M1
     htf_timeframe: int = mt5.TIMEFRAME_H1   # identique au training
 
@@ -59,15 +72,20 @@ class LiveConfig:
     n_bars_m1: int = 50000
     n_bars_h1: int = 20000
 
-    # doit matcher le training (cfg.tp_shrink = 0.7)
-    tp_shrink: float = 0.7  # plus utilisé si pas de TP fixe
+    # config training originale (R:R 1:1.4)
+    tp_shrink: float = 1.0  # pas de shrink (formule explicite : atr_tp_mult contient déjà le facteur final)
 
     # trading (mêmes valeurs que PPOConfig)
     position_size: float = 0.01
-    leverage: float = 6.0
+    # Taille par le RISQUE (prioritaire sur dynamic_volume / position_size).
+    # Meme valeur que training.PPOConfig.risk_per_trade : le modele doit
+    # trader le risque sous lequel il a appris.
+    risk_volume: bool = True
+    risk_per_trade: float = 0.012
+    leverage: float = 100.0   # aligné sur training.py (XAUUSD)
     fee_rate: float = 0.0004  # juste informatif ici
-    atr_sl_mult: float = 1.2     # aligné avec training/backtest
-    atr_tp_mult: float = 2.4     # aligné avec training/backtest (TP réactivé)
+    atr_sl_mult: float = 5.0     # SL = 5 x ATR  (optimum mesure sur l'or)
+    atr_tp_mult: float = 10.0    # TP = 10 x ATR (R:R 1:2.0)
 
     spread_bps: float = 0.0
     slippage_bps: float = 0.0
@@ -91,9 +109,18 @@ class LiveConfig:
     trailing_dist_atr_mult: float = 1.0
 
     # ======= Seuil de confiance pour ouvrir un trade =======
-    # 0.0 = argmax pur (pas de filtre). Le modèle actuel plafonne ~0.40-0.47,
-    # donc tout seuil > 0.50 bloque tous les trades.
-    min_confidence: float = 0.0
+    # CALIBRÉ, plus fixé à la main : le training écrit le seuil réalisant la
+    # sélectivité visée dans `<checkpoint>_calib.json`, et c'est ce seuil-là qui
+    # a servi à sélectionner le checkpoint. En choisir un autre ici ferait
+    # tourner en production une politique différente de celle qui a été mesurée.
+    #
+    # La règle est : meilleur côté (BUY vs SELL) puis comparaison à la barre.
+    # Surtout PAS d'argmax sur les trois actions — une stratégie qui ne trade que
+    # 5 % du temps a p(HOLD) majoritaire presque partout, et l'argmax renverrait
+    # HOLD en permanence (mesuré : 0 trade en validation, même seuil à zéro).
+    #
+    # Valeur de repli si le .json est absent (None = refuser de trader).
+    min_confidence: Optional[float] = None
 
     # ======= Volume dynamique selon l'equity du compte =======
     # True  : lot = 0.01 sous 2000$, +0.01 par tranche de 1000$ au-dessus
@@ -103,10 +130,17 @@ class LiveConfig:
     max_lot: float = 100.0
 
     # ======= MULTI-AGENT (wf1 + wf2 + wf3 en parallèle) =======
-    # True  : charge les 3 checkpoints et chaque agent peut ouvrir SA position
-    #         indépendamment (max 3 positions simultanées, 1 par agent).
+    # True  : charge les checkpoints listés dans active_agents et chaque agent
+    #         peut ouvrir SA position indépendamment (max len(active_agents)
+    #         positions simultanées, 1 par agent).
     # False : mode single-agent classique selon cfg.side
     multi_agent: bool = True
+
+    # Liste des agents actifs en mode multi_agent.
+    # Mettre ["wf1","wf3"] pour 2 agents, None = tous (wf1 + wf2 + wf3).
+    # N'activer qu'un agent dont le .pth existe réellement : le chargement
+    # échoue volontairement (FileNotFoundError) plutôt que de trader à vide.
+    active_agents: Optional[List[str]] = field(default_factory=lambda: ["wf1"])
 
     # ======= Gestion de marge =======
     # Fraction max de margin_free utilisée par un ordre (0.0–1.0).
@@ -119,289 +153,19 @@ class LiveConfig:
     min_volume: float = 0.01
 
 
-# ============================================================
-# INDICATEURS — IDENTIQUES AU TRAINING "LOUP Ω"
-# ============================================================
-
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    o = df["open"]
-    h = df["high"]
-    l = df["low"]
-    c = df["close"]
-
-    # ---------- RSI ----------
-    def rsi(series: pd.Series, period: int) -> pd.Series:
-        delta = series.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.rolling(period).mean()
-        avg_loss = loss.rolling(period).mean()
-        rs = avg_gain / (avg_loss + 1e-8)
-        return 100 - 100 / (1 + rs)
-
-    df["rsi_14"] = rsi(c, 14)
-
-    # ---------- ATR ----------
-    prev_close = c.shift(1)
-    tr1 = h - l
-    tr2 = (h - prev_close).abs()
-    tr3 = (l - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df["atr_14"] = tr.rolling(14).mean()
-
-    # ---------- Vol / range ----------
-    df["returns"] = c.pct_change()
-    df["vol_20"] = df["returns"].rolling(20).std()
-    df["range_norm"] = (h - l) / (c + 1e-8)
-
-    # Momentum / filtre RSI / régime de volatilité
-    df["mom_5"] = df["close"] > df["close"].shift(5)
-    df["rsi_ok"] = (df["rsi_14"] > 28) & (df["rsi_14"] < 72)
-    df["vol_rank"] = df["vol_20"].rolling(1440).rank(pct=True)
-    df["high_vol_regime"] = df["vol_rank"] > 0.65
-
-    return df
-
-
-FEATURE_COLS_M1 = [
-    "open", "high", "low", "close",
-    "rsi_14",
-    "returns", "vol_20", "range_norm",
-    "mom_5", "rsi_ok", "high_vol_regime",
-]
-
-FEATURE_COLS_H1 = [
-    "close_h1",
-    "rsi_14_h1",
-    "returns_h1", "vol_20_h1", "range_norm_h1",
-]
-
-FEATURE_COLS = FEATURE_COLS_M1 + FEATURE_COLS_H1
-N_BASE_FEATURES = len(FEATURE_COLS)
-
-# Embedding de position identique à l'env :
-#   - position (-1,0,1)
-#   - entry_price_scaled
-#   - current_price_scaled
-#   - last_risk_scale
-N_POS_FEATURES = 4
-OBS_N_FEATURES = N_BASE_FEATURES + N_POS_FEATURES  # 16 + 4 = 20
-
-
-def safe_normalize(X, stats, clip_sigma=5.0):
-    z = (X - stats["mean"]) / (stats["std"] + 1e-8)
-    z = np.clip(z, -clip_sigma, clip_sigma)
-    return z
-
 
 # ============================================================
-# MODELE SAINTv2 — COPIÉ DU TRAINING
+# SEUIL CALIBRÉ
 # ============================================================
 
-class GatedFFN(nn.Module):
-    def __init__(self, d: int, mult: int = 2, dropout: float = 0.05):
-        super().__init__()
-        inner = d * mult
-        self.lin1 = nn.Linear(d, inner * 2)
-        self.lin2 = nn.Linear(inner, d)
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(d)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.norm(x)
-        a, gate = self.lin1(h).chunk(2, dim=-1)
-        h = a * torch.sigmoid(gate)
-        h = self.lin2(self.dropout(h))
-        return x + h
+def seuil_calibre(pth: str):
+    """Barres (BUY, SELL) du checkpoint. Source unique : saint_core."""
+    return load_calib_thresholds(pth)
 
 
-class ColumnAttention(nn.Module):
-    def __init__(self, d: int, heads: int, dropout: float):
-        super().__init__()
-        self.norm = nn.LayerNorm(d)
-        self.attn = nn.MultiheadAttention(
-            d, heads, dropout=dropout, batch_first=True
-        )
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, F, D = x.shape
-        h = x.reshape(B * T, F, D)
-        h2 = self.norm(h)
-        out, _ = self.attn(h2, h2, h2)
-        h = h + self.drop(out)
-        return h.reshape(B, T, F, D)
-
-
-class RowAttention(nn.Module):
-    def __init__(self, d: int, heads: int, dropout: float):
-        super().__init__()
-        self.norm = nn.LayerNorm(d)
-        self.attn = nn.MultiheadAttention(
-            d, heads, dropout=dropout, batch_first=True
-        )
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, F, D = x.shape
-        h = x.permute(0, 2, 1, 3).reshape(B * F, T, D)
-        h2 = self.norm(h)
-        out, _ = self.attn(h2, h2, h2)
-        h = h + self.drop(out)
-        h = h.reshape(B, F, T, D).permute(0, 2, 1, 3)
-        return h
-
-
-class SAINTv2Block(nn.Module):
-    def __init__(self, d: int, heads: int, dropout: float, mult: int):
-        super().__init__()
-        self.ra1 = RowAttention(d, heads, dropout)
-        self.ff1 = GatedFFN(d, mult, dropout)
-
-        self.ra2 = RowAttention(d, heads, dropout)
-        self.ff2 = GatedFFN(d, mult, dropout)
-
-        self.ca = ColumnAttention(d, heads, dropout)
-        self.ff3 = GatedFFN(d, mult, dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.ra1(x)
-        x = self.ff1(x)
-        x = self.ra2(x)
-        x = self.ff2(x)
-        x = self.ca(x)
-        x = self.ff3(x)
-        return x
-
-
-class SAINTPolicySingleHead(nn.Module):
-    """
-    Architecture identique au training :
-      - actor: logits (N_ACTIONS)
-      - critic: V(s)
-    """
-    def __init__(
-        self,
-        n_features: int = OBS_N_FEATURES,
-        d_model: int = 80,
-        num_blocks: int = 2,
-        heads: int = 4,
-        dropout: float = 0.05,
-        ff_mult: int = 2,
-        max_len: int = 64,
-        n_actions: int = N_ACTIONS,
-    ):
-        super().__init__()
-        self.n_features = n_features
-        self.d_model = d_model
-        self.n_actions = n_actions
-
-        self.input_proj = nn.Linear(1, d_model)
-        self.scale = math.sqrt(d_model)
-        self.row_emb = nn.Embedding(max_len, d_model)
-        self.col_emb = nn.Embedding(n_features, d_model)
-
-        self.blocks = nn.ModuleList([
-            SAINTv2Block(d_model, heads, dropout, ff_mult)
-            for _ in range(num_blocks)
-        ])
-
-        self.norm = nn.LayerNorm(d_model)
-
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, 256),
-            nn.ReLU(),
-            nn.Dropout(0.05),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-        )
-
-        self.actor = nn.Linear(256, n_actions)
-        self.critic = nn.Linear(256, 1)
-
-    def forward(self, x: torch.Tensor):
-        """
-        x : (B,T,F)
-        """
-        assert x.dim() == 3, f"Input x must be (B,T,F), got {x.shape}"
-        B, T, F = x.shape
-
-        tok = self.input_proj(x.unsqueeze(-1)) * self.scale  # (B,T,F,D)
-
-        rows = torch.arange(T, device=x.device).view(1, T, 1).expand(B, T, F)
-        cols = torch.arange(F, device=x.device).view(1, 1, F).expand(B, T, F)
-
-        tok = tok + self.row_emb(rows) + self.col_emb(cols)
-
-        for blk in self.blocks:
-            tok = blk(tok)
-
-        h_time = tok.mean(dim=1)
-        h_feat = tok.mean(dim=2)
-
-        cls_time = h_time.mean(dim=1)
-        cls_feat = h_feat.mean(dim=1)
-
-        h = cls_time + cls_feat
-        h = self.norm(h)
-        h = self.mlp(h)
-
-        logits = self.actor(h)
-        value = self.critic(h).squeeze(-1)
-
-        return logits, value
-
-
-# ============================================================
-# UTILS LIVE
-# ============================================================
-
-def get_device(cfg: LiveConfig):
-    if cfg.force_cpu:
-        return torch.device("cpu")
-    if torch.cuda.is_available():
-        print("CUDA détecté — utilisation GPU.")
-        return torch.device("cuda")
-    print("Pas de CUDA — utilisation CPU.")
-    return torch.device("cpu")
-
-
-def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
-    """
-    Masque d'actions, cohérent avec le training pour side="long"/"short".
-    """
-    mask = torch.zeros(N_ACTIONS, dtype=torch.bool, device=device)
-
-    # 0=BUY  1=SELL  2=HOLD
-    if pos != 0:
-        mask[2] = True
-        return mask
-
-    if side == "long":
-        mask[0] = True
-        mask[2] = True
-    elif side == "short":
-        mask[1] = True
-        mask[2] = True
-    else:  # "both" / "duel"
-        mask[0] = True
-        mask[1] = True
-        mask[2] = True
-
-    return mask
-
-
-def load_norm_stats(path: str) -> Dict[str, np.ndarray]:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Stats de normalisation introuvables : {path}")
-    data = np.load(path)
-    return {"mean": data["mean"], "std": data["std"]}
-
-
-def normalize_features(X: np.ndarray, stats: Dict[str, np.ndarray]) -> np.ndarray:
-    mean, std = stats["mean"], stats["std"]
-    std = np.where(std < 1e-8, 1.0, std)
-    return (X - mean) / std
+def get_calib_threshold(agent_name: str):
+    """Barres du checkpoint associé à un agent du mode multi-agent."""
+    return seuil_calibre(MULTI_AGENT_PATHS.get(agent_name, BEST_MODEL_DUEL_PATH))
 
 
 # ============================================================
@@ -419,32 +183,26 @@ def fetch_ohlc_with_indicators(cfg: LiveConfig) -> pd.DataFrame:
     if rates_m1 is None or rates_h1 is None:
         raise RuntimeError("MT5 n'a renvoyé aucune donnée M1 ou H1 (live).")
 
-    df_m1 = pd.DataFrame(rates_m1)
-    df_m1["time"] = pd.to_datetime(df_m1["time"], unit="s")
-    df_m1.set_index("time", inplace=True)
-    df_m1 = df_m1[["open", "high", "low", "close", "tick_volume"]]
-    df_m1 = add_indicators(df_m1)
+    # Argent : MEME source que l'or (MT5), donc meme horodatage et meme fuseau.
+    # Plus aucun appel REST, plus de detection de decalage horaire, plus de
+    # risque de divergence entre l'historique et le live — tout ce qui rendait
+    # le pipeline Binance fragile disparait ici.
+    #
+    # On ne demande que la fenetre utile : lookback + marge pour les moyennes
+    # glissantes des indicateurs.
+    t_to = datetime.now() + timedelta(minutes=2)
+    t_from = t_to - timedelta(minutes=cfg.lookback + 400)
+    feats_ext = charge_source_externe(t_from, t_to)
+    if feats_ext is None or len(feats_ext) == 0:
+        raise RuntimeError(
+            f"Source externe absente : {SOURCE_EXT_NOM}. Deux des dix "
+            f"features en dependent, tourner sans elles ferait decider le "
+            f"modele sur un vecteur qu'il n'a jamais vu."
+        )
+    _si = mt5.symbol_info(cfg.symbol)
+    point = float(_si.point) if _si is not None else 1.0
 
-    df_h1 = pd.DataFrame(rates_h1)
-    df_h1["time"] = pd.to_datetime(df_h1["time"], unit="s")
-    df_h1.set_index("time", inplace=True)
-    df_h1 = df_h1[["open", "high", "low", "close", "tick_volume"]]
-    df_h1 = add_indicators(df_h1)
-    df_h1 = df_h1.add_suffix("_h1")
-
-    df_m1_reset = df_m1.reset_index()
-    df_h1_reset = df_h1.reset_index()
-    df_h1_reset = df_h1_reset.rename(columns={"time_h1": "time"})
-
-    merged = pd.merge_asof(
-        df_m1_reset.sort_values("time"),
-        df_h1_reset.sort_values("time"),
-        on="time",
-        direction="backward"
-    )
-
-    merged = merged.dropna().reset_index(drop=True)
-    return merged
+    return merge_m1_h1(rates_m1, rates_h1, feats_ext=feats_ext, point=point)
 
 
 def build_live_obs(
@@ -477,9 +235,8 @@ def build_live_obs(
     else:
         unrealized_atr = 0.0
 
-    # Durée de détention normalisée (scalping_max_holding = 12, comme en training)
-    scalping_max_holding = 12
-    bars_held_norm = float(min(bars_in_position / max(scalping_max_holding, 1), 3.0))
+    # Durée de détention normalisée (même référence que l'env d'entraînement)
+    bars_held_norm = float(min(bars_in_position / max(SCALPING_MAX_HOLDING, 1), 3.0))
 
     pos_feature  = float(pos)
     risk_feature = float(last_risk_scale)
@@ -541,14 +298,6 @@ def get_current_position_by_magic(symbol: str, magic: int) -> Tuple[int, float, 
     return side, float(p.price_open), int(p.ticket)
 
 
-def compute_entry_atr(df_merged: pd.DataFrame) -> float:
-    if "atr_14" not in df_merged.columns or len(df_merged) == 0:
-        return 0.0
-    atr = float(df_merged["atr_14"].tail(5).mean())
-
-    return max(atr, 0.0)
-
-
 # ============================================================
 # Cache entry_atr par ticket — pour figer la feature unrealized_atr
 # IDENTIQUE training/backtest (qui freezent l'ATR à l'ouverture)
@@ -581,64 +330,6 @@ def gc_entry_atr_cache(symbol: str) -> None:
     for t in list(_ENTRY_ATR_CACHE.keys()):
         if t not in open_tickets:
             _ENTRY_ATR_CACHE.pop(t, None)
-
-
-def compute_sl_tp(cfg: LiveConfig, entry_price: float, side: int, entry_atr: float,
-                  spread: float = 0.0):
-    """SL+TP aligné training/backtest : SL=1.2×ATR, TP=2.4×ATR×0.7=1.68×ATR.
-
-    Correction symétrique du spread :
-      - TP : rapproché de l'entrée de `spread` (MT5 déclenche au BID pour LONG /
-              ASK pour SHORT → sans correction, le TP rate de "spread")
-      - SL : éloigné de l'entrée de `spread` (le SL en live se déclenche aussi
-              au prix de clôture côté défavorable → sans correction, le SL est
-              "trop facile" à toucher par rapport au backtest)
-
-    Effet net : les niveaux SL/TP de MT5 sont décalés vers l'intérieur (TP) et
-    l'extérieur (SL) du même montant pour matcher le mouvement de prix attendu
-    dans le backtest.
-    """
-    fallback = 0.0015 * entry_price
-    eff_atr = max(entry_atr, fallback, 1e-8)
-
-    sl_dist = cfg.atr_sl_mult * eff_atr
-    tp_dist = cfg.atr_tp_mult * eff_atr * cfg.tp_shrink
-    # Correction spread symétrique
-    sl_dist_eff = sl_dist + spread        # SL plus loin → moins de SL prématurés
-    tp_dist_eff = max(tp_dist - spread, 1e-8)  # TP plus proche → hits effectifs
-
-    if side == 1:
-        sl = entry_price - sl_dist_eff
-        tp = entry_price + tp_dist_eff
-    else:
-        sl = entry_price + sl_dist_eff
-        tp = entry_price - tp_dist_eff
-
-    sl = max(sl, 1e-8)
-    tp = max(tp, 1e-8)
-    return sl, tp
-
-
-def compute_dynamic_volume(equity: float, max_lot: float = 100.0) -> float:
-    """Volume dynamique par paliers de 1000$ à partir de 2000$.
-
-    Règle :
-      - equity ≤ 2000$       → 0.10 lot
-      - 2000 < equity ≤ 3000 → 0.20 lot
-      - 3000 < equity ≤ 4000 → 0.30 lot
-      - ... (+0.10 par tranche de 1000$)
-      - plafonné à max_lot (par défaut 100.00)
-
-    Retourne toujours un float arrondi à 2 décimales.
-    """
-    if equity <= 2000.0:
-        tier = 1
-    else:
-        # 2001 → tier=2, 3000 → tier=2, 3001 → tier=3, ...
-        tier = int((equity - 1.0) // 1000.0)
-    lot = 0.10 * tier
-    lot = min(lot, max_lot)
-    return round(lot, 2)
 
 
 def adjust_volume_to_margin(cfg: LiveConfig, side: int, price: float, desired_volume: float,
@@ -718,28 +409,60 @@ def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: 
         price = tick.bid
         order_type = mt5.ORDER_TYPE_SELL
 
-    # Volume : dynamique selon equity ou statique selon cfg.position_size
-    if getattr(cfg, "dynamic_volume", False):
+    # Le SL doit etre connu AVANT la taille : c'est sa distance qui la fixe.
+    entry_atr = compute_entry_atr(df_merged_closed)
+    sl, tp = compute_sl_tp(cfg, price, side, entry_atr)
+
+    etiq = ("/" + agent_name) if agent_name else ""
+
+    # Volume : par le RISQUE en priorite, sinon paliers d'equity, sinon fixe.
+    if getattr(cfg, "risk_volume", True):
+        info = mt5.account_info()
+        equity = float(info.equity) if info is not None else 0.0
+        # symbol_select AVANT symbol_info : MT5 renvoie trade_tick_value = 0.0
+        # pour un symbole absent du Market Watch, ce qui annulerait l'ordre.
+        mt5.symbol_select(symbol, True)
+        sinfo = mt5.symbol_info(symbol)
+        if sinfo is None or equity <= 0.0:
+            print(f"[VOL{etiq}] symbol_info/account_info indisponible — ordre annule")
+            return
+        base_volume, risque_eff, plancher = compute_risk_volume(
+            equity=equity,
+            risk_frac=float(getattr(cfg, "risk_per_trade", 0.012)),
+            sl_dist=abs(price - sl),
+            tick_value=float(sinfo.trade_tick_value),
+            tick_size=float(sinfo.trade_tick_size),
+            vol_min=float(sinfo.volume_min),
+            vol_step=float(sinfo.volume_step),
+            vol_max=min(float(sinfo.volume_max), float(getattr(cfg, "max_lot", 100.0))),
+            contract_size=float(getattr(sinfo, "trade_contract_size", 0.0) or 0.0),
+        )
+        if base_volume <= 0.0:
+            print(f"[VOL{etiq}] volume par le risque = 0 — ordre annule")
+            return
+        msg = (f"[VOL{etiq}] equity={equity:.2f}$ SL={abs(price - sl):.2f} "
+               f"→ lot={base_volume:g} (risque {100*risque_eff:.2f} %)")
+        if plancher:
+            # Le seul cas ou le controle du risque echoue : il doit etre visible.
+            msg += (f"  ⚠ VOLUME MINIMUM DU COURTIER — risque impose "
+                    f"{100*risque_eff:.2f} % au lieu de "
+                    f"{100*float(getattr(cfg, 'risk_per_trade', 0.012)):.2f} %")
+        print(msg)
+    elif getattr(cfg, "dynamic_volume", False):
         info = mt5.account_info()
         equity = float(info.equity) if info is not None else 0.0
         base_volume = compute_dynamic_volume(equity, getattr(cfg, "max_lot", 100.0))
-        print(f"[VOL{('/' + agent_name) if agent_name else ''}] equity={equity:.2f}$ → lot={base_volume:.2f}")
+        print(f"[VOL{etiq}] equity={equity:.2f}$ → lot={base_volume:.2f}")
     else:
         base_volume = float(cfg.position_size)
 
-    volume = round(base_volume * (risk_scale if risk_scale > 0 else 1.0), 2)
+    volume = base_volume * (risk_scale if risk_scale > 0 else 1.0)
 
-    # Ajustement marge : réduit le lot si margin_free insuffisante (anti reject NO_MONEY)
+    # Ajustement marge : reduit le lot si margin_free insuffisante (anti reject NO_MONEY)
     if getattr(cfg, "auto_scale_volume_to_margin", True):
         volume = adjust_volume_to_margin(cfg, side, price, volume, agent_name=agent_name)
         if volume <= 0.0:
-            return  # ordre annulé pour cause de marge
-
-    entry_atr = compute_entry_atr(df_merged_closed)
-    # Spread courant (ASK - BID) pour ajuster le TP (le close se fait
-    # à BID pour un LONG, à ASK pour un SHORT → le spread "mange" le TP)
-    current_spread = max(float(tick.ask) - float(tick.bid), 0.0)
-    sl, tp = compute_sl_tp(cfg, price, side, entry_atr, spread=current_spread)
+            return  # ordre annule pour cause de marge
 
     comment = f"SAINTv2_{agent_name}" if agent_name else "SAINTv2_Live_duel"
     request = {
@@ -1003,20 +726,23 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
     stats = load_norm_stats(NORM_STATS_PATH)
 
     def _build_policy():
-        return SAINTPolicySingleHead(
-            n_features=OBS_N_FEATURES,
-            d_model=80,
-            num_blocks=2,
-            heads=4,
-            dropout=0.05,
-            ff_mult=2,
-            max_len=cfg.lookback,
-            n_actions=N_ACTIONS
-        ).to(device)
+        return build_policy(device, lookback=cfg.lookback)
 
-    # Chargement des 3 modèles
+    # Filtre des agents actifs (None = tous)
+    active = getattr(cfg, "active_agents", None)
+    if active is None:
+        agents_to_load = list(MULTI_AGENT_PATHS.keys())
+    else:
+        agents_to_load = [a for a in active if a in MULTI_AGENT_PATHS]
+        if not agents_to_load:
+            raise ValueError(f"active_agents={active} ne contient aucun agent valide. "
+                             f"Choix possibles : {list(MULTI_AGENT_PATHS.keys())}")
+    print(f"Agents actifs : {' / '.join(a.upper() for a in agents_to_load)}")
+
+    # Chargement des checkpoints
     policies: Dict[str, nn.Module] = {}
-    for agent_name, path in MULTI_AGENT_PATHS.items():
+    for agent_name in agents_to_load:
+        path = MULTI_AGENT_PATHS[agent_name]
         if not os.path.exists(path):
             raise FileNotFoundError(f"Checkpoint {agent_name} introuvable : {path}")
         p = _build_policy()
@@ -1087,18 +813,19 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
                     mask_d = build_mask_from_pos_scalar(0, device, "both")
                     logits_d_m = logits_d.masked_fill(~mask_d, MASK_VALUE)
                     probs = torch.softmax(logits_d_m, dim=-1)
-                    a_pred = int(torch.argmax(probs, dim=-1).item())
-                    p_pred = float(probs[a_pred].item())
+                    pb, ps = float(probs[0]), float(probs[1])
 
+                barres = get_calib_threshold(agent_name)
+                a_pred = decide_avec_barres(pb, ps, barres)
                 print(
                     f"  [{agent_name.upper()}] probas "
                     f"BUY={probs[0]:.2f} SELL={probs[1]:.2f} HOLD={probs[2]:.2f}  "
-                    f"→ {action_labels[a_pred]} (p={p_pred:.2f})"
+                    f"barres B={barres[0]:.3f} S={barres[1]:.3f}  "
+                    f"→ {action_labels[a_pred]}"
                 )
-
-                # Filtre confiance
-                if a_pred in (0, 1) and p_pred < cfg.min_confidence:
-                    print(f"  [{agent_name.upper()}] prob {p_pred:.2f} < {cfg.min_confidence:.2f} → HOLD")
+                if a_pred == 2:
+                    print(f"  [{agent_name.upper()}] aucun côté au-dessus de sa "
+                          f"barre → HOLD")
                     continue
 
                 # Action finale
@@ -1133,16 +860,7 @@ def live_loop(cfg: LiveConfig, should_continue):
     stats = load_norm_stats(NORM_STATS_PATH)
 
     def _build_policy():
-        return SAINTPolicySingleHead(
-            n_features=OBS_N_FEATURES,
-            d_model=80,
-            num_blocks=2,
-            heads=4,
-            dropout=0.05,
-            ff_mult=2,
-            max_len=cfg.lookback,
-            n_actions=N_ACTIONS
-        ).to(device)
+        return build_policy(device, lookback=cfg.lookback)
 
     policy_long = None
     policy_short = None
@@ -1305,19 +1023,13 @@ def live_loop(cfg: LiveConfig, should_continue):
                         print("Logits DUEL :", logits_d_m.cpu().numpy().round(4))
                         print("Probas DUEL :", probs_d.cpu().numpy().round(4))
 
-                        a_duel = int(torch.argmax(probs_d, dim=-1).item())
-                        p_duel = float(probs_d[a_duel].item())
-                        print(
-                            f"BEST DUEL : action={a_duel}, "
-                            f"prob={p_duel:.3f} "
-                            f"({action_labels[a_duel]})"
-                        )
-                        # Filtre confiance : entrée uniquement si prob >= seuil
-                        if a_duel in (0, 1) and p_duel < cfg.min_confidence:
-                            print(f"[CONF] prob {p_duel:.3f} < {cfg.min_confidence:.2f} → HOLD")
-                            a = 2
-                        else:
-                            a = a_duel
+                        # Une barre par côté — identique au training et au
+                        # mode multi-agent.
+                        barres_d = seuil_calibre(BEST_MODEL_DUEL_PATH)
+                        a = decide_avec_barres(float(probs_d[0]),
+                                               float(probs_d[1]), barres_d)
+                        print(f"BEST DUEL : {action_labels[a]}  "
+                              f"barres B={barres_d[0]:.3f} S={barres_d[1]:.3f}")
 
                 elif cfg.side == "duel":
                     if policy_long is None or policy_short is None:
@@ -1355,8 +1067,8 @@ def live_loop(cfg: LiveConfig, should_continue):
                             p_cand = p_short_sell
 
                         # Filtre confiance
-                        if cand in (0, 1) and p_cand < cfg.min_confidence:
-                            print(f"[CONF] prob {p_cand:.3f} < {cfg.min_confidence:.2f} → HOLD")
+                        if cand in (0, 1) and p_cand < max(seuil_calibre(BEST_MODEL_LONG_PATH)):
+                            print(f"[CONF] p {p_cand:.3f} sous la barre calibree -> HOLD")
                             a = 2
                         else:
                             a = cand
@@ -1378,8 +1090,8 @@ def live_loop(cfg: LiveConfig, should_continue):
                         a_long = int(torch.argmax(probs_long, dim=-1).item())
                         p_long = float(probs_long[a_long].item())
                         print(f"BEST LONG : action={a_long}, prob={p_long:.3f}")
-                        if a_long in (0, 1) and p_long < cfg.min_confidence:
-                            print(f"[CONF] prob {p_long:.3f} < {cfg.min_confidence:.2f} → HOLD")
+                        if a_long in (0, 1) and p_long < max(seuil_calibre(BEST_MODEL_LONG_PATH)):
+                            print(f"[CONF] p {p_long:.3f} sous la barre calibree -> HOLD")
                             a = 2
                         else:
                             a = a_long
@@ -1401,8 +1113,8 @@ def live_loop(cfg: LiveConfig, should_continue):
                         a_short = int(torch.argmax(probs_short, dim=-1).item())
                         p_short = float(probs_short[a_short].item())
                         print(f"BEST SHORT : action={a_short}, prob={p_short:.3f}")
-                        if a_short in (0, 1) and p_short < cfg.min_confidence:
-                            print(f"[CONF] prob {p_short:.3f} < {cfg.min_confidence:.2f} → HOLD")
+                        if a_short in (0, 1) and p_short < max(seuil_calibre(BEST_MODEL_SHORT_PATH)):
+                            print(f"[CONF] p {p_short:.3f} sous la barre calibree -> HOLD")
                             a = 2
                         else:
                             a = a_short
