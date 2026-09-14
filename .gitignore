@@ -57,3 +57,7 @@ run_saintv2_*.json
 
 # Journaux et manifestes des runs precedents
 runs_archives/
+
+# Journaux et rapports generes
+analyse_epochs.md
+training_btc.err
