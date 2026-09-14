@@ -103,7 +103,7 @@ Le système est conçu pour fonctionner **24/7** sur cryptos (BTCUSD), avec gest
 | Espace d'action | **3 actions** : `BUY` / `SELL` / `HOLD` |
 | Période d'entraînement | 2022-12-15 → 2026-09 (~3.7 ans, 1.83 M bougies M1 après filtrage) |
 | Méthodologie | Walk-forward 3 folds (55/15/10) |
-| Backbone size | d_model=80, 2 blocks, 4 heads — 274 836 paramètres |
+| Backbone size | d_model=80, 2 blocks, 4 heads — 407 780 paramètres |
 | Features | 12 M1 + 13 H1 + 2 Binance + 3 liquidité/temps + 4 position = **34** |
 | Lookback | 25 bougies M1 |
 
@@ -124,13 +124,14 @@ Input (B, T=25, F=34)
               │
               ▼
    ┌──── Block × 2 ──────────────────────────────┐
-   │   RowAttn (axe T)                           │
-   │      ↳ chaque feature regarde ses voisins   │
-   │        temporels                            │
-   │   ColAttn (axe F)                           │
-   │      ↳ chaque pas de temps mixe ses         │
-   │        features entre elles                 │
-   │   GatedFFN (SwiGLU-like)                    │
+   │   Attention axe T  (+ RoPE, QK-Norm)        │
+   │      ↳ chaque feature regarde son histoire  │
+   │   SwiGLU                                    │
+   │   Attention axe F  (QK-Norm)                │
+   │      ↳ chaque instant mixe ses colonnes     │
+   │   SwiGLU                                    │
+   │                                             │
+   │   pre-RMSNorm + LayerScale sur les 4        │
    └─────────────────────────────────────────────┘
               │
               │   h = moyenne sur l'axe FEATURE ──► (B, T, d)
@@ -148,9 +149,52 @@ Input (B, T=25, F=34)
                   (B, 3)         (B, 1)
 ```
 
-> **Le bloc a été réduit** de `ra, ff, ra, ff, ca, ff` à `ra, ca, ff` :
-> 482 836 → 274 836 paramètres, 7.8 → 4.4 ms par passe. Aucune perte mesurée.
->
+### Composants, et la recherche derrière chacun
+
+| Composant | Référence | Pourquoi |
+|---|---|---|
+| pre-norm **RMSNorm** | Xiong 2020 ; Zhang & Sennrich 2019 | blocs profonds entraînables sans warmup ; le recentrage ne sert à rien après une projection linéaire |
+| **QK-Norm** | Henry 2020 ; ViT-22B 2023 | borne les logits d'attention — la perte du critique oscillait entre 24 et 47 |
+| **SDPA / FlashAttention** | Dao 2022 | attention exacte sans matérialiser la matrice T×T ; c'est ce qui paie la structure complète |
+| **RoPE** (axe temps seul) | Su 2021 | position relative par rotation. Pas sur l'axe features : les colonnes n'ont pas d'ordre naturel |
+| **SwiGLU** | Shazeer 2020 | largeur interne à 2/3 pour garder le même compte de paramètres |
+| **LayerScale** 1e-4 | Touvron 2021 (CaiT) | le réseau démarre proche de l'identité et ouvre les branches utiles |
+| plongement **périodique** | Gorishniy 2022 | un scalaire projeté n'occupe qu'une direction ; les fréquences apprises séparent des valeurs proches |
+| jeton **CLS** | Gorishniy 2021 (FT-Transformer) | remplace la moyenne, qui pèse toutes les colonnes également |
+| init acteur **gain 0.01** | Engstrom 2020 | sur PPO ce détail pèse plus que la plupart des choix algorithmiques |
+
+### Ce qui est délibérément absent : l'intersample attention
+
+C'est l'innovation qui donne son nom à SAINT — chaque ligne du **lot** regarde
+les autres lignes du lot. Elle est écartée, et pas pour une raison de coût.
+
+En production l'agent décide sur **une** observation : le lot vaut 1. Un softmax
+sur un seul élément rend 1, donc l'opération dégénère en simple projection. Les
+poids appris sous un lot de 128 se comporteraient autrement en live — un écart
+entraînement/production silencieux. Sur des séries temporelles, elle ferait en
+plus circuler de l'information entre dates différentes du même lot.
+
+Les deux axes conservés sont définis pour un échantillon unique.
+`test_architecture.py` le vérifie : **un lot de 8 donne exactement 8 passes de 1
+(écart 5.1e-09)**.
+
+### Coût mesuré
+
+Banc entrelacé, GPU bloqué à 210 MHz sur les six tours (donc même état thermique
+pour toutes les variantes), forward+backward à batch 128 :
+
+```
+ancien (ra,ca,ff) x2        298 596 params   279.55 ms   1.00x
+complet x2                  407 780 params   666.41 ms   2.38x
+complet x3                  509 620 params  1078.59 ms   3.86x
+complet x4                  611 460 params  1463.37 ms   5.23x
+```
+
+**bf16 ne rattrape rien** : 211.8 ms contre 186.0 en fp32 sur la même variante.
+À cette taille le coût est dans les lancements de noyaux et la mémoire, pas dans
+le calcul tensoriel, et l'autocast ajoute des conversions. Aucun gradient non
+fini en bf16 — l'ancien problème d'AMP était bien spécifique à fp16.
+
 > **Le pooling a été corrigé.** L'ancienne version moyennait le tenseur sur
 > chacun des deux axes puis re-moyennait : les deux « CLS » étaient
 > mathématiquement identiques (écart mesuré 4.5e-08). La moitié de la tête

@@ -3372,18 +3372,23 @@ if __name__ == "__main__":
     print("=" * 70)
     cfg_duel = PPOConfig(**cfg_base.__dict__)
     cfg_duel.side = "both"
-    # exec6 : ls_ratio_top (apport mesure +0.0000) remplacee par taker_1m_ma5
-    # (+0.0087). Compte de features inchange, donc meme cout GPU.
-    # exec4 : sortie par le temps retiree (max_holding_bars = 0) et detention
-    # de reference ramenee de 120 a 30 barres.
+    # Un prefixe par jeu d'observation OU par architecture : les poids ne sont
+    # jamais interchangeables d'une lignee a l'autre, et le manifeste refuse de
+    # reecrire un run existant.
     #
-    # Un prefixe par jeu d'observation : les poids ne sont pas interchangeables
-    # entre exec3, exec4 et exec6, et le manifeste refuse de reecrire un run
-    # existant.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec6"
+    #   exec3  30 features, scalping_max_holding 120, sortie temps a 240 barres
+    #   exec4  sortie par le temps retiree, detention de reference a 30 barres
+    #   exec6  ls_ratio_top (+0.0000) remplacee par taker_1m_ma5 (+0.0087)
+    #   exec7  ARCHITECTURE COMPLETE : une attention ET son FFN par axe,
+    #          RMSNorm en pre-norm, QK-Norm, RoPE sur l'axe temps, SwiGLU,
+    #          LayerScale, plongement numerique periodique, jeton CLS.
+    #          Cout mesure : 2.38x le fwd+bwd de la version reduite, a
+    #          profondeur egale et etat thermique identique.
+    #          AUCUN checkpoint anterieur n'est chargeable.
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec7"
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec6: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec7: trois folds sans bootstrap inter-fold.")
     run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10,
                     max_folds=3, start_fold=1,
                     bootstrap_from_path=None,

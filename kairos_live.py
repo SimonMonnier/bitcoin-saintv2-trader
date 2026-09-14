@@ -45,23 +45,26 @@ from saint_core import (
 BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf1_long_wf1.pth"
 BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf1_short_wf1.pth"
 # Modèle unifié (entraîné avec side="both") : décide BUY/SELL/HOLD dans un seul fichier
-BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_exec5_wf1_both_wf1.pth"
+BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_exec7_wf1_both_wf1.pth"
 
 # ============================================================
 # MULTI-AGENT : 3 modèles WF tradent en parallèle (comme dans le backtest)
 # Chaque modèle a son propre magic MT5 pour identifier ses positions.
 # ============================================================
-# Lignee BTCUSD, prefixe exec5 (detention de reference 30 barres, sortie par
-# le temps retiree). Les fichiers "exec3" sont du BTC mais avec une AUTRE
-# observation : leurs poids ne sont pas interchangeables. Ceux sans prefixe
-# d'exec sont les modeles OR — 1.96 Mo contre 1.20 Mo, architecture d'avant la
-# reduction du bloc SAINTv2. D'ou le nommage explicite plutot qu'un chemin
-# generique : un mauvais fichier charge ici trade sans erreur visible.
+# Lignee exec7 : architecture SAINT COMPLETE (une attention et son FFN par
+# axe, RMSNorm, QK-Norm, RoPE, SwiGLU, LayerScale, jeton CLS).
+#
+# AUCUNE autre lignee n'est chargeable ici. exec3 a exec6 sont du BTC mais
+# avec une autre observation ET l'ancien bloc reduit ; les fichiers sans
+# prefixe d'exec sont les modeles OR. D'ou le nommage explicite plutot qu'un
+# chemin generique : charger le mauvais fichier ne leve pas d'erreur visible,
+# soit le state_dict refuse de se charger, soit — pire — il se charge et
+# l'agent trade en lisant autre chose que ce sur quoi il a appris.
 # wf2/wf3 n'existent pas encore en BTC : leur activation doit echouer bruyamment.
 MULTI_AGENT_PATHS: Dict[str, str] = {
-    "wf1": "bestprofit_saintv2_loup_duel_exec5_wf1_both_wf1.pth",
-    "wf2": "bestprofit_saintv2_loup_duel_exec5_wf2_both_wf2.pth",
-    "wf3": "bestprofit_saintv2_loup_duel_exec5_wf3_both_wf3.pth",
+    "wf1": "bestprofit_saintv2_loup_duel_exec7_wf1_both_wf1.pth",
+    "wf2": "bestprofit_saintv2_loup_duel_exec7_wf2_both_wf2.pth",
+    "wf3": "bestprofit_saintv2_loup_duel_exec7_wf3_both_wf3.pth",
 }
 MULTI_AGENT_MAGICS: Dict[str, int] = {
     "wf1": 424241,
@@ -121,14 +124,16 @@ class LiveConfig:
     trailing_start_atr_mult: float = 1.5
     trailing_dist_atr_mult: float = 1.0
 
-    # ======= DIVERGENCE CONNUE AVEC LE TRAINING =======
-    # training.PPOConfig.max_holding_bars = 240 : l'environnement ferme au
-    # marche toute position encore ouverte apres 240 minutes, et les 92.3 % de
-    # resolution comme le +0.317 ATR/trade en dependent. Le live n'a AUCUN
-    # chemin de fermeture au marche (les positions ne sortent que par SL/TP du
-    # courtier), donc cette regle n'est pas appliquee ici. A implementer avant
-    # tout deploiement reel, sinon la strategie exécutée n'est pas celle qui a
-    # ete mesuree.
+    # ======= SORTIE PAR LE TEMPS =======
+    # Le live n'a AUCUN chemin de fermeture au marche : une position n'en sort
+    # que par le SL ou le TP poses chez le courtier. C'est precisement pour
+    # cela que training.PPOConfig.max_holding_bars vaut 0 — l'environnement ne
+    # simule pas une sortie que l'execution ne sait pas faire.
+    #
+    # Mesure qui rend ce choix peu couteux : 99.91 % des trades se resolvent
+    # en 240 barres, detention MEDIANE 7 barres. Ecrire une fermeture au
+    # marche reste souhaitable, mais ce n'est pas ce qui bloque la
+    # rentabilite.
 
     # ======= Seuil de confiance pour ouvrir un trade =======
     # CALIBRÉ, plus fixé à la main : le training écrit le seuil réalisant la

@@ -603,90 +603,256 @@ def build_obs(df: pd.DataFrame,
 # SAINT v2 — SINGLE-HEAD (ACTOR + CRITIC)
 # ============================================================
 
-class GatedFFN(nn.Module):
+# ============================================================
+#  ARCHITECTURE — SAINT a double axe, version complete
+# ============================================================
+#
+# Le bloc avait ete reduit a (attention temps, attention features, un FFN) pour
+# tenir dans le budget thermique. On revient a la structure COMPLETE — une
+# attention ET son FFN par axe — avec les composants qui font l'etat de l'art
+# depuis SAINT (2021). Chacun est la pour une raison mesurable, pas par mode.
+#
+#   Pre-norm + RMSNorm         Xiong et al. 2020 ; Zhang & Sennrich 2019.
+#                              La pre-norm rend les blocs profonds entrainables
+#                              sans warmup ; RMSNorm retire le recentrage, qui
+#                              ne sert a rien apres une projection lineaire.
+#
+#   QK-Norm                    Henry et al. 2020 ; Dehghani et al. 2023 (ViT-22B).
+#                              Normalise Q et K AVANT le produit scalaire. Sans
+#                              elle, les logits d'attention grandissent sans
+#                              borne et l'entrainement diverge tard, d'un coup.
+#                              Pertinent ici : la perte du critique oscillait
+#                              entre 24 et 47 d'une epoch a l'autre.
+#
+#   SDPA / FlashAttention      Dao et al. 2022. torch.nn.functional.
+#                              scaled_dot_product_attention dispatche vers le
+#                              noyau fusionne : attention EXACTE, mais sans
+#                              materialiser la matrice T x T. C'est ce qui paie
+#                              le surcout de la structure complete.
+#
+#   RoPE sur l'axe TEMPS       Su et al. 2021. Position RELATIVE par rotation.
+#                              Sur l'axe des features, on garde un plongement
+#                              appris : les colonnes n'ont pas d'ordre naturel,
+#                              leur imposer une geometrie de position serait
+#                              une contrainte fausse.
+#
+#   SwiGLU                     Shazeer 2020, "GLU Variants Improve Transformer".
+#                              Remplace le gating par sigmoide. Largeur interne
+#                              ramenee a 2/3 pour garder le meme compte de
+#                              parametres qu'un FFN dense equivalent.
+#
+#   LayerScale                 Touvron et al. 2021 (CaiT). Un gain par canal
+#                              sur chaque branche residuelle, initialise a 1e-4 :
+#                              le reseau demarre proche de l'identite et ouvre
+#                              les branches a mesure qu'elles servent. C'est ce
+#                              qui permet d'empiler des blocs sans instabilite.
+#
+#   Plongement numerique       Gorishniy et al. 2022, "On Embeddings for
+#   periodique + lineaire      Numerical Features". Un scalaire projete
+#                              lineairement occupe une seule direction ; les
+#                              activations periodiques lui donnent une
+#                              representation a haute frequence ou l'attention
+#                              peut distinguer des valeurs proches. C'est l'un
+#                              des gains les mieux repliques sur donnees
+#                              tabulaires. Variante PR (sans les bins), qui ne
+#                              demande aucune statistique externe au modele.
+#
+#   Jeton CLS                  Gorishniy et al. 2021 (FT-Transformer). Un jeton
+#                              appris sur l'axe des features, que l'attention
+#                              remplit. Remplace la moyenne, qui traite toutes
+#                              les colonnes a poids egal.
+#
+# CE QUI A ETE ECARTE, ET POURQUOI — l'INTERSAMPLE ATTENTION de SAINT.
+#
+# C'est l'innovation qui donne son nom au papier : chaque ligne du LOT regarde
+# les autres lignes du lot. Elle n'est pas utilisable ici, et pas pour une
+# raison de cout.
+#
+# En production, l'agent decide sur UNE observation a la fois : le lot vaut 1.
+# Un softmax sur un seul element rend 1, donc l'attention inter-echantillons
+# degenere en une simple projection de la valeur. Les poids appris sous un lot
+# de 128 se comporteraient autrement en live — un ecart entrainement/production
+# silencieux, exactement la classe de defaut que ce projet passe son temps a
+# eliminer. Sur des series temporelles, elle ferait en plus circuler de
+# l'information entre des dates differentes du meme lot.
+#
+# Les deux axes conserves — TEMPS et FEATURES — sont definis pour un echantillon
+# unique et se comportent donc identiquement a l'entrainement et en live.
+
+
+class RMSNorm(nn.Module):
+    """Normalisation par la norme quadratique, sans recentrage ni biais."""
+
+    def __init__(self, d: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        h = x.float()
+        h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (h * self.weight.float()).to(dtype)
+
+
+def _rope_tables(longueur: int, dim_tete: int, device, dtype, base: float = 10_000.0):
+    """Cosinus/sinus de RoPE. Recalcules a la volee : negligeable devant
+    l'attention, et evite un buffer dont la taille figerait le lookback."""
+    moitie = dim_tete // 2
+    freqs = 1.0 / (base ** (torch.arange(0, moitie, device=device).float() / moitie))
+    angles = torch.outer(torch.arange(longueur, device=device).float(), freqs)
+    return angles.cos().to(dtype), angles.sin().to(dtype)
+
+
+def _applique_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """x : (N, tetes, L, dim_tete). Rotation par paires de canaux."""
+    x1, x2 = x.chunk(2, dim=-1)
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+
+class AxialAttention(nn.Module):
+    """Attention multi-tetes sur UN axe, en pre-norm.
+
+    Rend la sortie de la BRANCHE, sans residu : c'est le bloc qui applique le
+    LayerScale puis l'addition, pour que le gain par canal porte bien sur la
+    branche et non sur la somme.
+    """
+
+    def __init__(self, d: int, heads: int, dropout: float, rope: bool = False):
+        super().__init__()
+        if d % heads != 0:
+            raise ValueError(f"d_model={d} n'est pas divisible par heads={heads}")
+        self.heads = heads
+        self.dim_tete = d // heads
+        self.rope = rope
+        self.norm = RMSNorm(d)
+        # Sans biais : la pre-norm en amont en produit deja l'equivalent.
+        self.qkv = nn.Linear(d, 3 * d, bias=False)
+        self.proj = nn.Linear(d, d, bias=False)
+        self.q_norm = RMSNorm(self.dim_tete)
+        self.k_norm = RMSNorm(self.dim_tete)
+        self.p_drop = dropout
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        N, L, D = x.shape
+        h = self.norm(x)
+        q, k, v = self.qkv(h).chunk(3, dim=-1)
+        q = q.view(N, L, self.heads, self.dim_tete).transpose(1, 2)
+        k = k.view(N, L, self.heads, self.dim_tete).transpose(1, 2)
+        v = v.view(N, L, self.heads, self.dim_tete).transpose(1, 2)
+
+        # QK-Norm : la norme des requetes et des cles ne depend plus de
+        # l'echelle des activations, seule leur DIRECTION compte.
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        if self.rope:
+            cos, sin = _rope_tables(L, self.dim_tete, x.device, q.dtype)
+            q, k = _applique_rope(q, cos, sin), _applique_rope(k, cos, sin)
+
+        o = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.p_drop if self.training else 0.0)
+        o = o.transpose(1, 2).reshape(N, L, D)
+        return self.drop(self.proj(o))
+
+
+class SwiGLU(nn.Module):
+    """FFN a porte SiLU, en pre-norm. Rend la branche, sans residu."""
+
     def __init__(self, d: int, mult: int = 2, dropout: float = 0.05):
         super().__init__()
-        inner = d * mult
-        self.lin1 = nn.Linear(d, inner * 2)
-        self.lin2 = nn.Linear(inner, d)
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(d)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.norm(x)
-        a, gate = self.lin1(h).chunk(2, dim=-1)
-        h = a * torch.sigmoid(gate)
-        h = self.lin2(self.dropout(h))
-        return x + h
-
-
-class ColumnAttention(nn.Module):
-    def __init__(self, d: int, heads: int, dropout: float):
-        super().__init__()
-        self.norm = nn.LayerNorm(d)
-        self.attn = nn.MultiheadAttention(
-            d, heads, dropout=dropout, batch_first=True
-        )
+        # 2/3 : deux projections d'entree au lieu d'une, on compense pour
+        # garder le meme nombre de parametres qu'un FFN dense de largeur d*mult.
+        inner = max(8, int(round(2 * mult * d / 3 / 8)) * 8)
+        self.norm = RMSNorm(d)
+        self.w_in = nn.Linear(d, 2 * inner, bias=False)
+        self.w_out = nn.Linear(inner, d, bias=False)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, F, D = x.shape
-        h = x.reshape(B * T, F, D)
-        h2 = self.norm(h)
-        out, _ = self.attn(h2, h2, h2)
-        h = h + self.drop(out)
-        return h.reshape(B, T, F, D)
-
-
-class RowAttention(nn.Module):
-    def __init__(self, d: int, heads: int, dropout: float):
-        super().__init__()
-        self.norm = nn.LayerNorm(d)
-        self.attn = nn.MultiheadAttention(
-            d, heads, dropout=dropout, batch_first=True
-        )
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, F, D = x.shape
-        h = x.permute(0, 2, 1, 3).reshape(B * F, T, D)
-        h2 = self.norm(h)
-        out, _ = self.attn(h2, h2, h2)
-        h = h + self.drop(out)
-        h = h.reshape(B, F, T, D).permute(0, 2, 1, 3)
-        return h
+        a, porte = self.w_in(self.norm(x)).chunk(2, dim=-1)
+        return self.drop(self.w_out(torch.nn.functional.silu(porte) * a))
 
 
 class SAINTv2Block(nn.Module):
-    """Un tour de melange : sur le TEMPS, puis sur les COLONNES, puis un FFN.
+    """Un tour COMPLET : (attention temps + FFN), puis (attention features + FFN).
 
-    L'ancienne version enchainait SIX modules — ra1, ff1, ra2, ff2, ca, ff3 —
-    soit DEUX attentions sur le temps par bloc, pour une seule sur les colonnes.
-    Une conception a double axe en fait normalement une de chaque : la seconde
-    RowAttention remelangeait le meme axe sans rien croiser de nouveau.
+    C'est la structure du papier : une attention et SON reseau feed-forward par
+    axe. La version reduite partageait un seul FFN pour les deux axes, ce qui
+    forcait le melange temporel et le melange inter-colonnes a passer par la
+    meme transformation non lineaire.
 
-    Mesure a batch 16, 34 features, GPU libre :
-      2 blocs x (ra, ff, ra, ff, ca, ff)   482 836 params   7.8 ms
-      2 blocs x (ra, ca, ff)               274 836 params   4.5 ms   -42 %
-      1 bloc  x (ra, ff, ra, ff, ca, ff)   287 716 params   4.1 ms   -48 %
-
-    On retient la deuxieme : presque le meme gain que la troisieme, mais elle
-    conserve DEUX tours de melange croise temps/colonnes, ce qui compte avec 30
-    features la ou un seul tour ne laisse chaque colonne en voir les autres
-    qu'une fois.
+    Chaque branche est mise a l'echelle par un gain appris par canal
+    (LayerScale) initialise a 1e-4 : au premier pas le bloc est quasiment
+    l'identite, et il ouvre les branches qui servent.
     """
 
-    def __init__(self, d: int, heads: int, dropout: float, mult: int):
+    def __init__(self, d: int, heads: int, dropout: float, mult: int,
+                 drop_path: float = 0.0, ls_init: float = 1e-4):
         super().__init__()
-        self.ra = RowAttention(d, heads, dropout)
-        self.ca = ColumnAttention(d, heads, dropout)
-        self.ff = GatedFFN(d, mult, dropout)
+        self.attn_temps = AxialAttention(d, heads, dropout, rope=True)
+        self.ff_temps = SwiGLU(d, mult, dropout)
+        self.attn_feat = AxialAttention(d, heads, dropout, rope=False)
+        self.ff_feat = SwiGLU(d, mult, dropout)
+        self.gamma = nn.ParameterList(
+            [nn.Parameter(ls_init * torch.ones(d)) for _ in range(4)])
+        self.drop_path = float(drop_path)
+
+    def _branche(self, h: torch.Tensor, sortie: torch.Tensor,
+                 gamma: torch.Tensor) -> torch.Tensor:
+        sortie = gamma * sortie
+        if self.training and self.drop_path > 0.0:
+            garde = 1.0 - self.drop_path
+            forme = (h.shape[0],) + (1,) * (h.dim() - 1)
+            masque = torch.rand(forme, device=h.device) < garde
+            sortie = sortie * masque / garde
+        return h + sortie
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.ra(x)
-        x = self.ca(x)
-        x = self.ff(x)
-        return x
+        B, T, F, D = x.shape
+
+        # ---- axe TEMPS : chaque colonne regarde sa propre histoire ----
+        h = x.permute(0, 2, 1, 3).reshape(B * F, T, D)
+        h = self._branche(h, self.attn_temps(h), self.gamma[0])
+        h = self._branche(h, self.ff_temps(h), self.gamma[1])
+        x = h.reshape(B, F, T, D).permute(0, 2, 1, 3)
+
+        # ---- axe FEATURES : chaque instant melange ses colonnes ----
+        h = x.reshape(B * T, F, D)
+        h = self._branche(h, self.attn_feat(h), self.gamma[2])
+        h = self._branche(h, self.ff_feat(h), self.gamma[3])
+        return h.reshape(B, T, F, D)
+
+
+class NumericalEmbedding(nn.Module):
+    """Plongement periodique + lineaire, un jeu de poids PAR COLONNE.
+
+    Un scalaire projete par une seule matrice n'occupe qu'une direction de
+    l'espace latent : deux valeurs proches donnent deux vecteurs proches, et
+    l'attention ne peut pas les separer. Les activations periodiques
+    sin/cos(2 pi f x), avec des frequences APPRISES par colonne, donnent une
+    representation ou un petit ecart devient une grande distance angulaire.
+
+    La valeur brute est concatenee aux composantes periodiques : sans elle, le
+    plongement serait invariant par periode et perdrait l'ordre.
+    """
+
+    def __init__(self, n_features: int, d: int, n_freq: int = 16,
+                 sigma: float = 0.05):
+        super().__init__()
+        self.freqs = nn.Parameter(torch.randn(n_features, n_freq) * sigma)
+        self.weight = nn.Parameter(torch.empty(n_features, 2 * n_freq + 1, d))
+        self.bias = nn.Parameter(torch.zeros(n_features, d))
+        nn.init.normal_(self.weight, std=(2 * n_freq + 1) ** -0.5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x : (B, T, F) -> (B, T, F, d)
+        v = x.unsqueeze(-1)
+        angles = 2.0 * math.pi * v * self.freqs
+        traits = torch.cat([angles.sin(), angles.cos(), v], dim=-1)
+        return torch.einsum("btfk,fkd->btfd", traits, self.weight) + self.bias
 
 
 class SAINTPolicySingleHead(nn.Module):
@@ -702,78 +868,97 @@ class SAINTPolicySingleHead(nn.Module):
         ff_mult: int = 2,
         max_len: int = 64,
         n_actions: int = N_ACTIONS,
+        n_freq: int = 16,
+        drop_path: float = 0.0,
+        ls_init: float = 1e-4,
     ):
         super().__init__()
         self.n_features = n_features
         self.d_model = d_model
         self.n_actions = n_actions
 
-        self.input_proj = nn.Linear(1, d_model)
-        self.scale = math.sqrt(d_model)
-        self.row_emb = nn.Embedding(max_len, d_model)
-        self.col_emb = nn.Embedding(n_features, d_model)
+        self.embed = NumericalEmbedding(n_features, d_model, n_freq=n_freq)
+        # Position TEMPORELLE : portee par RoPE dans l'attention, pas ici.
+        # Identite de COLONNE : apprise, car les features n'ont pas d'ordre.
+        self.col_emb = nn.Embedding(n_features + 1, d_model)
+        # Jeton de lecture, place en tete de l'axe des features.
+        self.cls = nn.Parameter(torch.zeros(1, 1, 1, d_model))
 
+        # Profondeur stochastique croissante : les premiers blocs, qui portent
+        # les representations de base, sont conserves plus souvent.
+        taux = [drop_path * i / max(num_blocks - 1, 1) for i in range(num_blocks)]
         self.blocks = nn.ModuleList([
-            SAINTv2Block(d_model, heads, dropout, ff_mult)
-            for _ in range(num_blocks)
+            SAINTv2Block(d_model, heads, dropout, ff_mult,
+                         drop_path=taux[i], ls_init=ls_init)
+            for i in range(num_blocks)
         ])
 
         # 2 x d_model : la tete recoit DEUX vues concatenees (cf. forward).
-        self.norm = nn.LayerNorm(2 * d_model)
+        self.norm = RMSNorm(2 * d_model)
 
         self.mlp = nn.Sequential(
             nn.Linear(2 * d_model, 256),
-            nn.ReLU(),
-            nn.Dropout(0.05),
+            nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(256, 256),
-            nn.ReLU(),
+            nn.GELU(),
         )
 
         self.actor = nn.Linear(256, n_actions)
         self.critic = nn.Linear(256, 1)
+        self._init_poids()
+
+    def _init_poids(self):
+        """Initialisation orthogonale, tete d'acteur a gain 0.01.
+
+        Engstrom et al. 2020, "Implementation Matters in Deep Policy Gradients" :
+        sur PPO, ce detail pese davantage que la plupart des choix
+        algorithmiques. Un acteur initialise a gain 1 sort des logits deja
+        marques, donc une politique prematurement piquee, et les premiers pas
+        de gradient corrigent un a priori arbitraire au lieu d'apprendre.
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, std=0.02)
+        nn.init.orthogonal_(self.actor.weight, gain=0.01)
+        nn.init.zeros_(self.actor.bias)
+        nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        nn.init.zeros_(self.critic.bias)
 
     def forward(self, x: torch.Tensor):
         assert x.dim() == 3, f"Input x must be (B,T,F), got {x.shape}"
         B, T, F = x.shape
 
-        tok = self.input_proj(x.unsqueeze(-1)) * self.scale
+        tok = self.embed(x)                                   # (B, T, F, D)
 
-        rows = torch.arange(T, device=x.device).view(1, T, 1).expand(B, T, F)
-        cols = torch.arange(F, device=x.device).view(1, 1, F).expand(B, T, F)
+        # Jeton CLS en tete de l'axe des features : l'attention inter-colonnes
+        # y agrege ce qui compte, au lieu d'une moyenne a poids egaux.
+        tok = torch.cat([self.cls.expand(B, T, 1, self.d_model), tok], dim=2)
 
-        tok = tok + self.row_emb(rows) + self.col_emb(cols)
+        cols = torch.arange(F + 1, device=x.device)
+        tok = tok + self.col_emb(cols).view(1, 1, F + 1, self.d_model)
 
         for blk in self.blocks:
             tok = blk(tok)
 
-        # LECTURE A DEUX VUES — corrigee.
+        # LECTURE A DEUX VUES.
         #
-        # L'ancienne version calculait :
-        #     cls_time = tok.mean(dim=1).mean(dim=1)   # moyenne T puis F
-        #     cls_feat = tok.mean(dim=2).mean(dim=1)   # moyenne F puis T
-        #     h = cls_time + cls_feat
-        # Or moyenner sur T puis sur F donne exactement la moyenne sur (T,F),
-        # dans les deux ordres : les deux vues etaient le MEME tenseur (verifie
-        # numeriquement, ecart 4.5e-08), leur somme valait 2x la moyenne
-        # globale, et le facteur 2 etait absorbe par le LayerNorm qui suit.
+        # L'ancienne version calculait cls_time et cls_feat par deux moyennes
+        # qui, prises dans l'un ou l'autre ordre, donnent EXACTEMENT le meme
+        # tenseur (ecart mesure 4.5e-08) : les deux vues etaient confondues et
+        # la moitie de la tete lisait la meme chose.
         #
-        # Toute la lecture a double axe se reduisait donc a une moyenne plate.
-        # Apres avoir fait travailler l'attention sur le temps ET sur les
-        # colonnes, la tete jetait l'information de POSITION : quel instant,
-        # quelle feature.
-        #
-        # On garde deux vues REELLEMENT distinctes :
-        #   - le resume global de la fenetre ;
+        # On garde deux vues reellement distinctes, lues sur le jeton CLS :
+        #   - le resume de toute la fenetre ;
         #   - la DERNIERE bougie, celle sur laquelle la decision se prend.
-        # Elles sont concatenees et non additionnees, pour que le MLP puisse
-        # les ponderer au lieu de les confondre.
-        h_feat = tok.mean(dim=2)              # (B, T, D) : un resume par instant
-        cls_global = h_feat.mean(dim=1)       # (B, D) : moyenne de la fenetre
-        cls_recent = h_feat[:, -1, :]         # (B, D) : l'instant de decision
-
-        h = torch.cat([cls_global, cls_recent], dim=-1)
-        h = self.norm(h)
-        h = self.mlp(h)
+        # Concatenees et non additionnees, pour que le MLP puisse les ponderer.
+        cls = tok[:, :, 0, :]                                 # (B, T, D)
+        h = torch.cat([cls.mean(dim=1), cls[:, -1, :]], dim=-1)
+        h = self.mlp(self.norm(h))
 
         logits = self.actor(h)
         value = self.critic(h).squeeze(-1)
