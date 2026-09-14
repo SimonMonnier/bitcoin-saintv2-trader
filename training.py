@@ -328,22 +328,35 @@ class PPOConfig:
     #     0.990    73.97%   54.72%   29.94%    8.96%     69 min
     #     0.995    86.04%   74.03%   54.80%   30.03%    138 min
     #
-    # Or `max_holding_bars` vaut 240 : un trade qui sort par le temps ne pese
-    # plus que 0.07 % a l'entree. L'agent est donc entraine a ignorer le
-    # resultat des trades les plus longs — ce n'est pas une erreur de calcul,
-    # c'est un horizon probablement mal adapte a la duree reelle des positions.
+    # LE CRITERE N'EST PAS LA DUREE D'UN TRADE. L'ancienne justification de
+    # cette ligne s'appuyait sur max_holding_bars = 240, qui vaut desormais 0
+    # — et qui ne concernait de toute facon que 0.09 % des trades. Elle
+    # generalisait un cas de queue a toute la distribution.
     #
-    # CHOIX : 0.995, par raisonnement sur l'horizon de detention, PAS par
-    # mesure — aucune ablation n'a encore compare les deux.
+    # Detention reellement mesuree sur BTCUSD a 2.0xATR : MEDIANE 7 barres,
+    # moyenne 12. Poids restant du resultat d'un trade a l'entree :
     #
-    # Le critere est max_holding_bars = 240. Pour que l'agent soit entraine sur
-    # le RESULTAT de ses trades, la recompense de sortie doit garder un poids
-    # reel a l'entree.
-    #   0.990 : 9 % a 240 min — les positions longues restent quasi invisibles
-    #   0.995 : 74 % a 60 min (l'ordre de la duree mediane), 30 % au plafond
-    #   0.999 : demi-vie de 11.5 h, tres au-dela du plafond ; ne distinguerait
-    #           plus un trade de 10 minutes d'un trade de 240, et le credit
-    #           deborderait sur des etats sans rapport avec le trade
+    #     gamma   7 barres  12 barres  32 barres   horizon   cycles
+    #     0.970      80.8%      69.4%      37.7%     33 min      1.0
+    #     0.990      93.2%      88.6%      72.5%    100 min      3.1
+    #     0.995      96.6%      94.2%      85.2%    200 min      6.2
+    #     0.999      99.3%      98.8%      96.8%   1000 min     31.2
+    #
+    # Meme a 0.97 le trade median garde 81 % de son poids : la duree n'est pas
+    # la contrainte qui mord. Le semi-MDP la traite deja par son bootstrap
+    # gamma^dt, et la recompense n'attend pas la cloture — log_ret est verse a
+    # CHAQUE barre.
+    #
+    # Ce que gamma gouverne ici, c'est l'HORIZON D'OPPORTUNITE ENTRE TRADES.
+    # L'agent est flat 91 % du temps et toute la strategie repose sur la
+    # selectivite : la valeur d'attendre doit refleter les occasions futures.
+    # Un cycle complet fait ~32 barres (~20 d'attente a 5 % de selectivite,
+    # ~12 de detention). A 0.995 l'agent voit ~6 cycles ; le descendre pour
+    # "coller" aux 7 barres d'un trade le ramenerait a un seul cycle et le
+    # rendrait myope sur precisement ce dont la strategie depend.
+    #
+    # CHOIX : 0.995, par raisonnement sur l'horizon d'opportunite, TOUJOURS PAS
+    # par mesure — aucune ablation n'a encore compare les valeurs entre elles.
     #
     # A SURVEILLER : un gamma plus haut augmente la variance des avantages et
     # l'echelle des cibles du critique. Si CriticL s'envole ou si quasi0
@@ -531,26 +544,40 @@ class PPOConfig:
 
     # Scalp
     # Detention de reference pour normaliser bars_held_norm — doit rester egale
-    # a saint_core.SCALPING_MAX_HOLDING. A SL 5xATR / R:R 2.0, 92.3 % des trades
-    # se resolvent dans les 240 min ; le deplacement etant diffusif, atteindre
-    # 5 ATR demande ~25 min et 10 ATR une centaine. On prend 120 pour que la
-    # feature garde de la dynamique jusqu'au plafond sans saturer.
-    scalping_max_holding: int = 120
+    # a saint_core.SCALPING_MAX_HOLDING, que le live utilise pour construire la
+    # meme feature. Les changer separement decale l'observation entre les deux.
+    #
+    # 120 venait des barrieres larges de l'or (5xATR : ~25 min pour toucher le
+    # SL, une centaine pour le TP). A 2.0xATR sur BTCUSD la detention mediane
+    # mesuree est de 7 barres : bars_held_norm valait ~0.06 pour un trade
+    # typique, soit une entree d'observation qui ne portait presque rien.
+    #
+    # A 30 : ~0.23 pour un trade median, saturation au-dela de 90 barres
+    # (environ 1 % des trades, 98.2 % se resolvant en 60 barres).
+    scalping_max_holding: int = 30
 
-    # SORTIE PAR LE TEMPS — indispensable a la coherence mesure/environnement.
+    # SORTIE PAR LE TEMPS — DESACTIVEE (0 = pas de plafond).
     #
-    # Sans plafond, une position a SL 5xATR / TP 10xATR peut courir des milliers
-    # de bougies sur l'or. Mesure a l'epoch 1 : l'agent passait 99.9 % du temps
-    # en position et n'obtenait que 574 decisions par epoch, contre ~9500 sur
-    # BTCUSD — seize fois moins d'occasions d'apprendre. Le critic explosait en
-    # consequence (loss 65 352 contre 46), les recompenses s'accumulant sur des
-    # centaines de bougies avant cloture.
+    # Le live n'a aucun chemin de fermeture au marche : une position n'y sort
+    # que par SL/TP chez le courtier. Un plafond present ici et absent la-bas
+    # fait mesurer une strategie qu'on ne peut pas executer.
     #
-    # Surtout, TOUTE la mesure qui a choisi ce SL/TP supposait une sortie forcee
-    # a 240 min avec cloture au marche : les 92.3 % de resolution et le
-    # +0.317 ATR/trade en dependent. Sans ce plafond, l'environnement simulerait
-    # une strategie jamais evaluee.
-    max_holding_bars: int = 240
+    # Le retirer ne coute presque rien sur BTCUSD aux barrieres actuelles.
+    # Mesure sur 250 000 entrees de la fenetre d'entrainement, SL 2.0xATR /
+    # TP 2.8xATR : detention MEDIANE de 7 barres, 99.91 % des trades resolus
+    # en 240 barres, 100 % en 1440. Le plafond interceptait moins d'un trade
+    # sur mille, et ceux-la finissaient 52 % TP / 48 % SL — aucun biais a
+    # preserver.
+    #
+    # Le motif d'origine venait de l'OR a SL 5xATR / TP 10xATR, ou l'agent
+    # restait 99.9 % du temps en position (574 decisions par epoch contre
+    # ~9500 sur BTC, critic loss 65 352 contre 46). A 2.0xATR ce regime
+    # n'existe pas. Si on revient un jour a des barrieres larges, remesurer
+    # AVANT de laisser ce champ a 0.
+    #
+    # Le biais de survie reste couvert : la fin d'episode liquide toute
+    # position encore ouverte (voir _close_position / terminal_reason).
+    max_holding_bars: int = 0
 
     # Break-even & trailing stop — DÉSACTIVÉ pour aligner sur le backtest no_be_trail
     # et sur le MQL5 (SaintV2_WF3 sans BE/trail).
@@ -1370,7 +1397,7 @@ class BTCTradingEnvDiscrete(gym.Env):
         manual_close = False
 
         # --------- OUVERTURE DIRECTE (pas de confirmation dans l'env) ---------
-        # La confirmation signal→pause→re-signal est gérée dans loup_live.py uniquement.
+        # La confirmation signal→pause→re-signal est gérée dans kairos_live.py uniquement.
         # En training, le reward shaping pénalise déjà les mauvaises entrées.
         if not manual_close and action in (0, 1) and old_pos == 0:
             side = 1 if action == 0 else -1
@@ -1470,8 +1497,9 @@ class BTCTradingEnvDiscrete(gym.Env):
                     exit_price = self.tp_price
                     hit_tp = True
 
-            # Ni SL ni TP : on cloture AU MARCHE au plafond de detention, comme
-            # le faisait la mesure qui a choisi ce SL/TP.
+            # Ni SL ni TP : cloture AU MARCHE au plafond de detention.
+            # INACTIF par defaut (max_holding_bars = 0) : le live ne sait pas
+            # fermer au marche, donc l'environnement ne le fait pas non plus.
             if (exit_price is None and self.cfg.max_holding_bars > 0
                     and self.bars_in_position >= self.cfg.max_holding_bars):
                 exit_price = self._apply_micro(price, -self.position, is_entry=False)
@@ -3356,10 +3384,18 @@ if __name__ == "__main__":
     print("=" * 70)
     cfg_duel = PPOConfig(**cfg_base.__dict__)
     cfg_duel.side = "both"
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec3"
+    # exec5 : ls_ratio_top (apport mesure +0.0000) remplacee par taker_1m_ma5
+    # (+0.0087). Compte de features inchange, donc meme cout GPU.
+    # exec4 : sortie par le temps retiree (max_holding_bars = 0) et detention
+    # de reference ramenee de 120 a 30 barres.
+    #
+    # Un prefixe par jeu d'observation : les poids ne sont pas interchangeables
+    # entre exec3, exec4 et exec5, et le manifeste refuse de reecrire un run
+    # existant.
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec5"
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec2: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec5: trois folds sans bootstrap inter-fold.")
     run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10,
                     max_folds=3, start_fold=1,
                     bootstrap_from_path=None,

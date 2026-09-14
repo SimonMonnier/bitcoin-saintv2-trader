@@ -29,7 +29,8 @@ env/
 .DS_Store
 Thumbs.db
 
-# Loup logs sauvegardés depuis la GUI
+# Journaux sauvegardés depuis la GUI
+kairos_log_*.txt
 loup_log_*.txt
 
 # Donnees lourdes — jamais versionnees
@@ -53,3 +54,6 @@ experiments/
 
 # Instantanes de configuration par run
 run_saintv2_*.json
+
+# Journaux et manifestes des runs precedents
+runs_archives/

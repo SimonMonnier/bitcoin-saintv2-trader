@@ -1,21 +1,47 @@
-# 🐺 Loup Ω — Agent RL Multi-Stratégie pour BTCUSD M1
+# KAIROS — Agent RL Multi-Stratégie pour BTCUSD M1
+
+> *Le modèle ne prédit pas le marché. Il attend le moment.*
 
 > **PPO + SAINTv2** : agent d'apprentissage par renforcement entraîné en walk-forward sur l'historique BTCUSD à la minute, déployable en live sur MetaTrader 5 via une interface graphique dédiée.
 
 ---
 
-## ⚠️ État actuel — les checkpoints doivent être réentraînés
+## ⚠️ État actuel — aucun modèle n'est déployable
 
-Un audit a mis au jour quatre défauts qui invalident les poids entraînés avant cette révision. Ils sont corrigés dans le code, mais **aucun `.pth` produit avant la correction n'est exploitable** :
+**Le run en cours (`exec5`) perd encore de l'argent.** Meilleur résultat mesuré à
+ce jour : **−2,60 $ par trade** en validation, winrate 33,1 % contre un point
+mort à 43,7 %. La progression est réelle mais l'écart au seuil reste d'une
+dizaine de points.
 
-| Défaut | Effet | Correctif |
-|--------|-------|-----------|
-| `tick_noise_bps = 12` étendait les bougies de ±71 $ alors que le SL est à ~54 $ | 83 % de SL touchés, 40 % en une bougie ; policy effondrée à 96 % HOLD | ramené à `3.0` |
-| `× leverage` appliqué au PnL du seul `training.py` | économie d'entraînement 6× fausse, garde-fous DD/capital déclenchés 6× trop tôt | supprimé (le levier ne concerne que la marge) |
-| `merge_asof` H1 renvoyait le bar en formation | jusqu'à 59 min de futur en training/backtest, valeurs partielles en live | `df_h1.shift(1)` — seul le dernier H1 clos est utilisé |
-| Bonus momentum testé sur des features z-scorées | `rsi_ok` plafonne à z = +0.48 < 0.5 → bonus jamais distribué | flags lus en brut (0/1) |
+Aucun `.pth` ne doit être mis en production. `kairos_live.py` refuse d'ailleurs
+de trader sans fichier `_calib.json` correspondant (`min_confidence = None`).
 
-Les mesures ayant motivé ces correctifs figurent dans `training_log_both_wf1.csv` (PnL bloqué à −1578 $ sur 148 epochs, PF 0.25) et `trades_both_wf1.csv` (25 174 trades, WR 17 %).
+### Lignées de checkpoints — elles ne sont PAS interchangeables
+
+Un préfixe par jeu d'observation. Charger le mauvais fichier ne produit aucune
+erreur visible : le modèle trade, simplement il lit autre chose que ce sur quoi
+il a appris.
+
+| Préfixe | Taille | Observation |
+|---------|--------|-------------|
+| `saintv2_loup_*` (sans exec) | 1,96 Mo | **modèles OR** — architecture d'avant la réduction du bloc SAINTv2 |
+| `..._exec3_...` | 1,20 Mo | BTC, 30 features, `scalping_max_holding = 120`, sortie par le temps à 240 barres |
+| `..._exec4_...` | 1,20 Mo | BTC, `scalping_max_holding = 30`, sortie par le temps retirée |
+| `..._exec5_...` | 1,20 Mo | idem + `ls_ratio_top` remplacée par `taker_1m_ma5` ← **courant** |
+
+### Le vrai sujet ouvert
+
+Une régression logistique atteint **0,6271 d'AUC** sur ces colonnes. Aucune
+politique entraînée n'a dépassé **0,5707**. Cet écart est le fait le plus
+reproductible et le moins expliqué du projet : le signal est dans les features,
+PPO n'arrive pas à le prendre.
+
+### Divergence connue entre l'entraînement et le live
+
+`kairos_live.py` n'a **aucun chemin de fermeture au marché** — les positions ne
+sortent que par SL/TP chez le courtier. Tant que ce n'est pas écrit, toute règle
+de sortie temporelle côté entraînement simulerait une stratégie inexécutable ;
+c'est pourquoi `max_holding_bars` vaut 0.
 
 ---
 
@@ -45,11 +71,16 @@ Les mesures ayant motivé ces correctifs figurent dans `training_log_both_wf1.cs
 18. [Références scientifiques](#-références-scientifiques)
 19. [Disclaimer](#-disclaimer)
 
+> 📓 **`JOURNAL_MESURES.md`** — ce qui a été mesuré, comment, et ce que chaque
+> mesure ne permet pas de conclure. À lire avant de proposer une feature, un
+> hyperparamètre ou une « évidence » : la plupart des impasses du projet ont été
+> des raisonnements plausibles jamais confrontés à une mesure.
+
 ---
 
 ## 🎯 Vue d'ensemble
 
-**Loup Ω** est un système complet de trading algorithmique BTCUSD M1 (1 minute) basé sur l'apprentissage par renforcement profond. Il combine :
+**KAIROS** est un système complet de trading algorithmique BTCUSD M1 (1 minute) basé sur l'apprentissage par renforcement profond. Il combine :
 
 - **PPO** (Proximal Policy Optimization) — algorithme on-policy stable de référence pour le contrôle
 - **SAINTv2** — transformer dual-axis (row + column attention) reconnu pour la modélisation de séries financières tabulaires
@@ -70,10 +101,10 @@ Le système est conçu pour fonctionner **24/7** sur cryptos (BTCUSD), avec gest
 | Algorithme RL | PPO clippé + GAE λ |
 | Backbone | SAINTv2 (RowAttn + ColAttn + GatedFFN) |
 | Espace d'action | **3 actions** : `BUY` / `SELL` / `HOLD` |
-| Période d'entraînement | 2022-01-01 → 2026-05 (~4.4 ans, ~2.2 M bougies M1) |
+| Période d'entraînement | 2022-12-15 → 2026-09 (~3.7 ans, 1.83 M bougies M1 après filtrage) |
 | Méthodologie | Walk-forward 3 folds (55/15/10) |
-| Backbone size | d_model=80, 2 blocks, 4 heads |
-| Features | 11 M1 + 5 H1 + 4 position = 20 |
+| Backbone size | d_model=80, 2 blocks, 4 heads — 274 836 paramètres |
+| Features | 12 M1 + 13 H1 + 2 Binance + 3 liquidité/temps + 4 position = **34** |
 | Lookback | 25 bougies M1 |
 
 ---
@@ -85,7 +116,7 @@ Le système est conçu pour fonctionner **24/7** sur cryptos (BTCUSD), avec gest
 Architecture transformer **dual-axis** spécialement adaptée aux données tabulaires temporelles, inspirée du papier _SAINT_ (Somepalli et al. 2021) avec amélioration v2 : gated FFN à la PaLM/Gemma + double row-attention par block.
 
 ```
-Input (B, T=25, F=20)
+Input (B, T=25, F=34)
    │
    ├─► Linear projection ──► (B, T, F, d_model=80)
    ├─► + Row embedding  (temporel)
@@ -93,30 +124,38 @@ Input (B, T=25, F=20)
               │
               ▼
    ┌──── Block × 2 ──────────────────────────────┐
-   │   RowAttn (T-axis attention)                │
+   │   RowAttn (axe T)                           │
    │      ↳ chaque feature regarde ses voisins   │
    │        temporels                            │
-   │   GatedFFN (SwiGLU-like)                    │
-   │   RowAttn (2e passe : raffinement)          │
-   │   GatedFFN                                  │
-   │   ColAttn (F-axis attention)                │
-   │      ↳ chaque pas de temps mixe ses        │
+   │   ColAttn (axe F)                           │
+   │      ↳ chaque pas de temps mixe ses         │
    │        features entre elles                 │
-   │   GatedFFN                                  │
+   │   GatedFFN (SwiGLU-like)                    │
    └─────────────────────────────────────────────┘
               │
-              ├──► time-mean ──► (B, F, d)
-              └──► feat-mean ──► (B, T, d)
+              │   h = moyenne sur l'axe FEATURE ──► (B, T, d)
+              │
+              ├──► moyenne sur T  ──► contexte global  (B, d)
+              └──► dernier pas    ──► instant courant  (B, d)
                           │
-                  CLS pooling (mean)
+                    concat ──► (B, 2d)
                           │
-                       LayerNorm
+                    LayerNorm(2d)
                           │
-                   MLP 80 → 256 → 256
+                   MLP 160 → 256 → 256
                        /        \
                   actor          critic
                   (B, 3)         (B, 1)
 ```
+
+> **Le bloc a été réduit** de `ra, ff, ra, ff, ca, ff` à `ra, ca, ff` :
+> 482 836 → 274 836 paramètres, 7.8 → 4.4 ms par passe. Aucune perte mesurée.
+>
+> **Le pooling a été corrigé.** L'ancienne version moyennait le tenseur sur
+> chacun des deux axes puis re-moyennait : les deux « CLS » étaient
+> mathématiquement identiques (écart mesuré 4.5e-08). La moitié de la tête
+> lisait donc la même chose. On concatène désormais le contexte global et le
+> dernier pas de temps, qui portent une information différente.
 
 **Pourquoi SAINTv2** : sur des données financières (M1 OHLC + indicateurs + HTF), la corrélation temporelle ET inter-features est cruciale. Les transformers classiques attaquent une seule des deux axes ; SAINTv2 mixe les deux dans chaque bloc → meilleure modélisation des patterns complexes (rejet de support, retest, divergence RSI vs prix, etc.).
 
@@ -128,11 +167,22 @@ Input (B, T=25, F=20)
 
 Implémentation maison avec :
 - **Clipped surrogate objective** (ratio ε = 0.18)
-- **GAE-λ** (γ=0.97, λ=0.95) pour le calcul des avantages
-- **Critic warmup** : 5 epochs où seul le critic apprend (init du baseline V(s))
+- **GAE semi-MDP** : bootstrap en `γ^Δt` (γ=0.995 par minute, λ=0.95). Le pas de
+  décision n'est pas constant — seule une fraction des pas en position est
+  conservée — donc un `γ` par transition fausserait l'actualisation.
+- **Critic warmup** : 5 epochs où seul le critic apprend. **Conséquence pour
+  lire les logs** : sur ces 5 epochs l'actor est gelé (`H = 1.099 = ln 3`,
+  `clipfrac 0 %`). Toute variation de résultat y vient du curriculum et du
+  tirage du seuil, jamais d'un apprentissage.
 - **KL early stop** : interruption d'une epoch si KL > 0.03
 - **Cosine LR scheduling** : 3e-4 → 1.5e-5 sur 240 epochs
-- **Reward normalization** : algorithme de Welford online pour stabiliser CriticL
+- **Plafond de décisions** (16 000/epoch) : sans lui le nombre de décisions
+  variait d'un facteur 17 d'une epoch à l'autre, rendant les durées et les
+  quantités de gradient incomparables.
+
+> **Reward normalization retirée.** L'estimateur de Welford initialisait sa
+> variance à 1.0 puis la ramenait à 0 au premier échantillon : écart-type 1e-8,
+> récompenses divisées par presque rien.
 
 ### Référence
 - [PPO paper (Schulman et al., 2017)](https://arxiv.org/abs/1707.06347)
@@ -140,27 +190,68 @@ Implémentation maison avec :
 
 ---
 
-## 🧬 Jeu de features — 10 colonnes, choisies sur mesure
+## 🧬 Jeu de features — 30 colonnes
 
-Le vecteur d'entrée a été reconstruit à partir d'une mesure d'apport marginal
-hors échantillon (régression logistique, cible = direction à 1 h, moyenne sur
-5 découpages temporels), et non d'une intuition :
+`saint_core.FEATURE_COLS` est la **source unique**. 12 colonnes M1, 13 H1,
+2 Binance, 3 liquidité/temps. L'observation ajoute 4 scalaires de position →
+`OBS_N_FEATURES = 34`.
 
-| Jeu | AUC | Commentaire |
-|-----|-----|-------------|
-| 21 features (prix + ticks) | 0.5263 | jeu précédent |
-| 8 features de prix élaguées | 0.5313 | **l'élagage seul a gagné +0.0050** |
-| **+ `taker_ratio` + `ls_ratio_top`** | **0.5442** | jeu retenu |
-| + 4 autres colonnes Binance | 0.5432 | rejeté : perd sur 5/5 découpages |
+> ⚠️ L'élagage à 10 colonnes documenté dans les versions précédentes de ce
+> fichier a été **annulé après mesure** : les apports marginaux NE SE COMPOSENT
+> PAS. Retirer 9 features individuellement « nulles » coûtait 0.0024 d'AUC, soit
+> plus que la meilleure feature du jeu n'en apporte.
 
-**Retirées** : `open_rel` (corrélée 0.99 à `returns` — mécaniquement la même
-colonne), `high_rel`/`low_rel` (0.72 avec `range_norm`), `vol_20`, `vol_20_h1`,
-`range_norm_h1` (AUC 0.501 = aucune information), `rsi_ok`, `rsi_14` (apport
-**négatif** : −0.0017), et les 5 features de ticks (apport mesuré : 0.0000).
+### Ce que pèse chaque source — mesuré, pas supposé
 
-**Ajoutées** — flux Binance BTCUSDT perpétuel, seule classe d'information
-absente d'un flux CFD. `taker_ratio` (déséquilibre du volume *agressif*) atteint
-à lui seul une AUC de 0.5266, soit plus que les 21 anciennes features réunies.
+Sonde logistique, barrières SL 2.0×ATR / R:R 1.4, friction complète, train
+0–55 % / validation 55–70 %, fenêtre de test intouchée.
+
+| Opération sur le jeu de 30 | AUC | Écart |
+|---|---|---|
+| référence | **0.6185** | — |
+| sans `taker_ratio` | 0.5680 | **−0.0498** |
+| sans `ls_ratio_top` | 0.6177 | −0.0000 |
+| + `taker_1m_ma5` | **0.6271** | **+0.0087** |
+
+`taker_ratio` porte à elle seule presque tout l'apport externe. `ls_ratio_top`
+n'apportait **rien** et a été remplacée par `taker_1m_ma5` — même compte de
+features, donc même coût GPU.
+
+### Le critère qui sépare les features utiles des inertes
+
+**Une feature doit varier à l'échelle où la décision se prend.** La détention
+médiane d'un trade est de **7 barres** ; une série constante sur cette durée ne
+peut pas départager deux entrées espacées de quelques minutes.
+
+| Colonne | Autocorr. 1 min | Apport |
+|---|---|---|
+| `taker_1m_ma5` | 0.86 | **+0.0087** |
+| `taker_ratio` (5 min) | 0.82 | **−0.0498 si retirée** |
+| `oi_change` | 0.989 | +0.0001 |
+| `funding_rate` | 0.9996 | −0.0000 |
+| `ls_ratio_top` | 0.99998 | −0.0000 |
+| `ls_ratio_retail` | 0.99998 | −0.0014 |
+
+Les quatre colonnes Binance jamais branchées donnent **0.4847 d'AUC à elles
+seules** — sous le hasard. Le funding change toutes les 10 heures : c'est une
+variable de *régime*, pas de *timing*.
+
+Le balayage de la fenêtre de lissage du flux 1 minute confirme le mécanisme —
+bosse régulière à sommet unique, retour à zéro quand la série devient un régime :
+
+```
+1min +0.0016 | 3min +0.0067 | 5min +0.0087 | 10min +0.0050
+15min +0.0027 | 30min +0.0017 | 60min +0.0004 | 120min -0.0000
+```
+
+> Ces mesures sont reproductibles : `mesure_features.py`, `mesure_binance_extra.py`,
+> `mesure_flux_1m.py`. Chacune porte dans son en-tête le biais de sélection
+> qu'elle subit — on lit le meilleur d'une grille sur la même fenêtre de
+> validation, donc les chiffres sont des bornes optimistes.
+
+**MetaTrader ne peut fournir aucune de ces grandeurs** : son `tick_volume`
+compte les changements de prix, pas les montants échangés, et il n'a ni flux
+taker, ni open interest, ni funding.
 
 Le **carnet d'ordres a été écarté après mesure** : les archives `bookDepth` ne
 descendent pas sous le palier ±1 %, alors que l'endpoint live `/fapi/v1/depth`
@@ -221,7 +312,7 @@ jours de trous en 2022). Coût : 2.28 M → 1.97 M bougies.
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│             3. LIVE TRADING (loup_live.py + gui_loup.py)         │
+│             3. LIVE TRADING (kairos_live.py + kairos_gui.py)         │
 │                                                                  │
 │  GUI PySide6 → TradingAgent thread → MT5 polling 1s →            │
 │  Détection nouvelle bougie M1 fermée → Construction obs →        │
@@ -424,12 +515,12 @@ Deux autres réserves méthodologiques sur ces chiffres :
   `__main__`, ce qui affaiblit l'indépendance walk-forward revendiquée.
 
 Le **live applique cette leçon** : `update_sl_be_trailing_live()` est commenté
-dans `loup_live.py`.
+dans `kairos_live.py`.
 
 ### 3. Live trading (GUI)
 
 ```powershell
-python gui_loup.py
+python kairos_gui.py
 ```
 
 - Choisis ta taille de lot
@@ -440,7 +531,7 @@ python gui_loup.py
 ### 4. Live sans GUI (CLI)
 
 ```powershell
-python loup_live.py
+python kairos_live.py
 ```
 
 ### 5. Export vers MT5 Strategy Tester (MQL5)
@@ -485,14 +576,29 @@ multi-agent-btcusd/
 │                                    #    Ne JAMAIS redupliquer ces fonctions ailleurs :
 │                                    #    c'est la duplication qui avait laissé diverger
 │                                    #    l'alignement H1, le bruit et le levier.
-├── build_binance_features.py        # ⭐ Récupère Binance + résout l'alignement
-│                                    #    horaire broker/UTC (DST américain).
-│                                    #    À lancer AVANT le training.
+├── build_binance_features.py        # ⭐ Récupère Binance (funding, metrics 5 min) et
+│                                    #    résout l'alignement horaire broker/UTC (DST
+│                                    #    américain). À lancer AVANT le training.
+├── telecharge_flux_1m.py            # Archives klines 1 MINUTE → features de flux.
+│                                    #    Seule source variant à l'échelle de la décision.
 ├── export_binance_for_mql5.py       # .pkl → binaire lu par l'EA (WebRequest est
 │                                    #    désactivé dans le Strategy Tester)
 ├── training.py                      # Entraînement PPO + SAINTv2 walk-forward
-├── loup_live.py                     # Agent live MT5 (single + multi-agent + marge)
-├── gui_loup.py                      # Interface graphique PySide6
+├── kairos_live.py                   # Agent live MT5 (single + multi-agent + marge)
+├── kairos_gui.py                    # Interface graphique PySide6 (présentation seule)
+├── kairos_theme.py                  # Palette, typographie, feuille de style QSS
+├── kairos_widgets.py                # Jauge winrate, sparkline, témoin d'état, tuiles
+├── suivi_live.ps1                   # Fenêtre de suivi du training en direct (lecture seule)
+├── relais_exec5.py                  # Enchaîne un run sur le suivant à une epoch donnée
+│                                    #    ⚠️ voir le piège os.kill documenté dedans
+│
+├── (mesures — chacune documente son propre biais de sélection)
+├── mesure_features.py               # Largeur du jeu × grille SL/R:R
+├── mesure_binance_extra.py          # Apport des colonnes Binance non branchées
+├── mesure_flux_1m.py                # Apport du flux 1 min, avec contrôle d'alignement bloquant
+├── mesure_sltp.py / mesure_minimal.py / mesure_binaire.py / mesure_lookback.py
+├── diag_auc.py / diag_conviction.py # Sonde logistique vs politique entraînée
+│
 ├── backtest_saintv2_stress_test.py  # Backtest institutionnel (BE/trail on)
 ├── backtest_saintv2_no_be_trail.py  # Variante sans BE/trail (comparaison)
 ├── backtest_saintv2_multi_agent.py  # Backtest multi-agent (wf1 + wf2 + wf3)
@@ -507,18 +613,27 @@ multi-agent-btcusd/
 │                                    #    Conservé pour traçabilité, plus alimenté.
 │
 ├── (générés avant training)
-├── binance_features_BTCUSD.pkl                                   # Features Binance, heure broker
-├── .cache_binance/                                              # Archives brutes UTC (re-alignement
+├── binance_features_BTCUSD.pkl                                  # Features Binance, heure broker
+├── binance_flux_1m_BTCUSD.pkl                                   # Flux 1 min, index UTC
+├── data_cache_BTCUSD_20221215.pkl                               # Frame M1+H1+externe fusionnée
+├── .cache_binance/                                              # Archives brutes UTC + table
+│                                                                #    d'offsets DST (re-alignement
 │                                                                #    sans retéléchargement)
 │
 ├── (générés après training)
 ├── norm_stats_ohlc_indics.npz                                   # Stats Z-score globales
-├── best_saintv2_loup_duel_wf{1,2,3}_both_wf{1,2,3}.pth          # Best Sortino30
-├── bestprofit_saintv2_loup_duel_wf{1,2,3}_both_wf{1,2,3}.pth    # Best ValPNL
-├── last_saintv2_loup_duel_wf{1,2,3}_both_wf{1,2,3}.pth          # Final epoch
+├── best_saintv2_loup_duel_exec5_wf1_both_wf1.pth                # Best Sortino30
+├── bestprofit_saintv2_loup_duel_exec5_wf1_both_wf1.pth          # Best ValPNL par trade
+├── *_calib.json                                                 # Seuils calibrés — SANS eux,
+│                                                                #    le live refuse de trader
+├── *_norm.npz                                                   # Stats de normalisation du modèle
+├── run_saintv2_loup_duel_exec5_*.json                           # Manifeste : refuse d'écraser
+│                                                                #    un run existant
+├── runs_archives/                                               # Journaux et manifestes des runs
+│                                                                #    précédents (exec3, exec4…)
 ├── training_log_both_wf{1,2,3}.csv                              # Logs CSV epoch-level
-├── trades_both_wf{1,2,3}.csv                                    # Trade-by-trade (NEW)
-└── backtest_trades_both.csv                                     # Trades du backtest (NEW)
+├── trades_both_wf{1,2,3}.csv                                    # Trade-by-trade
+└── backtest_trades_both.csv                                     # Trades du backtest
 ```
 
 ---
@@ -569,50 +684,54 @@ Le masque dépend de la **position courante** et du **mode side** :
 
 ---
 
-## 📐 Volume dynamique (position sizing)
+## 📐 Dimensionnement des positions — par le RISQUE
 
-Depuis mai 2026, le volume des ordres est calculé **dynamiquement** selon l'equity du compte. Le slider GUI a été remplacé par un label en lecture seule. Identique en backtest et en live :
-
-```python
-def compute_dynamic_volume(equity: float, max_lot: float = 100.0) -> float:
-    if equity <= 2000.0:
-        tier = 1
-    else:
-        tier = int((equity - 1.0) // 1000.0)
-    lot = 0.01 * tier
-    return round(min(lot, max_lot), 2)
-```
-
-### Paliers
-
-| Equity | Lot |
-|--------|-----|
-| 0 – 2 000 $ | **0.01** |
-| 2 001 – 3 000 $ | 0.02 |
-| 3 001 – 4 000 $ | 0.03 |
-| 4 001 – 5 000 $ | 0.04 |
-| … (+ 0.01 par tranche de 1 000 $) | … |
-| > 10 000 000 $ | **100.00** (cap) |
-
-### Effet boule de neige (compounding)
-
-Sur le backtest 2026-01-01 → en cours :
-- Lot fixe 0.01 (ancien) : +5 609 $ sur 75 jours
-- **Lot dynamique** : à 24 % du run, déjà **+3 550 $** avec lot 0.04 actif — projection >+25 000 $
-
-Chaque palier franchi accélère la croissance ; chaque drawdown coûte proportionnellement plus aussi.
-
-### Configuration
+Trois modes existent, et l'ordre de priorité compte : `risk_volume` l'emporte
+sur `dynamic_volume`, qui l'emporte sur `position_size`. **`risk_volume = True`
+est le mode par défaut et le seul aligné sur l'entraînement.**
 
 ```python
-# Dans LiveConfig (loup_live.py / backtest_*.py)
-dynamic_volume: bool = True   # True = paliers ; False = position_size fixe
-max_lot: float = 100.0        # cap absolu
+size = capital × risk_per_trade / sl_dist
 ```
 
-Pour revenir au lot fixe, passer `dynamic_volume=False`.
+Le lot n'est donc **pas connu à l'avance** : il dépend de la distance au stop,
+qui dépend de l'ATR à l'instant de l'entrée. Ce qui est fixe, c'est le budget de
+risque — 1,2 % de l'equity par trade, `risk_per_trade` devant rester identique
+entre `training.PPOConfig` et `LiveConfig` : le modèle doit trader le risque
+sous lequel il a appris.
 
-> ⚙️ **Paliers actuels (mai 2026)** : base **0.10** lot (au lieu de 0.01 dans la première version), +0.10 par tranche de 1 000 $. Justification : la formule de PnL du backtest a été alignée sur MT5 réel (suppression du facteur `× leverage` qui sur-estimait par ×6).
+> ⚠️ **Le défaut que ça a corrigé.** Le volume était auparavant constant à 0.06
+> lot et `risk_per_trade` n'était jamais lu. Comme la valeur du point diffère
+> d'un symbole à l'autre, le risque réel variait d'un **facteur 108** entre
+> BTCUSD et XAUUSD pour un même réglage.
+
+### Pièges d'exécution MT5
+
+- `symbol_info().trade_tick_value` vaut **0.0** tant que le symbole n'est pas
+  dans le Market Watch. Il faut appeler `symbol_select(symbol, True)` **avant**,
+  sinon le volume calculé est nul et l'ordre est annulé sans explication.
+- Quand le volume minimum du courtier dépasse le volume voulu, le risque imposé
+  est **supérieur** à la consigne. `compute_risk_volume` renvoie un drapeau
+  `plancher` et le log l'affiche en clair : c'est le seul cas où le contrôle du
+  risque échoue, il ne doit pas passer inaperçu.
+
+### Mode par paliers d'equity (secondaire)
+
+Utilisé seulement si `risk_volume = False`. Lot de base 0.01 sous 2 000 $, puis
++0.01 par tranche de 1 000 $, plafonné à `max_lot`.
+
+```python
+# Dans LiveConfig (kairos_live.py / backtest_*.py)
+risk_volume: bool = True        # ⭐ mode par défaut
+risk_per_trade: float = 0.012   # identique à training.PPOConfig
+dynamic_volume: bool = True     # secondaire : paliers d'equity
+max_lot: float = 100.0          # cap absolu
+```
+
+> Les projections de compounding qui figuraient ici (« +25 000 $ ») reposaient
+> sur un backtest dont la formule de PnL contenait un facteur `× leverage`
+> erroné, surestimant d'un facteur 6. Elles ont été retirées plutôt que
+> recalculées : aucun modèle n'est actuellement rentable.
 
 ---
 
@@ -633,7 +752,7 @@ Les **3 checkpoints walk-forward** peuvent désormais trader simultanément sur 
 ### Configuration
 
 ```python
-# LiveConfig dans loup_live.py
+# LiveConfig dans kairos_live.py
 multi_agent: bool = True   # active le mode 3-agents
 ```
 
@@ -651,7 +770,7 @@ Affichage par-agent dans les logs (couleur cyan/jaune/magenta) + résumé final 
 
 ### Equity et volume partagés
 
-Capital et equity sont **communs** aux 3 agents (un seul compte). Le volume dynamique est calculé sur l'equity courant au moment de chaque ouverture. Conséquence : si les 3 agents s'ouvrent en même temps, l'**exposition totale** = 3 × `compute_dynamic_volume(equity)`.
+Capital et equity sont **communs** aux 3 agents (un seul compte). Le volume est recalculé par le risque à chaque ouverture, sur l'equity du moment. Conséquence : si les 3 agents s'ouvrent en même temps, le risque cumulé vaut **3 × `risk_per_trade`**, soit 3,6 % de l'equity — et non 1,2 %. Le pré-check de marge borne l'exposition mais pas le risque.
 
 ---
 
@@ -665,7 +784,7 @@ MT5 déclenche le SL/TP **au prix de clôture** (BID pour un LONG, ASK pour un S
 
 L'asymétrie BID/ASK est modélisée **au déclenchement**, là où elle se produit réellement : la boucle de backtest teste `low <= sl + s` / `high >= tp + s` (`s` = spread échantillonné à l'entrée). Décaler les niveaux eux-mêmes aurait fait diverger le mouvement de prix requis entre ce que le modèle apprend et ce qu'il rencontre à l'exécution.
 
-Une version antérieure appliquait `sl_dist + spread` / `tp_dist - spread` dans le seul `loup_live.py` ; elle a été retirée pour cette raison. Le paramètre `spread` a disparu de la signature.
+Une version antérieure appliquait `sl_dist + spread` / `tp_dist - spread` dans le seul `kairos_live.py` ; elle a été retirée pour cette raison. Le paramètre `spread` a disparu de la signature.
 
 ### Poids réel du spread
 
@@ -770,7 +889,7 @@ Si mouvement favorable ≥ 1.5 × ATR :
 | Training (env) | ❌ Non — `PPOConfig.use_be_trail = False` |
 | Backtest stress-test | ✅ Oui |
 | Backtest **no_be_trail** | ❌ Non — variante de comparaison |
-| **Live (loup_live.py)** | ❌ **Non** |
+| **Live (kairos_live.py)** | ❌ **Non** |
 | MQL5 `SaintV2_WF3.mq5` | ❌ Non |
 
 ---
@@ -904,15 +1023,28 @@ Le backtest émet un verdict à la fin :
 
 L'interface graphique offre :
 
-### Panneau de contrôle
-- **Lot dynamique** (label readonly, mis à jour 1×/sec depuis l'equity)
-  - Hint affiché : `(≤2000$ : 0.01 · +0.01 par tranche de 1000$ · cap 100.00)`
-- **Démarrer / Arrêter l'IA**
-- **Statut** : EN COURS / ARRÊTÉ avec side et lot calculé
-- **Equity bar enrichie** : Equity / Balance / **P/L session** / **P/L flottant** / **P/L total** / Margin / Free
-  - `P/L session` = balance courant − balance au lancement (réalisé bot)
-  - `P/L flottant` = equity − balance (positions ouvertes)
-  - `P/L total` = session + flottant
+La présentation vit dans `kairos_theme.py` (palette, QSS) et `kairos_widgets.py`
+(widgets peints à la main). `kairos_gui.py` ne contient que l'assemblage et la
+logique MT5 — une retouche esthétique ne touche jamais au code de trading.
+
+### Barre haute
+- **Témoin d'état** : un point qui pulse quand l'agent tourne. Seul élément animé
+  de l'interface, donc l'œil y revient tout seul.
+- **Symbole et side**, lus depuis `cfg` — le titre de la fenêtre aussi. Une
+  constante écrite en dur avait fini par annoncer XAUUSD sur un agent BTC.
+- **Dimensionnement** : en mode `risk_volume` le lot n'existe pas à l'avance
+  (il dépend de la distance au stop à l'entrée), donc l'interface affiche le
+  **budget de risque en dollars**, qui est la grandeur réellement fixe.
+- **Démarrer / Arrêter**
+
+### Bandeau de mesures
+Equity, **P/L réalisé**, **P/L flottant** (séparés : les additionner donnait deux
+tuiles avec le même nombre en début de session), nombre de trades, et une
+**jauge de winrate marquant le point mort à 43,7 %** — l'arc passe au vert
+au-dessus, ambre en dessous. Un winrate brut ne veut rien dire sans ce repère.
+
+Sous le bandeau, une **courbe d'equity** de session : pas d'axes, elle ne sert
+qu'à montrer la forme (pente, décrochages, plateau).
 
 ### Stats de session
 Grille temps réel avec 3 lignes :
@@ -922,18 +1054,18 @@ Grille temps réel avec 3 lignes :
 
 Source : `mt5.history_deals_get(session_start − 24h, now + 24h, group="BTCUSD")` filtré sur :
 - `d.entry ∈ {DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT, DEAL_ENTRY_OUT_BY}` (tous les types de sortie MT5)
-- `d.magic == 424242` (uniquement les trades du bot, ignore manuels)
+- `d.magic ∈ {424241, 424242, 424243}` (les trois agents WF, ignore le manuel)
 - Dédup par `d.ticket`
 
-La fenêtre élargie ±24h absorbe le décalage timezone local ↔ serveur MT5. **Bouton 🔄 Reset stats** pour réinitialiser.
+La fenêtre élargie ±24h absorbe le décalage timezone local ↔ serveur MT5. **Bouton Réinitialiser** pour repartir de zéro.
 
 ### Zone de logs
 - **Couleurs ANSI** par catégorie (TRADE / SIGNAL / INFO / WARN / ERROR / DEBUG)
 - **Classification automatique** via regex (mots-clés `buy`, `sell`, `error`, etc.)
 - **Filtre texte** en temps réel
-- **Checkboxes** pour masquer/afficher chaque catégorie
+- **Pastilles colorées** cliquables pour masquer/afficher chaque catégorie
 - **Auto-scroll** désactivable
-- **🗑️ Effacer** + **💾 Sauver** (export `.txt` horodaté)
+- **Effacer** + **Exporter** (`.txt` horodaté)
 - **Ring buffer 5000 lignes** (anti-fuite mémoire sur sessions longues)
 - **Compteurs** par niveau en bas
 
@@ -980,8 +1112,8 @@ state = torch.load("bestprofit_saintv2_loup_duel_both_wf3.pth", map_location="cp
 - Tu charges un ancien `.pth` (5 actions) avec le nouveau code (3 actions)
 - Solution : retrainer le modèle (le code actuel utilise 3 actions BUY/SELL/HOLD)
 
-### "Modèle DUEL introuvable : bestprofit_saintv2_loup_duel_*.pth"
-- Le path dans `loup_live.py` / backtest doit correspondre au pattern réel :
+### "Modèle DUEL introuvable : bestprofit_saintv2_loup_duel_exec5_*.pth"
+- Le path dans `kairos_live.py` / backtest doit correspondre au pattern réel :
   `bestprofit_saintv2_loup_duel_wfN_both_wfN.pth` (avec `_wfN_` au milieu)
 - Vérifie les `.pth` réellement présents : `ls bestprofit_*.pth`
 
@@ -1017,9 +1149,22 @@ state = torch.load("bestprofit_saintv2_loup_duel_both_wf3.pth", map_location="cp
 - [ ] **Position sizing dynamique** : risk-parity sur volatilité réalisée
 - [ ] **Meta-learner d'ensemble** : combiner wf1+wf2+wf3 via un router neuronal
 - [ ] **Régime detector** : module auxiliaire (HMM ou TCN) qui informe la policy du régime (bull / bear / range)
-- [ ] **Order book features** : si broker fournit DOM via MT5, intégrer top-5 bid/ask
-- [ ] **Funding rate awareness** : pour les futures perpétuels
 - [ ] **Distillation** : compresser le SAINTv2 en MLP pour inférence < 1ms
+- [ ] **Fermeture au marché côté live** — prérequis à toute règle de sortie
+      temporelle dans l'entraînement (voir « Divergence connue » en tête)
+- [ ] **Ablation de gamma** — 0.995 est un choix par raisonnement, jamais mesuré
+- [ ] **Ablation de `scalping_max_holding`** — 120 → 30 lit nul à l'epoch 6,
+      la question reste ouverte
+
+### Écartés APRÈS MESURE — ne pas y revenir sans nouvelle mesure
+
+- ~~**Funding rate awareness**~~ — mesuré : −0.0000 d'AUC. Change toutes les
+  10 heures, donc constant sur un trade de 7 barres.
+- ~~**Order book features**~~ — les archives `bookDepth` ne descendent pas sous
+  ±1 % alors que l'endpoint live plafonne à ±0.17 % du mid. Aucun recouvrement :
+  entraînable, mais incalculable en live.
+- ~~**Open interest, ratios long/short**~~ — mesuré : 0.4847 d'AUC à eux seuls,
+  sous le hasard.
 
 ---
 
@@ -1081,4 +1226,4 @@ Code privé, tous droits réservés. Contactez l'auteur pour usage commercial.
 
 ---
 
-**Loup Ω** — _PPO + SAINTv2 pour BTCUSD M1_ — Made with ❤️ and a lot of GPUs.
+**KAIROS** — _PPO + SAINTv2 pour BTCUSD M1_ — Made with ❤️ and a lot of GPUs.

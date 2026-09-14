@@ -46,7 +46,17 @@ CLIP_SIGMA = 5.0
 # 5 ATR demande de l'ordre de 5^2 = 25 min et 10 ATR une centaine ; la detention
 # mediane se situe donc vers l'heure. On prend 120 pour que la feature garde de
 # la dynamique jusqu'au plafond de 240 min sans saturer.
-SCALPING_MAX_HOLDING = 120
+# Detention de reference pour normaliser bars_held_norm.
+# DOIT rester egale a training.PPOConfig.scalping_max_holding : training,
+# backtest et live construisent la meme feature avec cette constante, et les
+# desynchroniser decale l'observation entre l'apprentissage et l'execution.
+#
+# 120 venait des barrieres larges de l'or. Mesure sur 250 000 entrees BTCUSD a
+# SL 2.0xATR / TP 2.8xATR : detention MEDIANE de 7 barres, 98.2 % des trades
+# resolus en 60 barres. A 120 la feature valait ~0.06 pour un trade typique et
+# ne portait quasiment aucune information. A 30 elle vaut ~0.23 et sature
+# au-dela de 90 barres, ce qui ne concerne qu'environ 1 % des trades.
+SCALPING_MAX_HOLDING = 30
 
 
 # ============================================================
@@ -161,9 +171,11 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 #     27 + Binance      0.6191   +0.1249    +2.4
 #     30 (celui-ci)     0.6215   +0.1751    +3.4
 #
-# Les DEUX colonnes Binance pesent plus que les 25 autres reunies : 25 features
-# de prix seules donnent une esperance NEGATIVE ; on ajoute taker_ratio et
-# ls_ratio_top et l'AUC passe de 0.5783 a 0.6191.
+# Les colonnes Binance pesent plus que les 25 autres reunies : 25 features de
+# prix seules donnent une esperance NEGATIVE, et l'ajout du couple Binance fait
+# passer l'AUC de 0.5783 a 0.6191. Mesure ulterieure : tout cet apport vient de
+# taker_ratio (-0.0498 si on la retire), rien de ls_ratio_top (-0.0000) — voir
+# le bloc FEATURE_COLS_EXT plus bas.
 FEATURE_COLS_M1 = [
     "rsi_14", "returns", "vol_20", "range_norm", "open_rel", "high_rel",
     "low_rel", "close_ema_dev", "mom_5", "rsi_ok", "vol_rank", "high_vol_regime",
@@ -178,9 +190,32 @@ FEATURE_COLS_H1 = [
 
 # SOURCE EXTERNE — Binance BTCUSDT perpetuel : positionnement des acteurs et
 # flux agressif, la seule classe d'information absente du flux CFD.
+# Mesure du 2026-09-14 (sonde logistique, SL 2.0xATR / R:R 1.4, meme fenetre
+# de validation) : retirer une colonne du jeu de 30 et regarder ce que ca coute.
+#
+#     sans taker_ratio     0.6178 -> 0.5680   -0.0498
+#     sans ls_ratio_top    0.6178 -> 0.6177   -0.0000
+#
+# ls_ratio_top est INERTE. Son autocorrelation a une minute vaut 0.999985 :
+# c'est une variable de REGIME, constante sur les 7 barres d'un trade median,
+# donc incapable de departager deux entrees espacees de quelques minutes.
+# Meme verdict pour les quatre colonnes Binance jamais branchees (funding,
+# oi_change, ls_ratio_retail) : 0.4847 d'AUC a elles seules, sous le hasard.
+#
+# On la remplace par le meme flux agressif mais a la MINUTE, lisse sur 5 —
+# derive des archives klines 1m, que le pipeline n'avait jamais consommees.
+# Balayage de la fenetre de lissage, apport marginal sur les 30 :
+#
+#     1min +0.0016 | 3min +0.0067 | 5min +0.0087 | 10min +0.0050
+#     15min +0.0027 | 30min +0.0017 | 60min +0.0004 | 120min -0.0000
+#
+# Bosse reguliere a sommet unique, pas un pic : le signal a une echelle de
+# temps propre de 5 minutes. A 120 min la serie est redevenue une variable de
+# regime et vaut exactement zero, comme ls_ratio_top. Le remplacement garde le
+# compte a 30 features, donc le meme cout GPU.
 FEATURE_COLS_EXT = [
-    "taker_ratio",       # desequilibre du flux agressif acheteur/vendeur
-    "ls_ratio_top",      # ratio long/short des gros comptes
+    "taker_ratio",       # flux agressif acheteur/vendeur, agrege 5 min (metrics)
+    "taker_1m_ma5",      # le meme a la minute, moyenne causale sur 5 (klines)
 ]
 
 # LIQUIDITE ET TEMPS. J'avais exclu les features d'heure sur BTCUSD en invoquant

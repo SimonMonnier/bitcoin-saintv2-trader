@@ -1,0 +1,12 @@
+{
+  "calib_thr_buy": 0.359310507774353,
+  "calib_thr_sell": 0.2708849906921387,
+  "calib_thr": 0.359310507774353,
+  "calib_thr_train": 0.0,
+  "legacy_off_policy_curriculum": false,
+  "selectivite": 0.05,
+  "etendue_val": 0.006798,
+  "epoch": 7,
+  "val_trades": 6229,
+  "regle": "meilleur cote (BUY/SELL) puis p >= calib_thr ; PAS d'argmax sur les 3 actions"
+}

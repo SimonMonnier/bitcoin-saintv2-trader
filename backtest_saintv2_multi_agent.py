@@ -61,7 +61,7 @@ def banner(title: str, color: str = C.CYAN) -> str:
     return f"{_c(line, color)}\n  {_c(title, color + C.BOLD)}\n{_c(line, color)}"
 
 # ============================================================
-# BACKTEST ALIGNÉ AVEC training.py + loup_live.py (Loup Ω)
+# BACKTEST ALIGNÉ AVEC training.py + kairos_live.py (Loup Ω)
 # ------------------------------------------------------------
 #   - Pas de filtre de confiance (pure argmax comme en live)
 #   - FEATURE_COLS / N_POS_FEATURES identiques au training
@@ -131,7 +131,7 @@ class LiveConfig:
     initial_capital: float = 1000.0
     position_size: float = 0.01    # utilisé uniquement si dynamic_volume = False
     # Taille par le RISQUE (prioritaire). Meme valeur que
-    # training.PPOConfig.risk_per_trade et loup_live.LiveConfig.risk_per_trade.
+    # training.PPOConfig.risk_per_trade et kairos_live.LiveConfig.risk_per_trade.
     risk_volume: bool = True
     risk_per_trade: float = 0.012
     max_notional_mult: float = 30.0
@@ -140,7 +140,7 @@ class LiveConfig:
     atr_sl_mult: float = 5.0     # SL = 5 x ATR  (optimum mesure sur l'or)
     atr_tp_mult: float = 10.0    # TP = 10 x ATR (R:R 1:2.0)
 
-    # Volume dynamique : aligné avec loup_live.compute_dynamic_volume
+    # Volume dynamique : aligné avec kairos_live.compute_dynamic_volume
     #   - equity ≤ 2000$ → 0.01 lot
     #   - +0.01 par tranche de 1000$ au-dessus
     #   - plafonné à max_lot (par défaut 100.00)
@@ -180,7 +180,7 @@ class LiveConfig:
     date_from: datetime = datetime(2026, 1, 1)
     date_to: Optional[datetime] = None
 
-    # Agents à backtester — aligné avec LiveConfig.active_agents de loup_live.
+    # Agents à backtester — aligné avec LiveConfig.active_agents de kairos_live.
     # None = tous ceux de MULTI_AGENT_PATHS (exige que les 3 .pth existent).
     active_agents: Optional[List[str]] = field(default_factory=lambda: ["wf1"])
 
@@ -934,7 +934,7 @@ def run_backtest(cfg: LiveConfig):
             effective_entry_atr = effective_atr(entry_price, entry_atr)
 
             # Volume par le RISQUE — MEME regle que training.py
-            # (PPOEnv._compute_dynamic_size) et loup_live.py. Un backtest qui
+            # (PPOEnv._compute_dynamic_size) et kairos_live.py. Un backtest qui
             # dimensionne autrement que l'entrainement ne mesure pas la strategie
             # entrainee : l'ancienne regle etait un escalier sur l'equity, qui ne
             # regardait ni le prix ni la volatilite, si bien que le risque reel

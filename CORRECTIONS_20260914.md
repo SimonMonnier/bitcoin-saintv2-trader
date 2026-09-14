@@ -1,5 +1,11 @@
 # Corrections du moteur et de la normalisation — 14 septembre 2026
 
+> **Journal daté — deux points ci-dessous ont été invalidés depuis.**
+> Les frais ne passent pas à `0.0004` : ce courtier ne facture **aucune
+> commission** sur BTCUSD CFD, `fee_rate = 0.0`. Le lookback de l'export ONNX ne
+> passe pas à 54 : il doit valoir **25**, comme le training. Voir
+> `JOURNAL_MESURES.md` pour la suite.
+
 Les quatre défauts reproduits dans `AUDIT_ENTRAINEMENT_20260914.md` ont été corrigés. L'ancien entraînement a été arrêté et ses sources, poids, statistiques et journaux copiés dans `experiments/before-fixes-20260914/`. Les deux checkpoints archivés sont lisibles par PyTorch. Aucun modèle n'a été activé en live.
 
 ## Changements

@@ -44,16 +44,23 @@ from saint_core import (
 BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf1_long_wf1.pth"
 BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf1_short_wf1.pth"
 # Modèle unifié (entraîné avec side="both") : décide BUY/SELL/HOLD dans un seul fichier
-BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_wf1_both_wf1.pth"
+BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_exec5_wf1_both_wf1.pth"
 
 # ============================================================
 # MULTI-AGENT : 3 modèles WF tradent en parallèle (comme dans le backtest)
 # Chaque modèle a son propre magic MT5 pour identifier ses positions.
 # ============================================================
+# Lignee BTCUSD, prefixe exec5 (detention de reference 30 barres, sortie par
+# le temps retiree). Les fichiers "exec3" sont du BTC mais avec une AUTRE
+# observation : leurs poids ne sont pas interchangeables. Ceux sans prefixe
+# d'exec sont les modeles OR — 1.96 Mo contre 1.20 Mo, architecture d'avant la
+# reduction du bloc SAINTv2. D'ou le nommage explicite plutot qu'un chemin
+# generique : un mauvais fichier charge ici trade sans erreur visible.
+# wf2/wf3 n'existent pas encore en BTC : leur activation doit echouer bruyamment.
 MULTI_AGENT_PATHS: Dict[str, str] = {
-    "wf1": "bestprofit_saintv2_loup_duel_wf1_both_wf1.pth",
-    "wf2": "bestprofit_saintv2_loup_duel_wf2_both_wf2.pth",
-    "wf3": "bestprofit_saintv2_loup_duel_wf3_both_wf3.pth",
+    "wf1": "bestprofit_saintv2_loup_duel_exec5_wf1_both_wf1.pth",
+    "wf2": "bestprofit_saintv2_loup_duel_exec5_wf2_both_wf2.pth",
+    "wf3": "bestprofit_saintv2_loup_duel_exec5_wf3_both_wf3.pth",
 }
 MULTI_AGENT_MAGICS: Dict[str, int] = {
     "wf1": 424241,
@@ -64,7 +71,7 @@ MULTI_AGENT_MAGICS: Dict[str, int] = {
 
 @dataclass
 class LiveConfig:
-    symbol: str = "XAUUSD"
+    symbol: str = "BTCUSD"
     timeframe: int = mt5.TIMEFRAME_M1
     htf_timeframe: int = mt5.TIMEFRAME_H1   # identique au training
 
@@ -84,10 +91,10 @@ class LiveConfig:
     # trader le risque sous lequel il a appris.
     risk_volume: bool = True
     risk_per_trade: float = 0.012
-    leverage: float = 100.0   # aligné sur training.py (XAUUSD)
+    leverage: float = 100.0   # aligné sur training.py (BTCUSD)
     fee_rate: float = 0.0   # ce courtier ne facture pas de commission sur BTCUSD
-    atr_sl_mult: float = 5.0     # SL = 5 x ATR  (optimum mesure sur l'or)
-    atr_tp_mult: float = 10.0    # TP = 10 x ATR (R:R 1:2.0)
+    atr_sl_mult: float = 2.0     # SL = 2.0 x ATR   — training.PPOConfig.atr_sl_mult
+    atr_tp_mult: float = 2.8     # TP = 2.8 x ATR   — R:R 1:1.4, identique au training
 
     spread_bps: float = 0.0
     slippage_bps: float = 0.0
@@ -106,9 +113,21 @@ class LiveConfig:
     side: str = "both"
 
     # ======= BREAK-EVEN + TRAILING (en ATR) =======
+    # INACTIFS : l'appel a update_sl_be_trailing_live est commente dans la
+    # boucle (training.use_be_trail = False, et le backtest donne PF 0.98 avec
+    # contre 1.70 sans). Ces valeurs ne servent que si on le reactive.
     breakeven_atr_mult: float = 1.0
     trailing_start_atr_mult: float = 1.5
     trailing_dist_atr_mult: float = 1.0
+
+    # ======= DIVERGENCE CONNUE AVEC LE TRAINING =======
+    # training.PPOConfig.max_holding_bars = 240 : l'environnement ferme au
+    # marche toute position encore ouverte apres 240 minutes, et les 92.3 % de
+    # resolution comme le +0.317 ATR/trade en dependent. Le live n'a AUCUN
+    # chemin de fermeture au marche (les positions ne sortent que par SL/TP du
+    # courtier), donc cette regle n'est pas appliquee ici. A implementer avant
+    # tout deploiement reel, sinon la strategie exécutée n'est pas celle qui a
+    # ete mesuree.
 
     # ======= Seuil de confiance pour ouvrir un trade =======
     # CALIBRÉ, plus fixé à la main : le training écrit le seuil réalisant la

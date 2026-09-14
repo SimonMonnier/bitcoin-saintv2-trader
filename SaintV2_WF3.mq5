@@ -2,7 +2,7 @@
 //|                                                  SaintV2_WF3.mq5 |
 //|                                          Loup Omega — WF3 single |
 //|                                                                  |
-//| Replique loup_live.py / backtest_saintv2_no_be_trail.py en MQL5 |
+//| Replique kairos_live.py / backtest_saintv2_no_be_trail.py en MQL5 |
 //| pour Strategy Tester MT5.                                        |
 //|                                                                  |
 //| FICHIERS REQUIS (UseCommonFolder=true) :                         |
@@ -693,7 +693,7 @@ double ComputeEntryAtr()
 //| Volume tel qu'un stop touché coûte exactement RiskPerTrade.        |
 //|                                                                  |
 //| MEME règle que l'environnement d'entraînement (training.py,        |
-//| PPOEnv._compute_dynamic_size) et que loup_live.py. Elle doit      |
+//| PPOEnv._compute_dynamic_size) et que kairos_live.py. Elle doit      |
 //| l'être : le modèle a appris sous une loi de taille donnée, et le   |
 //| déployer sous une autre revient à jouer un risque que rien n'a     |
 //| validé.                                                           |
