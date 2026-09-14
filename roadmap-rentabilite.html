@@ -7,67 +7,279 @@
 <title>Loup Ω — Roadmap de rentabilité</title>
 <style>
 :root{--paper:#f4f3ee;--card:#fff;--ink:#172d37;--muted:#52656d;--line:#d9dfdb;--teal:#086b60;--mint:#e4f1e9;--orange:#a64b24;--sand:#fff0df;--red:#a43538;--nav:#142e38}*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:90px}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}a{color:var(--teal);text-underline-offset:4px}button,input,select,textarea{font:inherit}button,a,input,select,textarea,summary{touch-action:manipulation}button{cursor:pointer}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible{outline:3px solid #cf721f;outline-offset:4px}.wrap{max-width:1240px;margin:auto;padding:0 36px}.top{background:var(--nav);color:#fff}.top .wrap{display:flex;align-items:center;justify-content:space-between;gap:24px;min-height:72px}.brand{font-weight:750;letter-spacing:.07em}.brand span{color:#93c8b2}.top small{color:#c1d0d0}.eyebrow{font:700 12px/1.4 ui-monospace,Consolas,monospace;text-transform:uppercase;letter-spacing:.15em;color:var(--teal)}.hero{padding:58px 0 35px;display:grid;grid-template-columns:1.6fr 1fr;gap:56px;align-items:center}h1{font-size:clamp(34px,4.4vw,62px);line-height:1.08;letter-spacing:-.055em;font-weight:720;margin:16px 0 22px;max-width:760px}h1 em{font-style:normal;color:var(--teal)}h2{font-size:27px;line-height:1.2;letter-spacing:-.035em;margin:0 0 10px}h3{font-size:19px;line-height:1.35;margin:0 0 12px}.lead{max-width:650px;font-size:18px;color:var(--muted);margin:0}.hero-note{font-size:13px;color:var(--muted);margin:18px 0 0}.focus{background:var(--nav);color:white;padding:28px;border-radius:4px;border-top:4px solid #8cc8ad}.focus .eyebrow{color:#a9d6bf}.focus h2{font-size:24px;margin:14px 0}.focus p{color:#cad7d6;font-size:14px;margin:0 0 18px}.focus a{color:white;font-weight:650}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:4px;overflow:hidden;margin:6px 0 15px}.metric{background:var(--card);padding:23px}.metric .label{font-size:12px;color:var(--muted);font-weight:600}.metric strong{display:block;font-size:35px;line-height:1.35;letter-spacing:-.045em;font-variant-numeric:tabular-nums;margin:8px 0}.metric small{color:var(--muted);font-size:12px}.negative{color:var(--red)}.positive{color:var(--teal)}.caption{font-size:12px;color:var(--muted);margin:0 0 32px}.nav{display:flex;gap:22px;flex-wrap:wrap;padding:17px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);font-size:13px}.nav a{text-decoration:none;color:var(--ink);font-weight:650}.section{padding:38px 0 8px}.section-head{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;margin-bottom:22px}.section-head p{margin:0;color:var(--muted);font-size:14px}.panel{background:var(--card);border:1px solid var(--line);padding:25px;border-radius:4px}.diagnostic{display:grid;grid-template-columns:1.15fr 1fr;gap:22px}.chart{width:100%;height:auto;display:block}.chart text{font:12px system-ui;fill:var(--muted)}.facts{margin:0;padding-left:20px;font-size:14px}.facts li{margin:0 0 13px}.tag{font:700 11px ui-monospace,Consolas,monospace;letter-spacing:.045em;display:inline-block;padding:6px 8px;border-radius:3px;background:#edf1f2;color:#42565f;white-space:nowrap}.tag.done{background:var(--mint);color:var(--teal)}.tag.priority{background:var(--sand);color:var(--orange)}.toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:20px 0}.button{background:white;border:1px solid var(--line);border-radius:4px;color:var(--ink);padding:9px 14px;font-size:13px;font-weight:650}.button.primary{background:var(--teal);border-color:var(--teal);color:white}.button:hover{filter:brightness(.96)}.toolbar label{font-size:13px;color:var(--muted)}select{background:white;border:1px solid var(--line);border-radius:4px;padding:8px 12px;color:var(--ink);max-width:100%}.progress-row{display:flex;gap:20px;align-items:center;margin:16px 0 5px}.progress-row strong{font-size:13px;min-width:160px}progress{appearance:none;width:100%;height:8px;border:0;border-radius:6px;overflow:hidden;background:var(--line)}progress::-webkit-progress-bar{background:var(--line)}progress::-webkit-progress-value{background:var(--teal)}progress::-moz-progress-bar{background:var(--teal)}.tiny{font-size:12px;color:var(--muted)}.roadmap{position:relative;margin:24px 0}.phase{position:relative;display:grid;grid-template-columns:60px 1fr;gap:18px;margin:0 0 22px;break-inside:avoid}.phase:before{content:"";position:absolute;left:26px;top:48px;bottom:-23px;width:1px;background:#c7d3ce}.phase:last-child:before{display:none}.phase-number{height:54px;width:54px;border:1px solid #bbc9c4;background:var(--paper);border-radius:50%;display:grid;place-items:center;font:700 18px ui-monospace,Consolas,monospace;z-index:1;color:var(--teal)}.phase-body{background:white;border:1px solid var(--line);border-radius:4px;overflow:hidden}.phase-head{padding:23px 26px 18px;display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.phase-head h3{font-size:22px;letter-spacing:-.025em;margin:9px 0 8px}.phase-head p{margin:0;color:var(--muted);font-size:14px;max-width:720px}.phase-head .count{font:13px ui-monospace,Consolas,monospace;color:var(--muted);white-space:nowrap;margin-top:4px}.phase-main{padding:0 26px 23px;display:grid;grid-template-columns:1.7fr 1fr;gap:26px}.tasks{display:grid;gap:9px}.task{display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-bottom:1px solid #edf0ed;font-size:14px;cursor:pointer}.task:last-child{border:0}.task input{accent-color:var(--teal);width:17px;height:17px;margin:4px 0 0;flex-shrink:0}.task strong{display:block;font-weight:650}.task small{display:block;color:var(--muted);font-size:12px;line-height:1.5;margin-top:4px}.task:has(input:checked) strong{color:var(--teal)}.gate{background:#f2f6f3;padding:17px 18px;border-left:3px solid #91b6a4;align-self:start;font-size:13px}.gate strong{display:block;margin:7px 0}.gate p{margin:0 0 13px}.gate .stop{border-top:1px solid #d6e3da;padding-top:12px;color:#6b4d3b;margin:0}.phase details{border-top:1px solid var(--line);padding:13px 26px;background:#fcfcfa;font-size:13px}.phase summary{cursor:pointer;font-weight:600;color:var(--muted)}.phase details p{margin-bottom:0}code{font:12px/1.7 ui-monospace,Consolas,monospace;background:#eef1ed;padding:2px 5px;overflow-wrap:anywhere}.table-wrap{overflow-x:auto}.criteria{width:100%;border-collapse:collapse;font-size:14px;min-width:580px}.criteria th{text-align:left;padding:13px 16px;background:#eef2ee;font-size:12px;color:var(--muted)}.criteria td{padding:16px;border-bottom:1px solid var(--line);vertical-align:top}.criteria td:first-child{font-weight:650;width:22%}.criteria td:nth-child(2){width:25%;color:var(--teal);font-weight:650}.split{display:grid;grid-template-columns:1fr 1fr;gap:22px}.next-list{margin:15px 0 0;padding-left:22px;font-size:14px}.next-list li{margin-bottom:13px}.note-label{font-weight:650;font-size:14px;display:block;margin-bottom:12px}textarea{resize:vertical;min-height:175px;width:100%;border:1px solid var(--line);border-radius:4px;background:#fcfcfa;color:var(--ink);padding:13px;line-height:1.55;font-size:14px}.sources{font-size:13px;color:var(--muted);display:grid;grid-template-columns:1fr 1fr;gap:28px}.sources p{margin-top:8px}.footer{margin-top:40px;border-top:1px solid var(--line);padding:25px 0 38px;display:flex;justify-content:space-between;gap:20px;color:var(--muted);font-size:12px}[hidden]{display:none!important}.empty{padding:20px;color:var(--muted)}.print-only{display:none}@media(max-width:800px){.wrap{padding:0 20px}.hero{grid-template-columns:1fr;gap:25px;padding-top:35px}.metrics{grid-template-columns:repeat(2,1fr)}.diagnostic,.split,.sources{grid-template-columns:1fr}.phase-main{grid-template-columns:1fr;gap:15px}.phase-head{padding:18px}.phase-main{padding:0 18px 18px}.phase details{padding:13px 18px}.phase{grid-template-columns:42px 1fr;gap:10px}.phase-number{width:38px;height:38px;font-size:14px}.phase:before{left:18px;top:38px}.phase-head h3{font-size:20px}.section-head{align-items:flex-start;flex-direction:column}.top small{font-size:11px}.metric{padding:18px}.metric strong{font-size:29px}.toolbar{gap:9px}.footer{flex-direction:column}}@media print{body{background:white;font-size:11px}.wrap{max-width:none;padding:0}.top{background:white;color:var(--ink);border-bottom:2px solid var(--ink)}.top small{color:var(--muted)}.hero{padding:20px 0;gap:25px}h1{font-size:33px}.lead{font-size:13px}.focus{background:#f1f5f0;color:var(--ink);padding:16px}.focus p,.focus .eyebrow,.focus a{color:var(--ink)}.nav,.toolbar,.no-print{display:none}.metric{padding:12px}.metric strong{font-size:24px}.phase{display:block;margin:15px 0;break-inside:avoid}.phase-number,.phase:before{display:none}.phase-head h3{font-size:18px}.phase-main{grid-template-columns:1.7fr 1fr}.phase-head,.phase-main{padding:12px 16px}.task{font-size:11px;padding:5px 0}.task small,.gate,.phase details{font-size:10px}.section{padding-top:22px}.panel{padding:15px}.phase[hidden]{display:block!important}.print-only{display:block}.chart{max-height:190px}.footer{margin-top:20px}.sources{font-size:11px}}
+.phase-head>div{min-width:0}.phase-head .tag{white-space:normal}.phase-head .count{flex-shrink:0}
 </style>
 </head>
 <body>
-<header class="top"><div class="wrap"><div class="brand">LOUP <span>Ω</span> <span style="font-weight:400;font-size:12px;margin-left:12px">RESEARCH / BTCUSD</span></div><small>Roadmap v1 · 14 septembre 2026</small></div></header>
+<header class="top"><div class="wrap"><div class="brand">LOUP <span>Ω</span> <span style="font-weight:400;font-size:12px;margin-left:12px">RESEARCH / BTCUSD</span></div><small>Roadmap code v2 · 14 septembre 2026</small></div></header>
 <main class="wrap">
-<section class="hero"><div><div class="eyebrow">De l'apprentissage à la preuve</div><h1>Construire une IA<br>dont la rentabilité<br><em>se mesure.</em></h1><p class="lead">Une feuille de route pour passer d'un PPO corrigé à une stratégie profitable après coûts, puis vérifier que cet avantage résiste au temps.</p><p class="hero-note">Objectif de recherche, sans garantie de résultat. Chaque étape possède un critère de passage et une règle d'arrêt.</p></div><aside class="focus"><div class="eyebrow">Le prochain chantier</div><h2>Fiabiliser le PnL<br>avant d'optimiser.</h2><p>Le tirage des actions est corrigé. Les conventions d'exécution et le protocole d'évaluation doivent maintenant être vérifiés avant de multiplier les essais GPU.</p><a href="#phase-1">Commencer par le simulateur →</a></aside></section>
-<section aria-label="Bilan du dernier essai" class="metrics"><div class="metric"><span class="label">Profit factor · meilleur checkpoint</span><strong class="negative">0,56</strong><small>Époque 7 · seuil d'équilibre : 1</small></div><div class="metric"><span class="label">PnL moyen de validation</span><strong class="negative">−30,07 $</strong><small>Par épisode de 1 000 $</small></div><div class="metric"><span class="label">Drawdown maximal de validation</span><strong>12,25 %</strong><small>27 trades · 4 épisodes</small></div><div class="metric"><span class="label">Décisions PPO contrôlées</span><strong class="positive">7 631</strong><small>0 action forcée ou remplacée</small></div></section>
-<p class="caption">Mesures du second essai court : 8 époques, aucune validation bénéficiaire. Meilleur checkpoint sélectionné sur validation, pas sur un test final. Ces résultats sont exploratoires.</p>
-<nav class="nav" aria-label="Sections"><a href="#diagnostic">01 / Diagnostic</a><a href="#plan">02 / Plan d'action</a><a href="#criteres">03 / Critères de passage</a><a href="#prochain">04 / Prochaine session</a><a href="#sources">05 / Sources</a></nav>
-<section id="diagnostic" class="section"><div class="section-head"><div><div class="eyebrow">Point de départ</div><h2>Une correction réelle. Un avantage à démontrer.</h2></div></div><div class="diagnostic"><div class="panel"><h3>Profit factor par époque</h3><svg class="chart" viewBox="0 0 540 230" role="img" aria-label="Profit factor des huit validations : 0,093 ; 0,118 ; 0,143 ; 0,126 ; 0,009 ; 0,289 ; 0,563 ; 0,332. Toutes sont inférieures à 1."><line x1="40" y1="42" x2="516" y2="42" stroke="#a43538" stroke-dasharray="5 4"/><text x="42" y="29">Équilibre : PF = 1</text><line x1="40" y1="192" x2="516" y2="192" stroke="#d9dfdb"/><g fill="#96b4a7"><rect x="55" y="178" width="32" height="14"/><rect x="112" y="174" width="32" height="18"/><rect x="169" y="171" width="32" height="21"/><rect x="226" y="173" width="32" height="19"/><rect x="283" y="190.7" width="32" height="1.3"/><rect x="340" y="149" width="32" height="43"/><rect x="397" y="108" width="32" height="84" fill="#086b60"/><rect x="454" y="142" width="32" height="50"/></g><g text-anchor="middle"><text x="71" y="214">E1</text><text x="128" y="214">E2</text><text x="185" y="214">E3</text><text x="242" y="214">E4</text><text x="299" y="214">E5</text><text x="356" y="214">E6</text><text x="413" y="214">E7</text><text x="470" y="214">E8</text><text x="413" y="96">0,56</text><text x="470" y="130">0,33</text></g><text x="13" y="196">0</text></svg><p class="tiny">Fenêtres de validation rééchantillonnées à chaque époque : ce graphique ne prouve pas une progression régulière du modèle.</p></div><div class="panel"><span class="tag done">VÉRIFIÉ</span><ul class="facts" style="margin-top:17px"><li><strong>Le PPO tire les actions selon la distribution enregistrée.</strong> Écart maximal des log-probabilités : 2,3842 × 10⁻⁷. Sept tests de régression passent.</li><li><strong>Le modèle reste déficitaire.</strong> La dernière époque affiche un PF de 0,33. La correction technique ne suffit pas à créer un avantage économique.</li><li><strong>La mesure doit être renforcée.</strong> Normalisation globale dans le lanceur historique, calibration sur les épisodes évalués et liquidation terminale incomplète restent des points à traiter.</li></ul></div></div></section>
-<section id="plan" class="section"><div class="section-head"><div><div class="eyebrow">Ordre d'exécution</div><h2>Huit étapes, des preuves à chaque passage.</h2><p>Faire d'abord les vérifications peu coûteuses. Réserver les longs entraînements aux hypothèses qui résistent.</p></div><span class="tag priority">PRIORITÉ ACTUELLE : ÉTAPES 1 + 2</span></div><div class="toolbar"><label for="view">Afficher</label><select id="view"><option value="all">Toutes les étapes</option><option value="p0">Priorités immédiates</option><option value="remaining">Étapes non terminées</option><option value="done">Étapes cochées</option></select><button class="button" id="print" type="button">Imprimer / PDF</button><button class="button" id="export" type="button">Exporter mon suivi</button></div><div class="progress-row"><strong id="progress-label" aria-live="polite">Chargement du suivi…</strong><progress id="progress" max="32" value="4" aria-label="Tâches cochées"></progress></div><p class="tiny" id="save-status">Les cases suivent le travail déclaré, pas la rentabilité. Elles sont conservées dans ce navigateur, si le stockage local est disponible.</p><div class="roadmap" id="roadmap"></div><p id="empty" class="empty" hidden>Aucune étape dans cette vue.</p><noscript><p>Activez JavaScript pour afficher les tâches interactives. Ordre de travail : conserver les corrections PPO → auditer le simulateur → figer les données et la validation → établir des références simples → tester les paramètres économiques → comparer les apprentissages → vérifier hors échantillon → observer en démo. Aucun entraînement n'est lancé par cette page.</p></noscript></section>
-<section id="criteres" class="section"><div class="section-head"><div><div class="eyebrow">Décider avant de regarder les résultats</div><h2>Une définition explicite de « rentable ».</h2><p>Seuils de travail proposés à figer avant le test final. Ce ne sont ni des résultats acquis ni des garanties statistiques.</p></div></div><div class="panel table-wrap"><table class="criteria"><thead><tr><th scope="col">Mesure</th><th scope="col">Cible proposée</th><th scope="col">Condition d'interprétation</th></tr></thead><tbody><tr><td>Espérance nette</td><td>&gt; 0 après tous les coûts</td><td>Borne basse de l'intervalle à 95 % &gt; 0, estimée par blocs temporels adaptés à la dépendance des rendements. Publier les hypothèses et la sensibilité du bootstrap.</td></tr><tr><td>Profit factor</td><td>≥ 1,20 au coût central</td><td>Résultat d'un backtest chronologique après coûts, avec rentabilité sur la majorité des périodes préspécifiées. Ne pas sélectionner uniquement le meilleur seed.</td></tr><tr><td>Coûts dégradés</td><td>PF &gt; 1 à coûts × 1,5</td><td>Scénario hypothétique distinct du scénario central. Documenter aussi × 2 sans déplacer les seuils pour sauver un résultat.</td></tr><tr><td>Drawdown</td><td>≤ 10 % au risque fixé</td><td>Budget de recherche proposé, à définir avant évaluation. Calcul sur une courbe de capital continue incluant frais et positions ouvertes ; réduire le risque ne crée pas d'espérance positive.</td></tr><tr><td>Échantillon</td><td>≥ 300 trades, plusieurs régimes</td><td>Plancher de travail, pas une preuve suffisante. L'incertitude, les dépendances et la couverture des régimes priment sur le seul nombre de trades.</td></tr><tr><td>Démo prospective</td><td>≥ 4 semaines et ≥ 200 trades</td><td>Attendre que les deux critères soient satisfaits, sans forcer les entrées. Mesurer les écarts de coûts et de décisions face au simulateur.</td></tr></tbody></table></div><p class="tiny">Si les intervalles restent larges ou si les résultats dépendent d'une seule période, conclure « indéterminé » et collecter des données supplémentaires.</p></section>
-<section id="prochain" class="section"><div class="section-head"><div><div class="eyebrow">Passer à l'action</div><h2>La prochaine session de travail.</h2></div></div><div class="split"><div class="panel"><h3>Un livrable concret avant le GPU</h3><ol class="next-list"><li><strong>Geler l'état actuel.</strong> Copier code, configuration, données identifiées par hash, normalisation et checkpoints dans un dossier d'expérience.</li><li><strong>Écrire les cas de PnL attendus.</strong> Achat, vente, SL, TP, gap, double touche et liquidation de fin d'épisode, avec les unités du courtier.</li><li><strong>Comparer le journal à MT5.</strong> Rejouer un petit échantillon déterministe. Localiser chaque écart de prix, spread, frais et capital.</li><li><strong>Livrer un audit.</strong> Tableau « attendu / simulé / écart / cause », tests automatisés, liste des hypothèses économiques encore non mesurées.</li></ol><p class="tiny">Aucun ordre ni entraînement n'est déclenché par ce document.</p></div><div class="panel"><label class="note-label" for="notes">Journal de décisions</label><textarea id="notes" placeholder="Date · hypothèse · expérience · résultat · décision&#10;&#10;Exemple : ne pas modifier les coûts tant que l'audit des exécutions n'est pas terminé."></textarea><p class="tiny">Notez aussi les essais perdants : ils comptent dans le nombre total de recherches et aident à éviter de sélectionner un résultat chanceux.</p><button class="button" id="reset" type="button">Rétablir le suivi initial</button></div></div></section>
-<section id="sources" class="section"><div class="section-head"><div><div class="eyebrow">Traçabilité</div><h2>Les faits derrière la roadmap.</h2></div></div><div class="sources"><div><h3>Données locales · 14 septembre 2026</h3><p><a href="RAPPORT_PPO_20260914.md">Rapport du second essai PPO</a> · <a href="experiments/ppo_onpolicy_short_20260914/summary.json">Résumé des métriques</a> · <a href="experiments/ppo_onpolicy_short_20260914/sampling_audit_both_wf1.jsonl">Audit des décisions</a>.</p><p>Les résultats sont intégrés à cette page et ne s'actualisent pas automatiquement. Les liens locaux fonctionnent si le fichier reste dans le dossier du projet.</p></div><div><h3>Références méthodologiques</h3><p><a href="https://arxiv.org/abs/1707.06347" target="_blank" rel="noopener noreferrer">Schulman et al. — Proximal Policy Optimization Algorithms</a> : référence pour le contrôle de la politique de collecte et les mises à jour PPO.</p><p><a href="https://www.davidhbailey.com/dhbpapers/backtest-prob.pdf" target="_blank" rel="noopener noreferrer">Bailey et al. — The Probability of Backtest Overfitting</a> : motivation pour tracer les essais et limiter la sélection sur une même validation. Les seuils chiffrés ci-dessus sont des propositions propres à ce projet.</p></div></div></section>
-<footer class="footer"><span>LOUP Ω / Plan de recherche BTCUSD · document autonome, utilisable hors ligne</span><span>Corriger → mesurer → comparer → confirmer</span></footer>
+<section class="hero"><div><div class="eyebrow">Roadmap de développement · features / modèle / PPO</div><h1>Quel code changer<br>pour améliorer<br><em>les résultats ?</em></h1><p class="lead">Les bugs démontrés, les features à expérimenter et les évolutions du modèle : pour chaque chantier, le fichier concerné, la modification et le comparatif attendu.</p><p class="hero-note">Fondé sur le code du run lancé à 04:37 et l'audit de 09:15. Les gains de rentabilité restent à mesurer ; les propositions ne sont pas appliquées automatiquement.</p></div><aside class="focus"><div class="eyebrow">Deux défauts reproduits</div><h2>Des stops trop tôt.<br>Une récompense biaisée.</h2><p>Le simulateur peut fermer un LONG avant que le BID touche son stop. Le bruit ajoute aussi une pénalité répétée à prix constant. Corriger ces deux mécanismes avant d'interpréter les expériences de features.</p><a href="#phase-1">Voir les changements de code →</a></aside></section>
+<section aria-label="État de l'entraînement à l'instantané" class="metrics"><div class="metric"><span class="label">Profit factor · époque 38</span><strong class="negative">0,40</strong><small>Validation du run en cours</small></div><div class="metric"><span class="label">PnL moyen de validation</span><strong class="negative">−175,46 $</strong><small>Par épisode de 1 000 $ · 16 épisodes</small></div><div class="metric"><span class="label">Drawdown maximal</span><strong>40,36 %</strong><small>522 trades · 70,50 % au stop</small></div><div class="metric"><span class="label">Validations bénéficiaires</span><strong class="negative">0 / 38</strong><small>Meilleur PnL : E35, encore négatif</small></div></section><p class="caption">Instantané du 14 septembre à 09:15:42. Le run intègre déjà la correction PPO, vol_rank continu et le pooling global + dernier instant. Les anciennes mesures du pilote de 8 époques ne décrivent pas ce run.</p>
+<nav class="nav" aria-label="Sections"><a href="#diagnostic">01 / Diagnostic</a><a href="#plan">02 / Modifications du code</a><a href="#criteres">03 / Matrice des expériences</a><a href="#prochain">04 / Premier lot de corrections</a><a href="#sources">05 / Sources</a></nav>
+<section id="diagnostic" class="section"><div class="section-head"><div><div class="eyebrow">Audit du code actif</div><h2>Les défauts vérifiés passent avant les hypothèses.</h2></div></div><div class="diagnostic"><div class="panel"><h3>Les huit dernières validations de l'instantané</h3><svg class="chart" viewBox="0 0 540 230" role="img" aria-label="Profit factor des époques 31 à 38 ; aucune n'atteint le seuil d'équilibre de 1."><line x1="40" y1="42" x2="516" y2="42" stroke="#a43538" stroke-dasharray="5 4"/><text x="42" y="29">Équilibre : PF = 1</text><line x1="40" y1="192" x2="516" y2="192" stroke="#d9dfdb"/><rect x="55" y="117.65" width="32" height="74.35" fill="#086b60"/><text x="71" y="214" text-anchor="middle">E31</text><rect x="112" y="124.58" width="32" height="67.42" fill="#086b60"/><text x="128" y="214" text-anchor="middle">E32</text><rect x="169" y="108.36" width="32" height="83.64" fill="#086b60"/><text x="185" y="214" text-anchor="middle">E33</text><rect x="226" y="115.61" width="32" height="76.39" fill="#086b60"/><text x="242" y="214" text-anchor="middle">E34</text><rect x="283" y="116.91" width="32" height="75.09" fill="#086b60"/><text x="299" y="214" text-anchor="middle">E35</text><rect x="340" y="116.69" width="32" height="75.31" fill="#086b60"/><text x="356" y="214" text-anchor="middle">E36</text><rect x="397" y="119.33" width="32" height="72.67" fill="#086b60"/><text x="413" y="214" text-anchor="middle">E37</text><rect x="454" y="131.66" width="32" height="60.34" fill="#086b60"/><text x="470" y="214" text-anchor="middle">E38</text></svg><p class="tiny">Entropie flat : 0,046 / 1,099 ; HOLD dans 98,86 % des actions, positions ouvertes incluses. Le PPO évite presque toujours de trader, mais la validation par quantiles peut encore sélectionner des entrées perdantes.</p></div><div class="panel"><span class="tag priority">REPRODUCTIONS CPU</span><ul class="facts" style="margin-top:17px"><li><strong>Stop LONG prématuré.</strong> Stop 9 805, plus bas BID 9 810 : le code ferme au SL alors que le niveau n'a pas été atteint.</li><li><strong>Pénalité sans mouvement de prix.</strong> Prix constant, frais nuls : récompense cumulée −0,41944 sur 60 pas avec bruit, PnL de liquidation nul. Sans bruit : récompense nulle.</li><li><strong>Normalisation globale confirmée.</strong> Les statistiques sauvegardées correspondent exactement à tout l'historique, et non au seul train.</li></ul><p class="tiny">Ces cas prouvent les anomalies ; ils ne quantifient pas leur contribution aux pertes du run. <a href="AUDIT_ENTRAINEMENT_20260914.md">Lire l'audit complet</a>.</p></div></div></section>
+<section id="plan" class="section"><div class="section-head"><div><div class="eyebrow">Ordre d'exécution</div><h2>Huit chantiers de code, avec un test pour chacun.</h2><p>Les tâches 1 et 2 corrigent les bugs. Les tâches 3 à 6 testent les features et le modèle. La tâche 7 fournit le banc de comparaison commun.</p></div><span class="tag priority">PREMIER LOT : EXÉCUTION + REWARD + FINS DE FENÊTRE</span></div><div class="toolbar"><label for="view">Afficher</label><select id="view"><option value="all">Tous les chantiers</option><option value="p0">Priorités immédiates</option><option value="remaining">Chantiers non terminés</option><option value="done">Chantiers cochés</option></select><button class="button" id="print" type="button">Imprimer / PDF</button><button class="button" id="export" type="button">Exporter mon suivi</button></div><div class="progress-row"><strong id="progress-label" aria-live="polite">Chargement du suivi…</strong><progress id="progress" max="32" value="4" aria-label="Tâches cochées"></progress></div><p class="tiny" id="save-status">Les cases suivent le travail déclaré, pas la rentabilité. Elles sont conservées dans ce navigateur, si le stockage local est disponible.</p><div class="roadmap" id="roadmap"></div><p id="empty" class="empty" hidden>Aucune étape dans cette vue.</p><noscript><p>Activez JavaScript pour afficher les tâches interactives. Chantiers : bugs d’exécution et de reward ; features de coût et multi-horizon ; cibles supervisées de PnL net ; modèles compacts ; abstention économique ; benchmark contrôlé. Aucun entraînement n'est lancé par cette page.</p></noscript></section>
+<section id="criteres" class="section"><div class="section-head"><div><div class="eyebrow">Expériences proposées — pas des gains promis</div><h2>Changer une famille de variables à la fois.</h2><p>Après les corrections de simulation : mêmes fenêtres, mêmes coûts, même risque et au moins trois graines pour les apprentissages. Compter tous les essais.</p></div></div><div class="panel table-wrap"><table class="criteria"><thead><tr><th>Expérience</th><th>Modification précise</th><th>Décision sur les résultats</th></tr></thead><tbody><tr><td>E1 · Features de coût</td><td>+ spread / ATR<br>+ coût / distance du stop</td><td>Comparer aux 10 features actuelles. Garder si le PnL net et le PF progressent sur les fenêtres prédéfinies sans dépendre d'une seule période.</td></tr><tr><td>E2 · Contexte temporel</td><td>Rendements 15 / 60 min normalisés ; ratio de volatilité 15 / 240 min</td><td>Conserver mom_5 comme baseline : sa variante continue à 5 min a déjà été défavorable selon les notes du code. Tester ces nouveaux horizons en ablation.</td></tr><tr><td>E3 · Cible économique</td><td>E[R_LONG] et E[R_SHORT], frais et sorties au temps inclus</td><td>Comparer classement des occasions, PnL réalisé et référence sans trade. Une AUC supérieure seule ne suffit pas.</td></tr><tr><td>E4 · Architecture</td><td>SAINT actuel vs MLP / TCN compact</td><td>Même protocole et budget déclaré. Mesurer rentabilité, stabilité par seed, temps de collecte, mémoire et latence d'inférence.</td></tr><tr><td>E5 · Actualisation PPO</td><td>gamma 0,97 vs 0,995, puis 0,999 seulement si justifié</td><td>Propositions à tester après correction de la récompense. Conserver γ^Δt ; vérifier les effets par durée de trade, pas seulement le score global.</td></tr><tr><td>E6 · Acteur / critique</td><td>Tronc partagé vs gradient critique arrêté au tronc lors du warmup</td><td>Comparer la déformation des logits pendant le warmup, puis le PnL net. Ne pas confondre une forte entropie avec un avantage de trading.</td></tr></tbody></table></div><p class="tiny">La validation répétée sert à choisir ; une période ultérieure réservée sert ensuite à confirmer. Ces propositions peuvent être rejetées : aucune architecture ne garantit une espérance positive.</p></section>
+<section id="prochain" class="section"><div class="section-head"><div><div class="eyebrow">Premier lot de développement</div><h2>Trois corrections avant le prochain A/B.</h2></div></div><div class="split"><div class="panel"><h3>Livrable : un environnement cohérent</h3><ol class="next-list"><li><strong>Extraire un moteur de prix partagé.</strong> Dans <code>training.py</code> et les backtests, remplacer les demi-spreads ambigus par BID/ASK explicites ; un stop LONG ne doit pas être touché quand BID_low &gt; SL.</li><li><strong>Remplacer la référence d'equity reconstruite.</strong> Mémoriser une valorisation cohérente entre deux pas ; le bruit de stress ne doit pas être refacturé dans la récompense à chaque bougie immobile.</li><li><strong>Clarifier la fin de fenêtre.</strong> Liquider réellement et enregistrer le terminal, ou gérer une troncature avec bootstrap valide. Corriger aussi les statistiques de normalisation du fold.</li><li><strong>Relancer à configuration identique.</strong> Comparer les trades, le reward et l'entropie ; ajouter les nouvelles features dans une expérience suivante.</li></ol><p class="tiny">L'audit et cette roadmap n'ont pas modifié le code Python de production ni arrêté le run actif.</p></div><div class="panel"><label class="note-label" for="notes">Journal des patches et expériences</label><textarea id="notes" placeholder="Fichier · changement · hypothèse · test · résultat&#10;&#10;Exemple : training.py / step — réconcilier les quotes d'entrée et de stop avant de tester de nouvelles features."></textarea><p class="tiny">Inscrire le hash du code, la configuration, les seeds et les expériences rejetées. Les cases restent un suivi manuel.</p><button class="button" id="reset" type="button">Rétablir le suivi initial</button></div></div></section>
+<section id="sources" class="section"><div class="section-head"><div><div class="eyebrow">Sources et statut</div><h2>Code observé, bugs reproduits, hypothèses identifiées.</h2></div></div><div class="sources"><div><h3>Preuves locales</h3><p><a href="AUDIT_ENTRAINEMENT_20260914.md">Audit du run à 38 époques</a> · <a href="experiments/audit-code-20260914/reproductions.json">Reproductions numériques</a> · <a href="experiments/audit-code-20260914/run_analysis.json">Métriques et empreintes des sources</a>.</p><p>Historique : <a href="RAPPORT_PPO_20260914.md">second essai court de 8 époques</a>. Le pooling et les réglages BTCUSD du préentraînement sont déjà corrigés dans le code du run actuel ; ils ne sont pas comptés comme bugs actifs.</p></div><div><h3>Références techniques</h3><p><a href="https://www.metatrader5.com/en/terminal/help/trading/general_concept" target="_blank" rel="noopener noreferrer">MetaTrader 5 : quotes et ordres SL/TP</a> · <a href="https://farama.org/Gymnasium-Terminated-Truncated-Step-API" target="_blank" rel="noopener noreferrer">Farama : terminated / truncated</a>.</p><p><a href="https://arxiv.org/abs/1707.06347" target="_blank" rel="noopener noreferrer">PPO — Schulman et al.</a> · <a href="https://www.davidhbailey.com/dhbpapers/backtest-prob.pdf" target="_blank" rel="noopener noreferrer">Sélection et surapprentissage des backtests — Bailey et al.</a>. Les variantes de features et d'architecture sont des propositions pour ce projet, pas des performances établies par ces sources.</p></div></div></section>
+<footer class="footer"><span>LOUP Ω / Plan de recherche BTCUSD · document autonome, utilisable hors ligne</span><span>Bugs → features → modèle → décision → comparatif</span></footer>
 </main>
 <script>
 'use strict';
 const phases = [
-{id:0,priority:'socle',title:'Conserver les corrections démontrées',why:'Un point de départ reproductible pour ne pas réintroduire les défauts déjà corrigés.',gate:'Conserver les preuves de l’essai : audit de collecte, tests et couples modèle / seuils.',stop:'Une correction qui régresse doit être réparée avant tout comparatif de performance.',files:'training.py · test_training_selection.py · run_profitability_experiment.py',tasks:[
-['ppo','Collecte PPO cohérente','7 631 décisions contrôlées ; aucun forçage ni remplacement de l’action.',true],
-['threshold','Filtre maintenu quand les probabilités varient peu','Seuils par côté ; cas des probabilités identiques couvert par les tests.',true],
-['snapshot','Copie indépendante du meilleur modèle et de ses seuils','Correction présente ; la branche de test final reste à exercer en intégration.',true],
-['isolation','Essais isolés et normalisation sur le train','Vérifié dans le lanceur expérimental ; le lanceur historique reste à corriger.',true]]},
-{id:1,priority:'p0',title:'Rendre le simulateur économiquement fiable',why:'Une bonne optimisation d’un PnL mal calculé peut sélectionner la mauvaise stratégie.',gate:'Journal de capital réconcilié avec les exécutions ; cas déterministes conformes aux unités et arrondis du courtier.',stop:'Si une convention de prix ou de frais est ambiguë, suspendre la recherche de paramètres et résoudre cet écart.',files:'training.py : BTCTradingEnvDiscrete · backtest_saintv2_no_be_trail.py · loup_live.py · SaintV2_WF3.mq5',tasks:[
-['quotes','Unifier les prix BID/ASK et les déclenchements','Vérifier BUY à l’ASK, SELL au BID, fermeture et niveaux SL/TP ; éviter tout double comptage du spread.'],
-['costs','Mesurer les coûts réellement applicables à BTCUSD','Spread, commission, glissement et frais de détention du produit exact ; ne pas transférer automatiquement les coûts des futures Binance au CFD.'],
-['fills','Tester les scénarios difficiles et la sortie terminale','Gap au-delà du stop, SL et TP dans la même bougie, fin d’épisode : fermer au prix exécutable, frais compris. Séparer bruit synthétique et scénario central.'],
-['ledger','Réconcilier le risque, les lots et le capital','P&L de tous les trades, frais, capital final, marge et arrondis. Comparer un replay MT5 ; fixer les tolérances d’après tick et volume réels.']]},
-{id:2,priority:'p0',title:'Séparer apprendre, calibrer, sélectionner et tester',why:'Éviter qu’un seuil ou une normalisation utilise des informations de la période censée mesurer le résultat.',gate:'Découpage chronologique figé, calibration antérieure à l’évaluation, dates et graines reproductibles, aucune statistique ajustée sur le test.',stop:'Une période déjà consultée ne redevient pas vierge. Si son historique d’utilisation est inconnu, réserver une période future prospective.',files:'training.py : run_walkforward / create_datasets_from_slices · saint_core.py : normalisation · manifest.json',tasks:[
-['foldnorm','Calculer et conserver la normalisation pour chaque fold','Corriger aussi le lanceur historique ; charger les mêmes statistiques avec chaque checkpoint en backtest et en inférence.'],
-['chronology','Créer quatre rôles temporels explicites','Train → calibration des seuils → validation de sélection → test final scellé. Utiliser des folds internes pour les choix répétés.'],
-['purge','Purger les cibles qui franchissent les frontières','Tenir compte de l’horizon de détention / labellisation, des fenêtres de features et de l’heure de disponibilité réelle des données externes.'],
-['fixed','Fixer les fenêtres, seeds et règles de comparaison','Même calendrier et même budget pour un A/B ; journaliser aussi les échecs. Les répétitions de coût sur une même fenêtre ne sont pas des périodes indépendantes.']]},
-{id:3,priority:'p1',title:'Vérifier qu’un signal exploitable existe',why:'Le réseau complexe doit apporter une valeur mesurable face à des références simples soumises aux mêmes coûts.',gate:'Une référence ou le modèle présente une espérance nette positive sur les validations prévues, avec une incertitude publiée.',stop:'Si toutes les approches perdent après coûts, réexaminer l’information disponible ou l’horizon ; ne pas augmenter aveuglément les époques.',files:'pretrain_supervised.py · mesure_features.py · nouvelle comparaison chronologique commune',tasks:[
-['cash','Ajouter la référence sans position','PnL de trading nul : une stratégie déficitaire ne bat pas l’abstention.'],
-['random','Comparer à des entrées aléatoires équitables','Même calendrier, exposition, fréquence et contraintes de risque ; rapporter la distribution des résultats.'],
-['simple','Tester un modèle supervisé simple','Régression logistique ou modèle tabulaire sur les mêmes informations ; évaluer la décision de trading nette, pas seulement l’AUC.'],
-['features','Mesurer l’apport marginal des données Binance','Retirer puis réintroduire les familles de features sur les folds internes ; contrôler disponibilité, décalages horaires et changements de régime.']]},
-{id:4,priority:'p1',title:'Aligner les trades sur le signal et les coûts',why:'Les stops courts peuvent absorber une grande part du mouvement dans les frictions. Il faut le mesurer, pas le supposer.',gate:'Paramètres utiles sur plusieurs périodes, espérance nette positive et stabilité autour du choix retenu ; aucune réduction artificielle des frais.',stop:'Un optimum isolé, un côté unique choisi après coup ou un résultat dépendant d’un réglage exact ne suffit pas.',files:'mesure_sltp.py · compare_profitability.py (à valider contre le simulateur audité)',tasks:[
-['barriers','Tester une petite grille préenregistrée de barrières','Proposition : SL 2 / 3 / 5 ATR et R:R 1,4 / 2,0, soit 6 variantes. Inclure tous les trades non résolus, liquidés au marché.'],
-['select','Tester la sélectivité dans une étape séparée','Comparer par exemple 1 / 5 / 10 % sur calibration passée. Éviter le produit cartésien de tous les réglages.'],
-['sides','Analyser LONG et SHORT sans sélection opportuniste','PnL, coûts, exposition et pertes par côté et par régime ; tout filtre supplémentaire compte comme un nouvel essai.'],
-['risk','Fixer le risque pour comparer les espérances','Évaluer aussi en unités de risque. Levier et taille ne doivent pas masquer une stratégie intrinsèquement perdante.']]},
-{id:5,priority:'p2',title:'Améliorer le PPO par expériences contrôlées',why:'Le second essai valide la correction d’échantillonnage, mais ne mesure pas son gain causal de rentabilité.',gate:'Avantage reproductible au même budget de décisions, sur plusieurs graines, face au PPO de référence et aux modèles simples.',stop:'Si le PPO ne surpasse pas les références, conserver la méthode plus simple ou changer l’hypothèse d’apprentissage.',files:'training.py : collecte / GAE semi-MDP / loss acteur-critique · sampling_audit_both_wf1.jsonl',tasks:[
-['ab','Faire un vrai A/B de la correction PPO','Même préparation, budget, fenêtres et au moins 3 graines appariées ; seul le traitement des actions change. Garder le mode historique à des fins de diagnostic.'],
-['reward','Vérifier le lien récompense ↔ PnL net','Contrôler coûts, terminal, actualisation en minutes via γ^Δt et reward shaping ; éviter de récompenser une perte économique.'],
-['gradients','Isoler les problèmes de gradients','Mesurer gradients acteur / critique / tronc, KL, saturation HOLD et fréquence des décisions ; ne changer qu’une famille de paramètres à la fois.'],
-['budget','Augmenter progressivement le budget de calcul','Proposition : test court → pilote multi-seed → long run seulement si les critères précédents passent. Comparer en décisions et en temps, pas uniquement en époques.']]},
-{id:6,priority:'p2',title:'Confirmer la robustesse hors échantillon',why:'Une stratégie retenue doit survivre à d’autres périodes et à des conditions d’exécution moins favorables.',gate:'Configuration figée satisfaisant les cibles préenregistrées et leurs intervalles d’incertitude sur l’évaluation réservée.',stop:'Si le test échoue, enregistrer l’échec. Toute modification demande une nouvelle période indépendante ; ne pas retuner sur ce test.',files:'backtest_saintv2_stress_test.py · checkpoints + normalisations + seuils versionnés ensemble',tasks:[
-['walk','Exécuter un walk-forward strictement chronologique','Rendre visibles chaque fold, régime et seed ; publier tous les résultats et vérifier que les gains ne viennent pas de quelques trades.'],
-['stress','Dégrader l’exécution de façon documentée','Coûts × 1,5 puis × 2, glissement défavorable, gaps, délais et trous de données ; distinguer scénarios mesurés et hypothétiques.'],
-['uncertainty','Quantifier l’incertitude et la sélection','Bootstrap par blocs de rendements, sensibilité à la longueur des blocs et nombre total d’essais ; ne pas traiter les trades dépendants comme indépendants.'],
-['sealed','Effectuer une seule décision sur le test réservé','Geler le modèle, les statistiques, les seuils et les critères avant ouverture. Valider la liquidation terminale et la courbe de capital complète.']]},
-{id:7,priority:'p3',title:'Observer en démo avant de décider de la suite',why:'L’écart entre simulation et exécution doit être observé sur de nouvelles données.',gate:'Au moins 4 semaines et 200 trades démo, critères économiques maintenus, écarts simulation / exécution expliqués.',stop:'Si les coûts, le drawdown ou les décisions divergent, interrompre l’expérience démo et revenir à l’audit concerné.',files:'loup_live.py · gui_loup.py · logs MT5 / journal de surveillance',tasks:[
-['demo','Utiliser une configuration figée en démo','Lancement séparé et explicite ; aucune bascule automatique vers un compte réel.'],
-['parity','Comparer observations et décisions entre environnements','Mêmes bougies closes, features, normalisation, seuils et tailles ; journaliser chaque divergence.'],
-['monitor','Suivre coûts, latence et dérive du signal','Alertes sur données périmées, spread anormal, décalage horaire et performance hors de la plage attendue.'],
-['decision','Produire une décision documentée','Continuer, collecter davantage ou abandonner l’hypothèse. Un résultat de démo ne déclenche pas à lui seul un déploiement réel.']]}
+  {
+    "id": 0,
+    "priority": "socle",
+    "title": "Ce qui est déjà corrigé dans le code actif",
+    "why": "Ne pas reprendre les défauts des anciennes versions comme explication des pertes actuelles.",
+    "gate": "Conserver les corrections et leur compatibilité lors des prochains patches.",
+    "stop": "Un changement de features ou de tête de réseau exige une nouvelle version de checkpoint et de normalisation.",
+    "files": "training.py · saint_core.py · pretrain_supervised.py",
+    "tasks": [
+      [
+        "ppo",
+        "Collecte PPO cohérente",
+        "Forçage et remplacement désactivés ; audit actif autour de 3e-7.",
+        true
+      ],
+      [
+        "rank",
+        "Feature vol_rank continue",
+        "Déjà sélectionnée à la place de high_vol_regime ; ne pas la proposer comme ajout nouveau.",
+        true
+      ],
+      [
+        "pooling",
+        "Pooling global + dernier instant",
+        "Déjà concaténé dans SAINTPolicySingleHead ; ce défaut historique est corrigé.",
+        true
+      ],
+      [
+        "pretraincfg",
+        "Préentraînement sur BTCUSD avec les bonnes barrières",
+        "Lookback 54, SL 2 ATR, R:R 1,4 présents dans cette version.",
+        true
+      ]
+    ]
+  },
+  {
+    "id": 1,
+    "priority": "p0",
+    "title": "Corriger les prix et les stops du simulateur",
+    "why": "BUG REPRODUIT : un LONG est stoppé avant que le BID atteigne son SL. Ce biais dégrade les exemples donnés au modèle.",
+    "gate": "Tous les scénarios déterministes BUY/SELL réconcilient prix, frais, niveau de stop et capital final.",
+    "stop": "Ne pas chercher un meilleur SL/TP sur le moteur actuel : on optimiserait aussi ses erreurs.",
+    "files": "training.py : _apply_micro, BTCTradingEnvDiscrete.step · backtests · futur moteur commun execution.py",
+    "tasks": [
+      [
+        "quotes",
+        "Passer à des quotes BID/ASK explicites",
+        "Entrée BUY à ASK, entrée SELL à BID ; sorties inverses. Le close BID ne doit pas recevoir seulement un demi-spread."
+      ],
+      [
+        "sl",
+        "Retirer le +spread du test du stop LONG",
+        "Tester BID_low <= SL et BID_high >= TP ; pour SHORT, tester les extrêmes ASK correspondants."
+      ],
+      [
+        "fills",
+        "Éviter le spread supplémentaire sur un prix déjà exécutable",
+        "Un fill SL/TP en quote de fermeture ne repaie pas un demi-spread ; traiter frais, glissement et gaps séparément."
+      ],
+      [
+        "replay",
+        "Réutiliser les mêmes fonctions en training et backtest",
+        "Ajouter des tests de non-déclenchement, double touche, gap et arrondis de lot. Enregistrer la convention historique de spread."
+      ]
+    ]
+  },
+  {
+    "id": 2,
+    "priority": "p0",
+    "title": "Corriger le signal de récompense et la fin de fenêtre",
+    "why": "BUG REPRODUIT : prix constant et coûts nuls donnent 60 rewards négatifs. Le bootstrap terminal calculé est aussi annulé par le flag done.",
+    "gate": "Marché immobile sans coûts : reward nul. Fin de fenêtre : résultat financier et cible GAE cohérents avec la sémantique retenue.",
+    "stop": "Ne pas augmenter l’entropie pour forcer les trades tant que le reward peut punir artificiellement la détention.",
+    "files": "training.py : step, prev_equity, compute_gae_semi_mdp, _cloture, last_value",
+    "tasks": [
+      [
+        "equity",
+        "Mémoriser une equity de référence cohérente",
+        "La valeur précédente ne doit pas omettre le bruit déjà pris en compte au pas précédent. Séparer mark-to-market et stress sur les mèches."
+      ],
+      [
+        "reward",
+        "Tester une récompense économique simple",
+        "Comparer Δequity nette / capital initial au mélange actuel log-return + résultat en R. Garder la taille de risque fixe pour cette ablation."
+      ],
+      [
+        "terminal",
+        "Choisir liquidation réelle ou troncature avec bootstrap",
+        "Actuellement _cloture(k, True) masque last_value. Une limite d’échantillonnage ne doit pas être traitée implicitement comme une fin économique."
+      ],
+      [
+        "gamma",
+        "Ablater gamma après le correctif",
+        "À 0,97, un résultat à 120 min ne pèse plus que 2,59 %. Tester 0,995 à règles identiques ; vérifier aussi la variance des avantages."
+      ]
+    ]
+  },
+  {
+    "id": 3,
+    "priority": "p1",
+    "title": "Rendre le coût et le contexte visibles dans les features",
+    "why": "HYPOTHÈSE : les 10 features actuelles décrivent le marché, mais peu l’intérêt économique d’une entrée au coût et à l’horizon considérés.",
+    "gate": "Chaque famille ajoutée améliore les résultats nets sur les fenêtres fixées ; gains stables sans augmentation incontrôlée de l’exposition.",
+    "stop": "Conserver le jeu de 10 comme baseline. Ne pas remplacer mom_5 par une amplitude simple en supposant que continu est toujours meilleur.",
+    "files": "saint_core.py : add_indicators, merge_m1_h1, FEATURE_COLS · training.py : MarketData · build_binance_features.py",
+    "tasks": [
+      [
+        "costfeatures",
+        "Ajouter spread_atr et cost_stop_ratio",
+        "Formules proposées : spread_price / ATR ; coût aller-retour estimé / distance du stop. Utiliser uniquement un coût observable au moment de la décision."
+      ],
+      [
+        "returns",
+        "Tester des rendements normalisés à 15 et 60 minutes",
+        "log(close / close.shift(k)) / (volatilité M1 passée × √k + epsilon). Comparer sans supprimer le bit mom_5."
+      ],
+      [
+        "volcontext",
+        "Ajouter un contexte de volatilité multi-horizon",
+        "Tester ATR en bps et ratio de volatilité 15 / 240 min ; vol_rank existe déjà. Mesurer la redondance plutôt qu’empiler tous les indicateurs."
+      ],
+      [
+        "availability",
+        "Garantir le même calcul à l’entraînement et en live",
+        "N’utiliser que les observations déjà disponibles ; versionner features, caches, lookback, normalisation et export ONNX ensemble."
+      ]
+    ]
+  },
+  {
+    "id": 4,
+    "priority": "p1",
+    "title": "Préentraîner sur le résultat net, pas seulement TP avant SL",
+    "why": "Les paramètres BTCUSD sont alignés, mais la fonction barrieres écarte les non-résolus et ne reproduit pas toute l’économie du PPO.",
+    "gate": "Cibles LONG/SHORT réconciliées avec le moteur commun ; classement des entrées rentable après coûts face au modèle simple et à HOLD.",
+    "stop": "Une meilleure AUC ou un bon taux de TP n’est pas une amélioration si le PnL net reste négatif.",
+    "files": "pretrain_supervised.py : barrieres, garde · saint_core.py : têtes de modèle · training.py : initialisation",
+    "tasks": [
+      [
+        "labels",
+        "Conserver les trades non résolus",
+        "À MAX_HOLD, liquider et calculer le résultat net. Ne plus supprimer un état parce qu’un des deux côtés n’a pas touché de barrière."
+      ],
+      [
+        "nettargets",
+        "Construire deux cibles de PnL net en unités de risque",
+        "BUY et SELL, avec mêmes fills, frais, glissement et stop effectif que le simulateur audité. Purger les labels qui débordent le split."
+      ],
+      [
+        "heads",
+        "Comparer classification binaire et têtes E[R_LONG/SHORT]",
+        "Tester une régression robuste sur rendement net ; calibrer les scores sur une période antérieure à l’évaluation."
+      ],
+      [
+        "warmstart",
+        "Comparer préentraînement seul, PPO seul et transfert",
+        "Même calendrier et budget annoncé. Tester un tronc gelé au début du transfert pour voir si PPO détruit ou améliore le signal appris."
+      ]
+    ]
+  },
+  {
+    "id": 5,
+    "priority": "p2",
+    "title": "Simplifier le modèle et isoler l’acteur du critique",
+    "why": "Le pooling est déjà corrigé. La question devient : quelles composantes produisent un signal utile plutôt que du coût ou de l’interférence ?",
+    "gate": "Avantage net reproductible avec coût GPU et latence mesurés. Les gains de vitesse seuls ne sont pas des gains de rentabilité.",
+    "stop": "Ne pas ajouter des blocs ou augmenter d_model avant d’avoir comparé une architecture plus simple.",
+    "files": "saint_core.py : RowAttention, ColumnAttention, SAINTPolicySingleHead, build_policy · training.py : optimizer/loss",
+    "tasks": [
+      [
+        "attention",
+        "Tester need_weights=False dans les attentions",
+        "Les poids d’attention sont ignorés. Profiler ce changement et vérifier numériquement les logits sur la version de PyTorch installée."
+      ],
+      [
+        "compact",
+        "Comparer un MLP et un TCN au SAINT actuel",
+        "Garder les mêmes informations d’entrée ; comparer à budget de données égal puis à budget de calcul égal, en distinguant les deux expériences."
+      ],
+      [
+        "position",
+        "Séparer les features de position de l’encodeur marché",
+        "Dans la collecte flat, le bloc position est [0,0,0,1]. Tester un encodage des 10 features de marché avec contexte de position ajouté après pooling, en conservant la compatibilité nécessaire au critique."
+      ],
+      [
+        "critic",
+        "Isoler l’effet du critique sur la représentation",
+        "Tracer les gradients ; tester arrêt du gradient du critique vers le tronc pendant warmup ou branches séparées. Une faible critic_loss ne prouve pas la qualité de l’acteur."
+      ]
+    ]
+  },
+  {
+    "id": 6,
+    "priority": "p2",
+    "title": "Faire dépendre l’entrée d’un avantage économique",
+    "why": "Le filtre par quantile impose une fréquence relative ; il peut entrer alors que HOLD domine la politique et que l’espérance est négative.",
+    "gate": "L’abstention évite des trades à espérance négative sans sélectionner après coup les périodes gagnantes.",
+    "stop": "Aucun remappage BUY/SELL → HOLD après le tirage PPO. Si un filtre intervient en collecte, il doit appartenir à la distribution enregistrée et mise à jour.",
+    "files": "training.py : validation, calib_thr_val · saint_core.py : règle partagée · loup_live.py · exports",
+    "tasks": [
+      [
+        "abstain",
+        "Comparer la règle quantile à une vraie option HOLD",
+        "Mesurer séparément la politique argmax, la règle actuelle et une règle d’espérance nette. Zéro trade est un résultat acceptable si aucun avantage n’existe."
+      ],
+      [
+        "ev",
+        "Entrer seulement si le meilleur E[R] couvre sa marge",
+        "Avec les têtes économiques : choisir LONG/SHORT si leur espérance nette dépasse un seuil calibré ; sinon HOLD. Ne pas interpréter un logit PPO comme une probabilité de gain."
+      ],
+      [
+        "duration",
+        "Aligner barrières et horizon prédictif",
+        "Comparer une petite grille SL 2/3/5 ATR, R:R 1,4/2 et sortie au temps ; ne pas croiser cette grille avec toutes les features et tous les modèles à la fois."
+      ],
+      [
+        "flow",
+        "Tester des variations de flux Binance, puis un ensemble",
+        "D’abord EMA et variations passées de taker_ratio / ls_ratio_top, avec leur vraie fréquence de publication. Un ensemble multi-seed vient seulement si ses membres ont un signal validé."
+      ]
+    ]
+  },
+  {
+    "id": 7,
+    "priority": "p0",
+    "title": "Créer le banc de comparaison qui mesure chaque patch",
+    "why": "BUG DE MESURE CONFIRMÉ : les stats de normalisation actuelles sont celles de tout l’historique. Une sélection répétée sur la même validation ne démontre pas la rentabilité.",
+    "gate": "Un manifest identifie la version, les données, les fenêtres, les coûts, les seeds et le budget ; le test reste indépendant des décisions de réglage.",
+    "stop": "Si les périodes ou l’économie diffèrent entre deux variantes, ne pas attribuer leur écart de PnL au patch seul.",
+    "files": "training.py : run_walkforward · run_profitability_experiment.py · norm_stats_*.npz · futur benchmark_variants.py",
+    "tasks": [
+      [
+        "norm",
+        "Calculer les stats dans chaque train de fold",
+        "Sauvegarder et charger ces stats avec le checkpoint. Empêcher le fallback silencieux vers le fichier global historique."
+      ],
+      [
+        "windows",
+        "Fixer les fenêtres et séparer la calibration",
+        "Même dates pour chaque variante, calibration des seuils avant l’évaluation, labels purgés et journal de tous les essais."
+      ],
+      [
+        "config",
+        "Centraliser la configuration du modèle et des trades",
+        "Le préentraînement est aligné aujourd’hui par des constantes dupliquées. Utiliser une configuration commune pour empêcher la prochaine divergence."
+      ],
+      [
+        "bench",
+        "Mesurer les décisions réellement utilisées et le temps",
+        "Le run utilise 16 000 / 476 956 décisions à E38. Optimiser la collecte sans modifier sa distribution, puis comparer chaque famille de patches sur au moins trois seeds."
+      ]
+    ]
+  }
 ];
-const key='loup-roadmap-profitability-v1';
+const key='loup-roadmap-code-v2';
 const initial=Object.fromEntries(phases.flatMap(p=>p.tasks.map(t=>[t[0],Boolean(t[3])])));
 let state={checked:{...initial},notes:''};
 let storage=true;
@@ -81,7 +293,7 @@ document.getElementById('view').addEventListener('change',update);
 document.getElementById('notes').value=state.notes;
 document.getElementById('notes').addEventListener('input',e=>{state.notes=e.target.value;save();});
 document.getElementById('print').addEventListener('click',()=>window.print());
-document.getElementById('export').addEventListener('click',()=>{const data={version:1,exported_at:new Date().toISOString(),document:'Loup Ω — roadmap de rentabilité',...state};const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));const link=el('a');link.href=url;link.download='suivi-roadmap-loup.json';document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);});
+document.getElementById('export').addEventListener('click',()=>{const data={version:2,exported_at:new Date().toISOString(),document:'Loup Ω — roadmap de rentabilité',...state};const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));const link=el('a');link.href=url;link.download='suivi-roadmap-loup.json';document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);});
 document.getElementById('reset').addEventListener('click',()=>{if(window.confirm('Rétablir les quatre tâches initiales et effacer les notes de ce navigateur ?')){state={checked:{...initial},notes:''};document.getElementById('notes').value='';save();render();}});
 render();if(!storage)document.getElementById('save-status').textContent='Stockage local indisponible : utilisez l’export pour conserver votre suivi.';
 </script>

@@ -76,7 +76,18 @@ AGENT      = "wf1"
 CHECKPOINT = f"bestprofit_saintv2_loup_duel_{AGENT}_both_{AGENT}.pth"
 ONNX_OUT   = f"saintv2_{AGENT}.onnx"
 NORM_STATS = "norm_stats_ohlc_indics.npz"
-LOOKBACK   = 25
+# LOOKBACK LU DEPUIS LA CONFIG, jamais recopie.
+#
+# Il valait 54 en dur alors que l'entrainement produit desormais des poids sur
+# 25 pas de temps. Un modele exporte aurait attendu une entree de forme (1, 54,
+# 34) pour des poids entraines en (1, 25, 34) : desaccord silencieux au
+# deploiement, decouvert au premier tick en production.
+#
+# La valeur ne doit exister qu'a UN endroit. Toute duplication finit par
+# diverger — c'est deja arrive au plancher d'ATR, au spread et au jeu de
+# features au cours de ce projet.
+from training import PPOConfig as _PPOConfig
+LOOKBACK   = _PPOConfig().lookback
 
 # ============================================================
 # 1) Charge le modèle PyTorch
@@ -148,7 +159,8 @@ except ImportError:
 # ============================================================
 from saint_core import FEATURE_COLS as _FEATS
 
-stats = np.load(NORM_STATS)
+from saint_core import load_model_norm_stats
+stats = load_model_norm_stats(CHECKPOINT)
 mean = stats["mean"].astype(np.float64)
 std  = stats["std"].astype(np.float64)
 # Compté depuis saint_core, jamais en dur : un nombre figé ici avait survécu à

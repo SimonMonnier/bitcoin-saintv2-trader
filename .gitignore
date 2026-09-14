@@ -50,3 +50,6 @@ experiments/
 
 # Journaux d audit par run
 *.jsonl
+
+# Instantanes de configuration par run
+run_saintv2_*.json

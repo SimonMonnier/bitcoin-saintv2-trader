@@ -25,6 +25,7 @@ def main():
     parser.add_argument('--val-episodes', type=int, default=8)
     parser.add_argument('--warmup', type=int, default=5)
     parser.add_argument('--sl-mult', type=float, default=2.0)
+    parser.add_argument('--cpu', action='store_true')
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
     out = (root / args.output).resolve()
@@ -34,9 +35,10 @@ def main():
                       critic_warmup_epochs=args.warmup,
                       atr_sl_mult=args.sl_mult, atr_tp_mult=args.sl_mult * 1.4,
                       validation_selectivity=0.05, evaluate_test=False,
+                      force_cpu=args.cpu,
                       model_prefix='pilot_saintv2', side='both',
                       use_vol_curriculum=False)
-    for name in ('training.py', 'saint_core.py', Path(__file__).name):
+    for name in ('training.py', 'saint_core.py', 'execution_quotes.py', 'economic_learning.py', Path(__file__).name):
         shutil.copy2(root / name, out / name)
     frame = t.load_mt5_data(cfg)
     n = len(frame)
@@ -44,20 +46,20 @@ def main():
     # La fin de l'historique ne participe ni aux stats ni a la selection.
     os.chdir(out)
     stats = t.compute_and_save_global_norm_stats(frame.iloc[:a], t.FEATURE_COLS)
-    train, val, test = t.create_datasets_from_slices(
+    train, calib, val, test = t.create_datasets_from_slices(
         frame, t.FEATURE_COLS, start=0, train_len=a, val_len=b,
         test_len=c, stats=stats)
     manifest = {'config': vars(cfg), 'seed': t.SEED,
                 'features': t.FEATURE_COLS, 'train_rows': a, 'val_rows': b,
                 'test_rows_reserved': c, 'total_rows': n,
                 'normalization': 'train only', 'test_evaluated': False,
-                'validation_note': 'Exploratoire; calibration sur les episodes de validation.'}
+                'validation_note': 'Calibration anterieure et distincte de la validation.'}
     (out / 'manifest.json').write_text(json.dumps(manifest, default=str, indent=2), encoding='utf-8')
     # Reinitialiser apres la preparation pour une relance deterministe.
     random.seed(t.SEED)
     np.random.seed(t.SEED)
     torch.manual_seed(t.SEED)
-    t.run_training_on_split(train, val, test, stats, cfg, suffix='_wf1')
+    t.run_training_on_split(train, calib, val, test, stats, cfg, suffix='_wf1')
     log = pd.read_csv(out / 'training_log_both_wf1.csv')
     log['val_pnl_per_episode'] = log.val_pnl / cfg.val_episodes
     summary = {'epochs_completed': len(log),

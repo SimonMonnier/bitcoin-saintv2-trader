@@ -15,6 +15,7 @@ import os
 # Doit précéder l'import de torch/numpy (conflit OpenMP sous Windows/conda).
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+import collections
 import math
 from typing import Dict, List, Optional
 
@@ -147,67 +148,50 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # 1.22 M bougies contre 1.32 M sans lui. Les 8 % de donnees recuperees valent
 # +0.0025 a +0.0041 d'AUC selon le jeu — mesure sur les quatre.
 
-# JEU A 10 COLONNES, sur un lookback de 54 bougies.
+# JEU A 30 COLONNES — choisi sur mesure.
 #
-# C'est le jeu historique de BTCUSD : cinq features M1, trois H1, deux Binance.
-# Il a ete elague depuis 21 colonnes par mesure d'apport marginal.
-#
-# MESURE A CONNAITRE, faite sur UNE SEULE bougie (sonde logistique, 28 653
-# candidats de validation, friction complete, esperance par unite de risque
-# apres selection du meilleur 1 %) :
+# Sonde logistique, 28 653 candidats de validation, friction complete sans
+# commission (ce courtier n'en facture pas), esperance par unite de risque
+# apres selection du meilleur 1 % :
 #
 #     jeu                AUC      E[R]        t
 #      8 sans Binance   0.5450   -0.2102    -4.0
-#     10 (celui-ci)     0.6072   +0.0346    +0.6     non distinguable de zero
-#     30 large          0.6215   +0.1751    +3.4
+#     25 M1+H1 larges   0.5783   -0.0701    -1.4
+#     10 (ancien jeu)   0.6072   +0.0346    +0.6    non distinguable de zero
+#     27 + Binance      0.6191   +0.1249    +2.4
+#     30 (celui-ci)     0.6215   +0.1751    +3.4
 #
-# Sur une bougie, ce jeu n'etait donc PAS distinguable de zero la ou le jeu
-# large l'etait. Mais cette mesure ne dit rien du lookback : la sonde ne voit
-# qu'un instant, alors que le modele en verra 54. Les indicateurs derives que
-# le jeu large apportait — RSI, rang de volatilite, ecart aux moyennes — sont
-# precisement des resumes d'HISTORIQUE, et 54 bougies donnent au transformeur
-# de quoi les reconstruire lui-meme. C'est ce que ce reglage teste.
+# Les DEUX colonnes Binance pesent plus que les 25 autres reunies : 25 features
+# de prix seules donnent une esperance NEGATIVE ; on ajoute taker_ratio et
+# ls_ratio_top et l'AUC passe de 0.5783 a 0.6191.
 FEATURE_COLS_M1 = [
-    "close_ema_dev",     # ecart a l'EMA 60
-    "returns",
-    "range_norm",
-    # `mom_5` est un BIT : (close > close.shift(5)). Il a ete garde binaire
-    # apres mesure, contre l'intuition : sa version continue (rendement sur 5
-    # bougies) fait TOMBER l'esperance de +0.0253 a -0.0093. Son ecart-type
-    # vaut 1.46 bps quand le spread en vaut 2.61 — l'amplitude y est
-    # majoritairement du bruit de microstructure, et le signe est plus robuste.
-    "mom_5",
-    # `vol_rank` REMPLACE `high_vol_regime`, qui n'en etait que le seuillage a
-    # 0.65 — donc un bit la ou la colonne source est continue.
-    #
-    # Mesure (sonde logistique, friction complete, meilleur 1 %) :
-    #     10 avec high_vol_regime (bit)   E[R] +0.0253   t +0.5
-    #     10 avec vol_rank (continu)      E[R] +0.1166   t +2.1
-    # Seul changement du jeu a franchir le seuil de significativite. Le
-    # lookback n'y pouvait rien : cinquante-quatre bits successifs donnent
-    # l'historique du SIGNE, jamais l'amplitude.
-    "vol_rank",
+    "rsi_14", "returns", "vol_20", "range_norm", "open_rel", "high_rel",
+    "low_rel", "close_ema_dev", "mom_5", "rsi_ok", "vol_rank", "high_vol_regime",
 ]
 
 FEATURE_COLS_H1 = [
+    "rsi_14_h1", "returns_h1", "vol_20_h1", "range_norm_h1", "open_rel_h1",
+    "high_rel_h1", "low_rel_h1", "close_ema_dev_h1", "mom_5_h1", "rsi_ok_h1",
+    "vol_rank_h1", "high_vol_regime_h1",
     "close_h1_dev",      # ecart du dernier H1 CLOTURE au prix M1 courant
-    "rsi_14_h1",
-    "returns_h1",
 ]
 
-# SOURCE EXTERNE — Binance BTCUSDT perpetuel. Positionnement des acteurs et
-# flux agressif : la seule classe d'information absente du flux CFD.
-#
-# Mesure : 25 features de prix seules donnent 0.5783 d'AUC et une esperance
-# NEGATIVE ; on ajoute ces deux colonnes et l'AUC passe a 0.6191 avec t = +2.4.
-# Un bond de +0.041 pour deux colonnes, quand la meilleure feature de prix en
-# apporte 0.0025.
+# SOURCE EXTERNE — Binance BTCUSDT perpetuel : positionnement des acteurs et
+# flux agressif, la seule classe d'information absente du flux CFD.
 FEATURE_COLS_EXT = [
     "taker_ratio",       # desequilibre du flux agressif acheteur/vendeur
     "ls_ratio_top",      # ratio long/short des gros comptes
 ]
 
-FEATURE_COLS = FEATURE_COLS_M1 + FEATURE_COLS_H1 + FEATURE_COLS_EXT
+# LIQUIDITE ET TEMPS. J'avais exclu les features d'heure sur BTCUSD en invoquant
+# une mesure a -0.0022 ; la mesure comparative dit le contraire sous cette
+# configuration : 27 -> 30 colonnes fait passer l'esperance de +0.1249 a +0.1751.
+# `spread_rel` est rapporte a sa normale d'une journee — brut, il encoderait
+# l'ANNEE (1.74 ecart-type de derive sur huit ans, mesure sur l'or).
+FEATURE_COLS_LIQ_TEMPS = ["spread_rel", "heure_sin", "heure_cos"]
+
+FEATURE_COLS = (FEATURE_COLS_M1 + FEATURE_COLS_H1
+                + FEATURE_COLS_EXT + FEATURE_COLS_LIQ_TEMPS)
 
 N_BASE_FEATURES = len(FEATURE_COLS)
 
@@ -500,6 +484,28 @@ def safe_normalize(X, stats, clip_sigma: float = CLIP_SIGMA):
     return np.clip(z, -clip_sigma, clip_sigma)
 
 
+def load_model_norm_stats(checkpoint_path: str) -> Dict[str, np.ndarray]:
+    """Scaler du checkpoint; compatibilité explicite avec les anciens modèles."""
+    import warnings
+    from pathlib import Path
+    checkpoint_path = Path(checkpoint_path)
+    path = checkpoint_path.with_name(checkpoint_path.stem + '_norm.npz')
+    if not path.exists():
+        warnings.warn(f'{checkpoint_path}: ancien modèle sans scaler associé; statistiques historiques utilisées.', RuntimeWarning)
+        path = checkpoint_path.parent / NORM_STATS_PATH
+    return load_norm_stats(str(path))
+
+
+def load_shared_model_norm_stats(paths):
+    """Refuse une observation commune à des modèles normalisés différemment."""
+    stats = [load_model_norm_stats(p) for p in paths]
+    if not stats:
+        raise ValueError('Aucun modèle sélectionné')
+    if any(not all(np.array_equal(s[k], stats[0][k]) for k in ('mean', 'std')) for s in stats[1:]):
+        raise ValueError('Scalers différents: utiliser le mode multi_agent (observation par modèle).')
+    return stats[0]
+
+
 def load_norm_stats(path: str = NORM_STATS_PATH) -> Dict[str, np.ndarray]:
     """Charge les stats Z-score en VALIDANT qu'elles correspondent aux features.
 
@@ -534,7 +540,12 @@ def load_norm_stats(path: str = NORM_STATS_PATH) -> Dict[str, np.ndarray]:
             f"Relancer training.py pour le régénérer."
         )
 
-    return {"mean": mean, "std": data["std"]}
+    std = data["std"]
+    if (mean.shape != (N_BASE_FEATURES,) or std.shape != mean.shape
+            or not np.isfinite(mean).all() or not np.isfinite(std).all()
+            or (std < 0).any()):
+        raise ValueError(f"Statistiques invalides dans {path}")
+    return {"mean": mean, "std": std}
 
 
 def build_obs(df: pd.DataFrame,
@@ -807,6 +818,69 @@ def compute_dynamic_volume(equity: float, max_lot: float = 100.0) -> float:
     else:
         tier = int((equity - 1.0) // 1000.0)
     return round(min(0.10 * tier, max_lot), 2)
+
+
+class SeuilRang:
+    """Filtre de conviction par RANG GLISSANT, et non par niveau fige.
+
+    LE PROBLEME QU'IL RESOUT. Le filtre precedent calibrait un NIVEAU de
+    conviction sur une periode, puis l'appliquait telle quelle a la suivante.
+    Mesure sur un run reel : l'etendue des convictions sur la fenetre evaluee
+    est passee de 0.0035 a 0.0914 entre les epochs 6 et 12 — vingt-six fois
+    plus — pendant que le seuil herite restait autour de 0.24. La barre s'est
+    donc retrouvee tres haut dans la distribution courante, et le nombre de
+    trades s'est effondre de 1 461 a 20, dont zero vente.
+
+    Un niveau ne transfere pas quand la politique derive. Un RANG, si :
+    « entrer si cette occasion est dans les q % les plus convaincues des N
+    dernieres vues » ne depend d'aucune echelle absolue.
+
+    C'EST AUSSI CE QU'ON FERAIT EN LIVE. Le bot ne peut pas connaitre la
+    distribution des convictions a venir ; il ne connait que celles qu'il a
+    deja vues. Cette regle est donc causale par construction, et le simulateur
+    reproduit enfin la contrainte de production au lieu de la contourner.
+
+    La fenetre glissante est en NOMBRE D'OCCASIONS, pas en minutes : ce qui
+    compte est d'avoir assez d'echantillons pour estimer un quantile, pas de
+    couvrir une duree.
+    """
+
+    def __init__(self, fraction: float, taille_fenetre: int = 2000,
+                 amorce=None):
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError("fraction hors de ]0, 1]")
+        self.fraction = float(fraction)
+        self.taille = int(taille_fenetre)
+        self._vus = collections.deque(maxlen=self.taille)
+        # Minimum d'echantillons avant de trancher. Sous ce seuil, un quantile
+        # a 5 % n'a aucun sens : on s'abstient plutot que de tirer au sort.
+        self._minimum = max(50, int(2.0 / self.fraction))
+        if amorce is not None:
+            for v in amorce:
+                self._vus.append(float(v))
+
+    def pret(self) -> bool:
+        return len(self._vus) >= self._minimum
+
+    def seuil(self) -> float:
+        """Niveau courant correspondant a la fraction visee."""
+        if not self.pret():
+            return float("inf")
+        return float(np.quantile(self._vus, 1.0 - self.fraction))
+
+    def accepte(self, conviction: float) -> bool:
+        """Cette conviction est-elle dans le haut du rang glissant ?
+
+        On decide AVANT d'enregistrer : une occasion ne doit pas participer au
+        quantile qui la juge.
+        """
+        ok = self.pret() and float(conviction) >= self.seuil()
+        self._vus.append(float(conviction))
+        return bool(ok)
+
+    def observe(self, conviction: float) -> None:
+        """Enregistre une conviction sans decider (occasions non evaluees)."""
+        self._vus.append(float(conviction))
 
 
 def compute_risk_volume(equity: float, risk_frac: float, sl_dist: float,

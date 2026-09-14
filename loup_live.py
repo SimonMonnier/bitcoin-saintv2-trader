@@ -25,6 +25,8 @@ from saint_core import (
     SOURCE_EXT_NOM,
     safe_normalize,
     load_norm_stats,
+    load_model_norm_stats,
+    load_shared_model_norm_stats,
     build_policy,
     get_device,
     build_mask_from_pos_scalar,
@@ -83,7 +85,7 @@ class LiveConfig:
     risk_volume: bool = True
     risk_per_trade: float = 0.012
     leverage: float = 100.0   # aligné sur training.py (XAUUSD)
-    fee_rate: float = 0.0004  # juste informatif ici
+    fee_rate: float = 0.0   # ce courtier ne facture pas de commission sur BTCUSD
     atr_sl_mult: float = 5.0     # SL = 5 x ATR  (optimum mesure sur l'or)
     atr_tp_mult: float = 10.0    # TP = 10 x ATR (R:R 1:2.0)
 
@@ -723,7 +725,7 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
         raise RuntimeError("Erreur MT5.initialize() en live multi-agent.")
 
     device = get_device(cfg)
-    stats = load_norm_stats(NORM_STATS_PATH)
+    agent_stats = {}
 
     def _build_policy():
         return build_policy(device, lookback=cfg.lookback)
@@ -749,6 +751,7 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
         p.load_state_dict(torch.load(path, map_location=device))
         p.eval()
         policies[agent_name] = p
+        agent_stats[agent_name] = load_model_norm_stats(path)
         magic = MULTI_AGENT_MAGICS[agent_name]
         print(f"Modèle {agent_name.upper():3s} chargé (magic={magic}) : {path}")
 
@@ -796,7 +799,7 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
 
                 # Construction de l'obs (cet agent est flat)
                 obs = build_live_obs(
-                    df_closed, stats, cfg,
+                    df_closed, agent_stats[agent_name], cfg,
                     pos=0,
                     entry_price=0.0,
                     last_risk_scale=1.0,
@@ -857,7 +860,10 @@ def live_loop(cfg: LiveConfig, should_continue):
         raise RuntimeError("Erreur MT5.initialize() en live.")
 
     device = get_device(cfg)
-    stats = load_norm_stats(NORM_STATS_PATH)
+    norm_paths = ([BEST_MODEL_DUEL_PATH] if cfg.side == "both" else
+                  [p for side, p in (("long", BEST_MODEL_LONG_PATH), ("short", BEST_MODEL_SHORT_PATH))
+                   if cfg.side in (side, "duel")])
+    stats = load_shared_model_norm_stats(norm_paths)
 
     def _build_policy():
         return build_policy(device, lookback=cfg.lookback)

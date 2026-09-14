@@ -8,6 +8,8 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import math
+from economic_learning import downside_score
+from execution_quotes import execution_quote
 import copy
 import random
 import time
@@ -104,6 +106,7 @@ from saint_core import (
     charge_source_externe,
     SOURCE_EXT_NOM,
     safe_normalize,
+    SeuilRang,
     SAINTPolicySingleHead,
     build_mask_from_pos_scalar,
 )
@@ -223,19 +226,28 @@ class PPOConfig:
     # BTCUSD tourne 24/7 : densite mesuree 0.971 bougie par minute calendaire
     # (1 913 925 bougies du 2022-12-14 au 2026-09-13).
     n_bars: int = 2_100_000
-    # 54 bougies d'historique, contre 25 auparavant.
+    # 25 bougies — MESURE, pas suppose. Le reglage a 54 etait moins bon.
     #
-    # Le jeu a 10 colonnes ne contient aucun resume d'historique long : ni RSI
-    # M1, ni rang de volatilite, ni ecart a une moyenne longue — ceux-la
-    # appartenaient au jeu a 30. Le pari de ce reglage est que le modele peut
-    # les former lui-meme s'il voit assez loin, et 54 bougies lui en donnent
-    # deux fois plus qu'avant.
+    # Sonde logistique sur le jeu a 30 colonnes, esperance par unite de risque
+    # apres selection :
     #
-    # COUT GPU : l'observation passe de 25 x 14 = 350 cases a 54 x 14 = 756,
-    # soit 2.2 fois plus. C'est comparable au jeu a 30 colonnes sur 25 bougies
-    # (850 cases), qui faisait chauffer la machine jusqu'au bridage. La ligne
-    # gpu[...] du log dira si ce reglage y retombe.
-    lookback: int = 54
+    #     profondeur          AUC     E[R] top1%   t     E[R] top5%    t
+    #     1 bougie          0.6094     +0.1753   +3.4     +0.0513    +2.2
+    #     3 consecutives    0.6128     +0.1860   +3.6     +0.0847    +3.6
+    #     5 espacees (0-12) 0.6120     +0.1860   +3.6     +0.1077    +4.6
+    #     6 espacees (0-25) 0.6105     +0.1610   +3.1     +0.1147    +4.8
+    #     7 espacees (0-53) 0.6094     +0.1247   +2.4     +0.0811    +3.4
+    #
+    # L'historique aide jusqu'a ~25 bougies puis NUIT : a 53 l'esperance
+    # retombe sous celle d'une bougie unique. La colonne qui decide est celle
+    # du top 5 %, puisque c'est la selectivite a laquelle le modele opere
+    # desormais — elle culmine a 0-25.
+    #
+    # Le jeu a 30 colonnes porte deja des resumes d'historique (RSI sur 14,
+    # rang de volatilite sur 1440, range_norm rapporte a sa moyenne sur 1440) :
+    # empiler cinquante pas de temps en plus etait redondant, et le bruit
+    # ajoute l'emportait sur l'information.
+    lookback: int = 25
 
     # PPO Training
     epochs: int = 240               # +50% vs 160 pour cosine LR plus douce
@@ -257,7 +269,11 @@ class PPOConfig:
     # Idem pour la validation : 21-32 trades donnaient un Sortino purement
     # bruité (PF 3.10 puis 0.51 d'une epoch à l'autre), donc une sélection du
     # "best model" au hasard.
-    val_episodes: int = 16
+    # 48 au lieu de 16 : a selectivite figee a 5 %, le nombre de trades par
+    # epoch tombait a 38 — soit +-7.9 points d'incertitude sur le winrate, ou
+    # plus rien n'est distinguable de rien. Trois fois plus d'episodes rendent
+    # la mesure exploitable sans toucher a la REGLE de decision.
+    val_episodes: int = 48
     episode_length: int = 6000      # ~4.2j de M1
     # Fraction des états EN POSITION conservée pour la mise à jour PPO.
     # Ils sont masqués à HOLD donc sans gradient d'actor ; les garder tous
@@ -302,7 +318,37 @@ class PPOConfig:
     # Batch reduit : avec ~1700 decisions par epoch, 256 ne donnait que 6
     # minibatches. A 128 on double le nombre de pas de gradient a donnees egales.
     batch_size: int = 128
-    gamma: float = 0.97
+    # GAMMA — a ablater, PAS a changer a l'aveugle.
+    #
+    # Le pas vaut UNE MINUTE, donc 0.97 correspond a une demi-vie de 23 minutes.
+    # Poids restant d'une recompense selon l'horizon :
+    #
+    #     gamma     30min    60min   120min   240min   demi-vie
+    #     0.970    40.10%   16.08%    2.59%    0.07%     23 min
+    #     0.990    73.97%   54.72%   29.94%    8.96%     69 min
+    #     0.995    86.04%   74.03%   54.80%   30.03%    138 min
+    #
+    # Or `max_holding_bars` vaut 240 : un trade qui sort par le temps ne pese
+    # plus que 0.07 % a l'entree. L'agent est donc entraine a ignorer le
+    # resultat des trades les plus longs — ce n'est pas une erreur de calcul,
+    # c'est un horizon probablement mal adapte a la duree reelle des positions.
+    #
+    # CHOIX : 0.995, par raisonnement sur l'horizon de detention, PAS par
+    # mesure — aucune ablation n'a encore compare les deux.
+    #
+    # Le critere est max_holding_bars = 240. Pour que l'agent soit entraine sur
+    # le RESULTAT de ses trades, la recompense de sortie doit garder un poids
+    # reel a l'entree.
+    #   0.990 : 9 % a 240 min — les positions longues restent quasi invisibles
+    #   0.995 : 74 % a 60 min (l'ordre de la duree mediane), 30 % au plafond
+    #   0.999 : demi-vie de 11.5 h, tres au-dela du plafond ; ne distinguerait
+    #           plus un trade de 10 minutes d'un trade de 240, et le credit
+    #           deborderait sur des etats sans rapport avec le trade
+    #
+    # A SURVEILLER : un gamma plus haut augmente la variance des avantages et
+    # l'echelle des cibles du critique. Si CriticL s'envole ou si quasi0
+    # remonte, c'est le premier suspect.
+    gamma: float = 0.995
     lambda_gae: float = 0.95
     clip_eps: float = 0.18
     lr: float = 3e-4
@@ -334,7 +380,30 @@ class PPOConfig:
     # requise tombe à 115 $, soit 11.5 % du capital, sous le plafond de 35 %.
     # Le levier ne multiplie toujours PAS le PnL : il borne le notionnel.
     leverage: float = 100.0
-    fee_rate: float = 0.0004
+    # COMMISSION NULLE — ce courtier n'en facture pas sur BTCUSD CFD.
+    #
+    # A 0.0004 (4 bps du notionnel) le simulateur prelevait un cout qui n'existe
+    # pas. Et il le prelevait au pire endroit : la commission etant
+    # proportionnelle au NOTIONNEL, et le notionnel variant comme l'inverse de
+    # la distance de stop a risque constant (size = risque / sl_dist), elle
+    # penalisait surtout les stops serres :
+    #
+    #     SL       notionnel   commission   WR d'equilibre (R:R 1.4)
+    #     2xATR     11 583 $      4.63 $         57.8 %
+    #     5xATR      4 633 $      1.85 $         48.1 %
+    #    10xATR      2 317 $      0.93 $         44.9 %
+    #                         sans commission :  41.7 %
+    #
+    # Sur un risque de 12 $, 4.63 $ representent 39 % — l'agent apprenait donc
+    # une economie bien plus dure que la realite, ce qui peut expliquer qu'il
+    # atteigne presque systematiquement sa limite de pertes.
+    #
+    # Le cout reel de ce courtier est ENTIEREMENT dans le spread, mesure a
+    # 2.61 bps et deja facture. Le slippage reste actif : c'est un cout distinct.
+    #
+    # A REVERIFIER si le compte change : un historique de deals MT5 donne la
+    # commission reelle par lot (le champ `commission` de history_deals_get).
+    fee_rate: float = 0.0
     min_capital_frac: float = 0.20  # garde-fou capital : épisode terminé si capital < 20%
                                      # config validée +135 EUR MT5 tester
     max_drawdown: float = 0.40  # garde-fou DD : épisode terminé si drawdown > 40%
@@ -440,7 +509,25 @@ class PPOConfig:
     # SL a 5xATR vaut donc 25.9 bps et un bruit moyen de 0.6 bps n'en represente
     # que 2.3 %, contre 4.2 % sur l'or. La valeur en bps est conservee telle
     # quelle : c'est deja une unite relative.
-    tick_noise_bps: float = 1.2
+    # BRUIT DE TICK — DESACTIVE PAR DEFAUT.
+    #
+    # Il etendait artificiellement high et low de 0 a 1.2 bps, avec ce
+    # commentaire : « simule les wicks intra-minute non capturees par
+    # l'agregation M1 ». C'est faux. Une bougie MT5 porte DEJA le prix maximum
+    # et minimum atteints sur la periode ; l'agregation perd l'ORDRE des
+    # mouvements, pas les extremes. Il n'y a donc aucune meche a recuperer.
+    #
+    # Ce que le bruit faisait reellement, a 66 000 $ : ajouter jusqu'a 7.92 $ a
+    # chaque extreme, donc declencher des stops et des objectifs qui n'auraient
+    # pas ete touches. Et comme le moteur compte PERDANTE une bougie qui touche
+    # les deux barrieres, l'effet net est un biais PESSIMISTE — sur un stop a
+    # 2xATR (69 $), 7.92 $ representent 11 % de la distance.
+    #
+    # On le garde disponible pour les TESTS DE ROBUSTESSE (« le resultat
+    # survit-il a une execution degradee ? »), jamais dans la reference. Le
+    # spread et le slippage restent actifs : ce sont des couts d'execution
+    # reels, distincts et mesures.
+    tick_noise_bps: float = 0.0
 
     # Scalp
     # Detention de reference pour normaliser bars_held_norm — doit rester egale
@@ -482,7 +569,54 @@ class PPOConfig:
     # la validation garde son budget d'entrees sauf comparaison legacy explicite.
     pbs_etendue_min: float = 0.01
     # Comparaisons experimentales : ne pas ouvrir tout lorsque le signal est plat.
-    validation_selectivity: Optional[float] = None
+    # SELECTIVITE DE VALIDATION — FIGEE.
+    #
+    # A None, elle suivait celle du training, qui descend de 50 % a 5 % sur 40
+    # epochs. Mesure sur un run : 50 % a l'epoch 1, 37.6 % a l'epoch 12. Une
+    # amelioration du PnL melangeait donc l'apprentissage du modele et le
+    # resserrement du filtre — deux causes qu'on ne peut pas separer apres coup.
+    #
+    # Figer les fenetres ne suffisait pas : c'est la REGLE de decision qui
+    # devait l'etre aussi pour que deux checkpoints soient comparables.
+    #
+    # Valeur 5 % : la cible finale du calendrier d'entrainement, donc le regime
+    # qu'on cherche reellement a atteindre. Assez selectif pour approcher la
+    # zone ou la sonde mesurait un avantage, assez large pour garder une
+    # centaine de trades par epoch — au-dela, l'estimation du winrate devient
+    # trop bruitee pour suivre une progression.
+    validation_selectivity: Optional[float] = 0.05
+    # Part de la fenetre de validation reservee a la CALIBRATION des seuils.
+    #
+    # Les seuils etaient calibres sur les MEMES episodes que la passe 2 evaluait
+    # ensuite — l'etat du generateur aleatoire etait meme sauvegarde et restaure
+    # pour que les deux passes portent sur des fenetres identiques. Le quantile
+    # de conviction resumait donc toute la periode AVANT que ses trades ne
+    # soient simules. En live, cette information n'existe pas : on calibre sur
+    # le passe et on trade la suite.
+    #
+    # On decoupe donc la fenetre en deux dans l'ordre du temps : la premiere
+    # partie calibre, la seconde evalue, et les seuils sont figes entre les deux.
+    calib_frac: float = 0.35
+    # Taille de la fenetre glissante du filtre par RANG, en nombre d'occasions.
+    #
+    # Mesure du taux d'acceptation reel pour une cible de 5 %, sous trois
+    # regimes de derive de l'echelle des convictions :
+    #
+    #     fenetre    stable   derive x26   resserrement
+    #        250      5.1%       6.6%          4.8%
+    #        500      5.2%       7.9%          4.4%
+    #       2000      4.8%      15.0%          6.3%
+    #       5000      4.8%      24.6%         11.1%
+    #
+    # Les grandes fenetres retardent sur la distribution courante. 500 garde
+    # 25 echantillons au-dessus de la barre — assez pour estimer un quantile —
+    # tout en restant a moins de trois points de la cible sous une derive
+    # bien plus violente que celle observee.
+    rang_fenetre: int = 500
+    # Graine dediee aux fenetres de validation. Elles etaient tirees au sort a
+    # chaque epoch : une amelioration pouvait venir d'un scenario plus facile
+    # plutot que d'un meilleur modele. Fixees, les epochs deviennent comparables.
+    val_seed: int = 20260914
     legacy_flat_validation: bool = False
     evaluate_test: bool = True
     # PPO requiert les probabilites de la politique qui a tire les actions.
@@ -505,7 +639,8 @@ class PPOConfig:
     # exclut volontairement actor_loss de la loss pendant 5 epochs. Mesuré
     # après warmup : gActor passe de 2.45e-04 à 5.36e-01, soit la valeur
     # théorique attendue. La fp16 n'y était pour rien.
-    use_amp: bool = True
+    use_amp: bool = False  # FP32 reference: avoid the observed FP16 gradient overflows.
+    resume_weights: bool = False  # Explicit warm start, not a full optimizer resume.
 
     # Spécialisation d'agent (mode "close" supprimé)
     # "both"  → BUY + SELL + HOLD
@@ -743,7 +878,7 @@ def load_mt5_data(cfg: PPOConfig) -> pd.DataFrame:
 
 
 
-def compute_and_save_global_norm_stats(df: pd.DataFrame, feature_cols: List[str]) -> Dict[str, np.ndarray]:
+def compute_and_save_global_norm_stats(df: pd.DataFrame, feature_cols: List[str], path=NORM_STATS_PATH) -> Dict[str, np.ndarray]:
     X = df[feature_cols].values.astype(np.float32)
     mean, std = X.mean(0), X.std(0)
 
@@ -770,8 +905,9 @@ def compute_and_save_global_norm_stats(df: pd.DataFrame, feature_cols: List[str]
     # passer un changement de définition à cardinalité constante (remplacer les
     # prix bruts par des ratios, par exemple) — le fichier obsolète était alors
     # rechargé en silence et normalisait avec des mean/std sans rapport.
-    np.savez(NORM_STATS_PATH, mean=mean, std=std, features=np.array(feature_cols))
-    print(f"Stats de normalisation GLOBALes sauvegardées → {NORM_STATS_PATH}")
+    if path is not None:
+        np.savez(path, mean=mean, std=std, features=np.array(feature_cols))
+        print(f"Stats de normalisation TRAIN sauvegardées → {path}")
     return stats
 
 
@@ -826,6 +962,7 @@ class MarketData:
 
         self.features = X
         self.close = df["close"].values.astype(np.float32)
+        self.open = df["open"].values.astype(np.float32) if "open" in df.columns else self.close.copy()
         self.length = len(df)
 
         self.atr14 = df["atr_14"].values.astype(np.float32) if "atr_14" in df.columns else np.zeros(len(df), np.float32)
@@ -837,21 +974,30 @@ class MarketData:
         return self.length
 
 
-def create_datasets(df: pd.DataFrame, feature_cols: List[str], stats: Dict[str, np.ndarray]):
+def create_datasets(df: pd.DataFrame, feature_cols: List[str],
+                    stats: Dict[str, np.ndarray], calib_frac: float = 0.35):
     n = len(df)
     train_end = int(n * 0.70)
     val_end = int(n * 0.85)
 
     df_train = df[:train_end].reset_index(drop=True)
-    df_val = df[train_end:val_end].reset_index(drop=True)
+    df_val_tout = df[train_end:val_end].reset_index(drop=True)
     df_test = df[val_end:].reset_index(drop=True)
 
+    # Meme decoupe chronologique que create_datasets_from_slices : calibrer sur
+    # la periode qu'on evalue ensuite revient a la resumer avant de la trader.
+    n_cal = int(len(df_val_tout) * calib_frac)
+    df_calib = df_val_tout[:n_cal].reset_index(drop=True)
+    df_val = df_val_tout[n_cal:].reset_index(drop=True)
+
     train_data = MarketData(df_train, feature_cols, stats)
+    calib_data = MarketData(df_calib, feature_cols, stats)
     val_data   = MarketData(df_val,   feature_cols, stats)
     test_data  = MarketData(df_test,  feature_cols, stats)
 
-    print(f"SPLIT simple : train={len(df_train)}, val={len(df_val)}, test={len(df_test)}")
-    return train_data, val_data, test_data
+    print(f"SPLIT simple : train={len(df_train)}, calib={len(df_calib)}, "
+          f"val={len(df_val)}, test={len(df_test)}")
+    return train_data, calib_data, val_data, test_data
 
 
 def create_datasets_from_slices(
@@ -861,22 +1007,33 @@ def create_datasets_from_slices(
     train_len: int,
     val_len: int,
     test_len: int,
-    stats: Dict[str, np.ndarray]
+    stats: Dict[str, np.ndarray],
+    calib_frac: float = 0.35
 ):
     n = len(df)
     end = start + train_len + val_len + test_len
     assert end <= n, "Fenêtre walk-forward hors limites"
 
     df_train = df[start:start + train_len].reset_index(drop=True)
-    df_val   = df[start + train_len:start + train_len + val_len].reset_index(drop=True)
+    df_val_tout = df[start + train_len:start + train_len + val_len].reset_index(drop=True)
     df_test  = df[start + train_len + val_len:end].reset_index(drop=True)
 
+    # La fenetre de validation se coupe en deux DANS L'ORDRE DU TEMPS : la
+    # premiere partie sert a calibrer les seuils de conviction, la seconde a
+    # mesurer. Voir cfg.calib_frac — calibrer sur les episodes qu'on evalue
+    # ensuite revient a resumer la periode avant de la trader.
+    n_cal = int(len(df_val_tout) * calib_frac)
+    df_calib = df_val_tout[:n_cal].reset_index(drop=True)
+    df_val   = df_val_tout[n_cal:].reset_index(drop=True)
+
     train_data = MarketData(df_train, feature_cols, stats)
+    calib_data = MarketData(df_calib, feature_cols, stats)
     val_data   = MarketData(df_val,   feature_cols, stats)
     test_data  = MarketData(df_test,  feature_cols, stats)
 
-    print(f"  • Fenêtre WF : train={len(df_train)}, val={len(df_val)}, test={len(df_test)} (start={start}, end={end})")
-    return train_data, val_data, test_data
+    print(f"  • Fenêtre WF : train={len(df_train)}, calib={len(df_calib)}, "
+          f"val={len(df_val)}, test={len(df_test)} (start={start}, end={end})")
+    return train_data, calib_data, val_data, test_data
 
 
 # ======================================================================
@@ -1044,17 +1201,8 @@ class BTCTradingEnvDiscrete(gym.Env):
         return obs
 
     def _apply_micro(self, price: float, side: int, is_entry: bool = True) -> float:
-        """Paie le half-spread à chaque transaction (entrée OU sortie).
-        `side` = direction de l'exécution actuelle :
-          +1 = BUY  → paie ASK = mid + half_spread (price augmente)
-          -1 = SELL → reçoit BID = mid - half_spread (price diminue)
-        Le caller passe `side = self.position` à l'entrée et `side = -self.position`
-        à la sortie (direction du trade de fermeture).
-        À l'entrée, on ajoute aussi un slippage stochastique (delay 118ms MT5)
-        toujours défavorable au trader.
-        """
-        spread = self.current_trade_spread_bps / 10_000.0
-        price *= (1 + side * spread * 0.5)
+        """Convertit une bougie BID en prix BUY/SELL exécutable."""
+        price = execution_quote(price, side, self.current_trade_spread_bps)
         if is_entry and self.cfg.entry_slippage_bps > 0:
             extra = np.random.uniform(0.0, self.cfg.entry_slippage_bps) / 10_000.0
             price *= (1 + side * extra)
@@ -1133,14 +1281,70 @@ class BTCTradingEnvDiscrete(gym.Env):
 
         return float(max(size, 0.0))
 
+    def _latent_at_bid(self, bid):
+        if self.position == 0:
+            return 0.0
+        quote = execution_quote(bid, -self.position, self.current_trade_spread_bps)
+        return (self.position * (quote - self.entry_price)
+                - self.cfg.fee_rate * quote) * self.current_size
+
+    def _close_position(self, exit_price, hit_sl=False, hit_tp=False,
+                        hit_temps=False, terminal_reason=None):
+        pnl = self.position * (exit_price - self.entry_price) * self.current_size
+        fee = self.cfg.fee_rate * exit_price * self.current_size
+        realized = pnl - fee
+
+        self.capital += realized
+        self.last_realized_pnl = realized
+        self.trades_pnl.append(realized)
+        self.trades_side.append(int(self.position))
+        self.trades_meta.append({
+            "entry_idx": int(self.entry_idx),
+            "exit_idx": int(self.idx),
+            "side": int(self.position),
+            "entry_price": float(self.entry_price),
+            "exit_price": float(exit_price),
+            "pnl": float(realized),
+            "hit_sl": bool(hit_sl),
+            "hit_tp": bool(hit_tp),
+            "hit_temps": bool(hit_temps),
+            "terminal_reason": terminal_reason,
+            "hold_bars": int(self.idx - self.entry_idx),
+        })
+
+        self.position = 0
+        self.current_size = 0.0
+        self.entry_price = 0.0
+        self.sl_price = 0.0
+        self.tp_price = 0.0
+        self.entry_idx = -1
+        self.entry_atr = 0.0
+        self.risk_scale = 1.0
+        self.last_risk_scale = 1.0
+        self.break_even_done = False
+        self.trail_active    = False
+        return realized
+
     def step(self, action: int):
-        price = self.data.close[self.idx]
+        # DEUX PRIX DISTINCTS, et les confondre etait une erreur de timing.
+        #
+        # `_get_obs` ne montre au modele que les features jusqu'a l'indice
+        # idx-1 : il decide donc a la CHARNIERE entre la bougie idx-1 close et
+        # la bougie idx qui s'ouvre. Son ordre au marche part a cet instant, et
+        # se remplit a l'OUVERTURE de la bougie idx.
+        #
+        # L'ancienne version executait au CLOSE de la bougie idx. Le simulateur
+        # accordait donc au modele une minute entiere de mouvement qu'il n'avait
+        # pas vue — ce n'est pas de l'anticipation (il ne la voit toujours pas),
+        # mais une execution qui ne correspond a aucun ordre reel. Personne ne
+        # peut decider a l'ouverture et obtenir le close.
+        prix_execution = self.data.open[self.idx]     # entree : a l'ouverture
+        price = self.data.close[self.idx]             # marquage : a la cloture
         high_bar = self.data.high[self.idx]
         low_bar = self.data.low[self.idx]
 
-        # Tick noise : étend bar.high vers le haut / bar.low vers le bas
-        # pour simuler les wicks intra-minute non capturés par l'agrégation M1.
-        # MT5 tester real ticks voit ces extrêmes, le training pas → mismatch.
+        # Bruit de tick — nul par defaut, cf. cfg.tick_noise_bps. Ne sert qu'aux
+        # tests de robustesse : les bougies MT5 portent deja les extremes reels.
         if self.cfg.tick_noise_bps > 0:
             noise_h = np.random.uniform(0.0, self.cfg.tick_noise_bps) / 10_000.0
             noise_l = np.random.uniform(0.0, self.cfg.tick_noise_bps) / 10_000.0
@@ -1148,21 +1352,12 @@ class BTCTradingEnvDiscrete(gym.Env):
             low_bar  = low_bar  * (1.0 - noise_l)
 
         old_pos = self.position
-        prev_capital = self.capital
 
-        # ==================================================================
-        # 1. PREVIOUS EQUITY (worst-case à t-1)
-        # ==================================================================
-        prev_latent = 0.0
-        if old_pos != 0 and self.current_size > 0 and self.entry_price > 0:
-            if self.idx > 0:
-                prev_price_worst = self.data.low[self.idx - 1] if old_pos == 1 else self.data.high[self.idx - 1]
-            else:
-                prev_price_worst = price
-            prev_latent = old_pos * (prev_price_worst - self.entry_price) * self.current_size
-        prev_equity = prev_capital + prev_latent
+        # Même marquage au close exécutable aux deux bornes; les mèches
+        # bruitées servent uniquement aux triggers, jamais au reward latent.
+        prev_equity = self.capital + self._latent_at_bid(
+            self.data.close[self.idx - 1] if self.idx > 0 else price)
 
-        realized = 0.0
         realized_trade = 0.0
         hit_sl = hit_tp = hit_temps = False
 
@@ -1179,13 +1374,13 @@ class BTCTradingEnvDiscrete(gym.Env):
         # En training, le reward shaping pénalise déjà les mauvaises entrées.
         if not manual_close and action in (0, 1) and old_pos == 0:
             side = 1 if action == 0 else -1
-            size = self._compute_dynamic_size(price)
+            size = self._compute_dynamic_size(prix_execution)
             if size > 0.0:
                 self.current_size = size
                 self.position = side
                 # Échantillonne le spread pour ce trade (variabilité réaliste)
                 self.current_trade_spread_bps = self._sample_trade_spread_bps()
-                exec_price = self._apply_micro(price, side, is_entry=True)
+                exec_price = self._apply_micro(prix_execution, side, is_entry=True)
                 self.entry_price = exec_price
                 self.entry_idx = self.idx
 
@@ -1220,7 +1415,9 @@ class BTCTradingEnvDiscrete(gym.Env):
         if (self.cfg.use_be_trail and not manual_close and self.position != 0
                 and self.current_size > 0 and self.entry_atr > 1e-8
                 and self.idx > self.entry_idx):
-            fav_price = high_bar if self.position == 1 else low_bar
+            # Le SL de cette bougie ne peut utiliser que les bougies déjà closes.
+            fav_bid = self.data.high[self.idx - 1] if self.position == 1 else self.data.low[self.idx - 1]
+            fav_price = execution_quote(fav_bid, -self.position, self.current_trade_spread_bps)
             fav_move  = self.position * (fav_price - self.entry_price)
 
             # Break-even : déplace SL à l'entrée quand gain >= atr_be_mult × ATR
@@ -1241,29 +1438,35 @@ class BTCTradingEnvDiscrete(gym.Env):
                 self.trail_active = True
 
         # --------- SL/TP AUTO ---------
-        # Trigger asymétrique BID/ASK aligné sur MT5 réel :
-        #   - bar.high / bar.low représentent les extrêmes du BID
-        #   - LONG  exit  : SELL au BID → SL triggers quand BID <= sl + s, TP quand BID >= tp + s
-        #   - SHORT exit  : BUY  à l'ASK → SL triggers quand ASK >= sl, soit BID >= sl - s
-        #                                   TP triggers quand ASK <= tp, soit BID <= tp - s
-        # Quand spread_bps = 0, c'est équivalent à la version sans compensation.
-        if not manual_close and self.position != 0 and self.current_size > 0 and self.entry_price > 0 and self.idx > self.entry_idx:
+        # LONG ferme au BID, SHORT à l'ASK. SL/TP sont déjà des prix
+        # exécutables: aucun spread supplémentaire sur leur prix de sortie.
+        # La bougie d'ENTREE est desormais incluse dans le test des barrieres.
+        #
+        # Elle en etait exemptee (`self.idx > self.entry_idx`) parce que l'entree
+        # se faisait au CLOSE : tester la bougie contre un stop pose a sa propre
+        # cloture n'aurait eu aucun sens. Maintenant que l'entree est a
+        # l'OUVERTURE, la position vit pendant toute la bougie et son stop doit
+        # pouvoir etre touche — c'est le cas en reel.
+        #
+        # Cela supprime au passage un angle mort : une position a fort notionnel
+        # restait sans protection pendant sa premiere minute.
+        if not manual_close and self.position != 0 and self.current_size > 0 and self.entry_price > 0:
             exit_price = None
-            # Spread du trade en cours en $ (échantillonné à l'entrée)
-            s = self.entry_price * (self.current_trade_spread_bps / 10_000.0)
+            open_bid = getattr(self.data, 'open', self.data.close)[self.idx]
+            open_quote = execution_quote(open_bid, -self.position, self.current_trade_spread_bps)
 
             if self.position == 1:  # LONG
-                if self.sl_price > 0 and low_bar <= self.sl_price + s:
-                    exit_price = self.sl_price
+                if self.sl_price > 0 and low_bar <= self.sl_price:
+                    exit_price = min(self.sl_price, open_quote)
                     hit_sl = True
-                elif self.tp_price > 0 and high_bar >= self.tp_price + s:
+                elif self.tp_price > 0 and high_bar >= self.tp_price:
                     exit_price = self.tp_price
                     hit_tp = True
             else:                    # SHORT
-                if self.sl_price > 0 and high_bar + s >= self.sl_price:
-                    exit_price = self.sl_price
+                if self.sl_price > 0 and execution_quote(high_bar, 1, self.current_trade_spread_bps) >= self.sl_price:
+                    exit_price = max(self.sl_price, open_quote)
                     hit_sl = True
-                elif self.tp_price > 0 and low_bar + s <= self.tp_price:
+                elif self.tp_price > 0 and execution_quote(low_bar, 1, self.current_trade_spread_bps) <= self.tp_price:
                     exit_price = self.tp_price
                     hit_tp = True
 
@@ -1271,15 +1474,14 @@ class BTCTradingEnvDiscrete(gym.Env):
             # le faisait la mesure qui a choisi ce SL/TP.
             if (exit_price is None and self.cfg.max_holding_bars > 0
                     and self.bars_in_position >= self.cfg.max_holding_bars):
-                exit_price = price
+                exit_price = self._apply_micro(price, -self.position, is_entry=False)
                 hit_temps = True
 
             if exit_price is not None:
-                # Slippage asymétrique (118ms delay MT5) :
-                #   - SL : marché continue contre nous → fill PIRE que sl (loss++)
-                #   - TP : momentum continue avec nous → fill MIEUX que tp (profit++)
+                # SL/sortie au marché: slippage adverse. TP: niveau cible,
+                # sans amélioration favorable systématique inventée.
                 slip_max = self.cfg.slippage_bps / 10_000.0
-                if slip_max > 0:
+                if slip_max > 0 and not hit_tp:
                     slip_amount = exit_price * np.random.uniform(0.0, slip_max)
                     # Une sortie au marche (temps ecoule) traverse le spread :
                     # elle est DEFAVORABLE comme un SL, jamais favorable comme
@@ -1290,51 +1492,30 @@ class BTCTradingEnvDiscrete(gym.Env):
                     else:                     # SHORT
                         exit_price += (slip_amount if contre else -slip_amount)
 
-                # Spread cost à la sortie (half_spread payé en fermant le trade)
-                exit_price = self._apply_micro(exit_price, -self.position, is_entry=False)
-                pnl = self.position * (exit_price - self.entry_price) * self.current_size
-                fee = self.cfg.fee_rate * exit_price * self.current_size
-                realized = pnl - fee
-                realized_trade = realized
+                realized_trade = self._close_position(exit_price, hit_sl, hit_tp, hit_temps)
 
-                self.capital += realized
-                self.last_realized_pnl = realized
-                self.trades_pnl.append(realized)
-                self.trades_side.append(int(self.position))
-                self.trades_meta.append({
-                    "entry_idx": int(self.entry_idx),
-                    "exit_idx": int(self.idx),
-                    "side": int(self.position),
-                    "entry_price": float(self.entry_price),
-                    "exit_price": float(exit_price),
-                    "pnl": float(realized),
-                    "hit_sl": bool(hit_sl),
-                    "hit_tp": bool(hit_tp),
-                    "hit_temps": bool(hit_temps),
-                    "hold_bars": int(self.idx - self.entry_idx),
-                })
-
-                self.position = 0
-                self.current_size = 0.0
-                self.entry_price = 0.0
-                self.sl_price = 0.0
-                self.tp_price = 0.0
-                self.entry_idx = -1
-                self.entry_atr = 0.0
-                self.risk_scale = 1.0
-                self.last_risk_scale = 1.0
-                self.break_even_done = False
-                self.trail_active    = False
+        # Les fenêtres sont des épisodes FINIS: toute position restante est
+        # liquidée et comptée avant de calculer la dernière récompense.
+        marked_equity = self.capital + self._latent_at_bid(price)
+        marked_peak = max(self.peak_capital, marked_equity)
+        marked_dd = (marked_peak - marked_equity) / (marked_peak + 1e-8)
+        done_reason = None
+        if self.idx + 1 >= self.end_idx:
+            done_reason = "episode_end"
+        elif marked_dd > self.cfg.max_drawdown:
+            done_reason = "max_drawdown"
+        elif marked_equity < self.cfg.initial_capital * self.cfg.min_capital_frac:
+            done_reason = "min_capital"
+        if done_reason is not None and self.position != 0:
+            exit_price = self._apply_micro(price, -self.position, is_entry=False)
+            slip = np.random.uniform(0.0, self.cfg.slippage_bps) / 10000.0 if self.cfg.slippage_bps > 0 else 0.0
+            exit_price *= 1.0 - self.position * slip
+            realized_trade += self._close_position(exit_price, terminal_reason=done_reason)
 
         # ==================================================================
         # REWARD SHAPING Ω — LONG + SHORT AVEC BONUS MOMENTUM CONFIRMÉ
         # ==================================================================
-        latent = 0.0
-        if self.position != 0 and self.current_size > 0 and self.entry_price > 0:
-            price_for_pnl = low_bar if self.position == 1 else high_bar
-            latent = self.position * (price_for_pnl - self.entry_price) * self.current_size
-
-        equity = self.capital + latent
+        equity = self.capital + self._latent_at_bid(price)
         equity_clamped = max(equity, 1e-8)
         prev_equity_clamped = max(prev_equity, 1e-8)
         log_ret = math.log(equity_clamped / prev_equity_clamped)
@@ -1414,18 +1595,7 @@ class BTCTradingEnvDiscrete(gym.Env):
             reward -= 0.2
 
         self.idx += 1
-        done = (self.idx >= self.end_idx)
-        done_reason = "episode_end" if done else None
-
-        # Terminaisons anticipées RÉACTIVÉES (max_drawdown=0.40, min_capital_frac=0.20)
-        # Config validée +135 EUR MT5 tester.
-        if not done:
-            if dd > self.cfg.max_drawdown:
-                done = True
-                done_reason = "max_drawdown"
-            elif self.capital < self.cfg.initial_capital * self.cfg.min_capital_frac:
-                done = True
-                done_reason = "min_capital"
+        done = done_reason is not None
 
         obs = self._get_obs()
 
@@ -1622,6 +1792,7 @@ def map_agent_action_to_env_action(
 
 def run_training_on_split(
     train_data: MarketData,
+    calib_data: MarketData,
     val_data: MarketData,
     test_data: MarketData,
     stats: Dict[str, np.ndarray],
@@ -1631,6 +1802,20 @@ def run_training_on_split(
     import csv as _csv
 
     device = get_device(cfg)
+
+    # Persist the effective configuration: source defaults may change after a run.
+    import json
+    import hashlib
+    from pathlib import Path
+    manifest_path = Path(f"run_{cfg.model_prefix}_{cfg.side}{suffix}.json")
+    if manifest_path.exists() and not cfg.resume_weights:
+        raise FileExistsError(f"Run existant: {manifest_path}. Choisir un nouveau model_prefix ou dossier.")
+    manifest = {"config": vars(cfg), "seed": SEED, "features": list(FEATURE_COLS),
+                "splits": {"train": len(train_data), "calibration": len(calib_data),
+                           "validation": len(val_data), "test_reserved": len(test_data)},
+                "source_sha256": {name: hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest()
+                                  for name in ("training.py", "saint_core.py", "execution_quotes.py", "economic_learning.py")}}
+    manifest_path.write_text(json.dumps(manifest, default=str, indent=2), encoding="utf-8")
 
     # CSV de métriques
     csv_path = f"training_log_{cfg.side}{suffix}.csv"
@@ -1689,6 +1874,10 @@ def run_training_on_split(
     val_envs = [
         BTCTradingEnvDiscrete(val_data, cfg) for _ in range(cfg.val_episodes)
     ]
+    # Environnements de CALIBRATION, sur la fenetre qui PRECEDE celle de mesure.
+    calib_envs = [
+        BTCTradingEnvDiscrete(calib_data, cfg) for _ in range(cfg.val_episodes)
+    ]
 
     policy = SAINTPolicySingleHead(
         n_features=OBS_N_FEATURES,
@@ -1720,12 +1909,34 @@ def run_training_on_split(
         enabled=(cfg.use_amp and device.type == "cuda")
     )
 
+    def save_checkpoint(state, path):
+        # Sidecar portant le même nom: chaque modèle conserve SON scaler.
+        np.savez(path.replace('.pth', '_norm.npz'), **stats,
+                 features=np.array(FEATURE_COLS), execution_version=2,
+                 fee_rate=cfg.fee_rate)
+        torch.save(state, path)
+
     best_path = f"best_{cfg.model_prefix}_{cfg.side}{suffix}.pth"
     best_profit_path = f"bestprofit_{cfg.model_prefix}_{cfg.side}{suffix}.pth"
 
     if os.path.exists(best_path):
+        if not cfg.resume_weights:
+            raise ValueError("Poids existants: nouveau model_prefix requis, ou resume_weights=True explicitement.")
+        from saint_core import load_model_norm_stats
+        norm_path = best_path.replace('.pth', '_norm.npz')
+        if not os.path.exists(norm_path):
+            raise ValueError('Reprise interdite sans scaler associé au checkpoint')
+        previous_stats = load_model_norm_stats(best_path)
+        if any(not np.array_equal(previous_stats[k], stats[k]) for k in ('mean','std')):
+            raise ValueError('Reprise interdite avec un autre scaler')
         print(f"→ Chargement du modèle existant ({best_path}) pour continuation…")
-        policy.load_state_dict(torch.load(best_path, map_location=device))
+        norm_path = best_path.replace('.pth', '_norm.npz')
+        if not os.path.exists(norm_path):
+            raise ValueError("Checkpoint historique sans normalisation associée: utiliser un nouveau model_prefix.")
+        checkpoint_stats = np.load(norm_path)
+        if any(not np.array_equal(checkpoint_stats[k], stats[k]) for k in ("mean", "std")):
+            raise ValueError("Normalisation différente: repartir de zéro avec un nouveau model_prefix.")
+        policy.load_state_dict(torch.load(best_path, map_location=device, weights_only=True))
 
     # Mode "close" supprimé : pas de modèles gelés à charger.
     policy_long = None
@@ -2034,15 +2245,8 @@ def run_training_on_split(
                         "hold_bars": tm["hold_bars"],
                     })
 
-            if last_reason[k] == "max_drawdown":
-                last_value = 0.0
-            else:
-                with torch.no_grad():
-                    s_last = torch.as_tensor(
-                        states[k], dtype=torch.float32, device=device
-                    ).unsqueeze(0)
-                    _, v_last = policy(s_last)
-                    last_value = float(v_last.reshape(-1)[0].item())
+            # Toutes les fins sont terminales et les positions sont liquidées.
+            last_value = 0.0
 
             buf = ep_buf[k]
             adv, ret = compute_gae_semi_mdp(
@@ -2445,14 +2649,29 @@ def run_training_on_split(
         #
         # L'état du générateur est figé et restauré pour que les deux passes
         # portent sur EXACTEMENT les mêmes fenêtres.
+        # FENETRES FIXES d'une epoch a l'autre.
+        #
+        # Les episodes de validation etaient tires au sort a chaque epoch, donc
+        # une amelioration pouvait venir d'un scenario plus facile plutot que
+        # d'un meilleur modele — sur 4 a 16 episodes, la variance de tirage
+        # domine largement les ecarts qu'on cherche a mesurer. En figeant la
+        # graine, deux epochs deviennent comparables.
+        #
+        # Deux graines distinctes pour les deux passes : elles portent sur des
+        # fenetres DIFFERENTES (calibration puis mesure), et reutiliser la meme
+        # les correlerait sans raison.
         etat_rng = np.random.get_state()
+        np.random.seed(cfg.val_seed)
+
+        # PASSE 1 sur les environnements de CALIBRATION : la fenetre qui
+        # PRECEDE celle de mesure. Les seuils en sortent, puis sont figes.
         v_states = []
         v_infos = []
-        for e in val_envs:
+        for e in calib_envs:
             s0, i0 = e.reset()
             v_states.append(s0)
             v_infos.append(i0)
-        cal_active = list(range(n_val))
+        cal_active = list(range(len(calib_envs)))
         # PAS DE CALIBRATION — un quantile n'a pas besoin de chaque bougie.
         #
         # Cette passe ne sert qu'a estimer deux quantiles de la distribution de
@@ -2486,8 +2705,8 @@ def run_training_on_split(
                 pas_courant += 1
                 suite = []
                 for bi, k in enumerate(cal_active):
-                    val_envs[k].set_risk_scale(1.0)
-                    ns, _r, done, _, info = val_envs[k].step(2)   # HOLD forcé
+                    calib_envs[k].set_risk_scale(1.0)
+                    ns, _r, done, _, info = calib_envs[k].step(2)   # HOLD forcé
                     v_states[k] = ns
                     v_infos[k] = info
                     if not done:
@@ -2512,8 +2731,26 @@ def run_training_on_split(
 
         _chrono["calibration"] = time.time() - _t_phase; _t_phase = time.time()
 
-        # ---------- PASSE 2 : validation réelle ----------
-        np.random.set_state(etat_rng)
+        # FILTRE PAR RANG GLISSANT, et non par niveau fige.
+        #
+        # Le niveau calibre sur la fenetre precedente ne transferait pas : mesure
+        # sur un run reel, l'etendue des convictions est passee de 0.0035 a
+        # 0.0914 entre les epochs 6 et 12 pendant que le seuil restait a ~0.24,
+        # et le nombre de trades s'est effondre de 1 461 a 20, dont zero vente.
+        #
+        # Un rang ne depend d'aucune echelle absolue : « cette occasion est-elle
+        # dans les 5 % les plus convaincues des 500 dernieres vues ». La fenetre
+        # est amorcee avec les convictions de la passe de calibration, qui la
+        # precede chronologiquement — donc aucune information future.
+        seuils_rang = [
+            SeuilRang(val_selectivity / 2.0, cfg.rang_fenetre, amorce=pbs_val[c])
+            for c in (0, 1)
+        ]
+
+        # ---------- PASSE 2 : validation réelle, rang glissant ----------
+        # Fenetre posterieure a celle de calibration, graine distincte mais
+        # constante d'une epoch a l'autre.
+        np.random.seed(cfg.val_seed + 1)
         v_states = []
         v_infos = []
         for e in val_envs:
@@ -2556,10 +2793,14 @@ def run_training_on_split(
                         # Chaque côté est jugé sur SA barre. Si les deux passent,
                         # on retient le plus net par rapport à la sienne, pas le
                         # plus probable dans l'absolu.
-                        ok_b = pb >= calib_thr_val[0]
-                        ok_s = ps >= calib_thr_val[1]
+                        # Les niveaux courants sont lus AVANT d'enregistrer :
+                        # une occasion ne doit pas participer au quantile qui
+                        # la juge.
+                        sb, ss_ = seuils_rang[0].seuil(), seuils_rang[1].seuil()
+                        ok_b = seuils_rang[0].accepte(pb)
+                        ok_s = seuils_rang[1].accepte(ps)
                         if ok_b and ok_s:
-                            a = 0 if (pb - calib_thr_val[0]) >= (ps - calib_thr_val[1]) else 1
+                            a = 0 if (pb - sb) >= (ps - ss_) else 1
                         elif ok_b:
                             a = 0
                         elif ok_s:
@@ -2632,9 +2873,7 @@ def run_training_on_split(
         if val_num_trades > 10:
             rets = np.array(val_trades, dtype=np.float32) / cfg.initial_capital
             mean_ret = float(rets.mean())
-            downside = rets[rets < 0.0]
-            downside_std = float(downside.std()) if downside.size > 0 else 1e-4
-            sortino = mean_ret / (downside_std + 1e-8)
+            sortino = downside_score(rets)
         else:
             sortino = 0.0
 
@@ -2718,6 +2957,11 @@ def run_training_on_split(
         )
 
         # ----- Ligne 3 : METRICS PPO -----
+        # On rend au generateur son etat d'avant validation : les graines fixes
+        # ci-dessus ne doivent pas rendre deterministes les episodes
+        # d'ENTRAINEMENT, qui eux doivent varier.
+        np.random.set_state(etat_rng)
+
         _chrono["validation"] = time.time() - _t_phase
         print(
             f"{tag} {epoch_str}  "
@@ -2731,7 +2975,7 @@ def run_training_on_split(
             f"Hflat {np.mean(epoch_entropy_flat):>5.3f}/1.099  "
             f"sel[train {100*selectivite:>4.1f}% val {100*val_selectivity:>4.1f}%] "
             f"thr[tr {conf_thr:.3f} "
-            f"valB {calib_thr_val[0]:.3f} valS {calib_thr_val[1]:.3f}] "
+            f"valB {seuils_rang[0].seuil():.3f} valS {seuils_rang[1].seuil():.3f}] "
             f"etendue[tr {pbs_etendue:.4f} val {val_etendue:.4f}]  "
             f"KL {np.mean(epoch_kl):>+6.4f}  "
             f"dec {n_samples:>6d}"
@@ -2828,30 +3072,44 @@ def run_training_on_split(
                              "PAS d'argmax sur les 3 actions",
                 }, f, indent=2)
 
-        # Best sur PNL (pour info) — nécessite un minimum de trades
-        if val_num_trades >= cfg.min_val_trades_save and val_profit > best_val_profit:
-            best_val_profit = val_profit
+        # Best sur PnL PAR TRADE, et non sur le PnL TOTAL.
+        #
+        # Le critere comparait des totaux. Or la selectivite se resserre au fil
+        # du run, donc les epochs tardives tradent moins et perdent moins EN
+        # VALEUR ABSOLUE, quelle que soit leur qualite. Mesure sur un run reel :
+        #
+        #     epoch 10   -58.49 $ sur 182 trades = -0.32 $/trade   PF 0.96
+        #     epoch 16   -32.10 $ sur  38 trades = -0.84 $/trade   PF 0.88
+        #
+        # L'epoch 16 a ete retenue comme « NEW BEST PROFIT » alors qu'elle est
+        # 2.6 fois PIRE par trade et que son profit factor est inferieur. Le
+        # critere recompensait le fait de trader moins, pas de trader mieux.
+        val_profit_par_trade = (val_profit / val_num_trades
+                                if val_num_trades > 0 else -1e18)
+        if (val_num_trades >= cfg.min_val_trades_save
+                and val_profit_par_trade > best_val_profit):
+            best_val_profit = val_profit_par_trade
             state_profit = policy.state_dict().copy()
-            torch.save(state_profit, best_profit_path)
+            save_checkpoint(state_profit, best_profit_path)
             _sauve_seuil(best_profit_path)
             print(
                 f"  {_col('★', _C.YELLOW + _C.BOLD)} "
                 f"{_col(f'NEW BEST PROFIT', _C.YELLOW + _C.BOLD)}  "
-                f"ValPNL={_money(best_val_profit, width=10)}  trades={val_num_trades}"
+                f"ValPNL/trade={_money(best_val_profit, width=10)}  trades={val_num_trades}"
             )
 
-        # Best réel pour live : Sortino30 + min trades en validation
-        if val_num_trades >= cfg.min_val_trades_save and recent_metric > best_metric:
-            best_metric = recent_metric
+        # Select the CURRENT policy score, not an average of earlier policies.
+        if val_num_trades >= cfg.min_val_trades_save and metric > best_metric:
+            best_metric = metric
             best_state = copy.deepcopy(policy.state_dict())
             best_thresholds = list(calib_thr_val)
-            torch.save(best_state, best_path)
+            save_checkpoint(best_state, best_path)
             _sauve_seuil(best_path)
             epochs_no_improve = 0
             print(
                 f"  {_col('★', _C.MAGENTA + _C.BOLD)} "
-                f"{_col(f'NEW BEST SORTINO30', _C.MAGENTA + _C.BOLD)}  "
-                f"Sortino30={recent_metric:+.3f}  trades={val_num_trades}"
+                f"{_col(f'NEW BEST SORTINO', _C.MAGENTA + _C.BOLD)}  "
+                f"Sortino={metric:+.3f}  trades={val_num_trades}"
             )
         else:
             epochs_no_improve += 1
@@ -2859,7 +3117,7 @@ def run_training_on_split(
                 print(f"[{cfg.side.upper()}{suffix}] Early stopping après {epoch} epochs (Sortino rolling ne progresse plus).")
                 break
 
-    torch.save(policy.state_dict(), f"last_{cfg.model_prefix}_{cfg.side}{suffix}.pth")
+    save_checkpoint(policy.state_dict(), f"last_{cfg.model_prefix}_{cfg.side}{suffix}.pth")
 
     if not cfg.evaluate_test:
         print(f"[{cfg.side.upper()}{suffix}] Entrainement termine. TEST reserve, non consulte.")
@@ -2994,12 +3252,12 @@ def run_training_on_split(
 def run_training_full(cfg: PPOConfig):
     df = load_mt5_data(cfg)
 
-    stats = load_global_norm_stats()
-    if stats is None:
-        stats = compute_and_save_global_norm_stats(df, FEATURE_COLS)
+    stats = compute_and_save_global_norm_stats(df.iloc[:int(len(df) * .70)], FEATURE_COLS, path=None)
 
-    train_data, val_data, test_data = create_datasets(df, FEATURE_COLS, stats)
-    run_training_on_split(train_data, val_data, test_data, stats, cfg, suffix="")
+    train_data, calib_data, val_data, test_data = create_datasets(
+        df, FEATURE_COLS, stats, calib_frac=cfg.calib_frac)
+    run_training_on_split(train_data, calib_data, val_data, test_data, stats,
+                          cfg, suffix="")
 
 
 # ======================================================================
@@ -3014,28 +3272,20 @@ def run_walkforward(
     max_folds: int = 1,
     start_fold: int = 1,
     bootstrap_from_path: Optional[str] = None,
-    auto_chain: bool = True,
+    auto_chain: bool = False,
 ):
-    """Walk-forward training avec contrôle du fold de départ et bootstrap chain.
+    """Walk-forward: scaler calculé sur le train de chaque fold, sans transfert implicite.
 
-    Paramètres :
-      start_fold : N° du fold à partir duquel on entraîne (1=tous, 2=skip wf1, etc.)
-      bootstrap_from_path : chemin .pth à copier vers best_*_wf{start_fold}.pth
-                            avant le training (init du premier fold à entraîner).
-                            Si None et start_fold > 1 : tente d'auto-trouver
-                            bestprofit_*_wf{start_fold-1}.pth comme bootstrap.
-      auto_chain : à la fin de chaque fold N, copie bestprofit_*_wfN.pth vers
-                    best_*_wf{N+1}.pth pour bootstrap le fold suivant.
+    start_fold permet de sélectionner la première fenêtre. Les paramètres de
+    bootstrap historiques restent acceptés pour produire une erreur explicite.
     """
-    import shutil
+    if auto_chain or bootstrap_from_path is not None:
+        raise ValueError("Le bootstrap inter-fold exige une adaptation explicite de normalisation; auto_chain doit être False.")
     assert train_frac + val_frac + test_frac <= 1.0 + 1e-6, "Les fractions ne peuvent pas dépasser 1.0"
 
     df_full = load_mt5_data(cfg_base)
     n = len(df_full)
 
-    stats = load_global_norm_stats()
-    if stats is None:
-        stats = compute_and_save_global_norm_stats(df_full, FEATURE_COLS)
 
     train_len = int(n * train_frac)
     val_len   = int(n * val_frac)
@@ -3057,48 +3307,28 @@ def run_walkforward(
     if start_fold > 1:
         print(f"[SKIP] Folds 1 → {start_fold - 1} sautés (start_fold={start_fold})")
 
-    first_fold_in_loop = True
     while start + window_len <= n and fold < max_folds:
         fold += 1
         print(f"\n--- Fold {fold} : indices [{start} : {start + window_len}) ---")
 
-        # Bootstrap : copie le checkpoint d'init vers best_*_wf{fold}.pth
-        target_best = f"best_{cfg_base.model_prefix}_wf{fold}_{cfg_base.side}_wf{fold}.pth"
-        if first_fold_in_loop:
-            # Bootstrap explicite OU auto-détection
-            src_path = bootstrap_from_path
-            if src_path is None and fold > 1:
-                # Auto : cherche le bestprofit du fold précédent
-                candidate = f"bestprofit_{cfg_base.model_prefix}_wf{fold-1}_{cfg_base.side}_wf{fold-1}.pth"
-                if os.path.exists(candidate):
-                    src_path = candidate
-            if src_path is not None and os.path.exists(src_path):
-                print(f"[BOOTSTRAP] Copie {src_path} → {target_best}")
-                shutil.copy(src_path, target_best)
-            elif fold > 1:
-                print(f"[BOOTSTRAP] ⚠ Aucun checkpoint d'init trouvé pour wf{fold}, training from scratch")
-        elif auto_chain and fold > 1:
-            # Bootstrap chain : copie bestprofit du fold précédent → best du fold courant
-            prev_bestprofit = f"bestprofit_{cfg_base.model_prefix}_wf{fold-1}_{cfg_base.side}_wf{fold-1}.pth"
-            if os.path.exists(prev_bestprofit):
-                print(f"[AUTO-CHAIN] Copie {prev_bestprofit} → {target_best}")
-                shutil.copy(prev_bestprofit, target_best)
-        first_fold_in_loop = False
-
-        train_data, val_data, test_data = create_datasets_from_slices(
+        stats = compute_and_save_global_norm_stats(
+            df_full.iloc[start:start + train_len], FEATURE_COLS, path=None)
+        train_data, calib_data, val_data, test_data = create_datasets_from_slices(
             df_full, FEATURE_COLS,
             start=start,
             train_len=train_len,
             val_len=val_len,
             test_len=test_len,
-            stats=stats
+            stats=stats,
+            calib_frac=cfg_base.calib_frac
         )
 
         cfg_fold = PPOConfig(**cfg_base.__dict__)
         cfg_fold.model_prefix = f"{cfg_base.model_prefix}_wf{fold}"
 
         suffix = f"_wf{fold}"
-        run_training_on_split(train_data, val_data, test_data, stats, cfg_fold, suffix=suffix)
+        run_training_on_split(train_data, calib_data, val_data, test_data, stats,
+                              cfg_fold, suffix=suffix)
 
         start += step
 
@@ -3110,15 +3340,15 @@ def run_walkforward(
 # ======================================================================
 
 if __name__ == "__main__":
+    import sys
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
     cfg_base = PPOConfig()
 
     # =======================================================
     # PIPELINE DUEL : un seul modèle qui décide BUY ou SELL
     # =======================================================
-    # side="both"  → le masque d'actions autorise BUY1, SELL1, BUY1.8,
-    #                SELL1.8 et HOLD quand le modèle est flat.
-    # Le curriculum force aléatoirement BUY ou SELL au tirage (équiprobable
-    # entre 0,1,2,3) pour amorcer les deux directions.
+    # side="both": BUY, SELL ou HOLD à plat, sans actions forcées.
     # Résultat : un unique fichier .pth qui remplace LONG + SHORT,
     # exactement comme en live "duel".
     print("\n" + "=" * 70)
@@ -3126,62 +3356,21 @@ if __name__ == "__main__":
     print("=" * 70)
     cfg_duel = PPOConfig(**cfg_base.__dict__)
     cfg_duel.side = "both"
-    cfg_duel.model_prefix = "saintv2_loup_duel"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec3"
 
-    # =======================================================
-    # PIPELINE BAZOOKA (2026-05-19) :
-    #   WF1 → WF2 (init depuis bestprofit WF1)
-    #        → WF3 (init depuis bestprofit WF2)
-    #   PUIS retrain WF1 (init depuis bestprofit WF3) — boucle fermée
-    #
-    # Le auto_chain dans run_walkforward fait déjà WF1→WF2→WF3 avec bootstrap
-    # automatique. Le 2e appel re-train WF1 en partant du meilleur WF3.
-    # =======================================================
-
-    # Phase 1 : chaîne forward WF1 → WF2 → WF3
-    #
-    # Pas de warm start : le jeu de features est passé de 21 à 10 colonnes, donc
-    # la première couche du réseau n'a plus la même dimension d'entrée. Les
-    # anciens checkpoints sont archivés dans _archive_21features/ et ne peuvent
-    # pas — et ne doivent pas — être rechargés. On repart de zéro.
-    print("\n" + "=" * 70)
-    print("  PHASE 1 : WF1 → WF2 → WF3 (auto-chain, depuis zéro)")
-    print("=" * 70)
+    # Chaque fold repart de zéro avec les statistiques de son train.
+    print("Walk-forward exec2: trois folds sans bootstrap inter-fold.")
     run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10,
                     max_folds=3, start_fold=1,
                     bootstrap_from_path=None,
-                    auto_chain=True)
-
-    # ---------------------------------------------------------------------
-    # Phase 2 (DÉSACTIVÉE) : retrain WF1 depuis bestprofit WF3 — « closed loop »
-    #
-    # Ce 2e passage réinitialisait WF1 avec les poids de WF3, dont la fenêtre
-    # de validation va jusqu'à la date du jour. Le WF1 qui en sortait avait donc
-    # vu — indirectement — le futur de sa propre fenêtre de train (2022-2024),
-    # ce qui casse l'indépendance du walk-forward : ce checkpoint ne peut plus
-    # servir de mesure hors-échantillon, alors que c'est sa seule raison d'être.
-    #
-    # La Phase 1 va, elle, dans le sens du temps (WF1 → WF2 → WF3), donc chaque
-    # bootstrap n'utilise que du passé : elle reste saine.
-    #
-    # Ne réactiver que pour produire un modèle de production « toutes données »,
-    # jamais pour évaluer une performance.
-    # ---------------------------------------------------------------------
-    # print("\n" + "=" * 70)
-    # print("  PHASE 2 : retrain WF1 depuis bestprofit WF3 (closed loop)")
-    # print("=" * 70)
-    # wf3_best = "bestprofit_saintv2_loup_duel_wf3_both_wf3.pth"
-    # run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10,
-    #                 max_folds=1, start_fold=1,
-    #                 bootstrap_from_path=wf3_best,
-    #                 auto_chain=False)
+                    auto_chain=False)
 
     print("\n" + "=" * 70)
     print("  WALK-FORWARD TERMINÉ : 3 folds entraînés, indépendance préservée.")
     print("  Fichiers générés :")
-    print("    bestprofit_saintv2_loup_duel_wf1_both_wf1.pth")
-    print("    bestprofit_saintv2_loup_duel_wf2_both_wf2.pth")
-    print("    bestprofit_saintv2_loup_duel_wf3_both_wf3.pth")
+    print("    bestprofit_saintv2_loup_duel_exec2_wf1_both_wf1.pth")
+    print("    bestprofit_saintv2_loup_duel_exec2_wf2_both_wf2.pth")
+    print("    bestprofit_saintv2_loup_duel_exec2_wf3_both_wf3.pth")
     print("=" * 70)
 
     # ---------------------------------------------------------

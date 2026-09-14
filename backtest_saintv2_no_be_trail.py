@@ -1,4 +1,5 @@
 ﻿import os
+from execution_quotes import execution_quote
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import time as _time
@@ -79,6 +80,8 @@ from saint_core import (
     SOURCE_EXT_NOM,
     safe_normalize,
     load_norm_stats,
+    load_model_norm_stats,
+    load_shared_model_norm_stats,
     build_policy,
     get_device,
     build_mask_from_pos_scalar,
@@ -124,7 +127,7 @@ class LiveConfig:
     risk_per_trade: float = 0.012
     max_notional_mult: float = 30.0
     leverage: float = 6.0
-    fee_rate: float = 0.0         # commission BTCUSD CFD ≈ 0, coût déjà dans le spread
+    fee_rate: float = 0.0   # ce courtier ne facture pas de commission sur BTCUSD
     atr_sl_mult: float = 5.0     # SL = 5 x ATR  (optimum mesure sur l'or)
     atr_tp_mult: float = 10.0    # TP = 10 x ATR (R:R 1:2.0)
 
@@ -444,7 +447,8 @@ def compute_execution_price(
     close_price: float,
     time_i: datetime,
     cfg: LiveConfig,
-    stress: StressConfig
+    stress: StressConfig,
+    return_spread: bool = False,
 ) -> float:
     """
     Calcule un prix d'exécution avec :
@@ -467,27 +471,11 @@ def compute_execution_price(
         jitter = np.random.normal(0.0, base_spread * 0.3)
         base_spread = max(base_spread + jitter, 0.0)
 
-    half_spread = base_spread / 2.0
+    slippage = np.random.uniform(0.0, stress.max_slippage_bps) if stress.enable else 0.0
+    price = execution_quote(close_price, side, base_spread * 10000.0)
+    price *= 1.0 + side * slippage
+    return (float(price), float(base_spread)) if return_spread else float(price)
 
-    # slippage random
-    slippage = 0.0
-    if stress.enable:
-        slippage = np.random.uniform(-stress.max_slippage_bps, stress.max_slippage_bps)
-
-    # côté client : on paie le spread + slippage
-    if side == 1:  # LONG
-        exec_bps = half_spread + slippage
-        price = close_price * (1.0 + exec_bps)
-    else:          # SHORT
-        exec_bps = half_spread + slippage
-        price = close_price * (1.0 - exec_bps)
-
-    return float(price)
-
-
-# ============================================================
-# LOGIQUE SL/TP + BREAK-EVEN / TRAILING + ACTION MASK
-# ============================================================
 
 def compute_sl_tp(
     cfg: LiveConfig,
@@ -679,7 +667,10 @@ def run_backtest(cfg: LiveConfig):
         raise RuntimeError("Pas assez de données pour lancer le backtest.")
 
     device = get_device(cfg)
-    stats = load_norm_stats(NORM_STATS_PATH)
+    norm_paths = ([BEST_MODEL_DUEL_PATH] if cfg.side == "both" else
+                  [p for side, p in (("long", BEST_MODEL_LONG_PATH), ("short", BEST_MODEL_SHORT_PATH))
+                   if cfg.side in (side, "duel")])
+    stats = load_shared_model_norm_stats(norm_paths)
 
     # Chargement des modèles
     policy_long = None
@@ -774,32 +765,26 @@ def run_backtest(cfg: LiveConfig):
         # 1) SL / TP sur la barre i (avec prix "stressés")
         # Modélisation asymétrique BID/ASK alignée sur MT5 réel :
         #   - bar_low/bar_high représentent les extrêmes du BID
-        #   - LONG  : entrée à ASK, sortie à BID → SL hit s plus tôt, TP hit s plus tard
-        #   - SHORT : entrée à BID, sortie à ASK → SL hit s plus tôt, TP hit s plus tard
         #     (en termes de mouvement du BID requis)
-        # Quand state.spread = 0 (cfg.spread_bps = 0), le comportement est identique
         # à la version sans compensation.
         if state.position != 0 and i > state.entry_index:
             exit_price = None
             exit_reason = None
-            s = state.spread
 
             if state.position == 1:  # LONG
-                # SL : MT5 ferme quand BID <= sl. Asymétrie : MT5 sl est s plus haut → looser
-                if low_bar <= state.sl + s:
+                if low_bar <= state.sl:
                     exit_price = state.sl
                     exit_reason = "SL"
-                # TP : MT5 ferme quand BID >= tp. Asymétrie : MT5 tp est s plus haut → stricter
-                elif high_bar >= state.tp + s:
+                elif high_bar >= state.tp:
                     exit_price = state.tp
                     exit_reason = "TP"
             elif state.position == -1:  # SHORT
                 # SL : MT5 ferme quand ASK >= sl → BID >= sl - s → looser
-                if high_bar + s >= state.sl:
+                if execution_quote(high_bar, 1, state.spread_fraction * 10000) >= state.sl:
                     exit_price = state.sl
                     exit_reason = "SL"
                 # TP : MT5 ferme quand ASK <= tp → BID <= tp - s → stricter
-                elif low_bar + s <= state.tp:
+                elif execution_quote(low_bar, 1, state.spread_fraction * 10000) <= state.tp:
                     exit_price = state.tp
                     exit_reason = "TP"
 
@@ -808,7 +793,7 @@ def run_backtest(cfg: LiveConfig):
                 #   - SL : le marché continue contre nous → fill PIRE que sl (loss++)
                 #   - TP : le momentum continue avec nous → fill MIEUX que tp (profit++)
                 # Magnitude : uniforme [0, max_slippage_bps] appliqué sur exit_price.
-                if stress.enable:
+                if stress.enable and exit_reason == "SL":
                     slip_bps = np.random.uniform(0.0, stress.max_slippage_bps)
                     slip_amount = exit_price * slip_bps
                     if state.position == 1:  # LONG
@@ -881,7 +866,7 @@ def run_backtest(cfg: LiveConfig):
             # Latent PnL sans levier (cf fix PnL ci-dessus)
             latent = (
                 state.position *
-                (close_bar - state.entry_price) *
+                (execution_quote(close_bar, -state.position, state.spread_fraction * 10000) - state.entry_price) *
                 state.volume
             )
         else:
@@ -1042,12 +1027,12 @@ def run_backtest(cfg: LiveConfig):
             if env_action in (0, 1):
                 side = 1 if env_action == 0 else -1
 
-                entry_price = compute_execution_price(
+                entry_price, trade_spread = compute_execution_price(
                     side=side,
                     close_price=close_bar,
                     time_i=time_i,
                     cfg=cfg,
-                    stress=stress
+                    stress=stress, return_spread=True
                 )
 
                 entry_atr = compute_entry_atr(df_closed_for_obs)
@@ -1099,21 +1084,12 @@ def run_backtest(cfg: LiveConfig):
                 state.position = side
                 state.volume = volume
                 state.entry_price = entry_price
+                state.spread_fraction = trade_spread
                 state.sl = sl
                 state.tp = tp
                 state.entry_index = i
                 state.entry_atr = float(effective_entry_atr)
                 state.last_risk_scale = risk_scale
-                # Spread en unités de prix au moment de l'entrée — sert à modéliser
-                # l'asymétrie BID/ASK dans le trigger SL/TP (alignement avec MT5 réel).
-                # Distribution bimodale (mirror training) : 80% session tight, 20% wide.
-                if stress.enable and np.random.rand() < stress.spread_wide_prob:
-                    spread_mult = np.random.uniform(1.2, stress.spread_bps_wide_factor)
-                    state.spread = float(entry_price * cfg.spread_bps * spread_mult)
-                else:
-                    spread_mult = np.random.uniform(0.98, 1.02)
-                    state.spread = float(entry_price * cfg.spread_bps * spread_mult)
-
                 side_txt = "LONG " if side == 1 else "SHORT"
                 side_col = C.GREEN if side == 1 else C.RED
                 action_name = {0: "BUY", 1: "SELL"}.get(a, "HOLD")
@@ -1283,7 +1259,6 @@ if __name__ == "__main__":
         date_to=datetime(2026, 3, 31),
         # Spread réaliste BTCUSD ~17$ sur 68k = 0.00025 = 2.5 pips de fraction.
         # Sert à modéliser :
-        #   - coût d'entrée (half_spread payé dans compute_exec_price)
         #   - asymétrie BID/ASK dans le trigger SL/TP (cf. boucle principale)
         # Mets à 0.0 pour neutraliser (mode "frictionless" historique).
         spread_bps=0.00025,

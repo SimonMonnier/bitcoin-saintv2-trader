@@ -46,7 +46,11 @@ PAS = 10
 SPREAD_BPS = 2.61
 SLIP_SORTIE_BPS = 2.0
 SLIP_ENTREE_BPS = 1.0
-BRUIT_TICK_BPS = 0.6      # moyenne de la loi uniforme [0, 1.2] de l'env
+BRUIT_TICK_BPS = 0.0      # l'env ne bruite plus les meches : les bougies MT5
+                          # portent deja les extremes reels
+# Pas de commission : ce courtier n en facture pas sur BTCUSD CFD.
+# Le cout est entierement dans le spread, deja facture ci-dessus.
+FEE_RATE = 0.0
 TP_SLIPPAGE_FAVORABLE = ('--tp-neutre' not in sys.argv)
 
 # --------------------------------------------------------------- jeux testes
@@ -71,7 +75,8 @@ JEUX = {
     "30 tout":         JEU_M1_LARGE + JEU_H1_LARGE + JEU_EXT + JEU_LIQ_TEMPS,
 }
 
-GRILLE = [(2.0, 1.4), (2.0, 2.0), (3.0, 1.4), (3.0, 2.0), (5.0, 2.0)]
+GRILLE = [(2.0, 1.4), (3.0, 1.4), (5.0, 1.4), (5.0, 2.0),
+          (8.0, 1.4), (8.0, 2.0), (10.0, 1.4), (10.0, 2.0)]
 SELECTIVITES = (0.01, 0.05)
 
 
@@ -124,8 +129,12 @@ def barrieres(hi, lo, cl, atr, idx, sl_mult, rr, sens, demi_sp, slip_e, slip_s):
         # Variante prudente : un ordre limite remplit AU PRIX, jamais mieux.
         # L'env accorde le gain de traversee ; on mesure ce qu'il vaut.
         sortie = sortie - sens * np.where(contre, slip_s[idx], 0.0)
-    # Demi-spread paye en fermant.
-    pnl = sens * (sortie - entree) - demi_sp[idx]
+    # Demi-spread paye en fermant, PUIS la commission.
+    #
+    # La commission est en dollars sur la position : fee = taux x prix x taille.
+    # Le PnL etant ici par UNITE de prix, on retranche taux x prix_de_sortie —
+    # c'est l'equivalent par unite, et il ne depend pas de la taille.
+    pnl = sens * (sortie - entree) - demi_sp[idx] - FEE_RATE * sortie
     return pnl / dist_sl, ~ouvert
 
 
