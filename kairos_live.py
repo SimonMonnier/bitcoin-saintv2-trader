@@ -20,6 +20,7 @@ from saint_core import (
     SCALPING_MAX_HOLDING,
     merge_m1_h1,
     load_calib_thresholds,
+    load_decision_policy,
     decide_avec_barres,
     charge_source_externe,
     SOURCE_EXT_NOM,
@@ -762,6 +763,7 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
 
     # Chargement des checkpoints
     policies: Dict[str, nn.Module] = {}
+    entry_decisions = {}
     for agent_name in agents_to_load:
         path = MULTI_AGENT_PATHS[agent_name]
         if not os.path.exists(path):
@@ -770,6 +772,7 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
         p.load_state_dict(torch.load(path, map_location=device))
         p.eval()
         policies[agent_name] = p
+        entry_decisions[agent_name] = load_decision_policy(path)
         agent_stats[agent_name] = load_model_norm_stats(path)
         magic = MULTI_AGENT_MAGICS[agent_name]
         print(f"Modèle {agent_name.upper():3s} chargé (magic={magic}) : {path}")
@@ -837,8 +840,14 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
                     probs = torch.softmax(logits_d_m, dim=-1)
                     pb, ps = float(probs[0]), float(probs[1])
 
-                barres = get_calib_threshold(agent_name)
-                a_pred = decide_avec_barres(pb, ps, barres)
+                # Une instance par agent, jamais partagee : son historique
+                # glissant est propre a ce flux de decisions. Appelee une seule
+                # fois par bougie fermee ET a plat — la fenetre compte en
+                # OCCASIONS, donc l'appeler a chaque sondage la remplirait
+                # trente fois trop vite, avec des doublons.
+                decision = entry_decisions[agent_name]
+                barres = decision.thresholds
+                a_pred = decision.decide(pb, ps)
                 print(
                     f"  [{agent_name.upper()}] probas "
                     f"BUY={probs[0]:.2f} SELL={probs[1]:.2f} HOLD={probs[2]:.2f}  "
@@ -897,6 +906,7 @@ def live_loop(cfg: LiveConfig, should_continue):
         policy_duel = _build_policy()
         policy_duel.load_state_dict(torch.load(BEST_MODEL_DUEL_PATH, map_location=device))
         policy_duel.eval()
+        duel_decision = load_decision_policy(BEST_MODEL_DUEL_PATH)
         print(f"Modèle DUEL chargé : {BEST_MODEL_DUEL_PATH}")
     else:
         if cfg.side in ("duel", "long"):
@@ -1048,11 +1058,12 @@ def live_loop(cfg: LiveConfig, should_continue):
                         print("Logits DUEL :", logits_d_m.cpu().numpy().round(4))
                         print("Probas DUEL :", probs_d.cpu().numpy().round(4))
 
-                        # Une barre par côté — identique au training et au
-                        # mode multi-agent.
-                        barres_d = seuil_calibre(BEST_MODEL_DUEL_PATH)
-                        a = decide_avec_barres(float(probs_d[0]),
-                                               float(probs_d[1]), barres_d)
+                        # Une barre par côté, par RANG GLISSANT — la règle
+                        # exacte sous laquelle ce checkpoint a été sélectionné.
+                        # Appel unique par bougie fermée et à plat.
+                        barres_d = duel_decision.thresholds
+                        a = duel_decision.decide(float(probs_d[0]),
+                                                 float(probs_d[1]))
                         print(f"BEST DUEL : {action_labels[a]}  "
                               f"barres B={barres_d[0]:.3f} S={barres_d[1]:.3f}")
 

@@ -75,6 +75,7 @@ from saint_core import (
     SCALPING_MAX_HOLDING,
     merge_m1_h1,
     load_calib_thresholds,
+    load_decision_policy,
     decide_avec_barres,
     charge_source_externe,
     SOURCE_EXT_NOM,
@@ -686,6 +687,7 @@ def run_backtest(cfg: LiveConfig):
         policy_duel = _build_policy_bt()
         policy_duel.load_state_dict(torch.load(BEST_MODEL_DUEL_PATH, map_location=device))
         policy_duel.eval()
+        duel_decision = load_decision_policy(BEST_MODEL_DUEL_PATH, cfg.min_confidence)
         print(f"  {_c('✓', C.GREEN)} Modèle DUEL  : {_c(BEST_MODEL_DUEL_PATH, C.CYAN)}")
 
     if cfg.side in ("duel", "long"):
@@ -901,11 +903,11 @@ def run_backtest(cfg: LiveConfig):
         if state.position == 0 and not closed_this_bar:
             with torch.no_grad():
                 s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                barres = load_calib_thresholds(BEST_MODEL_DUEL_PATH,
-                                               cfg.min_confidence)
+                barres = (duel_decision if cfg.side == "both" else
+                          load_calib_thresholds(BEST_MODEL_DUEL_PATH, cfg.min_confidence))
                 # Les modes long/short séparés n'ont qu'un côté : une barre
                 # unique suffit, on prend la plus exigeante des deux.
-                thr = max(barres)
+                thr = max(barres.thresholds if cfg.side == "both" else barres)
 
                 # On garde des refs externes au bloc pour le log post-ouverture
                 prob_long_open = None
@@ -928,8 +930,11 @@ def run_backtest(cfg: LiveConfig):
                         # training, loup_live et l'EA MQL5. Un argmax sur les
                         # 3 actions exigerait p(BUY) > p(HOLD), ce qu'une
                         # strategie selective ne verifie presque jamais.
-                        a = decide_avec_barres(float(probs_duel[0]),
-                                               float(probs_duel[1]), barres)
+                        # `barres` est une EntryDecisionPolicy en mode
+                        # "both" : elle porte son historique glissant et se
+                        # consomme par .decide(), pas comme un tuple.
+                        a = barres.decide(float(probs_duel[0]),
+                                          float(probs_duel[1]))
 
                 elif cfg.side == "duel":
                     if policy_long is None or policy_short is None:

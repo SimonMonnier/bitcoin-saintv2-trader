@@ -1,4 +1,4 @@
-"""Noyau partagé Loup Ω — modèle, features, normalisation, masque, SL/TP.
+"""Noyau partagé KAIROS — modèle, features, normalisation, masque, SL/TP.
 
 Tout ce qui DOIT être strictement identique entre training, backtests, live et
 export ONNX vit ici, et nulle part ailleurs. Ces blocs étaient auparavant
@@ -37,15 +37,6 @@ NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
 
 CLIP_SIGMA = 5.0
 
-# Duree de detention de reference pour normaliser bars_held.
-# Doit correspondre a la detention TYPIQUE, sinon la feature sature a 3.0 en
-# permanence et ne porte plus d'information.
-#
-# Sur XAUUSD a SL 5xATR / R:R 2.0, 92.3 % des trades se resolvent dans les
-# 240 min (mesure sur barriere triple). Le deplacement etant diffusif, atteindre
-# 5 ATR demande de l'ordre de 5^2 = 25 min et 10 ATR une centaine ; la detention
-# mediane se situe donc vers l'heure. On prend 120 pour que la feature garde de
-# la dynamique jusqu'au plafond de 240 min sans saturer.
 # Detention de reference pour normaliser bars_held_norm.
 # DOIT rester egale a training.PPOConfig.scalping_max_holding : training,
 # backtest et live construisent la meme feature avec cette constante, et les
@@ -131,32 +122,29 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 
 # ============================================================
-#  JEU DE FEATURES — XAUUSD
+#  TROIS LECONS TRANSVERSALES — elles valaient deja sur XAUUSD
 # ============================================================
-#
-# Choisi sur mesure d'apport, hors echantillon, cible = ISSUE REELLE du trade
-# (le TP est-il touche avant le SL, a SL 5xATR / R:R 2.0), sur 1.32 M bougies.
-#
-#   PRIX seules (8)                  AUC 0.5313   PnL top1% -0.0985
-#   + argent + spread (13)           AUC 0.5309   PnL       +0.3789
-#   + heure (15)                     AUC 0.5327   PnL       +0.4805   <- retenu
-#   ELAGUE a 9 colonnes              AUC 0.5304   PnL       +0.3170
-#
-# DEUX LECONS de la mise au point, qui expliquent ce jeu :
 #
 # 1. Une feature n'est pas bonne ou mauvaise dans l'absolu, elle l'est pour une
 #    CIBLE donnee. Les colonnes horaires coutaient -0.0022 d'AUC contre une
-#    cible SL 3xATR / R:R 1.4, et rapportent +0.0018 contre SL 5xATR / R:R 2.0.
-#    Tout elagage doit etre refait si le SL/TP change.
+#    cible SL 3xATR / R:R 1.4 et rapportaient +0.0018 contre SL 5xATR / R:R 2.0.
+#    TOUT ELAGAGE DOIT ETRE REFAIT SI LE SL/TP CHANGE.
 #
-# 2. Les apports marginaux NE SE COMPOSENT PAS. Chacune des 9 colonnes retirees
-#    ci-dessous avait un apport individuel nul ou negatif ; les retirer toutes
-#    coutait 0.0024. Elles se couvrent mutuellement.
+# 2. Les apports marginaux NE SE COMPOSENT PAS. Neuf colonnes d'apport
+#    individuel nul ou negatif coutaient 0.0024 une fois retirees ensemble —
+#    plus que la meilleure feature du jeu n'en apporte. Elles se couvrent
+#    mutuellement. C'est ce qui a fait annuler l'elagage a 10 colonnes.
 #
-# L'INDICE DOLLAR (USDX) a ete ECARTE malgre une correlation de -0.345 avec
-# l'or : son apport marginal etait exactement 0.0000, et il limitait la fusion a
-# 1.22 M bougies contre 1.32 M sans lui. Les 8 % de donnees recuperees valent
-# +0.0025 a +0.0041 d'AUC selon le jeu — mesure sur les quatre.
+# 3. Une feature doit VARIER A L'ECHELLE OU LA DECISION SE PREND. La detention
+#    mediane d'un trade est de 7 barres ; une serie constante sur cette duree ne
+#    peut pas departager deux entrees. C'est le critere qui separe taker_ratio
+#    (autocorr 1 min 0.82, apport -0.0498 si retiree) du funding et des ratios
+#    long/short (autocorr 0.999+, apport 0.0000).
+#
+# Une source ECARTEE, pour memoire : l'indice dollar, malgre une correlation de
+# -0.345 avec l'or. Apport marginal exactement 0.0000, et il limitait la fusion
+# a 1.22 M bougies contre 1.32 M — les 8 % de donnees perdues valaient plus que
+# la colonne.
 
 # JEU A 30 COLONNES — choisi sur mesure.
 #
@@ -308,6 +296,8 @@ def load_calib_thresholds(pth: str, repli: Optional[float] = None):
 
 def decide_avec_barres(p_buy: float, p_sell: float, barres) -> int:
     """0 = BUY, 1 = SELL, 2 = HOLD. SOURCE UNIQUE de la règle de décision."""
+    if isinstance(barres, EntryDecisionPolicy):
+        return barres.decide(p_buy, p_sell)
     ok_b = p_buy >= barres[0]
     ok_s = p_sell >= barres[1]
     if ok_b and ok_s:
@@ -890,9 +880,11 @@ class SeuilRang:
         # Minimum d'echantillons avant de trancher. Sous ce seuil, un quantile
         # a 5 % n'a aucun sens : on s'abstient plutot que de tirer au sort.
         self._minimum = max(50, int(2.0 / self.fraction))
+        if self.taille < self._minimum:
+            raise ValueError('Fenêtre trop courte pour estimer ce quantile')
         if amorce is not None:
             for v in amorce:
-                self._vus.append(float(v))
+                self.observe(v)
 
     def pret(self) -> bool:
         return len(self._vus) >= self._minimum
@@ -901,7 +893,12 @@ class SeuilRang:
         """Niveau courant correspondant a la fraction visee."""
         if not self.pret():
             return float("inf")
-        return float(np.quantile(self._vus, 1.0 - self.fraction))
+        values = np.asarray(self._vus, dtype=np.float64)
+        threshold = float(np.quantile(values, 1.0 - self.fraction))
+        # An atom at the quantile must not turn a flat policy into 100% BUY.
+        if np.mean(values >= threshold) > self.fraction + 1.0 / len(values):
+            threshold = float(np.nextafter(threshold, np.inf))
+        return threshold
 
     def accepte(self, conviction: float) -> bool:
         """Cette conviction est-elle dans le haut du rang glissant ?
@@ -909,13 +906,84 @@ class SeuilRang:
         On decide AVANT d'enregistrer : une occasion ne doit pas participer au
         quantile qui la juge.
         """
+        if not np.isfinite(conviction):
+            raise ValueError('Conviction non finie')
         ok = self.pret() and float(conviction) >= self.seuil()
-        self._vus.append(float(conviction))
+        self.observe(conviction)
         return bool(ok)
 
     def observe(self, conviction: float) -> None:
         """Enregistre une conviction sans decider (occasions non evaluees)."""
+        if not np.isfinite(conviction):
+            raise ValueError('Conviction non finie')
         self._vus.append(float(conviction))
+
+
+class EntryDecisionPolicy:
+    """One mutable decision stream. Never share it across episodes or agents.
+
+    Call once per flat opportunity. In-position bars do not enter its history.
+    A checkpoint stores the immutable starting specification, not validation's
+    final history. A new stream always starts from an independent copy.
+    """
+    def __init__(self, spec):
+        import copy
+        self.spec = copy.deepcopy(spec)
+        if self.spec.get('version') != 1:
+            raise ValueError('Version de politique de décision inconnue')
+        self.mode = self.spec['mode']
+        if self.mode == 'rolling_rank':
+            if self.spec.get('ties') != 'conservative':
+                raise ValueError('Convention des égalités inconnue')
+            bootstrap = self.spec['bootstrap']
+            if len(bootstrap) != 2:
+                raise ValueError('Deux historiques BUY/SELL sont requis')
+            self.ranks = [SeuilRang(self.spec['fraction_per_side'], self.spec['window'], values)
+                          for values in bootstrap]
+        elif self.mode == 'fixed':
+            self.fixed = tuple(float(v) for v in self.spec['thresholds'])
+            if len(self.fixed) != 2 or not np.isfinite(self.fixed).all():
+                raise ValueError('Seuils fixes invalides')
+        else:
+            raise ValueError('Mode de décision inconnu')
+
+    @property
+    def thresholds(self):
+        return tuple(rank.seuil() for rank in self.ranks) if self.mode == 'rolling_rank' else self.fixed
+
+    def decide(self, p_buy, p_sell):
+        values = (float(p_buy), float(p_sell))
+        if not np.isfinite(values).all():
+            raise ValueError('Probabilités non finies')
+        thresholds = self.thresholds  # Both read before either history changes.
+        action = decide_avec_barres(*values, thresholds)
+        if self.mode == 'rolling_rank':
+            for rank, value in zip(self.ranks, values):
+                rank.observe(value)
+        return action
+
+
+def rolling_decision_spec(fraction, window, bootstrap):
+    spec = {'version': 1, 'mode': 'rolling_rank', 'ties': 'conservative',
+            'fraction_per_side': float(fraction), 'window': int(window),
+            'bootstrap': [[float(v) for v in side[-window:]] for side in bootstrap]}
+    EntryDecisionPolicy(spec)  # Fail before saving an unusable checkpoint.
+    return spec
+
+
+def load_decision_policy(checkpoint, fallback=None):
+    """Fresh state on every load; callers retain one instance per stream."""
+    import json
+    from pathlib import Path
+    path = Path(checkpoint).with_suffix('').with_name(Path(checkpoint).stem + '_calib.json')
+    if path.exists():
+        with path.open(encoding='utf-8') as f:
+            metadata = json.load(f)
+        if 'decision_policy' in metadata:
+            return EntryDecisionPolicy(metadata['decision_policy'])
+    # Older checkpoints retain their documented fixed-threshold behavior.
+    return EntryDecisionPolicy({'version': 1, 'mode': 'fixed',
+                                'thresholds': list(load_calib_thresholds(checkpoint, fallback))})
 
 
 def compute_risk_volume(equity: float, risk_frac: float, sl_dist: float,

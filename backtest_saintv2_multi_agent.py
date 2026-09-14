@@ -76,6 +76,7 @@ from saint_core import (
     SCALPING_MAX_HOLDING,
     merge_m1_h1,
     load_calib_thresholds,
+    load_decision_policy,
     decide_avec_barres,
     charge_source_externe,
     SOURCE_EXT_NOM,
@@ -703,6 +704,7 @@ def run_backtest(cfg: LiveConfig):
 
     device = get_device(cfg)
     agent_stats = {}
+    entry_decisions = {}
 
     # ========================================================
     # MULTI-AGENT : chargement des 3 modèles WF en parallèle
@@ -728,6 +730,7 @@ def run_backtest(cfg: LiveConfig):
         p.load_state_dict(torch.load(path, map_location=device))
         p.eval()
         policies[agent_name] = p
+        entry_decisions[agent_name] = load_decision_policy(path, cfg.min_confidence)
         agent_stats[agent_name] = load_model_norm_stats(path)
         print(f"  {_c('✓', C.GREEN)} Modèle {agent_name.upper():3s} : {_c(path, C.CYAN)}")
 
@@ -897,8 +900,7 @@ def run_backtest(cfg: LiveConfig):
                 s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                 # Barre écrite par le training à côté du checkpoint. cfg.min_confidence
                 # ne sert plus que de repli explicite pour un checkpoint ancien.
-                barres = load_calib_thresholds(MULTI_AGENT_PATHS[agent_name],
-                                               cfg.min_confidence)
+                barres = entry_decisions[agent_name]
 
                 logits_d, _ = policy(s)
                 logits_d = logits_d[0]
@@ -906,12 +908,16 @@ def run_backtest(cfg: LiveConfig):
                 logits_d_m = logits_d.masked_fill(~mask_d, MASK_VALUE)
                 probs_duel = torch.softmax(logits_d_m, dim=-1)
 
-                # Meilleur CÔTÉ puis barre calibrée — MÊME règle que training,
-                # loup_live et l'EA MQL5. Un argmax sur les 3 actions exigerait
-                # p(BUY) > p(HOLD), ce qu'une stratégie sélective ne vérifie
-                # presque jamais : mesuré, cela renvoie 0 trade.
-                a = decide_avec_barres(float(probs_duel[0]),
-                                       float(probs_duel[1]), barres)
+                # Meilleur CÔTÉ puis barre par RANG GLISSANT — MÊME règle que
+                # training, kairos_live et l'EA MQL5. Un argmax sur les
+                # 3 actions exigerait p(BUY) > p(HOLD), ce qu'une stratégie
+                # sélective ne vérifie presque jamais : mesuré, cela renvoie
+                # 0 trade.
+                #
+                # `barres` est l'instance de CET agent, pas un tuple : elle
+                # porte son propre historique glissant et ne doit etre appelee
+                # qu'une fois par occasion, a plat.
+                a = barres.decide(float(probs_duel[0]), float(probs_duel[1]))
 
             if a not in (0, 1):
                 continue  # HOLD pour cet agent

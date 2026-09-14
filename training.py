@@ -107,6 +107,8 @@ from saint_core import (
     SOURCE_EXT_NOM,
     safe_normalize,
     SeuilRang,
+    EntryDecisionPolicy,
+    rolling_decision_spec,
     SAINTPolicySingleHead,
     build_mask_from_pos_scalar,
 )
@@ -1974,6 +1976,7 @@ def run_training_on_split(
     best_metric = -1e9
     best_state = None
     best_thresholds = None
+    best_decision_spec = None
     epochs_no_improve = 0
     # patience proportionnelle au nombre d'epochs (60% du total)
     patience = max(100, int(cfg.epochs * 0.6))
@@ -2770,10 +2773,9 @@ def run_training_on_split(
         # dans les 5 % les plus convaincues des 500 dernieres vues ». La fenetre
         # est amorcee avec les convictions de la passe de calibration, qui la
         # precede chronologiquement — donc aucune information future.
-        seuils_rang = [
-            SeuilRang(val_selectivity / 2.0, cfg.rang_fenetre, amorce=pbs_val[c])
-            for c in (0, 1)
-        ]
+        decision_spec = rolling_decision_spec(
+            val_selectivity / 2.0, cfg.rang_fenetre, pbs_val)
+        val_decisions = [EntryDecisionPolicy(decision_spec) for _ in range(n_val)]
 
         # ---------- PASSE 2 : validation réelle, rang glissant ----------
         # Fenetre posterieure a celle de calibration, graine distincte mais
@@ -2824,17 +2826,7 @@ def run_training_on_split(
                         # Les niveaux courants sont lus AVANT d'enregistrer :
                         # une occasion ne doit pas participer au quantile qui
                         # la juge.
-                        sb, ss_ = seuils_rang[0].seuil(), seuils_rang[1].seuil()
-                        ok_b = seuils_rang[0].accepte(pb)
-                        ok_s = seuils_rang[1].accepte(ps)
-                        if ok_b and ok_s:
-                            a = 0 if (pb - sb) >= (ps - ss_) else 1
-                        elif ok_b:
-                            a = 0
-                        elif ok_s:
-                            a = 1
-                        else:
-                            a = 2
+                        a = val_decisions[k].decide(pb, ps)
                         v_actions[k] = a
 
                 still = []
@@ -3003,7 +2995,7 @@ def run_training_on_split(
             f"Hflat {np.mean(epoch_entropy_flat):>5.3f}/1.099  "
             f"sel[train {100*selectivite:>4.1f}% val {100*val_selectivity:>4.1f}%] "
             f"thr[tr {conf_thr:.3f} "
-            f"valB {seuils_rang[0].seuil():.3f} valS {seuils_rang[1].seuil():.3f}] "
+            f"valB {val_decisions[0].thresholds[0]:.3f} valS {val_decisions[0].thresholds[1]:.3f}] "
             f"etendue[tr {pbs_etendue:.4f} val {val_etendue:.4f}]  "
             f"KL {np.mean(epoch_kl):>+6.4f}  "
             f"dec {n_samples:>6d}"
@@ -3087,6 +3079,7 @@ def run_training_on_split(
             with open(chemin_pth.replace(".pth", "_calib.json"), "w",
                       encoding="utf-8") as f:
                 json.dump({
+                    "decision_policy": decision_spec,
                     "calib_thr_buy": float(calib_thr_val[0]),
                     "calib_thr_sell": float(calib_thr_val[1]),
                     "calib_thr": float(max(calib_thr_val)),
@@ -3096,8 +3089,7 @@ def run_training_on_split(
                     "etendue_val": round(val_etendue, 6),
                     "epoch": epoch,
                     "val_trades": val_num_trades,
-                    "regle": "meilleur cote (BUY/SELL) puis p >= calib_thr ; "
-                             "PAS d'argmax sur les 3 actions",
+                    "regle": "rolling_rank; historique par flux; egalites conservatrices",
                 }, f, indent=2)
 
         # Best sur PnL PAR TRADE, et non sur le PnL TOTAL.
@@ -3131,6 +3123,7 @@ def run_training_on_split(
             best_metric = metric
             best_state = copy.deepcopy(policy.state_dict())
             best_thresholds = list(calib_thr_val)
+            best_decision_spec = copy.deepcopy(decision_spec)
             save_checkpoint(best_state, best_path)
             _sauve_seuil(best_path)
             epochs_no_improve = 0
@@ -3145,7 +3138,9 @@ def run_training_on_split(
                 print(f"[{cfg.side.upper()}{suffix}] Early stopping après {epoch} epochs (Sortino rolling ne progresse plus).")
                 break
 
-    save_checkpoint(policy.state_dict(), f"last_{cfg.model_prefix}_{cfg.side}{suffix}.pth")
+    last_path = f"last_{cfg.model_prefix}_{cfg.side}{suffix}.pth"
+    save_checkpoint(policy.state_dict(), last_path)
+    _sauve_seuil(last_path)
 
     if not cfg.evaluate_test:
         print(f"[{cfg.side.upper()}{suffix}] Entrainement termine. TEST reserve, non consulte.")
@@ -3156,10 +3151,12 @@ def run_training_on_split(
     if best_state is not None:
         policy.load_state_dict(best_state)
         calib_thr_val = best_thresholds
+        decision_spec = best_decision_spec
     policy.eval()
 
     # 5 épisodes de test joués en parallèle, même schéma que train/val.
     n_test = 5
+    test_decisions = [EntryDecisionPolicy(decision_spec) for _ in range(n_test)]
     test_envs = [BTCTradingEnvDiscrete(test_data, cfg) for _ in range(n_test)]
     all_trades = []
     all_dd = []
@@ -3198,16 +3195,7 @@ def run_training_on_split(
                     # les recalibrer ici reviendrait à régler un paramètre sur
                     # les données censées mesurer la généralisation.
                     pb, ps = float(probs_np[bi, 0]), float(probs_np[bi, 1])
-                    ok_b = pb >= calib_thr_val[0]
-                    ok_s = ps >= calib_thr_val[1]
-                    if ok_b and ok_s:
-                        a = 0 if (pb - calib_thr_val[0]) >= (ps - calib_thr_val[1]) else 1
-                    elif ok_b:
-                        a = 0
-                    elif ok_s:
-                        a = 1
-                    else:
-                        a = 2  # HOLD
+                    a = test_decisions[k].decide(pb, ps)
                     t_actions[k] = a
 
             still = []
@@ -3384,18 +3372,18 @@ if __name__ == "__main__":
     print("=" * 70)
     cfg_duel = PPOConfig(**cfg_base.__dict__)
     cfg_duel.side = "both"
-    # exec5 : ls_ratio_top (apport mesure +0.0000) remplacee par taker_1m_ma5
+    # exec6 : ls_ratio_top (apport mesure +0.0000) remplacee par taker_1m_ma5
     # (+0.0087). Compte de features inchange, donc meme cout GPU.
     # exec4 : sortie par le temps retiree (max_holding_bars = 0) et detention
     # de reference ramenee de 120 a 30 barres.
     #
     # Un prefixe par jeu d'observation : les poids ne sont pas interchangeables
-    # entre exec3, exec4 et exec5, et le manifeste refuse de reecrire un run
+    # entre exec3, exec4 et exec6, et le manifeste refuse de reecrire un run
     # existant.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec5"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec6"
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec5: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec6: trois folds sans bootstrap inter-fold.")
     run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10,
                     max_folds=3, start_fold=1,
                     bootstrap_from_path=None,
