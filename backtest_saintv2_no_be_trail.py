@@ -678,31 +678,39 @@ def run_backtest(cfg: LiveConfig):
     policy_short = None
     policy_duel = None
 
-    def _build_policy_bt():
-        return build_policy(device, lookback=cfg.lookback)
+    def _charge(chemin):
+        # Architecture DEDUITE du fichier, jamais supposee : la taille de la
+        # banque de references voyage avec les poids.
+        etat = torch.load(chemin, map_location=device)
+        p = build_policy(device, lookback=cfg.lookback, state_dict=etat)
+        p.load_state_dict(etat, strict=True)
+        p.eval()
+        return p
 
     if cfg.side == "both":
         if not os.path.exists(BEST_MODEL_DUEL_PATH):
             raise FileNotFoundError(f"Modèle DUEL introuvable : {BEST_MODEL_DUEL_PATH}")
-        policy_duel = _build_policy_bt()
-        policy_duel.load_state_dict(torch.load(BEST_MODEL_DUEL_PATH, map_location=device))
-        policy_duel.eval()
+        policy_duel = _charge(BEST_MODEL_DUEL_PATH)
         duel_decision = load_decision_policy(BEST_MODEL_DUEL_PATH, cfg.min_confidence)
         print(f"  {_c('✓', C.GREEN)} Modèle DUEL  : {_c(BEST_MODEL_DUEL_PATH, C.CYAN)}")
 
     if cfg.side in ("duel", "long"):
         if not os.path.exists(BEST_MODEL_LONG_PATH):
             raise FileNotFoundError(f"Modèle LONG introuvable : {BEST_MODEL_LONG_PATH}")
-        policy_long = build_policy(device, lookback=cfg.lookback)
-        policy_long.load_state_dict(torch.load(BEST_MODEL_LONG_PATH, map_location=device))
+        _etat = torch.load(BEST_MODEL_LONG_PATH, map_location=device)
+        policy_long = build_policy(device, lookback=cfg.lookback,
+                                  state_dict=_etat)
+        policy_long.load_state_dict(_etat, strict=True)
         policy_long.eval()
         print(f"  {_c('✓', C.GREEN)} Modèle LONG  : {_c(BEST_MODEL_LONG_PATH, C.CYAN)}")
 
     if cfg.side in ("duel", "short"):
         if not os.path.exists(BEST_MODEL_SHORT_PATH):
             raise FileNotFoundError(f"Modèle SHORT introuvable : {BEST_MODEL_SHORT_PATH}")
-        policy_short = build_policy(device, lookback=cfg.lookback)
-        policy_short.load_state_dict(torch.load(BEST_MODEL_SHORT_PATH, map_location=device))
+        _etat = torch.load(BEST_MODEL_SHORT_PATH, map_location=device)
+        policy_short = build_policy(device, lookback=cfg.lookback,
+                                  state_dict=_etat)
+        policy_short.load_state_dict(_etat, strict=True)
         policy_short.eval()
         print(f"  {_c('✓', C.GREEN)} Modèle SHORT : {_c(BEST_MODEL_SHORT_PATH, C.CYAN)}")
 

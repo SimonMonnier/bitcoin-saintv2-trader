@@ -709,8 +709,14 @@ def run_backtest(cfg: LiveConfig):
     # ========================================================
     # MULTI-AGENT : chargement des 3 modèles WF en parallèle
     # ========================================================
-    def _build_policy_bt():
-        return build_policy(device, lookback=cfg.lookback)
+    def _charge(chemin):
+        # Architecture DEDUITE du fichier, jamais supposee : la taille de la
+        # banque de references voyage avec les poids.
+        etat = torch.load(chemin, map_location=device)
+        p = build_policy(device, lookback=cfg.lookback, state_dict=etat)
+        p.load_state_dict(etat, strict=True)
+        p.eval()
+        return p
 
     active = getattr(cfg, "active_agents", None)
     if active is None:
@@ -726,9 +732,7 @@ def run_backtest(cfg: LiveConfig):
         path = MULTI_AGENT_PATHS[agent_name]
         if not os.path.exists(path):
             raise FileNotFoundError(f"Checkpoint manquant pour {agent_name} : {path}")
-        p = _build_policy_bt()
-        p.load_state_dict(torch.load(path, map_location=device))
-        p.eval()
+        p = _charge(path)
         policies[agent_name] = p
         entry_decisions[agent_name] = load_decision_policy(path, cfg.min_confidence)
         agent_stats[agent_name] = load_model_norm_stats(path)

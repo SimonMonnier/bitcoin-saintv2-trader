@@ -855,6 +855,137 @@ class NumericalEmbedding(nn.Module):
         return torch.einsum("btfk,fkd->btfd", traits, self.weight) + self.bias
 
 
+class ReferenceMemory(nn.Module):
+    """Intersample attention DEPLOYABLE : le lot de reference est FIGE.
+
+    LE PROBLEME DE LA VERSION LITTERALE. Dans SAINT, chaque ligne regarde les
+    autres lignes DU LOT COURANT. En production l'agent decide sur une seule
+    observation : le lot vaut 1, le softmax sur un element rend 1, et
+    l'operation degenere en projection de la valeur. Les poids appris sous un
+    lot de 128 se comporteraient autrement en live. Fabriquer un faux lot en
+    live ne reglerait rien : il ne ressemblerait pas a celui de l'entrainement.
+
+    LA CORRECTION. Les « autres echantillons » ne sont pas le lot courant mais
+    une BANQUE de K observations reelles, tiree une fois pour toutes de la
+    fenetre d'ENTRAINEMENT et rangee dans le checkpoint. Le modele compare
+    l'instant present a une bibliotheque de situations historiques — ce que
+    l'axe temporel ne donne pas, lui qui ne voit que les 25 dernieres bougies.
+
+    Trois proprietes que cette forme conserve, et que la version littérale perd :
+
+      - INDEPENDANCE AU LOT. La banque est la meme pour tous les echantillons,
+        donc aucune information ne circule ENTRE les lignes du lot courant. Un
+        lot de 8 donne toujours exactement 8 passes de 1 (verifie par
+        test_architecture.py). C'est ce qui la rend deployable.
+
+      - IDENTITE ENTRAINEMENT / LIVE. La banque et ses representations encodees
+        voyagent avec les poids. Le live recharge exactement ce que le training
+        a utilise, sans rien recalculer.
+
+      - ABSENCE DE FUITE. La banque vient de la fenetre de TRAIN uniquement.
+        En validation comme en test, le modele consulte des situations
+        anterieures a la periode evaluee — c'est de la connaissance apprise,
+        au meme titre que les poids, pas de l'information future.
+
+    COUT. Les representations de la banque sont encodees une fois puis mises en
+    cache : la requete ne coute qu'une attention croisee depuis UN vecteur par
+    echantillon vers K cles. Le cache est rafraichi apres chaque mise a jour
+    PPO (les poids du tronc ayant bouge) et fige a la sauvegarde.
+
+    Parente : Gorishniy et al. 2023, "TabR: Tabular Deep Learning Meets Nearest
+    Neighbors" — une tete de recherche sur un jeu de references fige y bat les
+    transformers tabulaires purs.
+    """
+
+    def __init__(self, d_lecture: int, n_ref: int, heads: int, dropout: float,
+                 ls_init: float = 1e-4):
+        super().__init__()
+        self.n_ref = int(n_ref)
+        self.d = d_lecture
+        if d_lecture % heads != 0:
+            raise ValueError("d_lecture doit etre divisible par heads")
+        self.heads = heads
+        self.dim_tete = d_lecture // heads
+
+        self.norm_q = RMSNorm(d_lecture)
+        self.norm_kv = RMSNorm(d_lecture)
+        self.to_q = nn.Linear(d_lecture, d_lecture, bias=False)
+        self.to_kv = nn.Linear(d_lecture, 2 * d_lecture, bias=False)
+        self.proj = nn.Linear(d_lecture, d_lecture, bias=False)
+        self.q_norm = RMSNorm(self.dim_tete)
+        self.k_norm = RMSNorm(self.dim_tete)
+        self.drop = nn.Dropout(dropout)
+        self.gamma = nn.Parameter(ls_init * torch.ones(d_lecture))
+
+        # Buffers : sauvegardes avec le state_dict, donc transportes vers le
+        # live sans traitement particulier.
+        self.register_buffer("bank_obs", torch.zeros(0), persistent=True)
+        self.register_buffer("bank_repr", torch.zeros(0), persistent=True)
+        self.register_buffer("bank_pret", torch.zeros(1), persistent=True)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """Redimensionne les buffers AVANT de charger.
+
+        Ils naissent vides — la longueur de fenetre n'est pas connue a la
+        construction — et load_state_dict refuse une forme differente. Sans ce
+        crochet, un checkpoint portant une banque serait rejete, ou pire,
+        charge avec une memoire vide qui rendrait le modele silencieusement
+        different de celui qui a ete mesure.
+        """
+        for nom in ("bank_obs", "bank_repr", "bank_pret"):
+            cle = prefix + nom
+            if cle in state_dict:
+                courant = getattr(self, nom)
+                arrivant = state_dict[cle]
+                if courant.shape != arrivant.shape:
+                    setattr(self, nom, torch.zeros_like(arrivant))
+        return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def definit_banque(self, obs: torch.Tensor):
+        """Fixe les observations de reference. A n'appeler qu'avec du TRAIN."""
+        if obs.dim() != 3:
+            raise ValueError(f"banque attendue en (K, T, F), recue {tuple(obs.shape)}")
+        self.bank_obs = obs.detach().clone()
+        self.bank_repr = torch.zeros(obs.shape[0], self.d,
+                                     device=obs.device, dtype=obs.dtype)
+        self.bank_pret = torch.zeros(1, device=obs.device)
+
+    @torch.no_grad()
+    def rafraichit(self, encodeur):
+        """Re-encode la banque avec les poids courants du tronc.
+
+        Appelee apres chaque mise a jour PPO. Sans cela, les representations
+        mises en cache derivent des poids d'il y a N pas de gradient, et la
+        requete interroge une memoire perimee.
+        """
+        if self.bank_obs.numel() == 0:
+            return
+        morceaux = []
+        for i in range(0, self.bank_obs.shape[0], 64):
+            morceaux.append(encodeur(self.bank_obs[i:i + 64]))
+        self.bank_repr = torch.cat(morceaux, dim=0)
+        self.bank_pret = torch.ones(1, device=self.bank_repr.device)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        # Tant que la banque n'a pas ete encodee, la memoire est inerte :
+        # mieux vaut un modele sans memoire qu'un modele qui interroge des
+        # zeros et apprend a s'y fier.
+        if self.bank_repr.numel() == 0 or float(self.bank_pret) == 0.0:
+            return h
+
+        B = h.shape[0]
+        q = self.to_q(self.norm_q(h)).view(B, 1, self.heads, self.dim_tete).transpose(1, 2)
+        kv = self.to_kv(self.norm_kv(self.bank_repr))
+        k, v = kv.chunk(2, dim=-1)
+        k = k.view(1, self.n_ref, self.heads, self.dim_tete).transpose(1, 2).expand(B, -1, -1, -1)
+        v = v.view(1, self.n_ref, self.heads, self.dim_tete).transpose(1, 2).expand(B, -1, -1, -1)
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        o = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        o = o.transpose(1, 2).reshape(B, self.d)
+        return h + self.gamma * self.drop(self.proj(o))
+
+
 class SAINTPolicySingleHead(nn.Module):
     """actor : logits (N_ACTIONS) — critic : V(s)."""
 
@@ -871,6 +1002,7 @@ class SAINTPolicySingleHead(nn.Module):
         n_freq: int = 16,
         drop_path: float = 0.0,
         ls_init: float = 1e-4,
+        n_ref: int = 0,
     ):
         super().__init__()
         self.n_features = n_features
@@ -904,6 +1036,11 @@ class SAINTPolicySingleHead(nn.Module):
             nn.GELU(),
         )
 
+        # Intersample attention, forme deployable : voir ReferenceMemory.
+        # n_ref = 0 -> aucune memoire, le modele est strictement celui d'avant.
+        self.memoire = (ReferenceMemory(2 * d_model, n_ref, heads, dropout,
+                                        ls_init=ls_init) if n_ref > 0 else None)
+
         self.actor = nn.Linear(256, n_actions)
         self.critic = nn.Linear(256, 1)
         self._init_poids()
@@ -929,7 +1066,12 @@ class SAINTPolicySingleHead(nn.Module):
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
         nn.init.zeros_(self.critic.bias)
 
-    def forward(self, x: torch.Tensor):
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Tronc : (B, T, F) -> lecture a deux vues (B, 2*d_model).
+
+        Separe du forward pour que la banque de reference soit encodee par le
+        MEME tronc, sans repasser par la tete ni par la memoire elle-meme.
+        """
         assert x.dim() == 3, f"Input x must be (B,T,F), got {x.shape}"
         B, T, F = x.shape
 
@@ -957,22 +1099,56 @@ class SAINTPolicySingleHead(nn.Module):
         #   - la DERNIERE bougie, celle sur laquelle la decision se prend.
         # Concatenees et non additionnees, pour que le MLP puisse les ponderer.
         cls = tok[:, :, 0, :]                                 # (B, T, D)
-        h = torch.cat([cls.mean(dim=1), cls[:, -1, :]], dim=-1)
-        h = self.mlp(self.norm(h))
+        return torch.cat([cls.mean(dim=1), cls[:, -1, :]], dim=-1)
 
+    def forward(self, x: torch.Tensor):
+        h = self.encode(x)
+
+        # Attention vers la banque de reference. Identique pour tous les
+        # echantillons du lot, donc l'independance au lot est preservee.
+        if self.memoire is not None:
+            h = self.memoire(h)
+
+        h = self.mlp(self.norm(h))
         logits = self.actor(h)
         value = self.critic(h).squeeze(-1)
-
         return logits, value
+
+    def definit_banque(self, obs: torch.Tensor):
+        """Fixe les references. UNIQUEMENT des observations de la fenetre train."""
+        if self.memoire is None:
+            raise RuntimeError("Modele construit sans memoire (n_ref = 0)")
+        self.memoire.definit_banque(obs)
+        self.rafraichit_banque()
+
+    def rafraichit_banque(self):
+        """A appeler apres chaque mise a jour des poids du tronc."""
+        if self.memoire is not None:
+            self.memoire.rafraichit(self.encode)
+
+
+N_REF_DEFAUT = 256
 
 
 def build_policy(device, lookback: int = 25,
-                 n_features: int = OBS_N_FEATURES) -> SAINTPolicySingleHead:
+                 n_features: int = OBS_N_FEATURES,
+                 n_ref: int = N_REF_DEFAUT,
+                 state_dict=None) -> SAINTPolicySingleHead:
     """Instancie la policy avec les hyperparamètres d'architecture du training.
 
     Toute divergence ici rend les checkpoints incompatibles : passer par cette
     fabrique plutôt que de recopier les arguments.
+
+    `state_dict` : si fourni, la taille de la banque de références est DÉDUITE
+    des poids au lieu d'être supposée. C'est le seul moyen sûr — une constante
+    à tenir synchronisée entre training et live finit toujours par diverger, et
+    l'erreur serait soit un refus de chargement, soit pire, un modèle construit
+    sans mémoire qui trade en ignorant une partie de ce qu'il a appris.
     """
+    if state_dict is not None:
+        cle = "memoire.bank_repr"
+        n_ref = int(state_dict[cle].shape[0]) if cle in state_dict else 0
+
     return SAINTPolicySingleHead(
         n_features=n_features,
         d_model=80,
@@ -982,6 +1158,7 @@ def build_policy(device, lookback: int = 25,
         ff_mult=2,
         max_len=lookback,
         n_actions=N_ACTIONS,
+        n_ref=n_ref,
     ).to(device)
 
 

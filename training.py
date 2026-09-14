@@ -381,6 +381,17 @@ class PPOConfig:
     # SAINT
     d_model: int = 80
 
+    # INTERSAMPLE ATTENTION, forme deployable — voir saint_core.ReferenceMemory.
+    # Nombre d'observations de reference tirees de la fenetre de TRAIN, rangees
+    # dans le checkpoint et consultees a chaque decision. 0 desactive la memoire.
+    #
+    # La version litterale de SAINT fait regarder au modele les autres lignes du
+    # LOT. En live le lot vaut 1 : l'operation degenere et les poids appris sous
+    # un lot de 128 se comporteraient autrement. Une banque figee donne la meme
+    # capacite — comparer l'instant present a des situations historiques — en
+    # restant identique a l'entrainement et en production.
+    n_ref: int = 256
+
     # Trading
     initial_capital: float = 1000.0
     position_size: float = 0.06
@@ -1917,7 +1928,8 @@ def run_training_on_split(
         dropout=0.05,
         ff_mult=2,
         max_len=cfg.lookback,
-        n_actions=N_ACTIONS
+        n_actions=N_ACTIONS,
+        n_ref=cfg.n_ref,
     ).to(device)
 
     optimizer = optim.Adam(policy.parameters(), lr=cfg.lr, eps=1e-8)
@@ -2351,6 +2363,22 @@ def run_training_on_split(
         states_np = np.stack(batch_states, axis=0)
         states = torch.tensor(states_np, dtype=torch.float32, device=device)
 
+        # --------- banque de reference (intersample attention) ---------
+        # Constituee UNE fois, a partir d'observations reelles de la fenetre de
+        # TRAIN — donc aucune fuite : en validation et en test, le modele
+        # consulte des situations anterieures a la periode evaluee, au meme
+        # titre que ses poids.
+        #
+        # On la tire des etats deja collectes plutot que de reconstruire des
+        # observations a la main : c'est la garantie qu'elles sont baties par le
+        # meme chemin de code que celles vues en production.
+        if policy.memoire is not None and float(policy.memoire.bank_pret) == 0.0:
+            k = min(cfg.n_ref, states.shape[0])
+            idx = torch.randperm(states.shape[0], device=device)[:k]
+            policy.definit_banque(states[idx])
+            print(f"  [MEMOIRE] banque de {k} references figee "
+                  f"(fenetre train, epoch {epoch})")
+
         actions = torch.tensor(batch_actions, dtype=torch.long, device=device)
         oldlog = torch.tensor(batch_oldlog, dtype=torch.float32, device=device).view(-1)
         advantages = torch.tensor(batch_adv, dtype=torch.float32, device=device)
@@ -2773,6 +2801,11 @@ def run_training_on_split(
         # dans les 5 % les plus convaincues des 500 dernieres vues ». La fenetre
         # est amorcee avec les convictions de la passe de calibration, qui la
         # precede chronologiquement — donc aucune information future.
+        # Les poids du tronc ont bouge pendant l'epoch : les representations
+        # de la banque mises en cache sont perimees. Sans ce rafraichissement,
+        # la memoire repondrait avec l'encodage d'il y a N pas de gradient.
+        policy.rafraichit_banque()
+
         decision_spec = rolling_decision_spec(
             val_selectivity / 2.0, cfg.rang_fenetre, pbs_val)
         val_decisions = [EntryDecisionPolicy(decision_spec) for _ in range(n_val)]

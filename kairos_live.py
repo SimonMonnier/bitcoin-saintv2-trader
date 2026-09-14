@@ -752,8 +752,21 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
     device = get_device(cfg)
     agent_stats = {}
 
-    def _build_policy():
-        return build_policy(device, lookback=cfg.lookback)
+    def _charge_policy(chemin: str):
+        """Construit le reseau D'APRES le checkpoint, puis charge ses poids.
+
+        La taille de la banque de references est deduite du fichier, jamais
+        supposee : une constante a tenir synchronisee entre training et live
+        finit par diverger, et l'erreur serait soit un refus de chargement,
+        soit un modele construit sans memoire qui trade en ignorant une partie
+        de ce qu'il a appris. strict=True pour que tout ecart restant soit
+        bruyant.
+        """
+        etat = torch.load(chemin, map_location=device)
+        p = build_policy(device, lookback=cfg.lookback, state_dict=etat)
+        p.load_state_dict(etat, strict=True)
+        p.eval()
+        return p
 
     # Filtre des agents actifs (None = tous)
     active = getattr(cfg, "active_agents", None)
@@ -773,9 +786,7 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
         path = MULTI_AGENT_PATHS[agent_name]
         if not os.path.exists(path):
             raise FileNotFoundError(f"Checkpoint {agent_name} introuvable : {path}")
-        p = _build_policy()
-        p.load_state_dict(torch.load(path, map_location=device))
-        p.eval()
+        p = _charge_policy(path)
         policies[agent_name] = p
         entry_decisions[agent_name] = load_decision_policy(path)
         agent_stats[agent_name] = load_model_norm_stats(path)
@@ -898,8 +909,21 @@ def live_loop(cfg: LiveConfig, should_continue):
                    if cfg.side in (side, "duel")])
     stats = load_shared_model_norm_stats(norm_paths)
 
-    def _build_policy():
-        return build_policy(device, lookback=cfg.lookback)
+    def _charge_policy(chemin: str):
+        """Construit le reseau D'APRES le checkpoint, puis charge ses poids.
+
+        La taille de la banque de references est deduite du fichier, jamais
+        supposee : une constante a tenir synchronisee entre training et live
+        finit par diverger, et l'erreur serait soit un refus de chargement,
+        soit un modele construit sans memoire qui trade en ignorant une partie
+        de ce qu'il a appris. strict=True pour que tout ecart restant soit
+        bruyant.
+        """
+        etat = torch.load(chemin, map_location=device)
+        p = build_policy(device, lookback=cfg.lookback, state_dict=etat)
+        p.load_state_dict(etat, strict=True)
+        p.eval()
+        return p
 
     policy_long = None
     policy_short = None
@@ -908,26 +932,20 @@ def live_loop(cfg: LiveConfig, should_continue):
     if cfg.side == "both":
         if not os.path.exists(BEST_MODEL_DUEL_PATH):
             raise FileNotFoundError(f"Modèle DUEL introuvable : {BEST_MODEL_DUEL_PATH}")
-        policy_duel = _build_policy()
-        policy_duel.load_state_dict(torch.load(BEST_MODEL_DUEL_PATH, map_location=device))
-        policy_duel.eval()
+        policy_duel = _charge_policy(BEST_MODEL_DUEL_PATH)
         duel_decision = load_decision_policy(BEST_MODEL_DUEL_PATH)
         print(f"Modèle DUEL chargé : {BEST_MODEL_DUEL_PATH}")
     else:
         if cfg.side in ("duel", "long"):
             if not os.path.exists(BEST_MODEL_LONG_PATH):
                 raise FileNotFoundError(f"Modèle LONG introuvable : {BEST_MODEL_LONG_PATH}")
-            policy_long = _build_policy()
-            policy_long.load_state_dict(torch.load(BEST_MODEL_LONG_PATH, map_location=device))
-            policy_long.eval()
+            policy_long = _charge_policy(BEST_MODEL_LONG_PATH)
             print(f"Modèle LONG chargé : {BEST_MODEL_LONG_PATH}")
 
         if cfg.side in ("duel", "short"):
             if not os.path.exists(BEST_MODEL_SHORT_PATH):
                 raise FileNotFoundError(f"Modèle SHORT introuvable : {BEST_MODEL_SHORT_PATH}")
-            policy_short = _build_policy()
-            policy_short.load_state_dict(torch.load(BEST_MODEL_SHORT_PATH, map_location=device))
-            policy_short.eval()
+            policy_short = _charge_policy(BEST_MODEL_SHORT_PATH)
             print(f"Modèle SHORT chargé : {BEST_MODEL_SHORT_PATH}")
 
     print(f"Mode side='{cfg.side}'…")

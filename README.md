@@ -163,20 +163,40 @@ Input (B, T=25, F=34)
 | jeton **CLS** | Gorishniy 2021 (FT-Transformer) | remplace la moyenne, qui pèse toutes les colonnes également |
 | init acteur **gain 0.01** | Engstrom 2020 | sur PPO ce détail pèse plus que la plupart des choix algorithmiques |
 
-### Ce qui est délibérément absent : l'intersample attention
+### L'intersample attention, sous une forme déployable
 
-C'est l'innovation qui donne son nom à SAINT — chaque ligne du **lot** regarde
-les autres lignes du lot. Elle est écartée, et pas pour une raison de coût.
+C'est l'innovation qui donne son nom à SAINT : chaque ligne regarde **les autres
+lignes du lot**. Prise au pied de la lettre, elle n'est pas exécutable ici.
 
 En production l'agent décide sur **une** observation : le lot vaut 1. Un softmax
-sur un seul élément rend 1, donc l'opération dégénère en simple projection. Les
-poids appris sous un lot de 128 se comporteraient autrement en live — un écart
-entraînement/production silencieux. Sur des séries temporelles, elle ferait en
-plus circuler de l'information entre dates différentes du même lot.
+sur un seul élément rend 1, donc l'opération dégénère en simple projection, et
+les poids appris sous un lot de 128 se comporteraient autrement en live.
+Fabriquer un faux lot côté live ne réglerait rien — il ne ressemblerait pas à
+celui de l'entraînement, et l'écart reviendrait dans l'autre sens.
 
-Les deux axes conservés sont définis pour un échantillon unique.
-`test_architecture.py` le vérifie : **un lot de 8 donne exactement 8 passes de 1
-(écart 5.1e-09)**.
+**La correction** ([`ReferenceMemory`](saint_core.py)) : les « autres
+échantillons » ne sont pas le lot courant mais une **banque de K observations
+réelles**, tirée une fois de la fenêtre de *train* et rangée dans le checkpoint.
+Le modèle compare l'instant présent à une bibliothèque de situations
+historiques — ce que l'axe temporel ne donne pas, lui qui ne voit que les
+25 dernières bougies. Parenté : Gorishniy et al. 2023, *TabR: Tabular Deep
+Learning Meets Nearest Neighbors*.
+
+Trois propriétés que cette forme conserve et que la version littérale perd :
+
+- **Indépendance au lot.** La banque est identique pour tous les échantillons,
+  donc rien ne circule *entre* les lignes du lot. Vérifié : un lot de 8 donne
+  exactement 8 passes de 1, **écart 5.6e-09 avec la mémoire active**.
+- **Identité entraînement / live.** Banque et encodages voyagent avec les poids ;
+  `build_policy` **déduit** la taille de la banque du checkpoint au lieu de la
+  supposer. Aller-retour disque vérifié à 0.0e+00.
+- **Absence de fuite.** La banque vient du *train* : en validation comme en test,
+  le modèle consulte des situations antérieures à la période évaluée — de la
+  connaissance apprise, au même titre que les poids.
+
+Coût : les encodages sont mis en cache et rafraîchis une fois par epoch. La
+requête n'est qu'une attention croisée depuis un vecteur vers K clés —
+**mesuré nul** (56.6 ms contre 60.5 ms sans mémoire, à K=256).
 
 ### Coût mesuré
 
