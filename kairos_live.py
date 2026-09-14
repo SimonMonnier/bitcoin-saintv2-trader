@@ -45,13 +45,13 @@ from saint_core import (
 BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf1_long_wf1.pth"
 BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf1_short_wf1.pth"
 # Modèle unifié (entraîné avec side="both") : décide BUY/SELL/HOLD dans un seul fichier
-BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_exec7_wf1_both_wf1.pth"
+BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_exec8_wf1_both_wf1.pth"
 
 # ============================================================
 # MULTI-AGENT : 3 modèles WF tradent en parallèle (comme dans le backtest)
 # Chaque modèle a son propre magic MT5 pour identifier ses positions.
 # ============================================================
-# Lignee exec7 : architecture SAINT COMPLETE (une attention et son FFN par
+# Lignee exec8 : architecture SAINT COMPLETE (une attention et son FFN par
 # axe, RMSNorm, QK-Norm, RoPE, SwiGLU, LayerScale, jeton CLS).
 #
 # AUCUNE autre lignee n'est chargeable ici. exec3 a exec6 sont du BTC mais
@@ -62,9 +62,9 @@ BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_exec7_wf1_both_wf1.pth"
 # l'agent trade en lisant autre chose que ce sur quoi il a appris.
 # wf2/wf3 n'existent pas encore en BTC : leur activation doit echouer bruyamment.
 MULTI_AGENT_PATHS: Dict[str, str] = {
-    "wf1": "bestprofit_saintv2_loup_duel_exec7_wf1_both_wf1.pth",
-    "wf2": "bestprofit_saintv2_loup_duel_exec7_wf2_both_wf2.pth",
-    "wf3": "bestprofit_saintv2_loup_duel_exec7_wf3_both_wf3.pth",
+    "wf1": "bestprofit_saintv2_loup_duel_exec8_wf1_both_wf1.pth",
+    "wf2": "bestprofit_saintv2_loup_duel_exec8_wf2_both_wf2.pth",
+    "wf3": "bestprofit_saintv2_loup_duel_exec8_wf3_both_wf3.pth",
 }
 MULTI_AGENT_MAGICS: Dict[str, int] = {
     "wf1": 424241,
@@ -85,7 +85,7 @@ class LiveConfig:
     n_bars_m1: int = 50000
     n_bars_h1: int = 20000
 
-    # config training originale (R:R 1:1.4)
+    # config training (R:R 1:2.0)
     tp_shrink: float = 1.0  # pas de shrink (formule explicite : atr_tp_mult contient déjà le facteur final)
 
     # trading (mêmes valeurs que PPOConfig)
@@ -98,7 +98,7 @@ class LiveConfig:
     leverage: float = 100.0   # aligné sur training.py (BTCUSD)
     fee_rate: float = 0.0   # ce courtier ne facture pas de commission sur BTCUSD
     atr_sl_mult: float = 2.0     # SL = 2.0 x ATR   — training.PPOConfig.atr_sl_mult
-    atr_tp_mult: float = 2.8     # TP = 2.8 x ATR   — R:R 1:1.4, identique au training
+    atr_tp_mult: float = 4.0     # TP = 4.0 x ATR   — R:R 1:2.0, identique au training
 
     spread_bps: float = 0.0
     slippage_bps: float = 0.0

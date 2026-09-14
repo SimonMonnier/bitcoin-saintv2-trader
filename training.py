@@ -508,7 +508,21 @@ class PPOConfig:
     # dont les six premieres places du classement etaient toutes occupees par
     # les jeux larges.
     atr_sl_mult: float = 2.0
-    atr_tp_mult: float = 2.8      # R:R 1:1.4
+    # R:R 1:2.0. Le 1.4 precedent venait de la grille de mesure_features.py,
+    # qui echantillonne une entree toutes les 10 barres alors que les
+    # barrieres mettent jusqu'a 240 barres a se resoudre : les fenetres de
+    # resultat se recouvrent et gonflent l'esperance.
+    #
+    # Grille refaite en walk-forward PURGE (entrees espacees de 240 barres,
+    # purge de 240 entre train et bloc, 8 blocs), esperance en unites de
+    # risque a 2 % de selectivite :
+    #
+    #     SL 2.0 R:R 1.4   +0.055   5 blocs positifs sur 8
+    #     SL 2.0 R:R 2.0   +0.267   6 blocs sur 8
+    #
+    # Effet principal : le point mort passe de 44.0 % a 35.7 %. Les runs
+    # atteignaient 33.1 % — il leur manquait 11 points, il leur en manque 3.
+    atr_tp_mult: float = 4.0
 
     # Microstructure — v2 (palier intermédiaire validé, 2026-05-20)
     # v3 stress était trop dur : modèle convergeait vers HOLD-always (degenerate).
@@ -1930,7 +1944,8 @@ def run_training_on_split(
         n_features=OBS_N_FEATURES,
         d_model=cfg.d_model,
         num_blocks=cfg.num_blocks,
-        heads=4,
+        heads=5,   # head_dim 16 : voir saint_core._verifie_dim_tete
+
         dropout=0.05,
         ff_mult=2,
         max_len=cfg.lookback,
@@ -3424,10 +3439,10 @@ if __name__ == "__main__":
     #          Cout mesure : 2.38x le fwd+bwd de la version reduite, a
     #          profondeur egale et etat thermique identique.
     #          AUCUN checkpoint anterieur n'est chargeable.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec7"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec8"
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec7: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec8: trois folds sans bootstrap inter-fold.")
     run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10,
                     max_folds=3, start_fold=1,
                     bootstrap_from_path=None,

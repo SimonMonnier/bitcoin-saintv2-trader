@@ -41,7 +41,7 @@ def verifie(nom, condition, detail=""):
 def _modele(blocs=2, graine=0):
     torch.manual_seed(graine)
     return SAINTPolicySingleHead(n_features=OBS_N_FEATURES, d_model=80,
-                                 num_blocks=blocs, heads=4, ff_mult=2).eval()
+                                 num_blocks=blocs, heads=5, ff_mult=2).eval()
 
 
 def test_independance_au_lot():
@@ -153,7 +153,7 @@ def test_deterministe_en_eval():
 def _avec_memoire(K=64, graine=0):
     torch.manual_seed(graine)
     p = SAINTPolicySingleHead(n_features=OBS_N_FEATURES, d_model=80,
-                              num_blocks=2, heads=4, ff_mult=2, n_ref=K).eval()
+                              num_blocks=2, heads=5, ff_mult=2, n_ref=K).eval()
     p.definit_banque(torch.randn(K, 25, OBS_N_FEATURES))
     return p
 
@@ -223,7 +223,7 @@ def test_profondeur_deduite():
     import io as _io
     torch.manual_seed(0)
     p = SAINTPolicySingleHead(n_features=OBS_N_FEATURES, d_model=80,
-                              num_blocks=4, heads=4, ff_mult=2, n_ref=0).eval()
+                              num_blocks=4, heads=5, ff_mult=2, n_ref=0).eval()
     buf = _io.BytesIO()
     torch.save(p.state_dict(), buf)
     buf.seek(0)
@@ -243,7 +243,7 @@ def test_memoire_inerte_sans_banque():
     pas interroger des zeros et apprendre a s'y fier."""
     torch.manual_seed(0)
     p = SAINTPolicySingleHead(n_features=OBS_N_FEATURES, d_model=80,
-                              num_blocks=2, heads=4, ff_mult=2, n_ref=64).eval()
+                              num_blocks=2, heads=5, ff_mult=2, n_ref=64).eval()
     try:
         with torch.no_grad():
             o = p(torch.randn(4, 25, OBS_N_FEATURES))[0]

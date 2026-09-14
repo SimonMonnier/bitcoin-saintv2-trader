@@ -712,6 +712,40 @@ def _applique_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
 
+def _verifie_dim_tete(d: int, heads: int) -> int:
+    """La dimension de tete doit etre un MULTIPLE DE 8. Verifie tot et fort.
+
+    Sous PyTorch 2.5.1 / CUDA 12.4 / SM 8.6, une dimension de tete non
+    multiple de 8 ne provoque pas de repli sur le noyau generique : le
+    repartiteur de scaled_dot_product_attention lance un noyau fautif et la
+    carte remonte "an illegal memory access was encountered". L'erreur est
+    ASYNCHRONE, donc elle ressort n'importe ou plus tard — dans notre cas au
+    calcul de la norme du gradient, six epochs apres le debut du run.
+
+    Mesure, un processus neuf par cas :
+        head_dim  8 OK | 16 OK | 32 OK | 40 OK
+        head_dim 10 ECHEC | 20 ECHEC
+
+    d_model=80 avec 4 tetes donne 20. Avec 5 tetes, 16. La largeur du modele
+    et le nombre de parametres sont identiques — seul le decoupage change.
+
+    L'ancienne architecture n'etait pas touchee : nn.MultiheadAttention ne
+    passe pas par ce chemin.
+    """
+    if d % heads != 0:
+        raise ValueError(f"d_model={d} n'est pas divisible par heads={heads}")
+    dim_tete = d // heads
+    if dim_tete % 8 != 0:
+        raise ValueError(
+            f"dimension de tete {dim_tete} (d_model={d} / heads={heads}) : "
+            f"elle DOIT etre un multiple de 8, sinon scaled_dot_product_"
+            f"attention lance un noyau fautif et la carte tombe en acces "
+            f"memoire illegal, de facon asynchrone donc indebogable. "
+            f"Choisir heads parmi {[h for h in range(1, d + 1) if d % h == 0 and (d // h) % 8 == 0]}."
+        )
+    return dim_tete
+
+
 class AxialAttention(nn.Module):
     """Attention multi-tetes sur UN axe, en pre-norm.
 
@@ -722,10 +756,8 @@ class AxialAttention(nn.Module):
 
     def __init__(self, d: int, heads: int, dropout: float, rope: bool = False):
         super().__init__()
-        if d % heads != 0:
-            raise ValueError(f"d_model={d} n'est pas divisible par heads={heads}")
         self.heads = heads
-        self.dim_tete = d // heads
+        self.dim_tete = _verifie_dim_tete(d, heads)
         self.rope = rope
         self.norm = RMSNorm(d)
         # Sans biais : la pre-norm en amont en produit deja l'equivalent.
@@ -902,10 +934,8 @@ class ReferenceMemory(nn.Module):
         super().__init__()
         self.n_ref = int(n_ref)
         self.d = d_lecture
-        if d_lecture % heads != 0:
-            raise ValueError("d_lecture doit etre divisible par heads")
         self.heads = heads
-        self.dim_tete = d_lecture // heads
+        self.dim_tete = _verifie_dim_tete(d_lecture, heads)
 
         self.norm_q = RMSNorm(d_lecture)
         self.norm_kv = RMSNorm(d_lecture)
@@ -977,8 +1007,13 @@ class ReferenceMemory(nn.Module):
         q = self.to_q(self.norm_q(h)).view(B, 1, self.heads, self.dim_tete).transpose(1, 2)
         kv = self.to_kv(self.norm_kv(self.bank_repr))
         k, v = kv.chunk(2, dim=-1)
-        k = k.view(1, self.n_ref, self.heads, self.dim_tete).transpose(1, 2).expand(B, -1, -1, -1)
-        v = v.view(1, self.n_ref, self.heads, self.dim_tete).transpose(1, 2).expand(B, -1, -1, -1)
+        # Taille REELLE de la banque, pas celle demandee a la construction.
+        # training.py tire min(cfg.n_ref, nombre d'etats collectes) : si une
+        # epoch collecte moins d'etats que prevu, la banque est plus petite et
+        # une vue de taille self.n_ref porterait sur des elements inexistants.
+        n = self.bank_repr.shape[0]
+        k = k.view(1, n, self.heads, self.dim_tete).transpose(1, 2).expand(B, -1, -1, -1)
+        v = v.view(1, n, self.heads, self.dim_tete).transpose(1, 2).expand(B, -1, -1, -1)
         q, k = self.q_norm(q), self.k_norm(k)
 
         o = torch.nn.functional.scaled_dot_product_attention(q, k, v)
@@ -1172,7 +1207,9 @@ def build_policy(device, lookback: int = 25,
         n_features=n_features,
         d_model=80,
         num_blocks=num_blocks,
-        heads=4,
+        # 5 tetes et non 4 : d_model 80 / 4 = 20, qui n'est pas un multiple
+        # de 8. Voir _verifie_dim_tete.
+        heads=5,
         dropout=0.05,
         ff_mult=2,
         max_len=lookback,
