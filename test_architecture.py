@@ -213,6 +213,31 @@ def test_memoire_survit_au_checkpoint():
             f"{q.memoire.n_ref if q.memoire else None} vs {p.memoire.n_ref}")
 
 
+def test_profondeur_deduite():
+    """La profondeur etait ecrite en dur dans saint_core ET dans training.
+
+    Deux endroits a tenir d'accord a la main : c'est la forme exacte du defaut
+    qui a deja coute un checkpoint charge avec la mauvaise architecture. On la
+    deduit desormais du fichier.
+    """
+    import io as _io
+    torch.manual_seed(0)
+    p = SAINTPolicySingleHead(n_features=OBS_N_FEATURES, d_model=80,
+                              num_blocks=4, heads=4, ff_mult=2, n_ref=0).eval()
+    buf = _io.BytesIO()
+    torch.save(p.state_dict(), buf)
+    buf.seek(0)
+    etat = torch.load(buf, weights_only=True)
+    q = build_policy(torch.device("cpu"), lookback=25, state_dict=etat)
+    verifie(f"build_policy deduit la profondeur ({len(q.blocks)} blocs)",
+            len(q.blocks) == 4, f"{len(q.blocks)} au lieu de 4")
+    try:
+        q.load_state_dict(etat, strict=True)
+        verifie("chargement strict d'une profondeur non standard", True)
+    except Exception as e:
+        verifie("chargement strict d'une profondeur non standard", False, str(e)[:70])
+
+
 def test_memoire_inerte_sans_banque():
     """Avant que la banque soit figee, le modele doit tourner sans memoire —
     pas interroger des zeros et apprendre a s'y fier."""
@@ -240,6 +265,7 @@ if __name__ == "__main__":
     test_memoire_independante_du_lot()
     test_memoire_agit()
     test_memoire_survit_au_checkpoint()
+    test_profondeur_deduite()
     test_memoire_inerte_sans_banque()
     print(f"\n{_ok}/{_total} OK")
     sys.exit(0 if _ok == _total else 1)

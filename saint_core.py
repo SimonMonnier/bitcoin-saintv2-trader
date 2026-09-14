@@ -1129,10 +1129,24 @@ class SAINTPolicySingleHead(nn.Module):
 
 N_REF_DEFAUT = 256
 
+# Profondeur du tronc. 3 blocs, d'apres la configuration par defaut du
+# FT-Transformer (Gorishniy et al. 2021), presentee dans le papier comme une
+# baseline forte sans reglage et la mieux replique sur donnees tabulaires.
+#
+# La profondeur n'etait pas exploitable avant : les stabilisateurs ajoutes avec
+# l'architecture complete — pre-norm, LayerScale a 1e-4, QK-Norm — sont ce qui
+# rend un empilement plus profond entrainable (Bjorck et al. 2021, "Towards
+# Deeper Deep Reinforcement Learning" : sans normalisation adaptee, un reseau
+# profond en RL ne converge simplement pas).
+#
+# Cout mesure : 3.86x le fwd+bwd de l'ancien bloc reduit, contre 2.38x a 2.
+N_BLOCS_DEFAUT = 3
+
 
 def build_policy(device, lookback: int = 25,
                  n_features: int = OBS_N_FEATURES,
                  n_ref: int = N_REF_DEFAUT,
+                 num_blocks: int = N_BLOCS_DEFAUT,
                  state_dict=None) -> SAINTPolicySingleHead:
     """Instancie la policy avec les hyperparamètres d'architecture du training.
 
@@ -1148,11 +1162,16 @@ def build_policy(device, lookback: int = 25,
     if state_dict is not None:
         cle = "memoire.bank_repr"
         n_ref = int(state_dict[cle].shape[0]) if cle in state_dict else 0
+        # Profondeur deduite elle aussi : elle etait ecrite en dur ici ET dans
+        # training.py, deux endroits a tenir d'accord a la main.
+        vus = {int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")}
+        if vus:
+            num_blocks = max(vus) + 1
 
     return SAINTPolicySingleHead(
         n_features=n_features,
         d_model=80,
-        num_blocks=2,
+        num_blocks=num_blocks,
         heads=4,
         dropout=0.05,
         ff_mult=2,

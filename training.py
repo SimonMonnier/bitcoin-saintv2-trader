@@ -107,6 +107,7 @@ from saint_core import (
     SOURCE_EXT_NOM,
     safe_normalize,
     SeuilRang,
+    N_BLOCS_DEFAUT,
     EntryDecisionPolicy,
     rolling_decision_spec,
     SAINTPolicySingleHead,
@@ -380,6 +381,11 @@ class PPOConfig:
 
     # SAINT
     d_model: int = 80
+
+    # Profondeur du tronc — source unique : saint_core.N_BLOCS_DEFAUT.
+    # 3 d'apres la configuration par defaut du FT-Transformer (Gorishniy 2021).
+    # A ne PAS recopier en dur ailleurs : build_policy la deduit du checkpoint.
+    num_blocks: int = N_BLOCS_DEFAUT
 
     # INTERSAMPLE ATTENTION, forme deployable — voir saint_core.ReferenceMemory.
     # Nombre d'observations de reference tirees de la fenetre de TRAIN, rangees
@@ -1923,7 +1929,7 @@ def run_training_on_split(
     policy = SAINTPolicySingleHead(
         n_features=OBS_N_FEATURES,
         d_model=cfg.d_model,
-        num_blocks=2,
+        num_blocks=cfg.num_blocks,
         heads=4,
         dropout=0.05,
         ff_mult=2,
