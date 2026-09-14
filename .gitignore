@@ -44,3 +44,9 @@ loup_log_*.txt
 # Archives de runs (2.5 Go) : checkpoints, caches et logs des configurations
 # precedentes, gardes en local pour comparaison.
 _archive_*/
+
+# Experiences locales isolees (poids, donnees, copies de sources, metriques).
+experiments/
+
+# Journaux d audit par run
+*.jsonl

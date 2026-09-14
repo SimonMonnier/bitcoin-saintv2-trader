@@ -8,6 +8,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import math
+import copy
 import random
 import time
 from dataclasses import dataclass, field
@@ -141,6 +142,32 @@ SELECTIVITE_FIN = 0.05     # régime : les 5 % les plus favorables
 SELECTIVITE_RAMP_EPOCHS = 40
 
 
+def selective_threshold(samples, fraction: float) -> float:
+    """Seuil >= conservateur, y compris si les convictions sont identiques."""
+    samples = np.asarray(samples, dtype=np.float64)
+    if samples.size == 0 or not np.isfinite(samples).all():
+        raise ValueError("Convictions vides ou non finies")
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("La fraction doit etre dans ]0, 1]")
+    threshold = float(np.quantile(samples, 1.0 - fraction))
+    if np.mean(samples >= threshold) > fraction + 1.0 / len(samples):
+        threshold = float(np.nextafter(threshold, np.inf))
+    return threshold
+
+
+def rollout_action_probabilities(model_probs, force_prob, threshold, side):
+    """Distribution effective, apres curriculum et remplacement BUY/SELL -> HOLD."""
+    raw = np.asarray(model_probs, dtype=np.float64)
+    effective = raw / raw.sum()
+    for action in (0, 1):
+        if raw[action] < threshold:
+            effective[2] += effective[action]
+            effective[action] = 0.0
+    forced = np.array([1., 0., 0.] if side == 'long' else
+                      [0., 1., 0.] if side == 'short' else [.5, .5, 0.])
+    return (1.0-force_prob) * effective + force_prob * forced
+
+
 def selectivite_for_epoch(epoch: int) -> float:
     """Fraction d'occasions tradées à l'epoch donnée (décroissance linéaire).
 
@@ -236,6 +263,34 @@ class PPOConfig:
     # Ils sont masqués à HOLD donc sans gradient d'actor ; les garder tous
     # faisait passer la mise à jour de 40s à 7 minutes pour rien.
     in_position_keep_frac: float = 0.10
+    # PLAFOND sur le nombre de DECISIONS utilisees par mise a jour PPO.
+    #
+    # Sans lui, le cout d'une epoch croit sans borne, et pour une raison
+    # inscrite dans la conception : quand la selectivite descend, l'agent
+    # refuse plus d'occasions, reste donc FLAT plus longtemps, et le nombre
+    # d'instants ou il peut decider explose. Mesure sur un run reel, la
+    # selectivite passant de 50 % a 23 % :
+    #
+    #     epoch 1    dec   7 438    maj PPO   16 s
+    #     epoch 10   dec  10 964    maj PPO  125 s
+    #     epoch 15   dec  31 582    maj PPO  429 s
+    #     epoch 22   dec 129 429    maj PPO 1522 s
+    #
+    # Dix-sept fois plus de decisions, et la selectivite devait encore
+    # descendre de 23 % a 5 %. Le run n'aurait jamais atteint la fin.
+    #
+    # Ce n'est pas qu'une question de vitesse : la mise a jour consomme TOUTES
+    # les decisions collectees, donc elle faisait 232 pas de gradient a l'epoch
+    # 1 et 4 044 a l'epoch 22. Le taux d'apprentissage et le coefficient
+    # d'entropie suivent un calendrier PAR EPOCH — ils ne decrivaient plus ce
+    # qui se passait, et cela explique la volatilite observee (+12.6 puis -1.3
+    # entre deux epochs consecutives).
+    #
+    # Le sous-echantillonnage est uniforme et NON BIAISE : les avantages GAE
+    # sont calcules sur les trajectoires completes avant d'arriver ici, donc
+    # en retirer une partie ne fausse aucun calcul — c'est le meme argument
+    # qui justifie deja `in_position_keep_frac`.
+    max_decisions_per_epoch: int = 16_000
     # Nombre de passes PPO sur les données collectées.
     # Testé à 8 pour tenter de débloquer le KL (0.0004 contre un target de
     # 0.03) : sans effet sur le KL, resté à 0.0000, et le critique a divergé
@@ -423,12 +478,17 @@ class PPOConfig:
     # Seuil minimum de trades en val pour sauvegarder le meilleur modèle
     min_val_trades_save: int = 20
 
-    # Amplitude minimale (p99 − p01) de max(p_BUY, p_SELL) en dessous de laquelle
-    # le filtrage par quantile est désactivé. C'est LE diagnostic à surveiller :
-    # si cette étendue ne dépasse jamais ce seuil, le modèle est incapable de
-    # distinguer un instant favorable d'un autre, et aucune barre de conviction
-    # n'y changera quoi que ce soit.
+    # Diagnostic d'amplitude faible. Le train conserve son exploration;
+    # la validation garde son budget d'entrees sauf comparaison legacy explicite.
     pbs_etendue_min: float = 0.01
+    # Comparaisons experimentales : ne pas ouvrir tout lorsque le signal est plat.
+    validation_selectivity: Optional[float] = None
+    legacy_flat_validation: bool = False
+    evaluate_test: bool = True
+    # PPO requiert les probabilites de la politique qui a tire les actions.
+    # L'ancien curriculum forcait BUY/SELL ou remappait en HOLD sans corriger
+    # logprob. Conserve uniquement pour reproduire les anciens diagnostics.
+    legacy_off_policy_curriculum: bool = False
 
     # Curriculum vol
     use_vol_curriculum: bool = True
@@ -1674,6 +1734,7 @@ def run_training_on_split(
     best_val_profit = -1e9
     best_metric = -1e9
     best_state = None
+    best_thresholds = None
     epochs_no_improve = 0
     # patience proportionnelle au nombre d'epochs (60% du total)
     patience = max(100, int(cfg.epochs * 0.6))
@@ -1783,6 +1844,10 @@ def run_training_on_split(
         else:
             force_prob = 0.05
 
+        if not cfg.legacy_off_policy_curriculum:
+            force_prob = 0.0
+            conf_thr = 0.0
+
         # ============ ROLLOUT SEMI-MDP ============
         # Une DÉCISION n'existe que lorsque l'agent est flat : en position le
         # masque ne laisse que HOLD, donc appeler le réseau y est inutile — son
@@ -1797,6 +1862,8 @@ def run_training_on_split(
         # ce qui est la formulation semi-MDP standard pour des actions de durée
         # variable. Le GAE en tient compte via γ^Δt.
         pending: List[Optional[Dict]] = [None] * n_envs
+        sampling_audit = {"decisions": 0, "forced_actions": 0,
+                          "remapped_actions": 0, "max_logprob_error": 0.0}
 
         def _cloture(k: int, done_flag: bool) -> None:
             """Ferme la décision en cours de l'env k et la verse au buffer."""
@@ -1849,6 +1916,7 @@ def run_training_on_split(
                     # ---- CURRICULUM D'OUVERTURE FORCÉE ----
                     a = None
                     if np.random.rand() < force_prob:
+                        sampling_audit["forced_actions"] += 1
                         if cfg.side == "long":
                             a = 0
                         elif cfg.side == "short":
@@ -1869,7 +1937,15 @@ def run_training_on_split(
                         p = probs_np[bi]
                         a = int(np.random.choice(N_ACTIONS, p=p / p.sum()))
                         if a != 2 and p[a] < conf_thr:
+                            sampling_audit["remapped_actions"] += 1
                             a = 2  # conviction insuffisante → attendre
+
+                    sampling_audit["decisions"] += 1
+                    normalized_p = rollout_action_probabilities(
+                        probs_np[bi], force_prob, conf_thr, cfg.side)
+                    sampling_audit["max_logprob_error"] = max(
+                        sampling_audit["max_logprob_error"],
+                        abs(float(np.log(normalized_p[a])) - float(logp_np[bi, a])))
 
                     pending[k] = {
                         "state": states[k],
@@ -1992,7 +2068,22 @@ def run_training_on_split(
         # pour que le critique reste calibré.
         _pos_arr = np.asarray(batch_positions)
         _flat_mask = _pos_arr == 0
-        _keep = _flat_mask.copy()
+
+        # Plafond sur les DECISIONS (etats flat). Voir cfg.max_decisions_per_epoch :
+        # sans lui, leur nombre croit avec la selectivite jusqu'a rendre une
+        # epoch interminable, et fait varier d'un facteur 17 le nombre de pas de
+        # gradient entre le debut et la fin du run.
+        _flat_idx = np.flatnonzero(_flat_mask)
+        _dec_collectees = len(_flat_idx)
+        if 0 < cfg.max_decisions_per_epoch < _dec_collectees:
+            _tire = np.random.choice(_flat_idx, cfg.max_decisions_per_epoch,
+                                     replace=False)
+            _flat_retenu = np.zeros(len(_pos_arr), bool)
+            _flat_retenu[_tire] = True
+        else:
+            _flat_retenu = _flat_mask.copy()
+
+        _keep = _flat_retenu.copy()
         if cfg.in_position_keep_frac < 1.0:
             _tirage = np.random.rand(len(_pos_arr)) < cfg.in_position_keep_frac
             _keep |= (~_flat_mask) & _tirage
@@ -2269,6 +2360,12 @@ def run_training_on_split(
                 break
 
         scheduler.step()
+        import json as _json
+        with open(f"sampling_audit_{cfg.side}{suffix}.jsonl", "a", encoding="utf-8") as _fa:
+            _fa.write(_json.dumps({"epoch": epoch,
+                                  "on_policy": not cfg.legacy_off_policy_curriculum,
+                                  **sampling_audit}) + "\n")
+        print(f"[PPO SAMPLING] epoch={epoch} {sampling_audit}")
 
         # ---- Recalibration du seuil sur la conviction réellement observée ----
         # Le quantile (1 − sélectivité) de max(p_BUY, p_SELL) est, par
@@ -2399,20 +2496,18 @@ def run_training_on_split(
 
         # Barres issues de CETTE distribution, une par côté, budget partagé.
         #
-        # GARDE-FOU GLOBAL, et non par côté. Mesuré à l'epoch 6 : quand la barre
-        # d'un seul côté est désactivée, la règle compare (pb − 0) ≈ 0.33 à
-        # (ps − 0.360) ≈ quelques millièmes — le côté libre gagne toujours, d'où
-        # 732 longs et zéro short. Mélanger un côté filtré et un côté libre rend
-        # la comparaison des écarts incohérente : soit les deux sont filtrés,
-        # soit aucun.
-        q_cote = 1.0 - selectivite / 2.0
+        # Une faible amplitude ne justifie pas de supprimer le filtre.
+        # Garder un quantile par cote; une distribution constante ne declenche
+        # aucune entree. Le mode legacy sert uniquement aux ablations.
+        val_selectivity = (selectivite if cfg.validation_selectivity is None
+                           else cfg.validation_selectivity)
         etendues = [float(np.quantile(pbs_val[c], 0.99)
                           - np.quantile(pbs_val[c], 0.01)) for c in (0, 1)]
-        if min(etendues) < cfg.pbs_etendue_min:
+        if cfg.legacy_flat_validation and min(etendues) < cfg.pbs_etendue_min:
             calib_thr_val[0] = calib_thr_val[1] = 0.0
         else:
             for c in (0, 1):
-                calib_thr_val[c] = float(np.quantile(pbs_val[c], q_cote))
+                calib_thr_val[c] = selective_threshold(pbs_val[c], val_selectivity / 2.0)
         val_etendue = float(min(etendues))
 
         _chrono["calibration"] = time.time() - _t_phase; _t_phase = time.time()
@@ -2505,7 +2600,7 @@ def run_training_on_split(
                 _w = _csv.DictWriter(_ft, fieldnames=_trades_fields)
                 for tm in ve.trades_meta:
                     _w.writerow({
-                        "epoch": epoch, "phase": "val", "episode": 0,
+                        "epoch": epoch, "phase": "val", "episode": k,
                         "entry_idx": tm["entry_idx"], "exit_idx": tm["exit_idx"],
                         "side": tm["side"],
                         "entry_price": round(tm["entry_price"], 4),
@@ -2634,12 +2729,13 @@ def run_training_on_split(
             f"CriticL {np.mean(epoch_critic_loss):>7.4f}  "
             f"H {np.mean(epoch_entropy):>5.3f}  "
             f"Hflat {np.mean(epoch_entropy_flat):>5.3f}/1.099  "
-            f"sel {100*selectivite:>4.1f}% "
-            f"thr[tr {calib_thr_courant:.3f} "
+            f"sel[train {100*selectivite:>4.1f}% val {100*val_selectivity:>4.1f}%] "
+            f"thr[tr {conf_thr:.3f} "
             f"valB {calib_thr_val[0]:.3f} valS {calib_thr_val[1]:.3f}] "
             f"etendue[tr {pbs_etendue:.4f} val {val_etendue:.4f}]  "
             f"KL {np.mean(epoch_kl):>+6.4f}  "
-            f"dec {n_samples:>5d}  "
+            f"dec {n_samples:>6d}"
+            + (f"/{_dec_collectees}" if _dec_collectees > n_samples else "") + "  "
             f"|R| {np.mean(np.abs(batch_adv)) if batch_adv else 0.0:>6.3f}  "
             f"advStd {_adv_std_raw:>7.2f}  "
             f"clip {100*_frac_clip:>4.1f}%  quasi0 {100*_frac_nul:>4.1f}%  "
@@ -2719,11 +2815,12 @@ def run_training_on_split(
             with open(chemin_pth.replace(".pth", "_calib.json"), "w",
                       encoding="utf-8") as f:
                 json.dump({
-                    "calib_thr_buy": round(calib_thr_val[0], 6),
-                    "calib_thr_sell": round(calib_thr_val[1], 6),
-                    "calib_thr": round(max(calib_thr_val), 6),
-                    "calib_thr_train": round(calib_thr_courant, 6),
-                    "selectivite": round(selectivite, 6),
+                    "calib_thr_buy": float(calib_thr_val[0]),
+                    "calib_thr_sell": float(calib_thr_val[1]),
+                    "calib_thr": float(max(calib_thr_val)),
+                    "calib_thr_train": float(conf_thr),
+                    "legacy_off_policy_curriculum": cfg.legacy_off_policy_curriculum,
+                    "selectivite": float(val_selectivity),
                     "etendue_val": round(val_etendue, 6),
                     "epoch": epoch,
                     "val_trades": val_num_trades,
@@ -2746,7 +2843,8 @@ def run_training_on_split(
         # Best réel pour live : Sortino30 + min trades en validation
         if val_num_trades >= cfg.min_val_trades_save and recent_metric > best_metric:
             best_metric = recent_metric
-            best_state = policy.state_dict().copy()
+            best_state = copy.deepcopy(policy.state_dict())
+            best_thresholds = list(calib_thr_val)
             torch.save(best_state, best_path)
             _sauve_seuil(best_path)
             epochs_no_improve = 0
@@ -2763,10 +2861,15 @@ def run_training_on_split(
 
     torch.save(policy.state_dict(), f"last_{cfg.model_prefix}_{cfg.side}{suffix}.pth")
 
+    if not cfg.evaluate_test:
+        print(f"[{cfg.side.upper()}{suffix}] Entrainement termine. TEST reserve, non consulte.")
+        return
+
     print(f"[{cfg.side.upper()}{suffix}] Entraînement terminé, passage en TEST…")
 
     if best_state is not None:
         policy.load_state_dict(best_state)
+        calib_thr_val = best_thresholds
     policy.eval()
 
     # 5 épisodes de test joués en parallèle, même schéma que train/val.

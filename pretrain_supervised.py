@@ -36,10 +36,14 @@ from saint_core import (FEATURE_COLS, N_POS_FEATURES, merge_m1_h1,
                         charge_source_externe, SOURCE_EXT_NOM, load_norm_stats, safe_normalize,
                         build_policy, get_device)
 
-LOOKBACK = 25
-SL_MULT, RR = 5.0, 2.0        # doivent rester alignés sur PPOConfig
+# ALIGNES SUR training.PPOConfig — c'est tout l'interet du pre-entrainement :
+# produire des poids que PPO puisse reprendre. Des reglages differents
+# donneraient un modele entraine sur une AUTRE tache, et le transfert
+# vaudrait moins que rien.
+LOOKBACK = 54
+SL_MULT, RR = 2.0, 1.4        # = atr_sl_mult / (atr_tp_mult / atr_sl_mult)
 MAX_HOLD = 240
-DEB = datetime(2018, 9, 15)
+DEB = datetime(2022, 12, 15)   # debut de couverture des colonnes Binance
 PAS = 3                        # 1 fenêtre sur 3 : les fenêtres voisines sont
                                # quasi identiques, les garder toutes n'ajoute
                                # que du temps de calcul
@@ -89,11 +93,11 @@ def main() -> int:
         print(f"MT5 KO {mt5.last_error()}")
         return 1
     fin = datetime.now()
-    m1 = mt5.copy_rates_range("XAUUSD", mt5.TIMEFRAME_M1, DEB, fin)
-    h1 = mt5.copy_rates_range("XAUUSD", mt5.TIMEFRAME_H1,
+    m1 = mt5.copy_rates_range("BTCUSD", mt5.TIMEFRAME_M1, DEB, fin)
+    h1 = mt5.copy_rates_range("BTCUSD", mt5.TIMEFRAME_H1,
                               DEB - timedelta(days=20), fin)
     feats_ext = charge_source_externe(DEB - timedelta(days=1), fin)
-    info = mt5.symbol_info("XAUUSD")
+    info = mt5.symbol_info("BTCUSD")
     spread = float(pd.DataFrame(m1)["spread"].mean() * info.point)
     mt5.shutdown()
 

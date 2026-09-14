@@ -171,8 +171,22 @@ FEATURE_COLS_M1 = [
     "close_ema_dev",     # ecart a l'EMA 60
     "returns",
     "range_norm",
+    # `mom_5` est un BIT : (close > close.shift(5)). Il a ete garde binaire
+    # apres mesure, contre l'intuition : sa version continue (rendement sur 5
+    # bougies) fait TOMBER l'esperance de +0.0253 a -0.0093. Son ecart-type
+    # vaut 1.46 bps quand le spread en vaut 2.61 — l'amplitude y est
+    # majoritairement du bruit de microstructure, et le signe est plus robuste.
     "mom_5",
-    "high_vol_regime",
+    # `vol_rank` REMPLACE `high_vol_regime`, qui n'en etait que le seuillage a
+    # 0.65 — donc un bit la ou la colonne source est continue.
+    #
+    # Mesure (sonde logistique, friction complete, meilleur 1 %) :
+    #     10 avec high_vol_regime (bit)   E[R] +0.0253   t +0.5
+    #     10 avec vol_rank (continu)      E[R] +0.1166   t +2.1
+    # Seul changement du jeu a franchir le seuil de significativite. Le
+    # lookback n'y pouvait rien : cinquante-quatre bits successifs donnent
+    # l'historique du SIGNE, jamais l'amplitude.
+    "vol_rank",
 ]
 
 FEATURE_COLS_H1 = [
@@ -668,10 +682,11 @@ class SAINTPolicySingleHead(nn.Module):
             for _ in range(num_blocks)
         ])
 
-        self.norm = nn.LayerNorm(d_model)
+        # 2 x d_model : la tete recoit DEUX vues concatenees (cf. forward).
+        self.norm = nn.LayerNorm(2 * d_model)
 
         self.mlp = nn.Sequential(
-            nn.Linear(d_model, 256),
+            nn.Linear(2 * d_model, 256),
             nn.ReLU(),
             nn.Dropout(0.05),
             nn.Linear(256, 256),
@@ -695,13 +710,32 @@ class SAINTPolicySingleHead(nn.Module):
         for blk in self.blocks:
             tok = blk(tok)
 
-        h_time = tok.mean(dim=1)
-        h_feat = tok.mean(dim=2)
+        # LECTURE A DEUX VUES — corrigee.
+        #
+        # L'ancienne version calculait :
+        #     cls_time = tok.mean(dim=1).mean(dim=1)   # moyenne T puis F
+        #     cls_feat = tok.mean(dim=2).mean(dim=1)   # moyenne F puis T
+        #     h = cls_time + cls_feat
+        # Or moyenner sur T puis sur F donne exactement la moyenne sur (T,F),
+        # dans les deux ordres : les deux vues etaient le MEME tenseur (verifie
+        # numeriquement, ecart 4.5e-08), leur somme valait 2x la moyenne
+        # globale, et le facteur 2 etait absorbe par le LayerNorm qui suit.
+        #
+        # Toute la lecture a double axe se reduisait donc a une moyenne plate.
+        # Apres avoir fait travailler l'attention sur le temps ET sur les
+        # colonnes, la tete jetait l'information de POSITION : quel instant,
+        # quelle feature.
+        #
+        # On garde deux vues REELLEMENT distinctes :
+        #   - le resume global de la fenetre ;
+        #   - la DERNIERE bougie, celle sur laquelle la decision se prend.
+        # Elles sont concatenees et non additionnees, pour que le MLP puisse
+        # les ponderer au lieu de les confondre.
+        h_feat = tok.mean(dim=2)              # (B, T, D) : un resume par instant
+        cls_global = h_feat.mean(dim=1)       # (B, D) : moyenne de la fenetre
+        cls_recent = h_feat[:, -1, :]         # (B, D) : l'instant de decision
 
-        cls_time = h_time.mean(dim=1)
-        cls_feat = h_feat.mean(dim=1)
-
-        h = cls_time + cls_feat
+        h = torch.cat([cls_global, cls_recent], dim=-1)
         h = self.norm(h)
         h = self.mlp(h)
 
