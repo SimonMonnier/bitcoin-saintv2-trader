@@ -125,13 +125,15 @@ def flux(d):
     return d
 
 
-def main() -> int:
-    src = pd.read_pickle(SOURCE)
-    src["time"] = pd.to_datetime(src["time"])
-    h1 = src.sort_values("time").reset_index(drop=True)
-    print(f"source : {len(h1):,} bougies H1  "
-          f"{h1['time'].iloc[0]} -> {h1['time'].iloc[-1]}")
+def construit(h1):
+    """Chaine complete, du brut H1 aux colonnes. Rend (df, liste des noms).
 
+    EXTRAITE DE main() POUR ETRE TESTABLE. test_causalite.py la rappelle sur
+    une serie tronquee en t et verifie que la ligne t ne bouge pas. C'est le
+    seul moyen de prouver que le bloc H4 ne laisse pas entrer la bougie en
+    formation — le shift(1) ci-dessous est facile a ecrire, facile a oublier,
+    et son absence ne leve aucune erreur.
+    """
     h1 = indicateurs(h1, JOUR_H1)
     h1 = flux(h1)
 
@@ -167,6 +169,17 @@ def main() -> int:
     ext = ["taker_ratio", "taker_ma5"]
     liq = ["flux_taille_trade", "flux_intensite", "heure_sin", "heure_cos"]
     colonnes = BASES + cols_h4 + ext + liq + cols_rng + cols_ich
+    return h1, colonnes, cols_ich
+
+
+def main() -> int:
+    src = pd.read_pickle(SOURCE)
+    src["time"] = pd.to_datetime(src["time"])
+    h1 = src.sort_values("time").reset_index(drop=True)
+    print(f"source : {len(h1):,} bougies H1  "
+          f"{h1['time'].iloc[0]} -> {h1['time'].iloc[-1]}")
+
+    h1, colonnes, cols_ich = construit(h1)
 
     avant = len(h1)
     h1 = h1.replace([np.inf, -np.inf], np.nan)
@@ -174,10 +187,8 @@ def main() -> int:
     print(f"H1     : {avant:,} -> {len(h1):,} bougies apres dropna "
           f"({100*(1-len(h1)/avant):.1f} % perdues au warmup)")
     print(f"periode: {h1['time'].iloc[0]} -> {h1['time'].iloc[-1]}")
-    print(f"colonnes : {len(BASES)} H1 + {len(cols_h4)} H4 + {len(ext)} flux"
-          f" + {len(liq)} liquidite/temps + {len(cols_rng)} range "
-          f"+ {len(cols_ich)} ichimoku "
-          f"= {len(colonnes)}")
+    print(f"colonnes : {len(colonnes)} au total, dont {len(cols_ich)} "
+          f"ichimoku")
 
     # La liste de saint_core fait foi : si les deux divergent, l'entrainement
     # echouerait plus tard avec un KeyError peu lisible.
