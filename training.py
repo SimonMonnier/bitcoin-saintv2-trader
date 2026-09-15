@@ -3727,10 +3727,10 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec13"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec14"
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec13: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec14: trois folds sans bootstrap inter-fold.")
     run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10,
                     max_folds=3, start_fold=1,
                     bootstrap_from_path=None,

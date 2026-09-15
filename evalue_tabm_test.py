@@ -127,6 +127,12 @@ def ecart_au_point_mort(pnls):
 
 
 def main() -> int:
+    # Un argument force une selectivite FIXEE D'AVANCE, identique sur les trois
+    # folds, au lieu de la faire choisir par la validation. C'est le seul mode
+    # dont le chiffre soit un vrai hors-echantillon : la validation choisit
+    # systematiquement mal (mesure du 2026-09-15, -3 a -4 points sur deux
+    # methodes sans rapport).
+    sel_fixe = float(sys.argv[1]) if len(sys.argv) > 1 else None
     cfg = T.PPOConfig()
     df = T.load_mt5_data(cfg)
     n = len(df)
@@ -198,7 +204,10 @@ def main() -> int:
         meilleur_cal = np.maximum(sb[a_cal:b_cal], ss[a_cal:b_cal])
 
         best_sel, best_ec, marges = None, -1e9, {}
-        for c in CANDIDATS:
+        if sel_fixe is not None:
+            marges[sel_fixe] = float(np.quantile(meilleur_cal, 1.0 - sel_fixe))
+            best_sel, best_ec = sel_fixe, float("nan")
+        for c in ([] if sel_fixe is not None else CANDIDATS):
             marges[c] = float(np.quantile(meilleur_cal, 1.0 - c))
             ec = ecart_au_point_mort(
                 evalue(env_val, dep_val, sb[a_v2:b_v2], ss[a_v2:b_v2],
@@ -219,8 +228,10 @@ def main() -> int:
         r = resume(f"wf{fold}", pnls)
         if r:
             tous += pnls
-        print(f"       selectivite {100*best_sel:.0f} % choisie sur la "
-              f"validation ({best_ec:+.1f} pt), marge {marges[best_sel]:+.4f} R")
+        origine = ("FIXEE d'avance" if sel_fixe is not None
+                   else f"choisie sur la validation ({best_ec:+.1f} pt)")
+        print(f"       selectivite {100*best_sel:.0f} % {origine}, "
+              f"marge {marges[best_sel]:+.4f} R")
 
     print("-" * 78)
     r = resume("TOUS", tous)

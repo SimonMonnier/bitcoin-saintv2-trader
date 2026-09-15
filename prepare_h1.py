@@ -56,10 +56,19 @@ QUATRE PIEGES TRAITES ICI, chacun deja paye une fois dans ce projet.
 import numpy as np
 import pandas as pd
 
+from features_ichimoku import ajoute_features_ichimoku
 from features_range import ajoute_features_range
 
 SOURCE = "klines_h1_spot_BTCUSDT.pkl"
 SORTIE = "data_cache_BTCUSD_H1.pkl"
+# Jeu enrichi des 47 colonnes couvrant TOUTES les strategies Ichimoku,
+# pas seulement le range : Chikou-Span (le filtre du systeme), replis sur
+# plat Kijun, cassures de plus hauts, espace tradable, boussole du nuage
+# et les 14 structures en chandeliers. Ecrit A PART tant que le gain
+# n'est pas mesure : ajouter 47 colonnes a 56 sur 55 000 barres
+# d'entrainement n'est pas neutre, et ce depot a deja paye assez cher
+# les changements adoptes avant mesure.
+SORTIE_COMPLET = "data_cache_BTCUSD_H1_complet.pkl"
 JOUR_H1, JOUR_H4 = 24, 6
 SEMAINE_H1 = 168
 
@@ -152,9 +161,12 @@ def main() -> int:
     # ---------- Features de la strategie de range ----------
     h1, cols_rng = ajoute_features_range(h1)
 
+    # ---------- Features des AUTRES strategies Ichimoku ----------
+    h1, cols_ich = ajoute_features_ichimoku(h1)
+
     ext = ["taker_ratio", "taker_ma5"]
     liq = ["flux_taille_trade", "flux_intensite", "heure_sin", "heure_cos"]
-    colonnes = BASES + cols_h4 + ext + liq + cols_rng
+    colonnes = BASES + cols_h4 + ext + liq + cols_rng + cols_ich
 
     avant = len(h1)
     h1 = h1.replace([np.inf, -np.inf], np.nan)
@@ -164,6 +176,7 @@ def main() -> int:
     print(f"periode: {h1['time'].iloc[0]} -> {h1['time'].iloc[-1]}")
     print(f"colonnes : {len(BASES)} H1 + {len(cols_h4)} H4 + {len(ext)} flux"
           f" + {len(liq)} liquidite/temps + {len(cols_rng)} range "
+          f"+ {len(cols_ich)} ichimoku "
           f"= {len(colonnes)}")
 
     # La liste de saint_core fait foi : si les deux divergent, l'entrainement
@@ -183,6 +196,18 @@ def main() -> int:
     fric = (2.61 + 1.0 + 2.0) / 1e4 * prix_med
     print(f"\nATR median {atr_med:.2f} $  |  friction {fric:.2f} $  "
           f"=  {fric/atr_med:.3f} R par ATR")
+
+    # Le jeu COMPLET garde les deux blocs, le jeu de reference n'a
+    # que les colonnes en service. Les deux partagent exactement les
+    # memes lignes, donc toute comparaison entre eux est APPARIEE
+    # barre a barre — c'est ce qui permet de lire un ecart sans que
+    # la difference de periode vienne s'y melanger.
+    complet = h1.replace([np.inf, -np.inf], np.nan)
+    complet = complet.dropna(subset=cols_ich).reset_index(drop=True)
+    complet.to_pickle(SORTIE_COMPLET)
+    print()
+    print(f'{SORTIE_COMPLET} ecrit : {complet.shape}')
+    print(f'  +{len(cols_ich)} colonnes ich_*, {len(h1)-len(complet)} lignes perdues au warmup supplementaire')
 
     h1.to_pickle(SORTIE)
     print(f"\n{SORTIE} ecrit : {h1.shape}")

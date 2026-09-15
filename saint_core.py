@@ -301,9 +301,36 @@ FEATURE_COLS_SUP = [c.replace("_h1", "_h4") for c in FEATURE_COLS_H1]
 from features_range import GROUPES as _GROUPES_RANGE
 FEATURE_COLS_RANGE = [c for g in _GROUPES_RANGE.values() for c in g]
 
+# Features de TOUTES les autres strategies Ichimoku : Chikou-Span (le filtre
+# du systeme, dont le modele n'avait rien), replis sur plat Kijun, cassures de
+# nouveaux plus hauts, espace tradable pour le ratio 2/1, boussole du nuage, et
+# les 14 structures de renversement en chandeliers, cette fois NON conditionnees
+# a la proximite d'une borne de range.
+#
+# MESURE QUI A DECIDE DE LEUR ADOPTION, dans le MOTEUR REEL, sur les memes
+# fenetres de test que PPO, avec une selectivite de 5 % fixee avant tout test :
+#
+#      jeu          PnL    trades   ecart au point mort    PF    folds positifs
+#   56 colonnes   +207.69$   387        +1.6 pt           1.07        2/3
+#  103 colonnes   +568.31$   432        +3.8 +/- 2.3 pt   1.18        3/3
+#
+# Les 47 colonnes apportent +2.2 points et font passer de deux folds positifs
+# a trois. Ce n'est pas significatif (t = 1.6), mais c'est le meilleur chiffre
+# hors-echantillon que ce depot ait produit.
+#
+# UNE PREMIERE VERSION DE CES COLONNES FUYAIT LE FUTUR, et il faut que ce soit
+# ecrit ici. Cinq d'entre elles calculaient leur pente avec une difference
+# CENTREE, qui lit la barre suivante ; `ich_kumo_futur_pente` allait jusqu'a
+# contenir le plus haut et le plus bas du lendemain. Le test affichait alors
+# +25.5 points et un profit factor de 2.85. C'est l'invraisemblance du chiffre
+# qui a trahi la fuite, aucune verification ne l'aurait attrapee — la colonne
+# gardait son nom, sa forme et son ordre de grandeur. Voir features_ichimoku
+# `_pente`. Les mesures faites avant ce correctif ont ete jetees.
+from features_ichimoku import COLONNES as FEATURE_COLS_ICHIMOKU
+
 FEATURE_COLS = (FEATURE_COLS_TF + FEATURE_COLS_SUP
                 + FEATURE_COLS_EXT + FEATURE_COLS_LIQ_TEMPS
-                + FEATURE_COLS_RANGE)
+                + FEATURE_COLS_RANGE + FEATURE_COLS_ICHIMOKU)
 
 N_BASE_FEATURES = len(FEATURE_COLS)
 
