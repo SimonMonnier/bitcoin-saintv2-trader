@@ -146,24 +146,50 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # a 1.22 M bougies contre 1.32 M — les 8 % de donnees perdues valaient plus que
 # la colonne.
 
-# JEU A 30 COLONNES — choisi sur mesure.
+# JEU A 30 COLONNES — refait sous protocole PURGE, aux barrieres courantes.
 #
-# Sonde logistique, 28 653 candidats de validation, friction complete sans
-# commission (ce courtier n'en facture pas), esperance par unite de risque
-# apres selection du meilleur 1 % :
+# L'ancien tableau inscrit ici (AUC 0.6215, E[R] +0.1751, t +3.4) reposait sur
+# PAS = 10 : une entree toutes les 10 barres alors que les barrieres mettent
+# jusqu'a 240 barres a se resoudre. Les fenetres de resultat se recouvraient,
+# ce qui faisait compter 1 368 trades la ou il y en a 58 d'independants. Mesure
+# de l'ecart : a 5 % de selectivite, un modele a arbres passait de 58.0 % de
+# reussite avec chevauchement a 39.7 % sans.
 #
-#     jeu                AUC      E[R]        t
-#      8 sans Binance   0.5450   -0.2102    -4.0
-#     25 M1+H1 larges   0.5783   -0.0701    -1.4
-#     10 (ancien jeu)   0.6072   +0.0346    +0.6    non distinguable de zero
-#     27 + Binance      0.6191   +0.1249    +2.4
-#     30 (celui-ci)     0.6215   +0.1751    +3.4
+# PROTOCOLE ACTUEL (mesure_features_purgee.py) : 8 blocs successifs, entrees
+# espacees de 240 barres, purge de 240 entre train et bloc, 7 440 candidats
+# independants, SL 2.0xATR / R:R 2.0, fenetre de test intouchee.
 #
-# Les colonnes Binance pesent plus que les 25 autres reunies : 25 features de
-# prix seules donnent une esperance NEGATIVE, et l'ajout du couple Binance fait
-# passer l'AUC de 0.5783 a 0.6191. Mesure ulterieure : tout cet apport vient de
-# taker_ratio (-0.0498 si on la retire), rien de ls_ratio_top (-0.0000) — voir
-# le bloc FEATURE_COLS_EXT plus bas.
+#                              AUC     E[R] a 2 %
+#     30 actuel             0.5832       +0.2960
+#     sans les 2 Binance    0.5517       +0.0953
+#     sans le bloc H1       0.5967       +0.1367
+#     + Ichimoku rapide     0.5800       +0.2419
+#
+# TROIS LECTURES, dont une contre-intuitive.
+#
+# 1. Binance porte l'avantage. Retirer taker_ratio coute -0.0309 d'AUC et
+#    -0.2443 d'esperance ; retirer taker_1m_ma5 coute -0.2521 d'esperance.
+#    Ce sont les deux seules colonnes indispensables des trente.
+#
+# 2. Ichimoku est REJETE. Il donnait +0.0030 avec interactions sur une seule
+#    decoupe a R:R 1.4 ; sous protocole purge aux barrieres courantes il vaut
+#    -0.0031 d'AUC et -0.054 d'esperance.
+#
+# 3. LE H1 EST GARDE MALGRE UNE AUC DEFAVORABLE. Le retirer AMELIORE l'AUC de
+#    +0.0136 — et degrade l'esperance a toutes les selectivites utilisees :
+#
+#        selectivite    30 actuel    sans H1
+#             1 %        +0.3453     +0.1324
+#             2 %        +0.2960     +0.1367
+#             5 %        +0.1579     +0.0588
+#            10 %        -0.0177     +0.0614   <- il ne gagne qu'ici
+#
+#    et par bloc a 5 % : 7 blocs positifs sur 8 avec H1, 4 sur 8 sans.
+#
+#    L'AUC mesure le classement sur TOUTE la distribution ; la strategie ne
+#    touche jamais que les 2 a 5 % du sommet. Un groupe peut degrader l'ordre
+#    global tout en ameliorant l'extreme — et c'est l'extreme qui est trade.
+#    CHOISIR LA METRIQUE QUI CORRESPOND AU POINT DE FONCTIONNEMENT.
 FEATURE_COLS_M1 = [
     "rsi_14", "returns", "vol_20", "range_norm", "open_rel", "high_rel",
     "low_rel", "close_ema_dev", "mom_5", "rsi_ok", "vol_rank", "high_vol_regime",
