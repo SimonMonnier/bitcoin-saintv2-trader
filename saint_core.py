@@ -55,6 +55,24 @@ SCALPING_MAX_HOLDING = 30
 # ============================================================
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Indicateurs M1. LES FENETRES SONT CALIBREES POUR LA MINUTE.
+
+    ATTENTION AVANT DE REUTILISER CETTE FONCTION SUR UN AUTRE TIMEFRAME.
+    `rolling(1440)` apparait deux fois — pour `range_norm` et `vol_rank` — et
+    signifie UNE JOURNEE sur M1. Sur H1 cela ferait 60 jours, sur H4 240 jours.
+    Les colonnes porteraient alors leur nom sans mesurer ce qu'il annonce, et
+    le warmup mangerait le debut de l'historique : mesure sur un essai H4,
+    14.2 % des bougies perdues contre 4.5 % avec la fenetre a l'echelle.
+
+    Le decalage de warmup deplace les periodes evaluees, donc le point de
+    comparaison — assez pour inverser une conclusion. C'est arrive : un premier
+    test donnait le bloc H4 legerement favorable ; avec les fenetres corrigees
+    il degrade tout (AUC -0.0061, esperance a 5 % de +0.1579 a +0.0542, blocs
+    positifs de 7/8 a 5/8).
+
+    Pour un autre timeframe, passer la fenetre "journee" en parametre :
+    6 bougies en H4, 24 en H1, 1440 en M1.
+    """
     h = df["high"]
     l = df["low"]
     c = df["close"]
