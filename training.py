@@ -1912,11 +1912,21 @@ def run_training_on_split(
         _csv.DictWriter(_ft, fieldnames=_trades_fields).writeheader()
 
     def _param_grad_norm(params) -> float:
-        total = 0.0
-        for p in params:
-            if p.grad is not None:
-                total += float(p.grad.detach().norm(2).item()) ** 2
-        return total ** 0.5
+        """Norme L2 des gradients d'un groupe, en UNE synchronisation.
+
+        L'ancienne version appelait `.item()` sur chaque tenseur. Avec 82
+        tenseurs de parametres et trois groupes evalues a chaque pas
+        d'optimisation, cela faisait ~41 000 synchronisations GPU->CPU par
+        epoch, pour du code purement DIAGNOSTIQUE — il ne sert qu'a afficher
+        g[actor … critic … tronc …] dans la ligne META.
+
+        `_foreach_norm` calcule toutes les normes en un seul lancement fusionne,
+        et on ne rapatrie qu'un scalaire.
+        """
+        grads = [p.grad for p in params if p.grad is not None]
+        if not grads:
+            return 0.0
+        return float(torch.stack(torch._foreach_norm(grads)).norm(2).item())
 
     # Lignes de masque précalculées en numpy, dérivées de l'unique source de
     # vérité (build_mask_from_pos_scalar) pour rester cohérentes avec le live.
