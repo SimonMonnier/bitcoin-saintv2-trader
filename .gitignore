@@ -65,3 +65,5 @@ data_cache_BTCUSD_H1.pkl
 klines_h1_spot_BTCUSDT.pkl
 training_btc.err
 data_cache_BTCUSD_H1_complet.pkl
+lookback.log
+lookback.err

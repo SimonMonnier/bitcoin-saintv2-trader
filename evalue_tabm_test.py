@@ -67,6 +67,37 @@ PAS_TRAIN = 6          # un echantillon toutes les 6 barres : le chevauchement
 CANDIDATS = (0.20, 0.10, 0.05, 0.02)
 
 
+def modele_lineaire():
+    """Ridge : une somme ponderee, AUCUN croisement entre colonnes.
+
+    Sert de temoin. Le systeme Ichimoku est fait de conjonctions — le livre ne
+    dit jamais "achete si X" mais "signal ET Chikou libre ET ratio 2/1 ET
+    nuage oriente". Si la valeur des 47 nouvelles colonnes est dans leurs
+    croisements, un modele incapable d'en former doit rester loin derriere.
+    S'il fait aussi bien, c'est que les conjonctions ne portent rien, et il
+    devient inutile d'esperer quoi que ce soit d'une architecture concue pour
+    les modeliser.
+    """
+    from sklearn.linear_model import Ridge
+
+    class Enveloppe:
+        def fit(self, X, y):
+            self.m_ = X.mean(0)
+            self.s_ = X.std(0) + 1e-8
+            self.r_ = Ridge(alpha=10.0).fit((X - self.m_) / self.s_, y)
+            return self
+
+        def predict(self, X):
+            return self.r_.predict((X - self.m_) / self.s_)
+
+    return lambda: Enveloppe()
+
+
+MODELES = {"ridge": modele_lineaire,
+           "lightgbm": B.modele_arbres,
+           "tabm": B.modele_tabm}
+
+
 def cibles_brutes(df, idx):
     """Rendement NET en unites de risque, pour un BUY puis pour un SELL."""
     MF.MAX_HOLD = HOLD
@@ -133,6 +164,7 @@ def main() -> int:
     # systematiquement mal (mesure du 2026-09-15, -3 a -4 points sur deux
     # methodes sans rapport).
     sel_fixe = float(sys.argv[1]) if len(sys.argv) > 1 else None
+    nom_modele = sys.argv[2] if len(sys.argv) > 2 else "tabm"
     cfg = T.PPOConfig()
     df = T.load_mt5_data(cfg)
     n = len(df)
@@ -141,8 +173,8 @@ def main() -> int:
     window = train_len + val_len + test_len
 
     print(f"{n:,} barres | train {train_len:,} val {val_len:,} test {test_len:,}")
-    print(f"cible SL {SL_MULT}xATR  R:R {RR}  detention {HOLD} barres "
-          f"(reglage de l'environnement)")
+    print(f"modele {nom_modele}  |  cible SL {SL_MULT}xATR  R:R {RR}  "
+          f"detention {HOLD} barres (reglage de l'environnement)")
     print(f"seuil calibre sur CALIB, selectivite choisie sur VALIDATION "
           f"parmi {CANDIDATS}, test intouche")
     print()
@@ -150,7 +182,7 @@ def main() -> int:
           f"{'WR':>7} {'BE':>7} {'ecart':>8} {'+/-':>5} {'PF':>6}")
     print("-" * 78)
 
-    fab = B.modele_tabm()
+    fab = MODELES[nom_modele]()
     tous = []
     for fold in range(1, N_FOLDS + 1):
         start = (fold - 1) * test_len
