@@ -123,7 +123,7 @@ def erreur_type(wr, avg_w, avg_l, trades):
     return (avg_w + avg_l) * math.sqrt(p * (1 - p) / trades)
 
 
-def analyse(v, m, precedent, reference):
+def analyse(v, m, precedent, reference, moyenne=False):
     """Rend (lignes colorees, lignes brutes, gain par trade, ecart, gele)."""
     ep = int(v[1])
     pnl, trades, wr, pf = float(v[2]), int(v[3]), float(v[4]), float(v[5])
@@ -148,7 +148,8 @@ def analyse(v, m, precedent, reference):
     gele = clipfrac < 0.5 and H > 1.09
 
     L = []
-    L.append(f"EPOCH {ep:03d}   {par_trade:+.2f}$/trade   {trades} trades   "
+    L.append(("MODELE DEPLOYE (moyenne des poids)  " if moyenne else "")
+             + f"EPOCH {ep:03d}   {par_trade:+.2f}$/trade   {trades} trades   "
              f"WR {wr:.1f}%   PF {pf:.2f}   {duree:.0f} min")
     L.append(f"  point mort {equilibre:.1f}%  ->  ecart {ecart:+.1f} pt "
              f"(+/- {err_pt:.1f} au mieux)")
@@ -229,6 +230,7 @@ def main() -> int:
     metas, vals = {}, {}
     precedent = {}          # par fold
     geles = {}              # par fold : ecarts des epochs a actor gele
+    attend_moyenne = set()  # folds dont l'epoch suivante porte la moyenne
     position = 0
     fold_courant = None
 
@@ -243,7 +245,7 @@ def main() -> int:
                       f"relecture depuis le debut{C.FIN}\n")
                 position = 0
                 vus.clear(); vals.clear(); metas.clear()
-                precedent.clear(); geles.clear()
+                precedent.clear(); geles.clear(); attend_moyenne.clear()
                 fold_courant = None
             with open(JOURNAL, encoding="utf-8", errors="replace") as f:
                 f.seek(position)
@@ -256,6 +258,14 @@ def main() -> int:
         for ligne in ANSI.sub("", nouveau).split("\n"):
             if "[MEMOIRE]" in ligne:
                 print(f"{C.CYAN}  {ligne.strip()}{C.FIN}\n")
+            if "MOYENNE DES POIDS sur les" in ligne:
+                # Annonce emise par l'entrainement AVANT l'epoch
+                # concernee : les poids qui suivent sont la moyenne des
+                # dernieres epochs, donc le modele qui part au test.
+                print(f"{C.CYAN}{C.GRAS}  {ligne.strip()}{C.FIN}")
+                print()
+                attend_moyenne.add(
+                    ligne.split("]")[0].strip("[").split("_")[-1])
             mv, mm = RE_VAL.search(ligne), RE_META.search(ligne)
             if mv:
                 vals[(mv.group(1), int(mv.group(2)))] = mv.groups()
@@ -276,8 +286,12 @@ def main() -> int:
             if len(geles.get(fold, [])) >= 2:
                 g = geles[fold]
                 ref = (len(g), sum(g) / len(g))
+            # discard rend None : on lit l appartenance AVANT de retirer le
+            # fold, pour que le marqueur ne colle qu a une seule epoch.
+            est_moyenne = fold in attend_moyenne
+            attend_moyenne.discard(fold)
             console, brut, par_trade, ecart, gele = analyse(
-                vals[cle], metas[cle], precedent.get(fold), ref)
+                vals[cle], metas[cle], precedent.get(fold), ref, est_moyenne)
             precedent[fold] = par_trade
             if gele:
                 geles.setdefault(fold, []).append(ecart)

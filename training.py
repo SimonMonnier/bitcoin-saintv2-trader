@@ -272,7 +272,22 @@ class PPOConfig:
     mlp_dim: int = 128
 
     # PPO Training
-    epochs: int = 240               # +50% vs 160 pour cosine LR plus douce
+    # BUDGET FIXE, PAS D'ARRET PRECOCE. Mesure du 2026-09-15 : le checkpoint
+    # choisi sur la validation rend -3.3 points au test quand le dernier epoch
+    # en rend -0.2, et faire choisir la selectivite de TabM par la validation
+    # le fait passer de +1.6 a -2.1. Deux methodes sans rapport, meme verdict :
+    # ce qu'on regle sur cette fenetre se transfere NEGATIVEMENT. Validation et
+    # test font onze mois chacune et se suivent ; un reglage ajuste sur onze
+    # mois de marche est anti-correle aux onze suivants.
+    #
+    # L'arret precoce EST une selection sur la validation : il choisit quand
+    # s'arreter d'apres elle. On fixe donc le budget a l'avance. 40 epochs est
+    # choisi parce que les trois folds d'exec12 avaient plateau entre 30 et 35
+    # — c'est un budget lu sur la DYNAMIQUE d'entrainement, jamais sur le test.
+    epochs: int = 40
+    # Nombre d'epochs finales dont les poids sont moyennes. La moyenne remplace
+    # le "meilleur checkpoint" : elle ne depend d'aucun tirage particulier.
+    n_moyenne_poids: int = 10
     # Épisodes joués EN PARALLÈLE (un seul forward batché par pas) : le
     # profilage montre qu'un batch 16 coûte le même temps qu'un batch 1, donc
     # multiplier les épisodes est quasi gratuit en temps de rollout.
@@ -407,7 +422,8 @@ class PPOConfig:
 
     # Nombre d'epochs sans amelioration avant arret. Voir le commentaire de
     # `patience` dans run_training_on_split.
-    patience: int = 25
+    # patience <= 0 desactive l'arret precoce. Voir la note sur `epochs`.
+    patience: int = 0
     # (A) Clip très serré : 0.5 a laissé passer des gradients qui ont explosé
     # avec AMP (clip appliqué sur valeurs scaled). Maintenant 0.3 + unscale fix.
     max_grad_norm: float = 0.3
@@ -2173,8 +2189,28 @@ def run_training_on_split(
     # distribution rend les deux accessibles quel que soit un biais constant.
     calib_thr_val = [0.0, 0.0]      # [BUY, SELL]
 
-    for epoch in range(1, cfg.epochs + 1):
+    # Somme courante des poids des dernieres epochs, et son compteur.
+    somme_poids, n_moyennes = None, 0
+    stats_precedentes = None
+
+    # Un tour SUPPLEMENTAIRE, numerote cfg.epochs + 1 : il charge la moyenne
+    # des poids, saute la mise a jour PPO, et laisse le reste de la boucle
+    # calibrer puis mesurer le modele moyenne. Faire passer la moyenne par le
+    # chemin normal evite d'ecrire un second calibrage qui pourrait diverger du
+    # premier sans que rien ne le signale.
+    for epoch in range(1, cfg.epochs + 2):
         cfg.current_epoch = epoch
+        epoch_moyenne = (epoch == cfg.epochs + 1)
+        if epoch_moyenne:
+            if somme_poids is None:
+                break
+            ref = policy.state_dict()
+            moyenne = {k: (v / n_moyennes).to(dtype=ref[k].dtype)
+                       for k, v in somme_poids.items()}
+            policy.load_state_dict(moyenne)
+            print(f"[{cfg.side.upper()}{suffix}] MOYENNE DES POIDS sur les "
+                  f"{n_moyennes} dernieres epochs — le calibrage et la mesure "
+                  f"ci-dessous portent sur elle.")
 
         batch_states = []
         batch_actions = []
@@ -2579,7 +2615,7 @@ def run_training_on_split(
 
         _chrono["collecte"] = time.time() - _t_phase; _t_phase = time.time()
 
-        for upd in range(cfg.updates_per_epoch):
+        for upd in range(0 if epoch_moyenne else cfg.updates_per_epoch):
             np.random.shuffle(idx)
 
             for start in range(0, n_samples, cfg.batch_size):
@@ -3027,7 +3063,20 @@ def run_training_on_split(
                         still.append(k)
                 v_active = still
 
+        # Trades groupes par SOUS-PERIODE, pas seulement en un total.
+        #
+        # Les 19 episodes de validation sont disjoints et couvrent la fenetre
+        # dans l'ordre du temps : les regrouper par quatre donne quatre
+        # sous-periodes consecutives d'environ trois mois. Un total unique
+        # cache ce qui compte le plus ici — un modele qui gagne sur une periode
+        # et perd sur les trois autres affiche la meme moyenne qu'un modele
+        # regulier, et c'est exactement le piege dans lequel TabM est tombe
+        # (tout son avantage apparent venait d'un bloc haussier sur quatre).
+        trades_par_bloc = [[] for _ in range(4)]
+
         for k, ve in enumerate(val_envs):
+            trades_par_bloc[min(k * 4 // max(len(val_envs), 1), 3)].extend(
+                ve.trades_pnl)
             final_close = ve.data.close[ve.idx - 1] if ve.idx > 0 else ve.data.close[-1]
 
             latent = 0.0
@@ -3171,6 +3220,41 @@ def run_training_on_split(
         np.random.set_state(etat_rng)
 
         _chrono["validation"] = time.time() - _t_phase
+
+        # L'EPOCH DE MOYENNE N'A PAS DE STATISTIQUES D'OPTIMISATION : aucune
+        # mise a jour PPO n'y a eu lieu, donc np.mean([]) vaut nan, et `H nan`
+        # ne correspond a aucun motif numerique. La veille laisserait tomber la
+        # ligne en silence — c'est-a-dire precisement l'epoch deployee. On
+        # reprend donc les colonnes d'optimisation de la derniere epoch
+        # entrainee, et le mot MOYENNE en FIN de ligne dit ce qu'il en est ;
+        # il est place apres tous les champs lus, pour ne casser aucun motif.
+        if epoch_moyenne and stats_precedentes is not None:
+            (epoch_actor_loss, epoch_critic_loss, epoch_entropy,
+             epoch_entropy_flat, epoch_kl, epoch_grad_norm) = stats_precedentes
+
+        # Ecart au point mort, SOUS-PERIODE PAR SOUS-PERIODE. Le point mort est
+        # recalcule dans chaque bloc sur ses propres gains et pertes : un bloc
+        # ou l'on gagne gros et rarement n'a pas le meme seuil qu'un bloc ou
+        # l'on gagne petit et souvent, et comparer les deux a un seuil commun
+        # melangerait deux questions.
+        blocs_ecart = []
+        for _tb in trades_par_bloc:
+            _a = np.array(_tb, float)
+            if len(_a) < 15:
+                blocs_ecart.append(float("nan"))
+                continue
+            _g, _p = _a[_a > 0], _a[_a <= 0]
+            if not len(_g) or not len(_p):
+                blocs_ecart.append(float("nan"))
+                continue
+            _aw, _al = float(_g.mean()), abs(float(_p.mean()))
+            blocs_ecart.append(100.0 * len(_g) / len(_a)
+                               - 100.0 * _al / (_aw + _al))
+        _bl = " ".join("  nan" if np.isnan(x) else f"{x:+5.1f}"
+                       for x in blocs_ecart)
+        _npos = sum(1 for x in blocs_ecart if np.isfinite(x) and x > 0)
+        _nval = sum(1 for x in blocs_ecart if np.isfinite(x))
+
         print(
             f"{tag} {epoch_str}  "
             f"{_col('META ', _C.GREY + _C.BOLD)}  "
@@ -3185,6 +3269,7 @@ def run_training_on_split(
             f"thr[tr {conf_thr:.3f} "
             f"valB {val_decisions[0].thresholds[0]:.3f} valS {val_decisions[0].thresholds[1]:.3f}] "
             f"etendue[tr {pbs_etendue:.4f} val {val_etendue:.4f}]  "
+            f"blocs[{_bl}] {_npos}/{_nval}  "
             f"KL {np.mean(epoch_kl):>+6.4f}  "
             f"dec {n_samples:>6d}"
             + (f"/{_dec_collectees}" if _dec_collectees > n_samples else "") + "  "
@@ -3203,6 +3288,7 @@ def run_training_on_split(
             f"ENV [{_col(f'B {buy_ratio:>4.1%}', _C.GREEN)} "
             f"{_col(f'S {sell_ratio:>4.1%}', _C.BLUE)} "
             f"{_col(f'H {hold_ratio:>4.1%}', _C.GREY)}]"
+            + ("  MOYENNE DES POIDS" if epoch_moyenne else "")
         )
 
         # Écriture CSV
@@ -3292,6 +3378,30 @@ def run_training_on_split(
         # L'epoch 16 a ete retenue comme « NEW BEST PROFIT » alors qu'elle est
         # 2.6 fois PIRE par trade et que son profit factor est inferieur. Le
         # critere recompensait le fait de trader moins, pas de trader mieux.
+        # ---- MOYENNE DES POIDS des dernieres epochs ----
+        # Elle remplace le "meilleur checkpoint". Un checkpoint choisi sur la
+        # validation vaut -3.3 points au test la ou le dernier epoch en vaut
+        # -0.2 : selectionner, c'est attraper un pic de validation qui ne se
+        # reproduit pas. Une moyenne ne depend d'aucun tirage particulier.
+        #
+        # On accumule en float64 : sommer une dizaine de tenseurs float32 puis
+        # diviser perd des chiffres significatifs sur les petits poids, et rien
+        # ne le signalerait.
+        if not epoch_moyenne:
+            stats_precedentes = (epoch_actor_loss, epoch_critic_loss,
+                                 epoch_entropy, epoch_entropy_flat,
+                                 epoch_kl, epoch_grad_norm)
+
+        if not epoch_moyenne and epoch > cfg.epochs - cfg.n_moyenne_poids:
+            etat_courant = policy.state_dict()
+            if somme_poids is None:
+                somme_poids = {k: v.detach().to(torch.float64).clone()
+                               for k, v in etat_courant.items()}
+            else:
+                for k, v in etat_courant.items():
+                    somme_poids[k] += v.detach().to(torch.float64)
+            n_moyennes += 1
+
         val_profit_par_trade = (val_profit / val_num_trades
                                 if val_num_trades > 0 else -1e18)
         if (val_num_trades >= cfg.min_val_trades_save
@@ -3322,7 +3432,10 @@ def run_training_on_split(
             )
         else:
             epochs_no_improve += 1
-            if epochs_no_improve >= patience:
+            # patience <= 0 : aucun arret precoce. C'etait une selection sur la
+            # validation comme une autre — elle choisissait la longueur du run
+            # d'apres elle. Le budget est desormais fixe a l'avance.
+            if patience > 0 and epochs_no_improve >= patience:
                 print(f"[{cfg.side.upper()}{suffix}] Early stopping après {epoch} epochs (Sortino rolling ne progresse plus).")
                 break
 
@@ -3336,10 +3449,18 @@ def run_training_on_split(
 
     print(f"[{cfg.side.upper()}{suffix}] Entraînement terminé, passage en TEST…")
 
+    # LE TEST PORTE SUR LE MODELE COURANT, qui est la moyenne des poids des
+    # dernieres epochs (voir l'epoch cfg.epochs + 1). Les checkpoints "best" et
+    # "bestprofit" continuent d'etre ecrits pour comparaison, mais ils ne
+    # pilotent plus rien : mesure du 2026-09-15, le "best" choisi sur la
+    # validation rend -3.3 points au test quand le dernier epoch en rend -0.2.
+    #
+    # Les seuils et la regle de decision viennent du calibrage fait sur la
+    # moyenne elle-meme, sur la fenetre de calibration — un seuil doit suivre
+    # l'echelle des scores du modele qu'il filtre, ce n'est pas une selection.
     if best_state is not None:
-        policy.load_state_dict(best_state)
-        calib_thr_val = best_thresholds
-        decision_spec = best_decision_spec
+        print(f"[{cfg.side.upper()}{suffix}] (le checkpoint 'best' existe mais "
+              f"n'est PAS utilise pour le test — voir la note ci-dessus)")
     policy.eval()
 
     # Le test couvre sa fenetre ENTIERE, en episodes disjoints. Il jouait
