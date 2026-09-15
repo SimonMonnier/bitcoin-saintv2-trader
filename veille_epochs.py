@@ -64,17 +64,29 @@ JOURNAL = "training_btc.log"
 RAPPORT = "analyse_epochs.md"
 PAS_SONDAGE = 20             # secondes
 
+# Deplacement typique du seuil calibre d'une epoch a l'autre, mesure sur les
+# epochs a actor gele (meme reseau, donc tout ecart vient du calibrage seul) :
+# amplitude 0.0010 sur les cinq premieres epochs d'exec12.
+TREMBLEMENT_SEUIL = 0.0010
+
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-# `\s*` apres chaque signe egal et chaque `PNL` : le journal cadre ses champs,
-# donc la presence d'un espace depend du nombre de chiffres. Un motif qui
-# suppose l'absence d'espace marche jusqu'au jour ou le compte passe sous
-# le millier.
+# DEUX PIEGES DE FORMAT, tous deux payes une fois.
+#
+#   `\s*` apres chaque signe egal : le journal cadre ses champs, donc la
+#   presence d'un espace depend du nombre de chiffres. `trades=1482` en M1,
+#   `trades= 374` en H1.
+#
+#   `[+-]?` devant chaque nombre signe : le journal ecrit `PNL  -147.55$` mais
+#   `PNL  +667.73$`. Un motif qui n'accepte que le moins ne rate pas des
+#   epochs au hasard — il rate PRECISEMENT LES GAGNANTES. La veille n'affichait
+#   que les epochs perdantes et le run paraissait pire qu'il n'etait.
+RE_NB = r"[+-]?[\d.]+"
 RE_VAL = re.compile(
-    r"\[BOTH_(wf\d+)\]\s+EPOCH (\d+)\s+VAL\s+PNL\s+(-?[\d.]+)\$\s+"
+    r"\[BOTH_(wf\d+)\]\s+EPOCH (\d+)\s+VAL\s+PNL\s+(" + RE_NB + r")\$\s+"
     r"trades=\s*(\d+)\s+WR\s+([\d.]+)%\s+PF\s+([\d.]+)\s+DD\s+([\d.]+)%")
 RE_META = re.compile(
-    r"\[BOTH_(wf\d+)\]\s+EPOCH (\d+)\s+META\s+Sortino\s+(-?[\d.]+).*?"
-    r"AvgW\s+\+?(-?[\d.]+)\$\s+AvgL\s+(-?[\d.]+)\$.*?H ([\d.]+).*?"
+    r"\[BOTH_(wf\d+)\]\s+EPOCH (\d+)\s+META\s+Sortino\s+(" + RE_NB + r").*?"
+    r"AvgW\s+(" + RE_NB + r")\$\s+AvgL\s+(" + RE_NB + r")\$.*?H ([\d.]+).*?"
     r"etendue\[tr ([\d.]+) val ([\d.]+)\].*?clipfrac ([\d.]+)%\s+"
     r"temps\[collecte (\d+)s maj PPO (\d+)s calibration (\d+)s "
     r"validation (\d+)s\].*?gpu\[(\d+)C (\d+)/")
@@ -157,9 +169,26 @@ def analyse(v, m, precedent, reference):
     else:
         notes.append(f"entropie {H:.3f} (max 1.099) — la politique "
                      f"{'commence a se differencier' if H < 1.08 else 'reste quasi uniforme'}")
-        notes.append(f"etendue val {et_val:.4f} — ecart entre les convictions du "
-                     f"modele. Si elle est du meme ordre que le tremblement du "
-                     f"seuil (~0.002), la selection est quasi arbitraire.")
+    # Le diagnostic vaut pour TOUTES les epochs, gelees comprises — c'est meme
+    # la qu'il mord le plus fort. Mesure du 2026-09-15 sur les 5 epochs gelees
+    # d'exec12, qui partagent le meme reseau : le seuil calibre s'est deplace
+    # de 0.0010 alors que l'etendue totale des convictions valait 0.0002. Le
+    # seuil tremblait CINQ FOIS plus que l'ecart entre la meilleure et la pire
+    # situation, donc les 5 % retenus changeaient presque entierement d'une
+    # epoch a l'autre : 136 trades d'ecart et jusqu'a 10 points de resultat,
+    # a reseau identique.
+    #
+    # C'est ce qui fabrique les faux champions. Une fois l'etendue au-dessus
+    # de 0.05 le tirage cesse, et l'ecart redevient une mesure du modele.
+    if et_val < 10 * TREMBLEMENT_SEUIL:
+        notes.append(f"SELECTION TIREE AU SORT : etendue val {et_val:.4f} "
+                     f"contre un tremblement de seuil de ~{TREMBLEMENT_SEUIL:.4f}. "
+                     f"Les 5 % retenus changent presque entierement d'une epoch "
+                     f"a l'autre — ce chiffre mesure le tirage, pas le modele.")
+    else:
+        notes.append(f"etendue val {et_val:.4f}, soit "
+                     f"{et_val/TREMBLEMENT_SEUIL:.0f}x le tremblement du seuil : "
+                     f"la selection est portee par le modele.")
     if not math.isnan(err) and abs(par_trade) < err:
         notes.append(f"gain par trade ({par_trade:+.2f}$) sous l'erreur-type de "
                      f"cette epoch ({err:.2f}$) — non separable de zero.")
