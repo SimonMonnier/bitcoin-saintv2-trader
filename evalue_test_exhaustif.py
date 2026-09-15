@@ -48,21 +48,14 @@ PREFIXE = "saintv2_loup_duel_exec12"
 QUEL = "best"
 
 
-def episodes_disjoints(longueur, lookback, pas):
-    """Departs couvrant [lookback, longueur - pas) sans chevauchement."""
-    departs = list(range(lookback, longueur - pas - 2, pas))
-    return departs
-
-
 def joue(policy, env, decision, depart, device):
-    """Joue UN episode a partir d'un depart impose. Rend les PnL des trades."""
-    env.reset()
-    # Le depart est impose APRES le reset : reset() tire au sort via le
-    # curriculum de volatilite, qu'on ne veut pas au test.
-    env.start_idx = depart
-    env.end_idx = depart + env.cfg.episode_length
-    env.idx = depart
-    etat = env._get_obs()
+    """Joue UN episode a partir d'un depart impose. Rend les PnL des trades.
+
+    Le depart et le reset viennent de training.reset_au_depart : cette mesure
+    doit rester identique a celle que fait l'entrainement, sinon les deux
+    chiffres cesseraient d'etre comparables sans que rien ne le signale.
+    """
+    etat, _ = T.reset_au_depart(env, depart)
 
     fini = False
     while not fini:
@@ -150,8 +143,8 @@ def main() -> int:
 
         cfg = T.PPOConfig(**cfg_base.__dict__)
         env = T.BTCTradingEnvDiscrete(test_data, cfg)
-        departs = episodes_disjoints(test_data.length, env.lookback,
-                                     cfg.episode_length)
+        departs = T.departs_disjoints(test_data.length, cfg.lookback,
+                                      cfg.episode_length)
 
         pnls, sides = [], []
         for d in departs:

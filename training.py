@@ -1122,6 +1122,48 @@ def create_datasets(df: pd.DataFrame, feature_cols: List[str],
     return train_data, calib_data, val_data, test_data
 
 
+def departs_disjoints(longueur: int, lookback: int, pas: int) -> List[int]:
+    """Departs d'episodes couvrant la fenetre UNE FOIS, sans chevauchement.
+
+    POURQUOI CETTE FONCTION EXISTE, mesure du 2026-09-15. La validation et le
+    test tiraient leurs departs au hasard via `reset()`, avec deux
+    consequences qui ont fausse tout le pilotage d'exec10 a exec12 :
+
+      - COUVERTURE PARTIELLE. Le test jouait 5 episodes de 400 barres, soit
+        2 000 barres sur 7 934. Trois quarts de la fenetre n'etaient jamais
+        joues. Sur 132 trades l'erreur-type du winrate valait 4.1 points,
+        quand l'effet cherche en vaut 3 : les trois folds se contredisaient
+        (+3.9 / -9.8 / -3.2) par pur bruit d'echantillon. Reevalues sur la
+        fenetre entiere, ils se sont alignes a environ -3 points.
+
+      - ECHANTILLON BIAISE. `reset()` passe par le curriculum de volatilite,
+        qui tire parmi les 30 % de barres les moins volatiles et les 30 % les
+        plus volatiles. Le milieu de la distribution n'etait jamais mesure. Le
+        curriculum est un outil d'ENTRAINEMENT ; l'appliquer a la mesure fait
+        evaluer autre chose que ce qu'on croit.
+
+    Le train garde ses departs aleatoires : c'est la que le curriculum sert.
+    """
+    if longueur <= lookback + pas + 2:
+        return [lookback]
+    return list(range(lookback, longueur - pas - 2, pas))
+
+
+def reset_au_depart(env, depart: int):
+    """reset() puis depart IMPOSE, avec l'observation recalculee.
+
+    `reset()` tire son propre depart au hasard ; on le remplace ensuite. Le
+    point delicat est la derniere ligne : l'observation rendue par reset()
+    correspond au depart tire, pas a celui qu'on impose. L'oublier ne leve
+    aucune erreur — le premier pas de l'episode part simplement d'ailleurs.
+    """
+    _, info = env.reset()
+    env.start_idx = depart
+    env.end_idx = depart + env.cfg.episode_length
+    env.idx = depart
+    return env._get_obs(), info
+
+
 def create_datasets_from_slices(
     df: pd.DataFrame,
     feature_cols: List[str],
@@ -2004,13 +2046,22 @@ def run_training_on_split(
     train_envs = [
         BTCTradingEnvDiscrete(train_data, cfg) for _ in range(cfg.episodes_per_epoch)
     ]
-    val_envs = [
-        BTCTradingEnvDiscrete(val_data, cfg) for _ in range(cfg.val_episodes)
-    ]
+
+    # MESURE EXHAUSTIVE, pas échantillonnée. Voir departs_disjoints : la
+    # validation, la calibration et le test couvrent désormais leur fenêtre
+    # entière une fois, au lieu de tirer des départs au hasard dans un pool
+    # biaisé par le curriculum de volatilité. `cfg.val_episodes` ne dimensionne
+    # donc plus rien ; le nombre d'épisodes est celui qu'exige la fenêtre.
+    departs_val = departs_disjoints(val_data.length, cfg.lookback,
+                                    cfg.episode_length)
+    departs_calib = departs_disjoints(calib_data.length, cfg.lookback,
+                                      cfg.episode_length)
+    val_envs = [BTCTradingEnvDiscrete(val_data, cfg) for _ in departs_val]
     # Environnements de CALIBRATION, sur la fenetre qui PRECEDE celle de mesure.
-    calib_envs = [
-        BTCTradingEnvDiscrete(calib_data, cfg) for _ in range(cfg.val_episodes)
-    ]
+    calib_envs = [BTCTradingEnvDiscrete(calib_data, cfg) for _ in departs_calib]
+    print(f"  • Mesure exhaustive : {len(departs_val)} épisodes de validation "
+          f"({100*len(departs_val)*cfg.episode_length/max(val_data.length,1):.0f} % "
+          f"de la fenêtre), {len(departs_calib)} de calibration")
 
     policy = build_policy(
         device, lookback=cfg.lookback, n_features=OBS_N_FEATURES,
@@ -2830,8 +2881,8 @@ def run_training_on_split(
         # PRECEDE celle de mesure. Les seuils en sortent, puis sont figes.
         v_states = []
         v_infos = []
-        for e in calib_envs:
-            s0, i0 = e.reset()
+        for e, d in zip(calib_envs, departs_calib):
+            s0, i0 = reset_au_depart(e, d)
             v_states.append(s0)
             v_infos.append(i0)
         cal_active = list(range(len(calib_envs)))
@@ -2920,8 +2971,8 @@ def run_training_on_split(
         np.random.seed(cfg.val_seed + 1)
         v_states = []
         v_infos = []
-        for e in val_envs:
-            s0, i0 = e.reset()
+        for e, d in zip(val_envs, departs_val):
+            s0, i0 = reset_au_depart(e, d)
             v_states.append(s0)
             v_infos.append(i0)
 
@@ -3291,8 +3342,16 @@ def run_training_on_split(
         decision_spec = best_decision_spec
     policy.eval()
 
-    # 5 épisodes de test joués en parallèle, même schéma que train/val.
-    n_test = 5
+    # Le test couvre sa fenetre ENTIERE, en episodes disjoints. Il jouait
+    # auparavant 5 episodes tires au hasard, soit un quart de la fenetre :
+    # 132 trades pour les trois folds, une erreur-type de 4.1 points, et trois
+    # resultats qui se contredisaient. Voir departs_disjoints.
+    departs_test = departs_disjoints(test_data.length, cfg.lookback,
+                                     cfg.episode_length)
+    n_test = len(departs_test)
+    print(f"  • TEST exhaustif : {n_test} épisodes disjoints, "
+          f"{100*n_test*cfg.episode_length/max(test_data.length,1):.0f} % "
+          f"de la fenêtre")
     test_decisions = [EntryDecisionPolicy(decision_spec) for _ in range(n_test)]
     test_envs = [BTCTradingEnvDiscrete(test_data, cfg) for _ in range(n_test)]
     all_trades = []
@@ -3301,8 +3360,8 @@ def run_training_on_split(
 
     t_states: List[np.ndarray] = []
     t_infos: List[Dict] = []
-    for e in test_envs:
-        s0, i0 = e.reset()
+    for e, d in zip(test_envs, departs_test):
+        s0, i0 = reset_au_depart(e, d)
         t_states.append(s0)
         t_infos.append(i0)
     t_active = list(range(n_test))
@@ -3547,10 +3606,10 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec12"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec13"
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec12: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec13: trois folds sans bootstrap inter-fold.")
     run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10,
                     max_folds=3, start_fold=1,
                     bootstrap_from_path=None,
