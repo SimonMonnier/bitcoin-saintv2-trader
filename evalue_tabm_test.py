@@ -93,9 +93,16 @@ def modele_lineaire():
     return lambda: Enveloppe()
 
 
+def modele_groupes():
+    """Attention entre les onze groupes semantiques. Voir modele_groupes.py."""
+    import modele_groupes as MG
+    return MG.fabrique(list(FEATURE_COLS))
+
+
 MODELES = {"ridge": modele_lineaire,
            "lightgbm": B.modele_arbres,
-           "tabm": B.modele_tabm}
+           "tabm": B.modele_tabm,
+           "groupes": modele_groupes}
 
 
 def cibles_brutes(df, idx):

@@ -67,3 +67,5 @@ training_btc.err
 data_cache_BTCUSD_H1_complet.pkl
 lookback.log
 lookback.err
+groupes.log
+groupes.err
