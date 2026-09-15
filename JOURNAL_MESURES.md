@@ -8,6 +8,83 @@ Ordre antichronologique.
 
 ---
 
+## 15 septembre 2026 — trois biais de mesure, et ce qu'ils ont coûté
+
+La nuit a produit une chaîne de conclusions dont **aucune ne tenait**. Elles
+sont listées ici parce que chacune semblait raisonnable isolément.
+
+### Biais 1 — le chevauchement des fenêtres de résultat
+
+Entrées échantillonnées toutes les 10 barres, barrières mettant jusqu'à 240
+barres à se résoudre. Les résultats voisins se recouvrent presque
+entièrement : on compte 1 368 trades là où il y en a **58 d'indépendants**.
+
+    modele a arbres, 5 % de selectivite
+      avec chevauchement    58.0 % de reussite   t +9.02
+      sans chevauchement    39.7 %               t -0.87
+
+C'est ce biais qui avait fait choisir le R:R 1.4, et il contaminait le tableau
+inscrit dans `saint_core` (E[R] +0.1751, t +3.4).
+
+### Biais 2 — la métrique ne correspondait pas au point de fonctionnement
+
+L'AUC classe **toute** la distribution ; la stratégie ne touche que les 2 à
+5 % du sommet. Retirer le bloc H1 améliore l'AUC de +0.0136 et dégrade
+l'espérance à toutes les sélectivités utilisées. Suivre l'AUC aurait fait
+supprimer treize colonnes utiles.
+
+### Biais 3 — la phase d'échantillonnage
+
+Une entrée toutes les 240 barres : il y a 240 phases possibles. Même jeu,
+mêmes données, même protocole, seule la phase change :
+
+    E[R] a 5 %, 8 phases : +0.1579 -0.0696 +0.0317 -0.0487
+                           -0.0295 -0.0308 -0.0711 +0.0164
+    moyenne -0.0054   ecart-type 0.0757   etendue 0.2290
+
+**La phase 0, utilisée pour toutes les mesures, était la plus favorable des
+huit.** Tous les écarts conclus cette nuit — R:R (0.21), H1 (0.16), H4 (0.10),
+M5/M15 (0.06 à 0.29), Ichimoku (0.05) — sont du même ordre que ce bruit.
+
+**Correctif : moyenner sur les phases et comparer APPARIÉ à phase égale.**
+Le R:R 2.0 ne survit pas : écart +0.0382 (t +1.24) à 2 %, −0.0071 (t −0.31) à
+5 %. Ni meilleur ni pire que 1.4.
+
+### Ce que la mesure peut et ne peut pas dire
+
+Seuil de détection ≈ 0.05 en E[R]. Un E[R] de **+0.02** — deux fois et demie
+en dessous — donnerait +0.6 % par jour à 25 trades et 1.2 % de risque.
+
+**La sonde ne distingue donc pas « rien » d'« excellent ».** Conclure à
+l'absence d'avantage à partir d'elle est une erreur de raisonnement. Le
+protocole purgé jette 99.6 % des données pour garantir l'indépendance ;
+l'entraînement réel, lui, voit chaque barre.
+
+### Candidats mesurés, tous non concluants
+
+Ichimoku (3 jeux de périodes), bloc H4, bloc M5, bloc M15, retrait du H1,
+basis perpétuel/spot. Aucun écart ne dépasse le bruit de phase. Le basis seul
+donne **AUC 0.5003** — exactement le hasard.
+
+Seul effet robuste, à ~3 écarts-types : retirer `taker_ratio` (−0.244) ou
+`taker_1m_ma5` (−0.252).
+
+### exec8 — 26 epochs, architecture complète, R:R 2.0
+
+Apprentissage massif et mesurable : étendue ×2 400 (0.0002 → 0.489), perte du
+critique ÷18 (20.75 → 1.15), entropie de 1.099 à 0.187.
+
+**Résultat plat depuis l'epoch 7.** Meilleur écart au point mort −11.2 pt
+(epoch 9) ; −13.6 pt à l'epoch 26. 48 épisodes de validation sur 48 perdants.
+
+> **Ne pas sur-interpréter la convergence du critique.** J'avais écrit qu'un
+> critique à 1.15 sur une politique perdante prouvait qu'il n'y a rien de
+> mieux à trouver. C'est faux : une perte de critique basse signifie que la
+> valeur est bien prédite, ce qui n'établit rien sur le plafond atteignable.
+> Correction due à une analyse indépendante du même run.
+
+---
+
 ## 14 septembre 2026 — soirée
 
 ### Le flux Binance à la minute : +0.0087 d'AUC
