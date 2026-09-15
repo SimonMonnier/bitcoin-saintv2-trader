@@ -124,31 +124,57 @@ def cibles_brutes(df, idx):
     return out[0], out[1]
 
 
-def joue_avec_scores(env, depart, scores_b, scores_s, marge):
+def joue_avec_scores(env, depart, scores_b, scores_s, marge, reference=None,
+                     borne=(0.5, 2.0)):
     """Joue un episode ou la decision vient de deux scores par barre.
 
     `scores_*` sont indexes comme les barres du dataset. La decision au pas
     courant lit la barre idx-1, exactement comme l'observation de la policy :
     prendre idx ferait entrer la bougie en cours, donc du futur.
+
+    TAILLE DE POSITION SELON LA CONVICTION. Si `reference` est fourni, le
+    risque pris est proportionnel a la prediction, rapportee a cette reference
+    et bornee. Sinon toutes les positions font la meme taille.
+
+    POURQUOI C'EST LE LEVIER LE MOINS CHER DE LA LISTE. Le modele predit un
+    RENDEMENT NET en unites de risque. On ne s'en servait que pour classer et
+    seuiller, puis on risquait la meme fraction du capital sur chaque trade
+    retenu, qu'il promette +0.9 R ou +2.5 R. L'amplitude de la prediction
+    etait produite puis jetee. La reutiliser ne demande aucun modele nouveau,
+    aucun entrainement, et agit directement sur le rendement par unite de
+    risque — le chiffre qu'on cherche a bouger.
+
+    La reference est calibree sur la fenetre de CALIBRATION, jamais sur le
+    test : sinon la taille des positions serait reglee sur les donnees censees
+    les juger, ce qui est exactement la faute que ce depot a mesuree a trois ou
+    quatre points de cout.
+
+    Les bornes evitent les deux extremes que le Kelly integral produit : une
+    position minuscule qui ne paie pas ses frais, et une position enorme sur
+    une prediction qui n'est qu'un point d'une distribution large.
     """
     _, _ = T.reset_au_depart(env, depart)
     fini = False
     while not fini:
         i = env.idx - 1
         b, s = float(scores_b[i]), float(scores_s[i])
-        if max(b, s) < marge:
+        meilleur = max(b, s)
+        if meilleur < marge:
             action = 2                      # abstention
+            echelle = 1.0
         else:
             action = 0 if b >= s else 1
-        env.set_risk_scale(1.0)
+            echelle = (1.0 if reference is None
+                       else float(np.clip(meilleur / reference, *borne)))
+        env.set_risk_scale(echelle)
         _, _, fini, _, _ = env.step(action)
     return list(env.trades_pnl)
 
 
-def evalue(env, departs, sb, ss, marge):
+def evalue(env, departs, sb, ss, marge, reference=None):
     pnls = []
     for d in departs:
-        pnls += joue_avec_scores(env, d, sb, ss, marge)
+        pnls += joue_avec_scores(env, d, sb, ss, marge, reference)
     return pnls
 
 
@@ -172,6 +198,9 @@ def main() -> int:
     # methodes sans rapport).
     sel_fixe = float(sys.argv[1]) if len(sys.argv) > 1 else None
     nom_modele = sys.argv[2] if len(sys.argv) > 2 else "tabm"
+    # Troisieme argument : "conviction" pour dimensionner les positions selon
+    # la prediction au lieu de les faire toutes identiques.
+    par_conviction = len(sys.argv) > 3 and sys.argv[3] == "conviction"
     cfg = T.PPOConfig()
     df = T.load_mt5_data(cfg)
     n = len(df)
@@ -180,8 +209,9 @@ def main() -> int:
     window = train_len + val_len + test_len
 
     print(f"{n:,} barres | train {train_len:,} val {val_len:,} test {test_len:,}")
-    print(f"modele {nom_modele}  |  cible SL {SL_MULT}xATR  R:R {RR}  "
-          f"detention {HOLD} barres (reglage de l'environnement)")
+    print(f"modele {nom_modele}  |  taille "
+          f"{'PAR CONVICTION' if par_conviction else 'fixe'}  |  "
+          f"cible SL {SL_MULT}xATR  R:R {RR}  detention {HOLD} barres")
     print(f"seuil calibre sur CALIB, selectivite choisie sur VALIDATION "
           f"parmi {CANDIDATS}, test intouche")
     print()
@@ -261,8 +291,16 @@ def main() -> int:
         env = T.BTCTradingEnvDiscrete(test_data, cfg)
         departs = T.departs_disjoints(test_data.length, cfg.lookback,
                                       cfg.episode_length)
+        # Reference de taille : la mediane des convictions RETENUES sur la
+        # fenetre de calibration. Une position de taille normale correspond
+        # donc au trade median, et l'echelle dit "combien mieux que d'habitude"
+        # cette occasion est jugee.
+        reference = None
+        if par_conviction:
+            retenus = meilleur_cal[meilleur_cal >= marges[best_sel]]
+            reference = float(np.median(retenus)) if len(retenus) else None
         pnls = evalue(env, departs, sb[a_te:b_te], ss[a_te:b_te],
-                      marges[best_sel])
+                      marges[best_sel], reference)
 
         r = resume(f"wf{fold}", pnls)
         if r:

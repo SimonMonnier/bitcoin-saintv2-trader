@@ -1447,6 +1447,8 @@ def build_policy(device, lookback: int = 25,
                  archi: str = ARCHI_DEFAUT,
                  d_model_patch: int = 32,
                  mlp_dim: int = 128,
+                 taille_patch: int = 16,
+                 pas: int = 8,
                  state_dict=None):
     """Instancie la policy avec les hyperparamètres d'architecture du training.
 
@@ -1479,12 +1481,44 @@ def build_policy(device, lookback: int = 25,
         if est_patch and est_saint:
             raise ValueError("checkpoint ambigu : cles PatchTST ET SAINT")
         if est_patch:
-            lb = int(state_dict["pos"].shape[1] - 1) * 8 + 16   # patchs -> lookback
-            return PatchTSTPolicy(
-                n_features=n_features, lookback=lb,
+            # LA TAILLE DE SEGMENT SE LIT DANS LE FICHIER : proj projette un
+            # segment sur d_model, donc sa dimension d'entree EST la taille du
+            # segment. Le pas, lui, ne s'y trouve pas — on le deduit de la
+            # relation n_patchs = (lookback - segment) / pas + 1, avec le
+            # lookback fourni par l'appelant.
+            #
+            # CE QUE CELA REMPLACE. La version precedente ecrivait
+            # `(n_patchs - 1) * 8 + 16`, soit le pas et la taille codes en dur.
+            # Elle rendait le bon lookback pour la seule configuration 16/8 et
+            # un lookback FAUX pour toute autre, sans rien signaler — le meme
+            # defaut que la profondeur et la taille de banque, deja corrige
+            # ici, et qui a deja coute un checkpoint charge de travers.
+            seg = int(state_dict["proj.weight"].shape[1])
+            n_p = int(state_dict["pos"].shape[1])
+            pas_lu = ((lookback - seg) // (n_p - 1)) if n_p > 1 else pas
+            p = PatchTSTPolicy(
+                n_features=n_features, lookback=lookback,
+                taille_patch=seg, pas=max(1, pas_lu),
                 d_model=int(state_dict["pos"].shape[2]),
                 mlp_dim=int(state_dict["mlp.0.weight"].shape[0]),
                 n_actions=N_ACTIONS).to(device)
+            # CE QUE CE CONTROLE NE PEUT PAS FAIRE, et qu'il faut savoir. Le
+            # lookback n'est PAS recuperable depuis les poids : le pas etant
+            # deduit de la relation ci-dessus, n'importe quel lookback se
+            # reconstruit en ajustant le pas, et le reseau se charge alors sans
+            # broncher avec un espacement temporel faux. Verifie : un
+            # checkpoint de lookback 4 se reconstruit proprement en pretendant
+            # 96. Le seul symptome serait un modele qui trade mal.
+            #
+            # La geometrie est donc ecrite dans le fichier _calib.json a cote
+            # du checkpoint, qui est deja celui qui dit comment s'en servir.
+            # Le controle ci-dessous n'attrape que les incoherences grossieres.
+            if p.n_patchs != n_p:
+                raise ValueError(
+                    f"lookback {lookback} incompatible avec le checkpoint : "
+                    f"{p.n_patchs} segments construits contre {n_p} attendus "
+                    f"(segment {seg}, pas {max(1, pas_lu)})")
+            return p
         if est_saint:
             archi = "saint"
 
@@ -1498,6 +1532,7 @@ def build_policy(device, lookback: int = 25,
 
     if archi == "patchtst":
         return PatchTSTPolicy(n_features=n_features, lookback=lookback,
+                              taille_patch=taille_patch, pas=pas,
                               d_model=d_model_patch, mlp_dim=mlp_dim,
                               n_actions=N_ACTIONS).to(device)
 

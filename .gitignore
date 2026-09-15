@@ -69,3 +69,7 @@ lookback.log
 lookback.err
 groupes.log
 groupes.err
+meta.log
+meta.err
+conviction.log
+conviction.err

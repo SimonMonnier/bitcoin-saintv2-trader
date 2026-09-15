@@ -256,7 +256,28 @@ class PPOConfig:
     # l'attention porte sur ~L/8 segments au lieu de L barres, et les colonnes
     # sont traitees separement. A 96 barres avec des segments de 16 et un pas
     # de 8, cela fait 11 jetons — l'attention coute 75 fois moins qu'a 96.
-    lookback: int = 96              # 96 barres H1 = 4 jours de contexte
+    # LOOKBACK RAMENE DE 96 A 4. Mesure du 2026-09-16 : le meme modele, le
+    # meme protocole, seule change la profondeur de passe empilee en entree.
+    #
+    #     profondeur  colonnes       PnL   trades    ecart   PF    folds +
+    #              1       103   +579.40$     432   +3.9pt  1.18     3/3
+    #              4       412   +992.73$     471   +6.1pt  1.30     2/3
+    #             16      1648   +670.05$     500   +3.9pt  1.18     3/3
+    #
+    # Seize fois plus de colonnes rendent exactement le meme chiffre que la
+    # ligne seule. Le passe n'apporte rien de mesurable, et c'est coherent avec
+    # ce que sont ces colonnes : Tenkan resume deja 9 barres, Kijun 26, SSB 52,
+    # Chikou en regarde 26 en arriere. Tout cela est DEJA dans la ligne de
+    # l'instant t ; lui redonner les 95 precedentes lui redonne ce qu'il a
+    # deja, sous une forme plus difficile — et lui offre 95 barres de plus pour
+    # surajuster.
+    lookback: int = 4
+    # Le decoupage suit le lookback : des segments de 16 barres n'existent pas
+    # dans une fenetre de 4. Segment 2 et pas 1 donnent trois jetons, donc une
+    # attention qui a encore quelque chose a faire ; un segment de 4 n'en
+    # donnerait qu'un seul et l'encodeur deviendrait un simple MLP.
+    taille_patch: int = 2
+    pas_patch: int = 1
 
     # "M1" ou "H1". Choisit le cache et, avec lui, l'echelle de decision.
     timeframe_entrainement: str = "H1"
@@ -2083,6 +2104,7 @@ def run_training_on_split(
         device, lookback=cfg.lookback, n_features=OBS_N_FEATURES,
         archi=cfg.architecture, n_ref=cfg.n_ref, num_blocks=cfg.num_blocks,
         d_model_patch=cfg.d_model_patch, mlp_dim=cfg.mlp_dim,
+        taille_patch=cfg.taille_patch, pas=cfg.pas_patch,
     ) if cfg.architecture == "patchtst" else SAINTPolicySingleHead(
         n_features=OBS_N_FEATURES,
         d_model=cfg.d_model,
@@ -3364,6 +3386,18 @@ def run_training_on_split(
                     "epoch": epoch,
                     "val_trades": val_num_trades,
                     "regle": "rolling_rank; historique par flux; egalites conservatrices",
+                    # GEOMETRIE DE L'ENTREE. Elle n'est PAS recuperable depuis
+                    # les poids : avec un segment de 2, n'importe quel lookback
+                    # se reconstruit en ajustant le pas, et le reseau se charge
+                    # sans broncher avec un espacement temporel faux. Le seul
+                    # symptome serait un modele qui trade mal. On l'ecrit donc
+                    # ici, a cote du seuil, puisque c'est deja le fichier qui
+                    # dit comment se servir du checkpoint.
+                    "lookback": int(cfg.lookback),
+                    "taille_patch": int(cfg.taille_patch),
+                    "pas_patch": int(cfg.pas_patch),
+                    "architecture": cfg.architecture,
+                    "n_features": int(OBS_N_FEATURES),
                 }, f, indent=2)
 
         # Best sur PnL PAR TRADE, et non sur le PnL TOTAL.
@@ -3727,10 +3761,10 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec14"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec16"
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec14: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec16: trois folds sans bootstrap inter-fold.")
     run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10,
                     max_folds=3, start_fold=1,
                     bootstrap_from_path=None,
