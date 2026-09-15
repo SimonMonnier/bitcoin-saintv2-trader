@@ -26,19 +26,31 @@ import datetime as dt
 
 JOURNAL = "training_btc.log"
 RAPPORT = "analyse_epochs.md"
-LIGNE_HASARD = 22.8          # part de trades gagnants d'un tirage au hasard
+# Part de trades gagnants d'un tirage AU HASARD, aux barrieres courantes.
+#
+# A REMESURER A CHAQUE CHANGEMENT DE SL/TP : une cible plus lointaine est
+# mecaniquement moins souvent atteinte, donc cette ligne bouge avec le R:R.
+# La laisser figee fait comparer un winrate a une reference qui n'est plus la
+# sienne — l'erreur exacte commise en presentant le passage a R:R 2.0.
+#
+# Mesure sur 1 140 entrees INDEPENDANTES (espacees de 240 barres) de la
+# fenetre de validation :
+#
+#     SL 2.0xATR  R:R 1.4   hasard 32.7 %   point mort 49.3 %   ecart 16.6 pt
+#     SL 2.0xATR  R:R 2.0   hasard 26.7 %   point mort 40.7 %   ecart 14.0 pt
+#
+# L'ecart A COMBLER est la seule grandeur comparable entre configurations.
+LIGNE_HASARD = 26.7
 PAS_SONDAGE = 20             # secondes
 
-# Runs precedents au meme point, tous sur l'architecture REDUITE. exec7 est le
-# premier a changer de modele : c'est donc le premier ecart attribuable a
-# l'architecture plutot qu'aux features ou a l'environnement.
-REFERENCE = {
-    6:  {"exec3": -3.21, "exec4": -3.29, "exec5": -3.11},
-    7:  {"exec3": -2.60, "exec5": -2.84},
-    8:  {"exec3": -2.96, "exec5": -2.85},
-    9:  {"exec3": -2.98, "exec5": -2.89},
-    10: {"exec3": -2.79},
-}
+# VIDE VOLONTAIREMENT depuis exec8. Les runs exec3 a exec7 tournaient a
+# R:R 1.4 : leur PnL par trade n'est pas comparable, puisque gains et pertes
+# ne sont plus dans le meme rapport. Comparer les deux ferait exactement
+# l'erreur qu'on vient de corriger sur la ligne du hasard.
+#
+# Ce qui reste comparable d'une configuration a l'autre, c'est l'ECART AU
+# POINT MORT en points, que la veille affiche deja.
+REFERENCE = {}
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 RE_VAL = re.compile(
