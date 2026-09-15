@@ -247,18 +247,63 @@ FEATURE_COLS_H1 = [
 # compte a 30 features, donc le meme cout GPU.
 FEATURE_COLS_EXT = [
     "taker_ratio",       # flux agressif acheteur/vendeur, agrege 5 min (metrics)
-    "taker_1m_ma5",      # le meme a la minute, moyenne causale sur 5 (klines)
+    "taker_ma5",         # le meme, moyenne causale sur 5 barres (klines)
 ]
 
 # LIQUIDITE ET TEMPS. J'avais exclu les features d'heure sur BTCUSD en invoquant
 # une mesure a -0.0022 ; la mesure comparative dit le contraire sous cette
 # configuration : 27 -> 30 colonnes fait passer l'esperance de +0.1249 a +0.1751.
-# `spread_rel` est rapporte a sa normale d'une journee — brut, il encoderait
-# l'ANNEE (1.74 ecart-type de derive sur huit ans, mesure sur l'or).
-FEATURE_COLS_LIQ_TEMPS = ["spread_rel", "heure_sin", "heure_cos"]
+# LIQUIDITE ET TEMPS. `spread_rel` a ete RETIRE le 2026-09-15, quand le jeu H1
+# est passe de 3.6 a 9.1 ans en changeant de source. Le spread venait de MT5,
+# qui ne remonte qu'a 2023 ; sur les six annees ajoutees il aurait fallu le
+# constanter. Une colonne constante sur 70 % du jeu n'est pas neutre : elle
+# apprend au modele a distinguer "avant" de "apres", c'est-a-dire la date, qui
+# est la fuite la plus facile a commettre et la plus difficile a voir.
+#
+# Les deux colonnes qui le remplacent viennent des memes archives que le prix,
+# donc elles existent sur toute la periode :
+#   - taille moyenne d'un trade  : une heure poussee par de gros ordres ne se
+#     comporte pas comme une heure faite de poussiere, a volume egal ;
+#   - intensite                  : rang du nombre de trades sur une semaine
+#     glissante, soit le regime d'activite, en rang pour rester stationnaire
+#     entre 2017 et 2026 ou les volumes absolus n'ont aucune commune mesure.
+FEATURE_COLS_LIQ_TEMPS = ["flux_taille_trade", "flux_intensite",
+                          "heure_sin", "heure_cos"]
 
-FEATURE_COLS = (FEATURE_COLS_M1 + FEATURE_COLS_H1
-                + FEATURE_COLS_EXT + FEATURE_COLS_LIQ_TEMPS)
+# ============================================================
+#  ECHELLE DE DECISION — H1 depuis exec10
+# ============================================================
+#
+# La friction est un montant FIXE (~37.84 $ sur BTCUSD) ; l'unite de risque est
+# la distance au stop, qui grandit avec l'echelle. Rapport mesure :
+#
+#        UT    friction/ATR    E[R] de la strategie de range
+#        M1        1.05 R              -1.69
+#        M5        0.40 R              -0.66
+#       M15        0.21 R              -0.46
+#        H1        0.09 R              -0.27
+#        H4        0.04 R              +0.12
+#
+# Monotone sans exception. Sur M1 on paie plus que le stop avant d'avoir eu
+# raison. H1 est le point d'equilibre : friction basse ET assez de barres pour
+# entrainer (30 379), ce que le H4 n'offre pas (271 trades).
+#
+# Le jeu H1 est produit par prepare_h1.py. Les 12 colonnes de prix sont
+# calculees SUR H1 ; le contexte superieur est le H4, decale de shift(1).
+FEATURE_COLS_TF = FEATURE_COLS_M1                      # calculees sur H1
+FEATURE_COLS_SUP = [c.replace("_h1", "_h4") for c in FEATURE_COLS_H1]
+
+# Features de la strategie "bornes d'un range" (Ichimoku / Riguet).
+# Voir features_range.py pour les definitions exactes et, surtout, pour la
+# raison qui fait que les figures de chandeliers y sont CONDITIONNEES a la
+# proximite d'une borne : hors des bornes, les documents les disent
+# "strictement inutiles", et une colonne calculee partout n'est que du bruit.
+from features_range import GROUPES as _GROUPES_RANGE
+FEATURE_COLS_RANGE = [c for g in _GROUPES_RANGE.values() for c in g]
+
+FEATURE_COLS = (FEATURE_COLS_TF + FEATURE_COLS_SUP
+                + FEATURE_COLS_EXT + FEATURE_COLS_LIQ_TEMPS
+                + FEATURE_COLS_RANGE)
 
 N_BASE_FEATURES = len(FEATURE_COLS)
 
@@ -1206,6 +1251,149 @@ class SAINTPolicySingleHead(nn.Module):
             self.memoire.rafraichit(self.encode)
 
 
+class PatchTSTPolicy(nn.Module):
+    """Politique PPO batie sur PatchTST — actor : logits, critic : V(s).
+
+    POURQUOI CETTE ARCHITECTURE ICI. SAINT fait de l'attention sur DEUX axes,
+    dont celui des colonnes, ce qui coute cher et limite en pratique la
+    fenetre a 25 barres. PatchTST prend le probleme a l'envers : il decoupe la
+    serie en SEGMENTS et traite chaque colonne INDEPENDAMMENT, ce qui permet
+    d'allonger l'historique sans faire exploser le cout.
+
+    Deux mecanismes, tous deux tires du papier (Nie et al., ICLR 2023) :
+
+      SEGMENTATION. On regroupe les barres par paquets de `taille_patch` avec
+      recouvrement. L'attention porte alors sur ~L/pas jetons au lieu de L, et
+      chaque jeton represente un MOTIF local plutot qu'une barre isolee. A 96
+      barres avec des segments de 16 et un pas de 8, cela fait 11 jetons au
+      lieu de 96 — l'attention coute 75 fois moins.
+
+      CANAUX INDEPENDANTS. Le MEME encodeur voit chaque feature separement,
+      sans melange inter-colonnes. C'est l'exact oppose de SAINT. Le papier
+      defend que ce partage REGULARISE : au lieu d'apprendre une fonction sur
+      34 colonnes conjointes, on apprend une fonction sur une serie, vue 34
+      fois. Le melange entre colonnes n'a lieu qu'a la toute fin, dans la tete.
+
+    TETE AGREGEE, ET NON "FLATTEN". Le papier aplatit (F x N x d) parce qu'il
+    predit une sequence entiere. Ici la sortie est 3 logits et un scalaire : on
+    moyenne donc sur les segments avant la tete. A 192 barres, la version
+    aplatie ferait 11.4 M de parametres contre 0.6 M ici — pour un
+    environnement qui produit quelques milliers de decisions par epoch, le
+    surapprentissage serait certain.
+
+    INDEPENDANCE AU LOT. Aucune operation ne croise les echantillons d'un lot :
+    un lot de 8 donne exactement 8 passes de 1, ce que verifie
+    test_architecture.py. C'est la condition pour que les poids appris sous un
+    lot de 128 se comportent pareil en live, ou le lot vaut 1.
+    """
+
+    def __init__(
+        self,
+        n_features: int = OBS_N_FEATURES,
+        lookback: int = 96,
+        taille_patch: int = 16,
+        pas: int = 8,
+        d_model: int = 32,
+        heads: int = 4,
+        num_blocks: int = 3,
+        dropout: float = 0.1,
+        n_actions: int = N_ACTIONS,
+        mlp_dim: int = 128,
+    ):
+        super().__init__()
+        self.n_features = n_features
+        self.lookback = lookback
+        self.taille_patch = taille_patch
+        self.pas = pas
+        self.d_model = d_model
+        self.n_actions = n_actions
+        self.n_patchs = max(1, (lookback - taille_patch) // pas + 1)
+
+        self.proj = nn.Linear(taille_patch, d_model)
+        self.pos = nn.Parameter(torch.zeros(1, self.n_patchs, d_model))
+        nn.init.normal_(self.pos, std=0.02)
+
+        couche = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=heads, dim_feedforward=d_model * 4,
+            dropout=dropout, batch_first=True, norm_first=True,
+            activation="gelu")
+        self.enc = nn.TransformerEncoder(couche, num_layers=num_blocks)
+        self.norm = nn.LayerNorm(d_model)
+
+        # LA TETE DOMINE LE COMPTE DE PARAMETRES : n_features x d_model
+        # entrees, soit 59 x 64 = 3 776 a l'ancienne largeur. Sur un jeu H1 de
+        # 16 708 barres d'entrainement, cela faisait 71 parametres par exemple
+        # et le modele memorisait — mesure : entropie de 1.10 a 0.50 en quinze
+        # epochs, et l'ecart au point mort passant de -1.3 a -8.2 pendant que
+        # l'etendue montait a 0.95. Signature de surapprentissage.
+        self.mlp = nn.Sequential(
+            nn.Linear(n_features * d_model, mlp_dim), nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, mlp_dim), nn.GELU(),
+        )
+        self.actor = nn.Linear(mlp_dim, n_actions)
+        self.critic = nn.Linear(mlp_dim, 1)
+
+        # MEME INTERFACE QUE SAINT. L'entrainement interroge `policy.memoire`
+        # et appelle `rafraichit_banque()` a chaque epoch : sans ces deux
+        # attributs, changer de reseau plante au premier pas. On expose donc
+        # une memoire inexistante plutot que de semer des getattr dans la
+        # boucle d'entrainement — l'appelant n'a pas a savoir quel reseau il
+        # pilote.
+        #
+        # PatchTST n'a PAS de banque de references : sa regularisation vient
+        # du partage de l'encodeur entre colonnes, pas d'une memoire externe.
+        self.memoire = None
+
+        self._init_poids()
+
+    def rafraichit_banque(self):
+        """Sans objet ici — voir `self.memoire`."""
+        return
+
+    def definit_banque(self, obs):
+        raise RuntimeError(
+            "PatchTSTPolicy n'a pas de banque de references : sa "
+            "regularisation vient du partage de l'encodeur entre colonnes.")
+
+    def _init_poids(self):
+        """Tete d'acteur a gain 0.01 (Engstrom et al. 2020).
+
+        Sur PPO ce detail pese davantage que la plupart des choix
+        algorithmiques : un acteur initialise a gain 1 sort des logits deja
+        marques, donc une politique prematurement piquee que les premiers
+        gradients doivent defaire au lieu d'apprendre.
+        """
+        nn.init.orthogonal_(self.actor.weight, gain=0.01)
+        nn.init.zeros_(self.actor.bias)
+        nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        nn.init.zeros_(self.critic.bias)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, T, F) -> (B, n_features * d_model)."""
+        assert x.dim() == 3, f"Input x must be (B,T,F), got {x.shape}"
+        B, T, F = x.shape
+        if T < self.taille_patch:
+            raise ValueError(
+                f"lookback {T} plus court que la taille de segment "
+                f"{self.taille_patch}")
+        h = x.permute(0, 2, 1)                              # (B, F, T)
+        h = h.unfold(dimension=2, size=self.taille_patch, step=self.pas)
+        h = h[:, :, -self.n_patchs:, :]                     # segments les plus RECENTS
+        h = self.proj(h) + self.pos.unsqueeze(1)
+        # On replie F dans le lot : le meme encodeur voit chaque colonne
+        # separement, sans qu'aucune information ne circule entre colonnes
+        # ni entre echantillons.
+        h = h.reshape(B * F, self.n_patchs, self.d_model)
+        h = self.norm(self.enc(h))
+        h = h.reshape(B, F, self.n_patchs, self.d_model).mean(dim=2)
+        return h.reshape(B, F * self.d_model)
+
+    def forward(self, x: torch.Tensor):
+        h = self.mlp(self.encode(x))
+        return self.actor(h), self.critic(h).squeeze(-1)
+
+
 N_REF_DEFAUT = 256
 
 # Profondeur du tronc. 3 blocs, d'apres la configuration par defaut du
@@ -1222,11 +1410,17 @@ N_REF_DEFAUT = 256
 N_BLOCS_DEFAUT = 3
 
 
+ARCHI_DEFAUT = "patchtst"
+
+
 def build_policy(device, lookback: int = 25,
                  n_features: int = OBS_N_FEATURES,
                  n_ref: int = N_REF_DEFAUT,
                  num_blocks: int = N_BLOCS_DEFAUT,
-                 state_dict=None) -> SAINTPolicySingleHead:
+                 archi: str = ARCHI_DEFAUT,
+                 d_model_patch: int = 32,
+                 mlp_dim: int = 128,
+                 state_dict=None):
     """Instancie la policy avec les hyperparamètres d'architecture du training.
 
     Toute divergence ici rend les checkpoints incompatibles : passer par cette
@@ -1238,7 +1432,35 @@ def build_policy(device, lookback: int = 25,
     l'erreur serait soit un refus de chargement, soit pire, un modèle construit
     sans mémoire qui trade en ignorant une partie de ce qu'il a appris.
     """
+    # L'ARCHITECTURE elle-meme se deduit du fichier, DANS LES DEUX SENS. Le
+    # parametre `pos` n'existe que dans PatchTST, `embed.weight` que dans
+    # SAINT ; le fichier tranche donc seul, et `archi` ne sert plus que quand
+    # il n'y a pas de fichier (construction a neuf).
+    #
+    # POURQUOI DANS LES DEUX SENS. La version precedente ne reconnaissait que
+    # PatchTST : un checkpoint SAINT tombait dans la branche par defaut, qui
+    # vaut "patchtst" depuis exec10, et le live aurait construit la mauvaise
+    # architecture. Le chargement echouait ensuite sur une liste de cles
+    # illisible au lieu de dire ce qui n'allait pas. Une deduction qui ne
+    # couvre qu'un cas n'est pas une deduction, c'est un defaut par defaut.
+    #
+    # Le prefixe est aussi devenu une egalite : `startswith("pos")` aurait
+    # attrape n'importe quelle future colonne nommee pos_quelque_chose.
     if state_dict is not None:
+        est_patch = "pos" in state_dict
+        est_saint = any(k.startswith(("embed.", "blocks.")) for k in state_dict)
+        if est_patch and est_saint:
+            raise ValueError("checkpoint ambigu : cles PatchTST ET SAINT")
+        if est_patch:
+            lb = int(state_dict["pos"].shape[1] - 1) * 8 + 16   # patchs -> lookback
+            return PatchTSTPolicy(
+                n_features=n_features, lookback=lb,
+                d_model=int(state_dict["pos"].shape[2]),
+                mlp_dim=int(state_dict["mlp.0.weight"].shape[0]),
+                n_actions=N_ACTIONS).to(device)
+        if est_saint:
+            archi = "saint"
+
         cle = "memoire.bank_repr"
         n_ref = int(state_dict[cle].shape[0]) if cle in state_dict else 0
         # Profondeur deduite elle aussi : elle etait ecrite en dur ici ET dans
@@ -1246,6 +1468,11 @@ def build_policy(device, lookback: int = 25,
         vus = {int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")}
         if vus:
             num_blocks = max(vus) + 1
+
+    if archi == "patchtst":
+        return PatchTSTPolicy(n_features=n_features, lookback=lookback,
+                              d_model=d_model_patch, mlp_dim=mlp_dim,
+                              n_actions=N_ACTIONS).to(device)
 
     return SAINTPolicySingleHead(
         n_features=n_features,

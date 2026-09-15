@@ -111,6 +111,8 @@ from saint_core import (
     EntryDecisionPolicy,
     rolling_decision_spec,
     SAINTPolicySingleHead,
+    PatchTSTPolicy,
+    build_policy,
     build_mask_from_pos_scalar,
 )
 
@@ -250,7 +252,24 @@ class PPOConfig:
     # rang de volatilite sur 1440, range_norm rapporte a sa moyenne sur 1440) :
     # empiler cinquante pas de temps en plus etait redondant, et le bruit
     # ajoute l'emportait sur l'information.
-    lookback: int = 25
+    # PatchTST permet un historique bien plus long que SAINT a cout egal :
+    # l'attention porte sur ~L/8 segments au lieu de L barres, et les colonnes
+    # sont traitees separement. A 96 barres avec des segments de 16 et un pas
+    # de 8, cela fait 11 jetons — l'attention coute 75 fois moins qu'a 96.
+    lookback: int = 96              # 96 barres H1 = 4 jours de contexte
+
+    # "M1" ou "H1". Choisit le cache et, avec lui, l'echelle de decision.
+    timeframe_entrainement: str = "H1"
+
+    # "patchtst" ou "saint". build_policy DEDUIT l'architecture du checkpoint
+    # au chargement, donc ce reglage ne concerne que l'entrainement.
+    architecture: str = "patchtst"
+
+    # Largeur du reseau. 64/256 donnait 1.19 M de parametres pour 16 708
+    # barres d'entrainement, soit 71 parametres par exemple — et le modele
+    # memorisait. 32/128 ramene a 298 k.
+    d_model_patch: int = 32
+    mlp_dim: int = 128
 
     # PPO Training
     epochs: int = 240               # +50% vs 160 pour cosine LR plus douce
@@ -268,7 +287,10 @@ class PPOConfig:
     # unique minibatch, soit 2 pas de gradient par epoch. Le semi-MDP a rendu
     # le rollout peu coûteux (la policy n'est plus appelée qu'aux décisions) :
     # on convertit cette vitesse en volume. Attendu : ~1700 décisions/epoch.
-    episodes_per_epoch: int = 128
+    # DIMENSIONNEMENT H1. Le jeu fait 30 379 barres contre 1.8 M en M1 :
+    # un episode de 6 000 barres couvrirait 28 % du train a lui seul, et les
+    # episodes se recouvriraient presque entierement.
+    episodes_per_epoch: int = 96
     # Idem pour la validation : 21-32 trades donnaient un Sortino purement
     # bruité (PF 3.10 puis 0.51 d'une epoch à l'autre), donc une sélection du
     # "best model" au hasard.
@@ -276,8 +298,8 @@ class PPOConfig:
     # epoch tombait a 38 — soit +-7.9 points d'incertitude sur le winrate, ou
     # plus rien n'est distinguable de rien. Trois fois plus d'episodes rendent
     # la mesure exploitable sans toucher a la REGLE de decision.
-    val_episodes: int = 48
-    episode_length: int = 6000      # ~4.2j de M1
+    val_episodes: int = 40
+    episode_length: int = 400       # ~17 jours de H1
     # Fraction des états EN POSITION conservée pour la mise à jour PPO.
     # Ils sont masqués à HOLD donc sans gradient d'actor ; les garder tous
     # faisait passer la mise à jour de 40s à 7 minutes pour rien.
@@ -309,7 +331,10 @@ class PPOConfig:
     # sont calcules sur les trajectoires completes avant d'arriver ici, donc
     # en retirer une partie ne fausse aucun calcul — c'est le meme argument
     # qui justifie deja `in_position_keep_frac`.
-    max_decisions_per_epoch: int = 16_000
+    # Un episode H1 de 400 barres donne au plus 400 decisions ; 96 episodes
+    # en donnent ~38 000, dont la plupart en position. Le plafond garde son
+    # role : rendre les epochs comparables entre elles.
+    max_decisions_per_epoch: int = 12_000
     # Nombre de passes PPO sur les données collectées.
     # Testé à 8 pour tenter de débloquer le KL (0.0004 contre un target de
     # 0.03) : sans effet sur le KL, resté à 0.0000, et le critique a divergé
@@ -374,7 +399,15 @@ class PPOConfig:
     # Effectif = entropy_coef × (1.5 → 0.5) sur 120 epochs, soit 0.012 → 0.004.
     # Relation utile pour 3 actions : Hflat = 1.0889 ⟺ p_max = 0.40, la valeur
     # que le modèle DOIT dépasser pour franchir son propre filtre de conviction.
-    entropy_coef: float = 0.008
+    # Releve de 0.008 a 0.030. Mesure sur exec10 : a 0.008 l'entropie passait
+    # de 1.099 a 0.495 en quinze epochs, et le resultat se degradait en
+    # parallele. Le bonus ne retenait pas la politique, qui se figeait sur ce
+    # qu'elle avait memorise d'un jeu de 16 708 barres.
+    entropy_coef: float = 0.030
+
+    # Nombre d'epochs sans amelioration avant arret. Voir le commentaire de
+    # `patience` dans run_training_on_split.
+    patience: int = 25
     # (A) Clip très serré : 0.5 a laissé passer des gradients qui ont explosé
     # avec AMP (clip appliqué sur valeurs scaled). Maintenant 0.3 + unscale fix.
     max_grad_norm: float = 0.3
@@ -672,7 +705,9 @@ class PPOConfig:
     # 25 echantillons au-dessus de la barre — assez pour estimer un quantile —
     # tout en restant a moins de trois points de la cible sous une derive
     # bien plus violente que celle observee.
-    rang_fenetre: int = 500
+    # En OCCASIONS, pas en barres. A 5 % de selectivite sur H1, 500 occasions
+    # representent des mois : on raccourcit pour que le rang suive le regime.
+    rang_fenetre: int = 200
     # Graine dediee aux fenetres de validation. Elles etaient tirees au sort a
     # chaque epoch : une amelioration pouvait venir d'un scenario plus facile
     # plutot que d'un meilleur modele. Fixees, les epochs deviennent comparables.
@@ -767,6 +802,15 @@ def _fetch_paginated(symbol: str, timeframe: int,
 
 
 def _data_cache_path(cfg: PPOConfig) -> str:
+    """Le cache H1 est PRECALCULE par prepare_h1.py, pas reconstruit ici.
+
+    Recalculer les indicateurs a l'echelle H1 depuis MT5 exigerait de dupliquer
+    les fenetres corrigees de prepare_h1.py — et c'est precisement la
+    duplication qui avait laisse diverger l'alignement H1 et le bruit de ticks
+    dans ce projet. Une seule source.
+    """
+    if getattr(cfg, "timeframe_entrainement", "M1") == "H1":
+        return "data_cache_BTCUSD_H1.pkl"
     return f"data_cache_{cfg.symbol}_{cfg.date_from:%Y%m%d}.pkl"
 
 
@@ -780,7 +824,17 @@ def _try_load_data_cache(cfg: PPOConfig, date_to: datetime) -> Optional[pd.DataF
     reste valable pour un entraînement sur 4+ ans.
     """
     path = _data_cache_path(cfg)
+    h1 = getattr(cfg, "timeframe_entrainement", "M1") == "H1"
+
     if not os.path.exists(path):
+        if h1:
+            # En H1 le cache est PRECALCULE par prepare_h1.py. Le reconstruire
+            # depuis MT5 exigerait de dupliquer ici les fenetres corrigees a
+            # l'echelle, et c'est exactement la duplication qui a deja fait
+            # diverger l'alignement H1 dans ce projet.
+            raise FileNotFoundError(
+                f"{path} absent. Lancer `python prepare_h1.py` : en mode H1 "
+                f"le jeu n'est pas reconstruit depuis MT5.")
         return None
     try:
         df = pd.read_pickle(path)
@@ -798,7 +852,15 @@ def _try_load_data_cache(cfg: PPOConfig, date_to: datetime) -> Optional[pd.DataF
 
     last = pd.to_datetime(df["time"].iloc[-1])
     retard_h = (date_to - last).total_seconds() / 3600.0
-    if retard_h > cfg.data_cache_max_lag_hours:
+    if h1:
+        # Pas de rejet sur la fraicheur : le cache H1 ne peut pas etre
+        # reconstruit ici, donc le rejeter ne ferait que tomber dans le chemin
+        # M1 et echouer sur des colonnes H4 introuvables. On informe et on
+        # continue — c'est a l'operateur de relancer prepare_h1.py s'il veut
+        # des barres plus recentes.
+        print(f"[CACHE H1] {len(df):,} bougies, {retard_h:.1f}h de retard "
+              f"(precalcule par prepare_h1.py, pas de rechargement MT5).")
+    elif retard_h > cfg.data_cache_max_lag_hours:
         print(f"[CACHE] Trop ancien ({retard_h:.1f}h de retard) → rechargement depuis MT5.")
         return None
 
@@ -1950,7 +2012,11 @@ def run_training_on_split(
         BTCTradingEnvDiscrete(calib_data, cfg) for _ in range(cfg.val_episodes)
     ]
 
-    policy = SAINTPolicySingleHead(
+    policy = build_policy(
+        device, lookback=cfg.lookback, n_features=OBS_N_FEATURES,
+        archi=cfg.architecture, n_ref=cfg.n_ref, num_blocks=cfg.num_blocks,
+        d_model_patch=cfg.d_model_patch, mlp_dim=cfg.mlp_dim,
+    ) if cfg.architecture == "patchtst" else SAINTPolicySingleHead(
         n_features=OBS_N_FEATURES,
         d_model=cfg.d_model,
         num_blocks=cfg.num_blocks,
@@ -2021,8 +2087,15 @@ def run_training_on_split(
     best_thresholds = None
     best_decision_spec = None
     epochs_no_improve = 0
-    # patience proportionnelle au nombre d'epochs (60% du total)
-    patience = max(100, int(cfg.epochs * 0.6))
+    # ARRET PRECOCE. L'ancienne regle — 60 % du total, soit 144 epochs —
+    # laissait le run se degrader indefiniment. Mesure sur exec10 H1 : sommet
+    # a l'epoch 11 (ecart +5.1 pt, PF 1.16), puis chute reguliere jusqu'a
+    # -8.2 pt a l'epoch 20 pendant que l'entropie tombait de 1.10 a 0.50.
+    # Dix epochs de plus n'ont produit que de la degradation.
+    #
+    # Sur un jeu H1 de 16 708 barres, la patience se compte en dizaines
+    # d'epochs, pas en centaines.
+    patience = cfg.patience
     metric_history: List[float] = []
 
     reward_normalizer = RewardNormalizer()
@@ -3443,16 +3516,41 @@ if __name__ == "__main__":
     #   exec3  30 features, scalping_max_holding 120, sortie temps a 240 barres
     #   exec4  sortie par le temps retiree, detention de reference a 30 barres
     #   exec6  ls_ratio_top (+0.0000) remplacee par taker_1m_ma5 (+0.0087)
+    #   exec11 CONTRE LE SURAPPRENTISSAGE, les trois leviers ensemble :
+    #          modele divise par 4 (298 k au lieu de 1.19 M), coefficient
+    #          d'entropie x3.75 (0.030), patience ramenee de 144 a 25 epochs.
+    #          exec10 culminait a l'epoch 11 puis se degradait regulierement.
+    #   exec10 ECHELLE H1 et features de RANGE. La friction passe de 1.05 a
+    #          0.09 unite de risque par ATR — c'est le seul changement de la
+    #          session appuye sur une relation mecanique et non sur un ecart
+    #          a la limite du bruit. 55 features dont 25 de structure de range.
+    #   exec9  RESEAU PatchTST : segments temporels et canaux independants,
+    #          lookback 96 au lieu de 25. Mesure a lot 128 : 66.9 ms par pas
+    #          contre 285.9 pour SAINT a 25 — quatre fois plus d'historique
+    #          pour 4.3 fois moins cher, l'attention portant sur 11 segments
+    #          au lieu de 25 x 35 jetons.
+    #   exec8  R:R 2.0
     #   exec7  ARCHITECTURE COMPLETE : une attention ET son FFN par axe,
     #          RMSNorm en pre-norm, QK-Norm, RoPE sur l'axe temps, SwiGLU,
     #          LayerScale, plongement numerique periodique, jeton CLS.
     #          Cout mesure : 2.38x le fwd+bwd de la version reduite, a
     #          profondeur egale et etat thermique identique.
     #          AUCUN checkpoint anterieur n'est chargeable.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec8"
+    # exec12 — MEME reglage qu'exec11, seules les DONNEES changent. exec11
+    # avait change trois choses a la fois (arret precoce, modele reduit,
+    # entropie remontee) et n'avait rien donne : 0 epoch positif sur 24 apres
+    # warmup, entropie tombee de 1.099 a 0.51 malgre le coefficient a 0.030.
+    # Le diagnostic etait bon mais le remede portait sur le mauvais terme :
+    # 298 k parametres pour 16 708 barres font encore 18 parametres par barre.
+    #
+    # Le jeu H1 passe de 30 379 a 79 340 barres (2017-08 au lieu de 2023-02,
+    # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
+    # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
+    # comparables et on ne saurait pas ce qui a agi.
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec12"
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec8: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec12: trois folds sans bootstrap inter-fold.")
     run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10,
                     max_folds=3, start_fold=1,
                     bootstrap_from_path=None,

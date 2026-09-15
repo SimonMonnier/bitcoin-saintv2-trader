@@ -35,20 +35,64 @@ import warnings
 import numpy as np
 import pandas as pd
 
+import mesure_features as MF
 from saint_core import FEATURE_COLS, ATR_PLANCHER_FRAC
-from mesure_features import (barrieres, MAX_HOLD, SPREAD_BPS, SLIP_ENTREE_BPS,
+from mesure_features import (barrieres, SPREAD_BPS, SLIP_ENTREE_BPS,
                              SLIP_SORTIE_BPS, CACHE)
 
 warnings.filterwarnings("ignore")
 
 SL_MULT, RR = 2.0, 2.0
-N_BLOCS = 6
-PHASES = list(range(0, MAX_HOLD, 40))        # 6 phases
 FRAC_CALIB = 0.30        # part finale du train reservee au calibrage de marge
+
+# ------------------------------------------------------------------
+#  DEUX ECHELLES, DEUX DIMENSIONNEMENTS
+#
+# Le protocole exige des entrees espacees de la duree maximale de detention :
+# deux trades voisins ne doivent pas partager de barres de resultat, sinon le
+# meme mouvement est compte plusieurs fois et l'erreur-type est sous-estimee.
+# Ce meme protocole se dimensionne donc differemment selon l'echelle :
+#
+#          bougies   pas   entrees utilisables   phases   blocs
+#   M1     1.8 M     240        ~5 200             6        6
+#   H1      79 k      24         ~2 310            12        6
+#
+# En H1 on a soixante fois moins de barres. On compense en couvrant une plus
+# grande part de l'historique par le NOMBRE de phases (12 phases de pas 2
+# touchent une barre sur deux, chacune restant interne-ment sans chevauchement)
+# plutot qu'en relachant l'espacement, qui est justement ce qui garantit
+# l'independance des resultats.
+#
+# Le pas H1 vaut 24 barres — une journee — parce que la cible est une course
+# SL 2xATR / TP 4xATR : au-dela d'une journee la quasi-totalite des courses est
+# resolue, et allonger le pas ne ferait que reduire un echantillon deja mince.
+# ------------------------------------------------------------------
+CACHE_H1 = "data_cache_BTCUSD_H1.pkl"
+
+MODE = "h1"              # regle par configure() ; l'entrainement est en H1
+CACHE_UTILISE = CACHE_H1
+PAS = 24
+N_BLOCS = 6
+PHASES = list(range(0, 24, 2))
+MIN_TRAIN, MIN_VAL = 500, 80
+
+
+def configure(mode="h1"):
+    """Fixe l'echelle. `barrieres` lit MF.MAX_HOLD : il faut le reregler AUSSI,
+    sinon la course des barrieres durerait 240 heures au lieu de 24."""
+    global MODE, CACHE_UTILISE, PAS, N_BLOCS, PHASES, MIN_TRAIN, MIN_VAL
+    MODE = mode
+    if mode == "h1":
+        CACHE_UTILISE, PAS, N_BLOCS = CACHE_H1, 24, 6
+        PHASES, MIN_TRAIN, MIN_VAL = list(range(0, 24, 2)), 500, 80
+    else:
+        CACHE_UTILISE, PAS, N_BLOCS = CACHE, 240, 6
+        PHASES, MIN_TRAIN, MIN_VAL = list(range(0, 240, 40)), 600, 40
+    MF.MAX_HOLD = PAS
 
 
 def prepare():
-    df = pd.read_pickle(CACHE).dropna(
+    df = pd.read_pickle(CACHE_UTILISE).dropna(
         subset=FEATURE_COLS + ["atr_14"]).reset_index(drop=True)
     n = len(df)
     fin = int(n * 0.70)
@@ -182,15 +226,15 @@ def une_phase(d, fabrique, phase, regles):
     occasions = 0
     for b in range(N_BLOCS):
         a_va, b_va = d["bornes"][b], d["bornes"][b + 1]
-        i_all = np.arange(phase, a_va - 2 * MAX_HOLD, MAX_HOLD)
+        i_all = np.arange(phase, a_va - 2 * PAS, PAS)
         i_all = i_all[np.isfinite(d["atr"][i_all]) & (d["atr"][i_all] > 0)]
-        if len(i_all) < 600:
+        if len(i_all) < MIN_TRAIN:
             continue
         coupe = int(len(i_all) * (1 - FRAC_CALIB))
         i_tr, i_ca = i_all[:coupe], i_all[coupe:]
-        i_va = np.arange(a_va, b_va - MAX_HOLD, MAX_HOLD)
+        i_va = np.arange(a_va, b_va - PAS, PAS)
         i_va = i_va[np.isfinite(d["atr"][i_va]) & (d["atr"][i_va] > 0)]
-        if len(i_va) < 40:
+        if len(i_va) < MIN_VAL:
             continue
 
         rb_tr, rs_tr = cibles(d, i_tr)
@@ -216,11 +260,15 @@ def une_phase(d, fabrique, phase, regles):
             occasions)
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    import sys
+    argv = sys.argv[1:] if argv is None else argv
+    configure("m1" if "m1" in argv else "h1")
     d = prepare()
+    print(f"echelle {MODE.upper()}  |  {CACHE_UTILISE}")
     regles = ["q95", 0.0, 0.05, 0.10, 0.20]
     print(f"{d['n']:,} bougies  |  {N_BLOCS} blocs  |  {len(PHASES)} phases  |  "
-          f"entrees tous les {MAX_HOLD} barres")
+          f"entrees tous les {PAS} barres")
     print(f"barrieres SL {SL_MULT}xATR  R:R {RR}  —  cout DEJA dans la cible")
     print(f"marge calibree sur les {int(100 * FRAC_CALIB)} % finaux du train\n")
 

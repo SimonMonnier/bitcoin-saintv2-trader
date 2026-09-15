@@ -261,22 +261,32 @@ def ligne(nom, res, quantiles=(0.85, 0.95)):
 
 
 def main() -> int:
+    import sys
+    # `python banc_sequentiel.py patchtst` ne lance QUE PatchTST ; `saint` que
+    # SAINT ; sans argument, les deux. Chaque modele coute environ une heure
+    # sur GPU bride — pouvoir n'en relancer qu'un evite de tout refaire.
+    quoi = sys.argv[1].lower() if len(sys.argv) > 1 else "tout"
+
     d = B.prepare()
-    print(f"{d['n']:,} bougies  |  {B.N_BLOCS} blocs  |  {len(PHASES)} phases")
+    print(f"{d['n']:,} bougies  |  {B.N_BLOCS} blocs  |  {len(PHASES)} phases"
+          f"  |  selection : {quoi}")
     print(f"repere : hasard {HASARD:+.4f}   oracle du cote {ORACLE:+.4f}   "
-          f"il faut capturer 48 % pour atteindre zero\n")
+          f"il faut capturer 48 % pour atteindre zero")
+    print("reperes tabulaires, memes blocs : TabM 31 %, LightGBM 24 %\n")
     print(f"{'modele':<22} {'seuil':>5} {'part':>8} "
           f"{'E[R]':>10} {'err-type':>9} {'% oracle':>8} {'ph +':>6}")
-    print("-" * 74)
+    print("-" * 74, flush=True)
 
-    ligne("SAINT (lookback 25)",
-          evalue(d, lambda: _Regresseur(_net_saint, LOOKBACK_SAINT, epochs=20),
-                 LOOKBACK_SAINT))
+    if quoi in ("tout", "saint"):
+        ligne("SAINT (lookback 25)",
+              evalue(d, lambda: _Regresseur(_net_saint, LOOKBACK_SAINT, epochs=20),
+                     LOOKBACK_SAINT))
 
-    for lb in LOOKBACKS_PATCH:
-        ligne(f"PatchTST ({lb} bougies)",
-              evalue(d, lambda lb=lb: _Regresseur(_net_patchtst, lb, epochs=20),
-                     lb))
+    if quoi in ("tout", "patchtst"):
+        for lb in LOOKBACKS_PATCH:
+            ligne(f"PatchTST ({lb} bougies)",
+                  evalue(d, lambda lb=lb: _Regresseur(_net_patchtst, lb, epochs=20),
+                         lb))
 
     print("\n'% oracle' = part de l'ecart hasard->oracle que le modele capture.")
     print("Reperes tabulaires sur les memes blocs : TabM 31 %, LightGBM 24 %.")

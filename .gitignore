@@ -61,3 +61,6 @@ runs_archives/
 # Journaux et rapports generes
 analyse_epochs.md
 training_btc.err
+data_cache_BTCUSD_H1.pkl
+klines_h1_spot_BTCUSDT.pkl
+training_btc.err

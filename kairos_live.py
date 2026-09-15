@@ -45,13 +45,13 @@ from saint_core import (
 BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf1_long_wf1.pth"
 BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf1_short_wf1.pth"
 # Modèle unifié (entraîné avec side="both") : décide BUY/SELL/HOLD dans un seul fichier
-BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_exec8_wf1_both_wf1.pth"
+BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_exec11_wf1_both_wf1.pth"
 
 # ============================================================
 # MULTI-AGENT : 3 modèles WF tradent en parallèle (comme dans le backtest)
 # Chaque modèle a son propre magic MT5 pour identifier ses positions.
 # ============================================================
-# Lignee exec8 : architecture SAINT COMPLETE (une attention et son FFN par
+# Lignee exec11 : architecture SAINT COMPLETE (une attention et son FFN par
 # axe, RMSNorm, QK-Norm, RoPE, SwiGLU, LayerScale, jeton CLS).
 #
 # AUCUNE autre lignee n'est chargeable ici. exec3 a exec6 sont du BTC mais
@@ -62,9 +62,9 @@ BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_exec8_wf1_both_wf1.pth"
 # l'agent trade en lisant autre chose que ce sur quoi il a appris.
 # wf2/wf3 n'existent pas encore en BTC : leur activation doit echouer bruyamment.
 MULTI_AGENT_PATHS: Dict[str, str] = {
-    "wf1": "bestprofit_saintv2_loup_duel_exec8_wf1_both_wf1.pth",
-    "wf2": "bestprofit_saintv2_loup_duel_exec8_wf2_both_wf2.pth",
-    "wf3": "bestprofit_saintv2_loup_duel_exec8_wf3_both_wf3.pth",
+    "wf1": "bestprofit_saintv2_loup_duel_exec11_wf1_both_wf1.pth",
+    "wf2": "bestprofit_saintv2_loup_duel_exec11_wf2_both_wf2.pth",
+    "wf3": "bestprofit_saintv2_loup_duel_exec11_wf3_both_wf3.pth",
 }
 MULTI_AGENT_MAGICS: Dict[str, int] = {
     "wf1": 424241,
@@ -79,7 +79,11 @@ class LiveConfig:
     timeframe: int = mt5.TIMEFRAME_M1
     htf_timeframe: int = mt5.TIMEFRAME_H1   # identique au training
 
-    lookback: int = 25
+    # DOIT valoir training.PPOConfig.lookback : le reseau PatchTST est bati
+    # pour un nombre de segments donne, et build_policy le deduit du
+    # checkpoint. Une valeur differente ici ferait charger un reseau d'une
+    # autre forme, ou nourrirait le bon reseau avec une fenetre tronquee.
+    lookback: int = 96
 
     # nombre de bougies pour recalculer les indicateurs
     n_bars_m1: int = 50000

@@ -238,3 +238,140 @@ l'autre.
 
 Sur les `AvgW` / `AvgL` **réalisés**, jamais sur le R:R nominal. Il oscille
 autour de 43.7–44.3 %. La ligne du hasard, elle, est à 22.8 %.
+
+---
+
+## 2026-09-15 — Le mur n'était pas l'architecture, c'était la taille du jeu
+
+### Ce qui a été mesuré, dans l'ordre
+
+**1. exec11 a échoué, et ses trois correctifs avec lui.** Arrêt précoce
+(patience 25), modèle réduit (1.19 M → 298 k), entropie 0.008 → 0.030. Résultat
+sur trois folds : 0/9, 1/15 et 0/22 epochs positives après warmup, moyennes
+−3.36, −4.37 et −4.97 points sous le seuil d'équilibre. L'entropie est tombée
+de 1.099 à 0.51 malgré le coefficient quadruplé — ralentie, pas retenue. Le
+modèle réduit a fait **pire** qu'exec10 sur le même fold (−0.57 pt au mieux
+contre +5.1 pt à l'epoch 11).
+
+Trois changements simultanés : on sait que l'ensemble n'a pas aidé, pas lequel
+a coûté.
+
+**2. Les TEST affichés par le walk-forward ne sont pas propres.** Les trois
+tranches (−313 $, −82 $, −69 $) ont été traversées par exec2 à exec11. Elles
+confirment la validation, elles ne la remplacent pas.
+
+**3. Le repère qui manquait depuis le début : le coût d'entrer au hasard.**
+
+```
+entrer au hasard, M1, SL 2xATR / TP 4xATR :  -0.45  R
+entrer au hasard, H1, même géométrie      :  -0.012 R   (jeu MT5, 3.6 ans)
+```
+
+Le passage en H1 avait donc **réussi** : la friction était effacée. Le problème
+avait changé de nature sans qu'on s'en aperçoive.
+
+**4. TabM, première fausse piste, attrapée à temps.** Sur le jeu MT5 de 30 379
+barres, TabM montrait une progression monotone avec la sélectivité (+0.009 →
++0.030 R), 8 phases sur 12 positives. La décomposition par période l'a tuée :
+
+```
+bloc                    0        1        2        3
+hasard             -0.049   +0.044   -0.023   -0.020
+toujours acheter   +0.092   +0.135   -0.090   -0.004
+TabM (marge 0.40)  -0.068   +0.222   +0.067       -
+```
+
+Tout venait du bloc 1, la seule période haussière, et TabM y faisait **moins
+bien qu'un ordre d'achat aveugle**. Sur le bloc 0 il faisait pire que le hasard.
+L'erreur-type publiée par le banc est calculée sur les PHASES, distantes de deux
+heures : elles ne sont pas indépendantes et l'erreur est trop belle. **La seule
+dimension qui sépare est le temps.**
+
+**5. Le chiffre qui explique tout le projet.**
+
+```
+écart-type d'un trade                    ~1.4  R
+avantage recherché                       ~0.02 R
+trades indépendants pour le détecter   (1.4/0.02)^2 ≈ 4 900
+
+fenêtre d'entraînement H1 (MT5)              890
+par bloc de validation                       143
+```
+
+Facteur **trente** entre ce qu'il faut pour *mesurer* l'avantage et ce dont on
+disposait. Cela réconcilie tout l'historique : en M1 on avait les échantillons
+mais la friction mangeait tout (−0.45 R) ; en H1 la friction avait disparu mais
+les échantillons avec.
+
+### Ce qui a été changé
+
+**Source de données : MT5 → archives Binance spot.** 2017-08 au lieu de
+2023-02, 79 340 barres au lieu de 30 379, ~2 310 occasions d'entraînement au
+lieu de 890. Spot et non futures : deux ans et demi de plus, et surtout une
+seule source sur toute la période — mélanger les deux créerait une couture au
+milieu du jeu, que le modèle apprendrait. La friction reste celle du courtier,
+qui est le choix prudent.
+
+**`spread_rel` retiré.** Il venait de MT5, qui ne remonte qu'à 2023 ; sur les
+six années ajoutées il aurait fallu le constanter. Une colonne constante sur
+70 % du jeu apprend au modèle à distinguer « avant » de « après », c'est-à-dire
+la date. Remplacé par deux colonnes issues des mêmes archives que le prix
+(taille moyenne d'un trade, rang d'intensité sur la semaine), toutes deux en
+rang ou en écart à leur propre normale — sur neuf ans où le volume horaire a
+changé d'ordre de grandeur, tout niveau absolu encoderait l'année.
+
+### Ce que le jeu long a donné
+
+```
+TabM, 6 blocs, marge +0.10       E[R] +0.024 ± 0.006 (phases), 11/12 phases
+                                 écart au hasard +0.085 R, 6 blocs sur 6
+                                 test des signes : p = 0.016
+```
+
+Premier résultat du projet dont le **signe tient sur toutes les périodes**.
+L'E[R] absolu (+0.034 ± 0.031 au niveau des blocs) reste indistinguable de zéro.
+
+### La géométrie des barrières, mesurée sans aucun modèle
+
+```
+SL 1.0xATR  →  E[R] hasard  -0.079     (friction = 0.146 R aller-retour)
+SL 1.5xATR  →               -0.049
+SL 2.0xATR  →               -0.035     ← réglage en place
+SL 3.0xATR  →               -0.020
+SL 3 / R:R 3 / 48 h  →      +0.021     (57 % de courses résolues)
+```
+
+Encore la friction fixe : élargir le stop la divise. Mais tester TabM sur les
+géométries neutres a donné l'inverse de l'intuition — le stop large monte le
+niveau et **perd l'avantage du modèle** :
+
+```
+géométrie                repère    TabM +0.10    blocs mieux    err-type
+SL 2 / R:R 2 / 24 h      -0.033      +0.028          5/6         0.027
+SL 3 / R:R 3 / 48 h      +0.013      +0.063          3/6         0.065
+SL 3 / R:R 2 / 48 h      -0.014      +0.009          4/6         0.055
+SL 3 / R:R 1.5 / 48 h    -0.016      +0.040          4/6         0.051
+```
+
+Un stop trois fois plus large divise par deux le nombre de trades et double
+l'erreur-type. **La géométrie en place était la bonne ; ce qui manquait,
+c'étaient les données.**
+
+### Un défaut de déploiement trouvé au passage
+
+`build_policy` ne déduisait l'architecture que dans un sens : il reconnaissait
+un checkpoint PatchTST, mais un checkpoint SAINT tombait dans la branche par
+défaut — qui vaut « patchtst » depuis exec10. Le live aurait construit la
+mauvaise architecture et échoué sur une liste de clés illisible. La déduction
+couvre désormais les deux cas et refuse explicitement un fichier ambigu.
+
+### Ce que ces mesures ne disent PAS
+
+- Que TabM gagnerait en réel. +0.034 ± 0.031 n'est pas significativement
+  positif ; seul l'**écart au hasard** l'est.
+- Que PPO va y arriver. exec12 tourne avec exactement le réglage d'exec11 et
+  2.6 fois plus de données (5.4 paramètres par barre au lieu de 18) — c'est la
+  seule variable qui change, précisément pour que le résultat soit lisible.
+- Que le spot Binance se comporte comme le CFD du courtier. Les prix diffèrent
+  de quelques points de base et les frais n'ont rien à voir ; on n'en reprend
+  que la forme du marché.
