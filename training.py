@@ -758,7 +758,42 @@ class PPOConfig:
     # La valeur 0.10 n'est pas mesuree — c'est une limite de prudence, pas un
     # optimum. Ce qui est mesure, c'est qu'elle mord la ou la marge ne mord
     # pas. Le modele apprend a l'interieur ; il ne la choisit pas.
-    budget_risque: float = 0.10
+    # 10 % -> 3 %, ET LE 10 % TUAIT LE COMPTE.
+    #
+    # La valeur venait de moi, sans mesure : "une limite de prudence". La
+    # mesure de portefeuille — equite continue, ordre chronologique, toutes
+    # les contraintes du courtier, entrees NEUTRES sans modele, 1.9 an :
+    #
+    #   budget  graine  positions   gain   par an  creux max          fin
+    #       1%       1          5    +41%     +20%        11%  fenetre finie
+    #       1%       2          5    +18%      +9%        15%  fenetre finie
+    #       3%       1         17   +130%     +55%        20%  fenetre finie
+    #       3%       2          5    +38%     +19%        18%  fenetre finie
+    #       5%       1         23   +126%     +54%        34%  fenetre finie
+    #       5%       2         11    -10%     -19%        40%   max_drawdown
+    #      10%       1         22     +8%     +15%        40%   max_drawdown
+    #      10%       2         16     +4%      +5%        40%   max_drawdown
+    #      20%       1         48    -32%    -100%        40%   max_drawdown
+    #      20%       2         36    -32%    -100%        40%   max_drawdown
+    #
+    # A 10 % le compte meurt sur LES DEUX graines, a 20 % en trois secondes,
+    # a 5 % sur une graine sur deux. A 3 % les deux survivent avec 18 a 20 %
+    # de creux. La courbe ne se degrade pas doucement : elle se retourne
+    # entre 3 et 5 %.
+    #
+    # POURQUOI CETTE MESURE ETAIT INDISPENSABLE. Tous les autres chiffres de
+    # geometrie sont des R PAR TRADE ADDITIONNES, ce qui suppose des trades
+    # independants pris a 1 R chacun. Sous concurrence ils correlent a 0.72 a
+    # une heure d'ecart : l'addition ne peut pas voir un creux. Il a fallu une
+    # equite qui compose et qui peut mourir.
+    #
+    # Le trade est joue par l'environnement lui-meme, en un episode long —
+    # pas par un second simulateur qui aurait fini par diverger.
+    #
+    # RESERVE : 1.9 an et deux graines. La dispersion entre graines (+55 % et
+    # +19 % a 3 %) est du meme ordre que l'effet du budget. Ce qui n'est PAS
+    # dans le bruit, c'est la mort a 10 % sur les deux graines.
+    budget_risque: float = 0.03
     # ------------------------------------------------------------------
 
     # 84 -> 20, ET C'EST UN GAIN, pas une reduction.
@@ -2481,6 +2516,31 @@ class BTCTradingEnvDiscrete(gym.Env):
         self._realise_slots = _e(self._realise_slots)
         self._latent_prec = _e(self._latent_prec)
 
+    def peut_financer_un_lot(self, prix: float) -> bool:
+        """Le SOLDE permet-il encore un lot minimum ? La ruine, c'est cela.
+
+        A NE PAS CONFONDRE AVEC `places_ouvrables`. Celle-ci applique aussi le
+        budget de risque, qui est NOTRE politique : quand un pic de volatilite
+        fait qu'un lot minimum depasse 1 % de l'equity, elle rend zero alors
+        que le compte se porte tres bien. Premiere version de la regle de
+        ruine : un compte a +16 % avec 4 % de creux etait declare mort parce
+        qu'il ne pouvait pas ouvrir A CET INSTANT.
+
+        La ruine est une contrainte de COURTIER, pas de politique : c'est
+        quand la marge ne suffit plus au plus petit ordre possible. Ne pas
+        vouloir trader n'est pas mourir.
+        """
+        if not getattr(self.cfg, "marge_realiste", False):
+            return True
+        eq = self._equity_courante()
+        if eq <= 0:
+            return False
+        frac = float(getattr(self.cfg, "marge_frac", 0.001734))
+        seuil = float(getattr(self.cfg, "niveau_marge_ouverture", 3.0))
+        m_une = max(prix * float(getattr(self.cfg, "lot_min", 0.01)) * frac,
+                    1e-12)
+        return (eq / max(seuil, 1e-9) - self.marge_utilisee) >= m_une
+
     def peut_entrer(self) -> bool:
         """Une DECISION existe quand le solde permet encore une position."""
         prix = float(self.data.close[min(self.idx, self.data.length - 1)])
@@ -3088,8 +3148,8 @@ class BTCTradingEnvDiscrete(gym.Env):
         elif _niveau < float(getattr(self.cfg, "niveau_marge_liquidation", 0.5)):
             done_reason = "appel_de_marge"
         elif (getattr(self.cfg, "marge_realiste", False)
-              and self._p_sens.sum() == 0 and not self._p_sens.any()
-              and self.places_ouvrables(price) <= 0):
+              and not self._p_sens.any()
+              and not self.peut_financer_un_lot(price)):
             # LA RUINE. Aucune position ouverte, et le solde n'en permet plus
             # aucune : le compte ne peut plus rien faire. Laisser tourner
             # l'episode enseignerait qu'on survit a la ruine en attendant, ce
@@ -5632,7 +5692,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec50"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec52"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -5656,7 +5716,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec50: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec52: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
