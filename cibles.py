@@ -106,7 +106,8 @@ def _regle(cfg) -> dict:
     }
 
 
-def rendements(df, idx, cfg, borne: int = BORNE_DEFAUT, indicateur: bool = False):
+def rendements(df, idx, cfg, borne: int = BORNE_DEFAUT, indicateur: bool = False,
+               durees: bool = False):
     """Rendement net (achat, vente) en unites de risque, aux indices donnes.
 
     Rend deux tableaux alignes sur `idx`, avec NaN quand la course ne se
@@ -123,9 +124,10 @@ def rendements(df, idx, cfg, borne: int = BORNE_DEFAUT, indicateur: bool = False
     n = len(c)
     fric = (SPREAD_BPS + SLIP_ENTREE_BPS + SLIP_SORTIE_BPS) / 1e4
 
-    sorties = []
+    sorties, temps = [], []
     for sens in (1, -1):
         out = np.full(len(idx), np.nan)
+        dur = np.full(len(idx), np.nan)
         for k, i in enumerate(idx):
             i = int(i)
             fin = min(i + 1 + borne, n)
@@ -172,7 +174,15 @@ def rendements(df, idx, cfg, borne: int = BORNE_DEFAUT, indicateur: bool = False
                 continue
             sortie = stop[int(ja)] if ja <= jb else tp
             out[k] = sens * (sortie - entree) / d - fric * entree / d
+            # La DUREE, en barres depuis l'entree. Elle n'est pas un detail :
+            # une seule position peut etre tenue a la fois, donc c'est elle
+            # qui plafonne le nombre de trades qu'une selectivite peut
+            # produire. A 12xATR elle vaut 34 h en mediane contre 17 h a 8x.
+            dur[k] = float(min(ja, jb)) + 1.0
         sorties.append(out)
+        temps.append(dur)
+    if durees:
+        return sorties[0], sorties[1], temps[0], temps[1]
     return sorties[0], sorties[1]
 
 

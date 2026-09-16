@@ -72,7 +72,12 @@ RE_TRAIN = re.compile(
     r"\[BOTH_(wf\d+)\]\s+EPOCH (\d+)\s+TRAIN\s+PNL\s+(" + NB + r")\$\s+"
     r"trades=\s*(\d+)\s+WR\s+([\d.]+)%\s+PF\s+([\d.]+)\s+DD\s+([\d.]+)%")
 RE_META = re.compile(
-    r"\[BOTH_(wf\d+)\]\s+EPOCH (\d+)\s+META\s+Sortino\s+(" + NB + r").*?"
+    # `rho` s'intercale entre META et Sortino depuis le 2026-09-16. Le groupe
+    # est NON CAPTURANT : la suite du fichier lit m[2] a m[22] par position, et
+    # un groupe de plus les decalerait tous en silence. Il est OPTIONNEL pour
+    # que la veille continue de lire les journaux des runs anterieurs.
+    r"\[BOTH_(wf\d+)\]\s+EPOCH (\d+)\s+META\s+(?:rho\s+" + NB + r"\s+)?"
+    r"Sortino\s+(" + NB + r").*?"
     r"AvgW\s+(" + NB + r")\$\s+AvgL\s+(" + NB + r")\$.*?H ([\d.]+).*?"
     r"sel\[train\s+([\d.]+)% val\s+([\d.]+)%\].*?"
     r"etendue\[tr ([\d.-]+) val ([\d.-]+)\].*?"
@@ -81,6 +86,8 @@ RE_META = re.compile(
     r"temps\[collecte (\d+)s maj PPO (\d+)s calibration (\d+)s "
     r"validation (\d+)s\].*?gpu\[(\d+)C (\d+)/"
     r".*?ENV \[B\s+([\d.]+)% S\s+([\d.]+)% H\s+([\d.]+)%\]")
+
+RE_RHO = re.compile(r"META\s+rho\s+(" + NB + r")")
 
 # Seuil sous lequel le gradient de l'acteur est considere comme NUL, donc la
 # politique reellement gelee. Mesure : pendant le warmup du critic il vaut
@@ -181,7 +188,7 @@ def _point_mort(avg_w, avg_l):
 
 
 def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
-            ent_prec=None):
+            ent_prec=None, rho=None):
     """Rend (lignes colorees, lignes brutes, gain par trade, ecart, gele)."""
     ep = int(v[1])
     pnl, trades, wr, pf, dd = (float(v[2]), int(v[3]), float(v[4]),
@@ -257,6 +264,23 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
              f"DD {dd:.1f}%   Sortino {sortino:+.3f}")
     L.append(f"  point mort {equilibre:.1f}%  ->  ecart {ecart:+.1f} pt "
              f"(+/- {err_pt:.1f} au mieux)")
+
+    # LE CLASSEMENT, et pourquoi il vaut mieux que la ligne au-dessus. Le PnL
+    # porte sur ~150 trades : son erreur-type vaut 0.11 R, donc il ne separe
+    # pas un modele qui ajoute 0.10 R d'un modele qui n'ajoute rien. Le rho
+    # porte sur toutes les decisions de la fenetre, et son incertitude est
+    # environ 0.024 — mesuree par bootstrap par blocs sur exec32.
+    if rho is not None:
+        if rho > 0.05:
+            coul, quoi = C.VERT, "classe nettement"
+        elif rho > 0.02:
+            coul, quoi = C.VERT, "classe"
+        elif rho > -0.02:
+            coul, quoi = C.GRIS, "n'ordonne rien"
+        else:
+            coul, quoi = C.ROUGE, "classe A L'ENVERS"
+        L.append(f"  classement rho {coul}{rho:+.4f}{C.FIN} "
+                 f"(+/- 0.024 env.)  -> {quoi}")
 
     if reference is not None:
         n_ref, moy_ref = reference
@@ -369,7 +393,7 @@ def main() -> int:
     print(f"  {'-' * 66}{C.FIN}\n")
 
     vus = set()
-    metas, vals, trains = {}, {}, {}
+    metas, vals, trains, rhos = {}, {}, {}, {}
     precedent = {}          # par fold
     geles = {}              # par fold : ecarts des epochs a actor gele
     cumul = {}              # par fold : PnL de validation cumule
@@ -389,6 +413,7 @@ def main() -> int:
                       f"relecture depuis le debut{C.FIN}\n")
                 position = 0
                 vus.clear(); vals.clear(); metas.clear(); trains.clear()
+                rhos.clear()
                 precedent.clear(); geles.clear(); cumul.clear()
                 entropie.clear()
                 attend_moyenne.clear()
@@ -420,6 +445,11 @@ def main() -> int:
                 vals[(mv.group(1), int(mv.group(2)))] = mv.groups()
             if mm:
                 metas[(mm.group(1), int(mm.group(2)))] = mm.groups()
+                # Lu par un motif separe : l'inclure dans RE_META decalerait
+                # les indices que `analyse` lit par position.
+                mr = RE_RHO.search(ligne)
+                rhos[(mm.group(1), int(mm.group(2)))] = (
+                    float(mr.group(1)) if mr else None)
             if mt:
                 trains[(mt.group(1), int(mt.group(2)))] = mt.groups()
 
@@ -438,7 +468,8 @@ def main() -> int:
             attend_moyenne.discard(fold)
             console, brut, par_trade, ecart, gele = analyse(
                 vals[cle], metas[cle], trains.get(cle), precedent.get(fold),
-                ref, cumul[fold], est_moyenne, entropie.get(fold))
+                ref, cumul[fold], est_moyenne, entropie.get(fold),
+                rhos.get(cle))
             entropie[fold] = float(metas[cle][5])
             precedent[fold] = par_trade
             if gele:

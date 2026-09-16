@@ -609,7 +609,9 @@ class PPOConfig:
     # donc un gradient moins bruite a volume egal. Les episodes tournent EN
     # PARALLELE avec un seul forward batche par pas, et la politique fait
     # 45 000 parametres — le surcout GPU d'un batch 336 contre 96 est nul.
-    episodes_per_epoch: int = 336
+    # 336 -> 84 : le produit avec `episode_length` est conserve a 483 840
+    # barres. On allonge les episodes sans changer ce qu'une epoch consomme.
+    episodes_per_epoch: int = 84
     # Idem pour la validation : 21-32 trades donnaient un Sortino purement
     # bruité (PF 3.10 puis 0.51 d'une epoch à l'autre), donc une sélection du
     # "best model" au hasard.
@@ -635,7 +637,41 @@ class PPOConfig:
     # d'echantillons deja diagnostique. 336 x 1 440 = 483 840 barres, soit 73 %
     # de la fenetre d'entrainement a chaque epoch et ~2 300 decisions — le
     # regime H1, ou le modele voyait presque tout son jeu a chaque passage.
-    episode_length: int = 1440      # 5 jours de M5
+    # 1 440 -> 5 760, mesure du 2026-09-16, et c'est une CORRECTION DE DEFAUT,
+    # pas un reglage.
+    #
+    # A la fin d'un episode l'environnement FERME LA POSITION AU MARCHE
+    # (`done_reason = "episode_end"`). Avec la sortie au stop suiveur a
+    # 12xATR, la duree d'un trade vaut 26 h en mediane mais 59 h en moyenne,
+    # p90 a 148 h et une queue jusqu'a 30 jours. Un episode de 1 440 barres
+    # fait 5 jours : 13.1 % des trades durent plus longtemps qu'un episode
+    # ENTIER, et pour une entree uniforme dans l'episode 35.5 % sont coupes
+    # avant leur sortie.
+    #
+    # Ce ne serait qu'un biais si la coupe frappait au hasard. Elle frappe
+    # exactement l'inverse :
+    #
+    #     trades coupes     E[R] +0.5192   duree 127 h   n=31 253
+    #     trades non coupes E[R] -0.2752   duree  22 h   n=56 780
+    #
+    # TOUT LE PROFIT DE CETTE GEOMETRIE EST DANS LES TRADES LONGS, et
+    # l'environnement les fermait a cinq jours. Les trades de plus de cinq
+    # jours, 13 % du total, rendent +0.905 R chacun. C'est pour les laisser
+    # courir que l'objectif a ete retire le matin meme ; l'episode les coupait
+    # quand meme, une barriere plus loin.
+    #
+    # C'est aussi un ECART TRAIN/LIVE. `max_holding_bars` vaut 0 avec ce
+    # commentaire : "l'environnement ne simule pas une sortie que l'execution
+    # ne sait pas faire". Or `episode_end` fait precisement cela — une
+    # fermeture au marche dont le live est incapable. Le commentaire etait
+    # contredit par le code trente lignes plus bas.
+    #
+    # 5 760 barres = 20 jours couvre le p95 (225 h) et ramene la coupe de
+    # 35.5 % a environ 13 %. Le budget de collecte ne bouge pas : 84 x 5 760
+    # fait les memes 483 840 barres que 336 x 1 440, donc le meme nombre de
+    # decisions PPO et le meme nombre de trades par epoch. Ce qui change est
+    # qu'ils vont au bout.
+    episode_length: int = 5760      # 20 jours de M5
     # Fraction des états EN POSITION conservée pour la mise à jour PPO.
     # Ils sont masqués à HOLD donc sans gradient d'actor ; les garder tous
     # faisait passer la mise à jour de 40s à 7 minutes pour rien.
@@ -4747,7 +4783,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec38"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec39"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -4771,7 +4807,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec38: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec39: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
