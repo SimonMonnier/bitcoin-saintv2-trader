@@ -39,9 +39,19 @@ REFERENCE = "reference_env_k1.json"
 GRAINE = 12345
 N_PAS = 6000
 
+# CHAQUE SCENARIO FIGE SA GEOMETRIE. Les deux premiers lisaient les defauts de
+# `PPOConfig`, donc le moindre changement de reglage — stop, trailing —
+# faisait echouer le temoin alors que le CODE n'avait pas bouge. Un test qui
+# crie au loup a chaque reglage finit ignore, et c'est pire que pas de test.
+#
+# Les valeurs figees ici sont celles qui etaient en production au moment de
+# l'enregistrement de la reference (stop 12xATR, trailing 1.5 R) : elles n'ont
+# plus a suivre la production, leur seul role est d'exercer le code.
 SCENARIOS = [
-    ("production", 3000, {}),
-    ("production", 90000, {}),
+    ("production", 3000, {"atr_sl_mult": 12.0, "atr_trail_mult": 18.0,
+                          "atr_trail_dist": 18.0, "aux_tp_mult": 24.0}),
+    ("production", 90000, {"atr_sl_mult": 12.0, "atr_trail_mult": 18.0,
+                           "atr_trail_dist": 18.0, "aux_tp_mult": 24.0}),
     ("stop serre", 3000, {"atr_sl_mult": 2.0, "atr_trail_mult": 3.0,
                           "atr_trail_dist": 3.0}),
     ("stop serre", 250000, {"atr_sl_mult": 2.0, "atr_trail_mult": 3.0,

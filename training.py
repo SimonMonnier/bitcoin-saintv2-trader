@@ -3239,7 +3239,29 @@ class BTCTradingEnvDiscrete(gym.Env):
         if self._slot_ouvert >= 0:
             _concernes.add(int(self._slot_ouvert))
         if _concernes:
-            _pen = 0.2 / len(_concernes) if dd > self.cfg.max_drawdown else 0.0
+            # LA PENALITE DE DRAWDOWN N'EST PAS PARTAGEE, ELLE EST PORTEE
+            # PAR CHAQUE POSITION.
+            #
+            # Je l'avais divisee par le nombre de positions concernees, pour
+            # ne pas la compter soixante fois. J'ai obtenu l'inverse du but :
+            # a K=1 elle valait -0.2, a 60 positions -0.003. Elle disparaissait
+            # exactement quand elle devait mordre le plus.
+            #
+            # Et ce n'est pas un detail de reglage. Mesure du 2026-09-16 : la
+            # part de marquage au marche a une mediane de 0.0007 par barre
+            # quand le terme de trade realise atteint 3. Sur la vie d'un
+            # trade le marquage cumule ~0.09 contre 1 a 3 — donc la concavite
+            # du logarithme, seule chose qui facture le risque, pese 3 a 10 %
+            # du signal. Tout le reste est LINEAIRE dans le nombre de
+            # positions et aveugle a leur correlation.
+            #
+            # Le pricing du risque reposait donc entierement sur cette
+            # penalite, que j'avais annulee. Non partagee, elle totalise
+            # 0.2 x K : elle croit avec l'exposition, ce qui est precisement
+            # le gradient qui manquait pour distinguer la 1re position de la
+            # 40e. Chaque position ouverte a contribue au creux ; chaque
+            # decision doit le sentir.
+            _pen = 0.2 if dd > self.cfg.max_drawdown else 0.0
             _clip = (hasattr(self.cfg, "current_epoch")
                      and self.cfg.current_epoch >= 10)
             _lat = self._latents_par_slot(price)
@@ -5610,7 +5632,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec49"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec50"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -5634,7 +5656,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec49: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec50: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
