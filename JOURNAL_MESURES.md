@@ -8,6 +8,292 @@ Ordre antichronologique.
 
 ---
 
+## 16 septembre 2026 — cinq défauts de mesure, et la géométrie choisie sur une table incohérente
+
+Journée entière passée à corriger des **instruments**, pas des modèles. Aucune
+des cinq erreurs ci-dessous n'était visible dans un résultat : chacune
+produisait des chiffres plausibles, du bon ordre de grandeur, du bon signe.
+C'est la raison d'être de cette entrée.
+
+### Le jeu de données — trois échelles, 260 colonnes
+
+`data_cache_BTCUSD_M5.pkl` : 948 532 barres, 2017-08-31 → 2026-09-14.
+
+| bloc | colonnes | contenu |
+|---|---|---|
+| M5 | 103 | bases, flux, temps, range, Ichimoku |
+| H1 | 85 | les mêmes structures, resamplées et décalées d'un `shift(1)` |
+| H4 | 85 | idem |
+
+Les périodes Ichimoku sont des nombres de **bougies** : Tenkan 9 couvre 45 min
+en M5, 9 h en H1, 36 h en H4. Les trois blocs portent les mêmes noms et ne
+décrivent pas du tout la même chose. Un trade M5 durant 3 h 40 à 12 h selon la
+géométrie, le M5 décrit ce qui se passe *pendant* le trade, le H1 le mouvement
+qui le contient, le H4 le régime qui contient ce mouvement.
+
+Les features sont stockées en `float32` : 2.1 Go → 1.1 Go, ce qui laisse la
+place de faire tourner l'entraînement, la veille et le test de causalité
+ensemble sur 16 Go. Aucune n'est un niveau absolu, toutes sont des rapports,
+des écarts normalisés ou des rangs.
+
+**Pas de M1, et ce n'est pas une question de téléchargement.** La plus longue
+ligne Ichimoku en M1, Senkou-B 52, couvre 52 minutes — moins que le Kijun M5
+(2 h 10). Le bloc M1 entier tiendrait *à l'intérieur* de ce que les deux
+premières lignes M5 décrivent déjà : c'est de la résolution en plus, pas un
+horizon en plus. Et l'hypothèse qu'on teste est que le signal vit **au-dessus**
+du M5, pas en dessous.
+
+---
+
+### Défaut 1 — le test de causalité passait sans rien tester
+
+`test_causalite.py` compare chaque colonne calculée sur la série entière à la
+même colonne calculée sur la série tronquée en t. Sa marge d'échauffement
+valait 3 000 barres M5, soit **62 bougies H4**. Or le bloc H4 réclame
+`FENETRE_EXT = 200` bougies plus `SENKOU_B = 52` et son décalage de 26 :
+~280 bougies H4, soit 13 400 barres M5.
+
+Les deux calculs rendaient donc `NaN`, et `NaN` contre `NaN` compte comme un
+accord. Les **85 colonnes H4 étaient déclarées saines sans avoir jamais été
+évaluées.** C'est le pire mode de défaillance possible pour un test : celui qui
+rassure à tort.
+
+Correctif : `MARGE = 16000`, et le test affiche désormais le nombre de colonnes
+**réellement évaluées**. Résultat après correction : **260 / 260, aucune fuite.**
+
+### Défaut 2 — le point mort était calculé sur la mauvaise fenêtre
+
+La ligne `META` publie `AvgW`/`AvgL` calculés sur l'**entraînement**. La veille
+les comparait au winrate de **validation**.
+
+Preuve arithmétique, exec23 epoch 7 :
+
+```
+PF_train x pertes/gains   = 1.708
+AvgW/AvgL de META         = 1.717     <- c'est l'entrainement
+le meme rapport cote VAL  = 1.542
+```
+
+Le révélateur ne demande aucune donnée : **le signe de l'écart au point mort
+est celui de `PF − 1`**. L'epoch 7 affichait `+0.3 pt` avec un `PF` de 0.91,
+ce qui est impossible. Trois epochs de suite avaient été lues comme « revenues
+au point mort » alors qu'elles perdaient. Après correction : `−2.2 pt`.
+
+Tout se déduit maintenant de la seule ligne VAL, où les trois chiffres sont
+cohérents entre eux, et une assertion vérifie l'identité à chaque epoch.
+
+### Défaut 3 — la collecte divisée par 3.5 sur une comparaison inter-échelles
+
+En recalculant les réglages PPO, `episode_length` est passé de 2 016 à 576
+barres. Le raisonnement : « des épisodes cinq fois plus longs rendent le même
+nombre de décisions, 2 054 en M5 contre 2 195 en H1 ».
+
+**Ces deux chiffres viennent de deux échelles différentes.** À l'intérieur du
+M5, les décisions sont proportionnelles aux barres collectées, et la mesure ne
+disait rien de cela. C'est la même faute que la mesure à plafond de 30 barres
+qui avait recommandé un stop de 8×ATR inexistant : comparer entre échelles ce
+qu'il fallait comparer à échelle constante.
+
+Coût : la collecte est tombée à 55 296 barres par epoch, soit **10 % de la
+fenêtre d'entraînement**, et les décisions PPO de ~2 050 à ~850. Le jeu M5
+offre ~15 100 occasions indépendantes ; chaque epoch n'en échantillonnait que
+6 %, tirées ailleurs à chaque fois. Après dix epochs le modèle avait vu
+**0.7 passage** sur ses données. En H1 il voyait 2 195 décisions pour 2 314
+occasions — la quasi-totalité du jeu à chaque epoch.
+
+**On avait acheté 6.5 fois plus de données et on ne les livrait jamais à
+l'optimiseur.**
+
+Le symptôme qui l'a trahi : le `PF` d'**entraînement** plafonnait à 0.87–0.95
+pendant dix epochs. Un modèle qui n'arrive pas à gagner sur les données qu'il
+optimise ne sur-apprend pas — il manque d'échantillons.
+
+Correctif : `episodes_per_epoch` 96 → 336, ce qui redonne les 193 536 barres
+d'origine avec 336 départs indépendants au lieu de 96. Vérifié : 3 073
+décisions à l'epoch 1 contre 867.
+
+### Défaut 4 — un plafond CUDA sur le PRODUIT features × épisodes
+
+SAINT replie un axe dans la dimension de lot avant d'appeler l'attention : sur
+l'axe temps le lot vaut `B × F`. À 336 épisodes et 261 colonnes cela fait
+87 696, au-dessus de la limite de grille CUDA de 65 535 — et le message est
+`CUDA error: invalid configuration argument`, qui ne nomme ni le lot, ni les
+colonnes, ni l'attention.
+
+Le plafond portait donc sur le **produit** de deux réglages choisis séparément
+et pour des raisons sans rapport. Chaque enrichissement du jeu de colonnes
+aurait dû se payer d'une réduction de la collecte, exactement quand on cherche
+à augmenter les deux.
+
+Correctif : le lot est tranché à 32 768 dans `AxialAttention.forward`. Le
+résultat est identique au bit près — l'attention ne mélange jamais deux
+éléments du lot entre eux, donc la découper n'en change aucun.
+
+### Défaut 5 — la géométrie choisie sur une table à deux échelles d'historique
+
+La table qui a fait retenir `SL 4×ATR` comptait les occasions de deux façons
+selon la ligne. Les mesures viennent du cache M1, soit **3.6 ans** ; le jeu M5
+en couvre **9.05**. La ligne retenue a été mise à l'échelle des neuf ans
+(5 811 → 15 089), la ligne écartée est restée à celle des 3.6 ans (1 739), et
+c'est ce 1 739 qui la faisait tomber sous le seuil de ~4 900.
+
+À la même échelle :
+
+```
+config         friction   horizon   occasions 9 ans   avantage requis
+H1  SL 2xATR    0.047 R     13.0 h            2 314        +0.0233 R
+M5  SL 4xATR    0.099 R      3.7 h           15 089        +0.0892 R
+M5  SL 8xATR    0.049 R     12.2 h            4 516        +0.0425 R
+```
+
+Ce qui tranche est la **détectabilité**, `(avantage − friction) × √N` :
+
+```
+avantage brut   SL 4     SL 8
+     0.09 R     0.10     3.19
+     0.11 R     2.56     4.54
+     0.13 R     5.01     5.88
+     0.15 R     7.47     7.22
+```
+
+Le croisement tombe à **0.1456 R**. L'avantage mesuré du modèle vaut +0.09 à
++0.13 R : il est tout entier du côté où 8×ATR gagne. À 0.09 R, le 4×ATR ne
+laisse pas 1 % de l'avantage brut survivre à la friction.
+
+**Et surtout, l'horizon.** Les +0.09 à +0.13 R ont été mesurés en H1, où le
+trade médian dure 13 heures. Le 4×ATR en M5 dure 3 h 40 : un avantage mesuré
+sur un horizon, déployé sur un autre 3.5 fois plus court, en supposant qu'il
+suivrait. Rien ne le garantissait — prédire quatre heures et prédire douze
+heures sont deux problèmes différents. Le 8×ATR dure 12.2 h et rend la question
+identique à celle qu'on savait résoudre.
+
+Le M5 garde alors son seul avantage réel sur le H1 : deux fois plus d'occasions
+indépendantes, 4 516 contre 2 314, à friction et horizon inchangés.
+
+---
+
+### Ce que les runs ont mesuré
+
+**exec23** — 260 colonnes, SL 4×ATR, 850 décisions/epoch.
+
+```
+politique GELEE   n=5  ecart moyen  -5.07 pt   ecart-type 1.97
+ENTRAINEE         n=4  ecart moyen  -3.56 pt   ecart-type 2.15
+gain  +1.52 +/- 1.39  (1.1 ecart-type)  ->  rien
+```
+
+**exec24** — identique, collecte réparée, 3 073 décisions/epoch.
+
+```
+politique GELEE   n=5  ecart moyen  -5.34 pt   ecart-type 0.80
+ENTRAINEE         n=3  ecart moyen  -7.29 pt   ecart-type 1.49
+gain  -1.95 +/- 0.93  (-2.1 ecarts-types)
+```
+
+**La collecte réparée n'a pas rendu le modèle meilleur : elle a rendu la mesure
+assez fine pour montrer qu'il est plus mauvais que le hasard.** L'écart-type de
+la référence passe de 1.97 à 0.80 — le mètre étalon est devenu 2.5 fois plus
+fin, et ce que le bruit cachait était une dégradation.
+
+Décomposé par sens, sur l'ensemble des trades de validation :
+
+```
+sens    etat      trades      WR      PnL      vs gele
+LONG    gele        1442   31.9%   -2609$
+LONG    entraine    1122   34.2%   -1383$      +2.3 pt  (+1.2 ecart-type)
+SHORT   gele        1767   32.4%   -2667$
+SHORT   entraine     931   26.5%   -3308$      -5.9 pt  (-3.2 ecarts-types)
+```
+
+L'amélioration des longs n'est pas significative. **Le modèle casse les
+shorts**, et il les casse *avec assurance* : le seuil de sélection des shorts
+monte de 0.393 à 0.440 puis 0.520 pendant que celui des longs reste à
+0.37–0.385. Les 5 % de shorts retenus sont de plus en plus confiants et de plus
+en plus faux — signature d'un motif trouvé dans la fenêtre d'entraînement qui
+**s'inverse** en validation, pas d'une distribution aplatie où la sélection
+redeviendrait aléatoire.
+
+**exec25** — SL 8×ATR / TP 16×ATR, épisodes de 1 440 barres, 1 966 décisions.
+
+```
+politique GELEE   n=5  ecart moyen  -2.46 pt   ecart-type 4.27   positives 2/5
+```
+
+La référence du hasard passe de −5.06 à −2.46 points. La friction passait de
+0.099 à 0.049 R, rapport **2.02** ; le trou dans lequel une politique aléatoire
+se trouve passe de 5.06 à 2.46 points, rapport **2.06**. Les deux coïncident à
+2 % près : le calcul qui a motivé le changement décrivait bien ce qui se passe.
+La cible passe de « trouver 5.3 points » à « trouver 2.5 points ».
+
+---
+
+### Deux faits de mesure à garder
+
+**L'écart train-val existe sans modèle.** Sur les cinq epochs **gelées**
+d'exec24 il vaut `+3.28 ± 1.05 pt`. La fenêtre de validation est structurellement
+plus dure que celle d'entraînement, indépendamment de ce qu'on apprend. Un gap
+ne devient un sur-ajustement qu'au-delà de `+5.4 pt` ; en dessous c'est la
+fenêtre qui parle. Sans ce garde-fou, les `+6.6 pt` d'exec24 auraient été lus
+comme un sur-ajustement franc alors qu'ils dépassent le bruit de justesse.
+
+**Le bruit par epoch suit la durée des trades.** À SL 8×ATR la fenêtre de
+validation, 321 jours, ne porte plus que 180 à 270 trades au lieu de 600 à 800 :
+un trade de 12.2 h y tient 3.3 fois moins souvent qu'un trade de 3 h 40.
+L'incertitude par epoch passe de ±1.9 à ±3.4 points de winrate. Deux epochs
+**gelées** consécutives ont donné +0.2 puis −7.5 sans que la politique bouge
+d'un iota — quatorze points d'écart, du bruit pur. Ce bruit ne contamine rien,
+puisque la moyenne des dix derniers jeux de poids a remplacé le choix du
+meilleur checkpoint ; il rend seulement la veille illisible epoch par epoch.
+
+---
+
+### Binance — la question est close, et elle l'était déjà
+
+Les quatre colonnes jamais branchées — `funding_rate`, `funding_cum24`,
+`oi_change`, `ls_ratio_retail` — donnent **0.4847 d'AUC à elles seules, sous le
+hasard**, et une corrélation plate aux rendements à tous les décalages.
+`ls_ratio_top` avait été retirée pour un apport marginal de −0.0000, avec une
+autocorrélation de 0.999985 : une variable de régime, constante pendant un
+trade, incapable de départager deux entrées.
+
+La raison structurelle empire au M5 : le funding est un cycle de 8 heures pour
+un trade de 3 h 40 à 12 h.
+
+La seule qui portait quelque chose, `taker_ratio` (−0.0498 si on la retire),
+**est déjà là** — et en M5 elle vient des klines spot sur les neuf ans, pas du
+fichier de features qui s'arrête à 2022-12-15.
+
+Le prix serait d'ailleurs prohibitif :
+
+```
+jeu                           barres   occasions independantes
+actuel, neuf ans             948 532            15 090  (SL 4)
+limite aux metrics Binance   599 659             9 540
+limite au fichier actuel     394 530             6 276
+```
+
+Remplir le trou par une constante serait la panne `spread_rel`, déjà payée une
+fois : une colonne absente sur 60 % du jeu n'apprend pas le marché, elle
+apprend la date.
+
+### Ce que cette journée ne dit PAS
+
+- Que le SL 8×ATR va marcher. Une seule epoch entraînée au moment d'écrire,
+  `+1.6 pt` contre un bruit de `±4.3` : ça ne prouve rien. Il faudra une
+  douzaine d'epochs entraînées pour que l'écart sorte à deux écarts-types.
+- Que les trois échelles apportent quelque chose. exec23 et exec24 les portent
+  toutes deux, et aucun des deux n'a rien montré de positif ; la seule variable
+  qui a déplacé un chiffre est la géométrie.
+- Que les shorts sont perdus. La dégradation à −3.2 écarts-types a été mesurée
+  **à SL 4×ATR uniquement**, c'est-à-dire sur l'horizon où l'avantage n'avait
+  jamais été mesuré. À SL 8×ATR la première epoch entraînée les laisse à 34.2 %,
+  dans la plage gelée. Si le motif revient, l'expérience à faire est un run
+  **long seul** — `cfg_long` existe déjà dans `training.py`.
+- Que la fenêtre de test dise quoi que ce soit. Elle n'a pas été touchée, et
+  elle ne le sera qu'une fois.
+
+---
+
 ## 15 septembre 2026 — trois biais de mesure, et ce qu'ils ont coûté
 
 La nuit a produit une chaîne de conclusions dont **aucune ne tenait**. Elles

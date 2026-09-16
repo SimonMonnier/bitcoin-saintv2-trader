@@ -1,47 +1,89 @@
-# KAIROS — Agent RL Multi-Stratégie pour BTCUSD M1
+# KAIROS — Agent RL Multi-Stratégie pour BTCUSD M5
 
 > *Le modèle ne prédit pas le marché. Il attend le moment.*
 
-> **PPO + SAINTv2** : agent d'apprentissage par renforcement entraîné en walk-forward sur l'historique BTCUSD à la minute, déployable en live sur MetaTrader 5 via une interface graphique dédiée.
+> **PPO + SAINTv2** : agent d'apprentissage par renforcement entraîné en walk-forward sur neuf ans d'historique BTCUSD en barres de cinq minutes, lu simultanément à trois échelles (M5, H1, H4), déployable en live sur MetaTrader 5 via une interface graphique dédiée.
 
 ---
 
 ## ⚠️ État actuel — aucun modèle n'est déployable
 
-**Le run en cours (`exec5`) perd encore de l'argent.** Meilleur résultat mesuré à
-ce jour : **−2,60 $ par trade** en validation, winrate 33,1 % contre un point
-mort à 43,7 %. La progression est réelle mais l'écart au seuil reste d'une
-dizaine de points.
+**Le run en cours (`exec25`) n'a pas encore d'epoch entraînée concluante.** Le
+meilleur résultat hors échantillon jamais obtenu reste **TabM à +3.8 ± 2.3
+points** au-dessus du point mort, PF 1.18, 3 folds sur 3 — non significatif. La
+meilleure politique PPO, `exec18`, donne **+2.2 ± 2.2 points**, 2 folds sur 3.
 
 Aucun `.pth` ne doit être mis en production. `kairos_live.py` refuse d'ailleurs
-de trader sans fichier `_calib.json` correspondant (`min_confidence = None`).
+de trader sans fichier `_calib.json` correspondant (`min_confidence = None`),
+et il tourne **encore sur l'ancien pipeline M1** : il n'a pas été porté au M5
+ni aux 260 colonnes. Le porter est un chantier ouvert, pas un détail.
+
+### Ce que le projet a compris de lui-même
+
+Le mur n'a jamais été l'architecture ni l'algorithme. Six expériences
+d'architecture ont rendu nul ou négatif (SAINT contre PatchTST, attention entre
+groupes −2.3, méta-étiquetage −2.9, lookback nul, taille par conviction +0.3).
+Ce qui a déplacé des chiffres : l'**échelle de temps**, l'**historique**, les
+**features**, et la **taille du modèle** — réduire le réseau de 493 796 à
+15 680 paramètres a fait passer PPO de −1.4 à +2.2 en test.
+
+La grandeur qui commande tout est le nombre d'**occasions indépendantes** :
+la durée d'historique divisée par la durée d'un trade, **jamais** le nombre de
+barres. Il en faut ~4 900 pour qu'un avantage de 0.02 R soit lisible.
+
+| configuration | friction / R | horizon | occasions | avantage requis |
+|---|---|---|---|---|
+| H1, SL 2×ATR | 0.047 R | 13.0 h | 2 314 | +0.0233 R |
+| M5, SL 4×ATR | 0.099 R | 3.7 h | 15 089 | +0.0892 R |
+| **M5, SL 8×ATR** | **0.049 R** | **12.2 h** | **4 516** | **+0.0425 R** |
+
+Le `SL 8×ATR` en M5 domine le H1 sur tous les axes : même friction, même
+horizon — donc le même problème de prédiction, celui sur lequel l'avantage de
++0.09 à +0.13 R a effectivement été mesuré — pour deux fois plus d'occasions.
 
 ### Lignées de checkpoints — elles ne sont PAS interchangeables
 
 Un préfixe par jeu d'observation. Charger le mauvais fichier ne produit aucune
 erreur visible : le modèle trade, simplement il lit autre chose que ce sur quoi
-il a appris.
+il a appris. Depuis `exec23`, `build_policy` déduit l'architecture complète des
+poids et le reste du fichier `_calib.json` ; un fichier ambigu est refusé.
 
-| Préfixe | Taille | Observation |
-|---------|--------|-------------|
-| `saintv2_loup_*` (sans exec) | 1,96 Mo | **modèles OR** — architecture d'avant la réduction du bloc SAINTv2 |
-| `..._exec3_...` | 1,20 Mo | BTC, 30 features, `scalping_max_holding = 120`, sortie par le temps à 240 barres |
-| `..._exec4_...` | 1,20 Mo | BTC, `scalping_max_holding = 30`, sortie par le temps retirée |
-| `..._exec5_...` | 1,20 Mo | idem + `ls_ratio_top` remplacée par `taker_1m_ma5` ← **courant** |
+| Préfixe | Échelle | Observation |
+|---------|---------|-------------|
+| `saintv2_loup_*` (sans exec) | M1 | modèles OR, architecture d'avant la réduction SAINTv2 |
+| `..._exec5_...` | M1 | 30 colonnes, `taker_1m_ma5` |
+| `..._exec10` à `..._exec20` | H1 | 103 colonnes, contexte H4 |
+| `..._exec22` | M5 | 103 colonnes, contexte H1 |
+| `..._exec23`, `..._exec24` | M5 | 260 colonnes, M5 + H1 + H4, SL 4×ATR |
+| `..._exec25` | M5 | idem, **SL 8×ATR / TP 16×ATR** ← courant |
 
 ### Le vrai sujet ouvert
 
-Une régression logistique atteint **0,6271 d'AUC** sur ces colonnes. Aucune
-politique entraînée n'a dépassé **0,5707**. Cet écart est le fait le plus
+Une régression logistique atteint **0.6271 d'AUC** sur ces colonnes. Aucune
+politique entraînée n'a dépassé **0.5707**. Cet écart est le fait le plus
 reproductible et le moins expliqué du projet : le signal est dans les features,
 PPO n'arrive pas à le prendre.
+
+Et la validation **sélectionne à l'envers**, de façon reproductible : −3.3
+points pour le choix du checkpoint, −4 points pour la sélectivité TabM, et le
+fold 2 d'exec18 affichait +8.14 en validation pour −0.9 en test. C'est pourquoi
+le choix du meilleur checkpoint a été remplacé par la **moyenne des dix
+derniers jeux de poids**, qui ne dépend d'aucun tirage particulier.
 
 ### Divergence connue entre l'entraînement et le live
 
 `kairos_live.py` n'a **aucun chemin de fermeture au marché** — les positions ne
 sortent que par SL/TP chez le courtier. Tant que ce n'est pas écrit, toute règle
 de sortie temporelle côté entraînement simulerait une stratégie inexécutable ;
-c'est pourquoi `max_holding_bars` vaut 0.
+c'est pourquoi `max_holding_bars` vaut 0, et pourquoi toutes les mesures de
+géométrie se font **sans plafond de durée**.
+
+### Où est écrit ce qu'on a appris
+
+`JOURNAL_MESURES.md`, en ordre antichronologique. Chaque entrée dit ce qui a
+été mesuré, comment, et ce que la mesure **ne** permet pas de conclure. La
+plupart des impasses de ce projet ont été des raisonnements plausibles jamais
+confrontés à une mesure.
 
 ---
 
@@ -254,11 +296,27 @@ Implémentation maison avec :
 
 ---
 
-## 🧬 Jeu de features — 30 colonnes
+## 🧬 Jeu de features — 260 colonnes, trois échelles
 
-`saint_core.FEATURE_COLS` est la **source unique**. 12 colonnes M1, 13 H1,
-2 Binance, 3 liquidité/temps. L'observation ajoute 4 scalaires de position →
-`OBS_N_FEATURES = 34`.
+`saint_core.FEATURE_COLS` est la **source unique**. L'observation ajoute
+4 scalaires de position → `OBS_N_FEATURES = 264`.
+
+| bloc | colonnes | contenu |
+|---|---|---|
+| M5 | 103 | 12 bases, 2 Binance, 4 liquidité/temps, 25 range, 47 Ichimoku, 13 contexte |
+| H1 | 85 | les mêmes structures, resamplées et décalées d'un `shift(1)` |
+| H4 | 85 | idem |
+
+Les périodes Ichimoku sont des nombres de **bougies**, pas des durées : Tenkan 9
+couvre 45 minutes en M5, 9 heures en H1, 36 heures en H4. Les trois blocs
+portent les mêmes noms et ne décrivent pas du tout la même chose — un trade
+médian durant 12 heures, le M5 décrit ce qui se passe *pendant* le trade, le H1
+le mouvement qui le contient, le H4 le régime qui contient ce mouvement.
+
+`test_causalite.py` recalcule les 260 colonnes sur une série tronquée et exige
+la valeur identique. Il affiche le nombre de colonnes **réellement évaluées** :
+une marge d'échauffement trop courte rendrait `NaN` des deux côtés, ce qui
+compte comme un accord et déclarerait saines des colonnes jamais calculées.
 
 > ⚠️ L'élagage à 10 colonnes documenté dans les versions précédentes de ce
 > fichier a été **annulé après mesure** : les apports marginaux NE SE COMPOSENT
@@ -406,31 +464,38 @@ jours de trous en 2022). Coût : 2.28 M → 1.97 M bougies.
 
 ### Hyperparamètres clés
 
+Valeurs en vigueur sur `exec25`. Les justifications complètes, avec la mesure
+qui a fait choisir chaque valeur, sont dans les commentaires de `training.py`.
+
 | Paramètre | Valeur | Justification |
 |-----------|--------|---------------|
-| `epochs` | 240 | Plus de runway avec cosine LR |
-| `episodes_per_epoch` | 4 | Diversité par epoch |
-| `episode_length` | 4 000 | ~2.8 jours M1, trajectoires longues |
-| `val_episodes` | 7 | Augmenté de 2 → 7 pour stabiliser le Sortino |
-| `batch_size` | 256 | GPU-friendly |
-| `clip_eps` | 0.18 | Standard PPO |
-| `target_kl` | 0.03 | Early stop si dépassé |
-| `gamma` | 0.97 | Horizon court pour scalping |
-| `lambda_gae` | 0.95 | Standard |
-| `lr` | 3e-4 → 1.5e-5 (cosine) | Décroissance douce |
-| `entropy_coef` | 0.30 | Pousse l'exploration SHORT (×2.0 → ×0.8 sur 120 ep) |
-| `value_coef` | 0.5 | Standard |
-| `max_grad_norm` | 0.3 | Anti gradient-explosion (resserré + unscale AMP) |
-| `max_drawdown` | 0.4 | Force l'apprentissage prudent (resserré depuis 0.8) |
-| `CONF_THRESHOLD` | 0.40 | Filtre exploration training — aligné live/backtest/MQL5 |
-| `critic_warmup_epochs` | 5 | Stabilité initiale |
-| `lookback` | 25 | ~25 minutes de contexte |
-| `position_size` | 0.06 lot | Risk-tuned BTCUSD |
-| `leverage` | 6× | **Marge uniquement** — jamais un multiplicateur de PnL |
-| `atr_sl_mult` | 1.2 | SL = 1.2 × ATR(14) |
-| `atr_tp_mult` | 1.68 | TP = 1.68 × ATR (R:R 1:1.4) |
-| `tp_shrink` | 1.0 | Pas de shrink : `atr_tp_mult` contient le facteur final |
-| `tick_noise_bps` | 3.0 | Extension des wicks. **Doit rester ≪ `atr_sl_mult` × ATR** (≈ 8.8 bps sur BTCUSD M1), sinon le bruit déclenche le SL avant le marché |
+| `timeframe_entrainement` | `M5` | échelle de décision ; H1 et H4 en contexte |
+| `atr_sl_mult` | 8.0 | friction 0.049 R et horizon 12.2 h — ceux du H1, pour 2× ses occasions |
+| `atr_tp_mult` | 16.0 | R:R 2.0 |
+| `epochs` | 40 | + une itération de moyenne des poids |
+| `episodes_per_epoch` | 336 | 483 840 barres/epoch = 73 % de la fenêtre, ~2 000 décisions |
+| `episode_length` | 1 440 | 5 jours de M5, ~10 trades médians par épisode |
+| `val_episodes` | 40 | couvre 100 % de la fenêtre de validation |
+| `updates_per_epoch` | 8 | doubler les passes sans collecter une barre de plus |
+| `batch_size` | 128 | deux fois plus de pas de gradient à données égales |
+| `lr` | 1e-3 | la KL croît comme le carré du pas ; à 3e-4 elle valait 0.0002 pour une cible de 0.030 |
+| `entropy_coef` | 0.015 | le terme de politique est 40 % plus faible en M5, celui-ci est absolu |
+| `max_grad_norm` | 0.6 | la norme observée vaut 0.90 : à 0.3 chaque mise à jour était divisée par trois |
+| `clip_eps` | 0.18 | standard PPO |
+| `target_kl` | 0.03 | arrêt précoce à 1.5× — rend sûr d'augmenter le pas |
+| `gamma` | 0.995 | semi-MDP : l'escompte est `γ^Δt`, Δt en barres |
+| `lambda_gae` | 0.95 | standard |
+| `critic_warmup_epochs` | 5 | l'actor est gelé, ces epochs servent de référence au hasard |
+| `n_moyenne_poids` | 10 | remplace le choix du meilleur checkpoint, qui coûtait −3.3 points |
+| `patience` | 0 | pas d'arrêt précoce : il sélectionnerait sur la validation |
+| `lookback` | 4 | mesuré : le passé n'apporte rien au-delà |
+| `architecture` | `saint` | attention sur deux axes, features et temps |
+| `d_model` / `num_blocks` | 8 / 2 | ~45 000 paramètres pour ~4 500 occasions |
+| `saint_heads` / `saint_n_freq` | 1 / 4 | `d_model // heads` doit être multiple de 8 |
+| `saint_mlp_dim` | 16 | la tête pèse 92–98 % du réseau ; c'est elle qu'il faut contenir |
+| `saint_lecture` | `colonnes` | lit chaque colonne, au lieu d'un CLS agrégé |
+| `max_drawdown` | 0.4 | force l'apprentissage prudent |
+| `tick_noise_bps` | 3.0 | extension des wicks. **Doit rester ≪ `atr_sl_mult` × ATR**, sinon le bruit déclenche le SL avant le marché |
 
 ---
 

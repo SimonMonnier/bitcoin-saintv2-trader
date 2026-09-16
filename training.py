@@ -280,17 +280,76 @@ class PPOConfig:
     pas_patch: int = 1
 
     # "M1" ou "H1". Choisit le cache et, avec lui, l'echelle de decision.
-    timeframe_entrainement: str = "H1"
+    timeframe_entrainement: str = "M5"
 
     # "patchtst" ou "saint". build_policy DEDUIT l'architecture du checkpoint
     # au chargement, donc ce reglage ne concerne que l'entrainement.
-    architecture: str = "patchtst"
+    # SAINT PLUTOT QUE PATCHTST, a budget de parametres EGAL.
+    #
+    # Ce que la nuit du 2026-09-16 a etabli, dans l'ordre :
+    #   - l'axe du TEMPS ne porte rien (profondeur 16 = profondeur 1) ;
+    #   - croiser les COLONNES vaut +2 points au banc (ridge +1.8, LightGBM
+    #     +2.6, TabM +3.8 sur les memes fenetres) ;
+    #   - PatchTST est a canaux INDEPENDANTS : il ne peut pas croiser les
+    #     colonnes, par construction. C'est le defaut de Ridge transpose au
+    #     modele sequentiel, et Ridge est celui qui perd ;
+    #   - reduire le reseau a fait passer PPO de -1.4 a +2.2 points au test.
+    #
+    # SAINT etait ecarte parce qu'il coutait 19 690 ms par passe et 8.9 Go.
+    # Deux choses ont change : le lookback est tombe de 96 a 4, ce qui divise
+    # par 24 le produit T x F, et la largeur de sa tete est devenue reglable —
+    # elle valait 256 en dur et pesait 67 % du reseau, quand l'attention entre
+    # features en coute 2 %.
+    #
+    # A d_model 8, n_freq 4, mlp_dim 32 : 13 592 parametres contre 15 680 pour
+    # PatchTST. SAINT est donc PLUS PETIT que la configuration qui vient de
+    # donner +2.2, pour 15.4 ms contre 8.7. Une seule chose change entre les
+    # deux runs : croiser les colonnes, ou non.
+    architecture: str = "saint"
 
     # Largeur du reseau. 64/256 donnait 1.19 M de parametres pour 16 708
     # barres d'entrainement, soit 71 parametres par exemple — et le modele
     # memorisait. 32/128 ramene a 298 k.
-    d_model_patch: int = 32
-    mlp_dim: int = 128
+    # D_MODEL 32 -> 8. Le relevé de l'architecture d'exec16 a montré ce que
+    # personne n'avait regardé : la TETE pese 92 % des parametres et
+    # l'encodeur 8 %. Les jetons sont moyennes avant la tete, donc reduire le
+    # lookback de 96 a 4 n'a rien enleve au modele — il a seulement moins a
+    # lire. Six essais d'architecture ont donc porte sur 8 % du reseau.
+    #
+    # d_model est le seul reglage qui agisse sur les 92 % : il multiplie les
+    # 107 entrees de la tete. 32 -> 8 fait tomber le compte de 493 796 a
+    # 129 404 parametres, soit 2.3 par barre d'entrainement au lieu de 8.9.
+    #
+    # Les tetes d'attention restent a 4, donc 2 dimensions chacune. C'est
+    # etroit, mais l'encodeur ne represente plus que 2 % du reseau : ce n'est
+    # plus lui qu'on regle.
+    # D_MODEL 8 -> 4 ET MLP_DIM 128 -> 32. Les deux agissent sur la taille de
+    # la TETE, qui pese 95 a 99 % du reseau : c'est le meme levier pris par ses
+    # deux bouts, pas deux variables.
+    #
+    # LA COLONNE QUI COMMANDE n'est pas le nombre de parametres par barre mais
+    # par OCCASION INDEPENDANTE. La fenetre d'entrainement fait 55 538 barres,
+    # mais seulement ~2 314 occasions sans chevauchement — une par jour, la
+    # duree d'un trade. C'est ce nombre-la qui borne ce qu'on peut apprendre.
+    #
+    #   d_model  mlp_dim   params   par barre   par occasion
+    #         8      128   129 404       2.33          55.9   exec17
+    #         8       32    31 292       0.56          13.5
+    #         4      128    72 704       1.31          31.4
+    #         4       32    15 680       0.28           6.8   ici
+    #
+    # Trois runs successifs designent la meme direction sur le meme fold :
+    # -3.08 (d_model 32, lookback 96), -1.62 (d_model 32, lookback 4), -0.73
+    # (d_model 8). C'est la seule tendance monotone que ce depot ait produite.
+    #
+    # CE QU'IL FAUT SAVOIR EN ARRIVANT LA. A d_model 4 avec quatre tetes,
+    # chaque tete d'attention a UNE dimension : l'attention devient une
+    # similarite scalaire, c'est-a-dire a peu pres rien, et l'encodeur ne pese
+    # plus que 5 % des poids. Ce qu'on entraine est un petit MLP sur des
+    # features moyennees, avec un transformer decoratif. C'est la description
+    # de TabM, qui rend +3.8 points en quelques minutes.
+    d_model_patch: int = 4
+    mlp_dim: int = 32
 
     # PPO Training
     # BUDGET FIXE, PAS D'ARRET PRECOCE. Mesure du 2026-09-15 : le checkpoint
@@ -326,7 +385,50 @@ class PPOConfig:
     # DIMENSIONNEMENT H1. Le jeu fait 30 379 barres contre 1.8 M en M1 :
     # un episode de 6 000 barres couvrirait 28 % du train a lui seul, et les
     # episodes se recouvriraient presque entierement.
-    episodes_per_epoch: int = 96
+    # 96 episodes de 2 016 barres couvrent 193 536 barres, soit 29 % des
+    # 666 421 barres d'entrainement a chaque epoch. En H1 le meme reglage en
+    # couvrait 69 % — mais le jeu H1 etait douze fois plus petit, et ce qui
+    # compte n'est pas la part du jeu vue par epoch, c'est le nombre de trades
+    # que la collecte produit. A ~46 trades par episode, une epoch en voit
+    # environ 4 400, contre 1 400 en H1.
+    #
+    # 96 -> 336, le 2026-09-16, POUR REPARER UNE ERREUR INTRODUITE ICI MEME.
+    #
+    # Le paragraphe ci-dessus decrit 96 episodes de 2 016 barres = 193 536
+    # barres par epoch. En ramenant episode_length a 576, j'ai divise ce volume
+    # par 3.5 sans toucher au nombre d'episodes : la collecte est tombee a
+    # 55 296 barres, soit 10 % de la fenetre d'entrainement, et les decisions
+    # PPO de ~2 050 a ~850 par epoch.
+    #
+    # L'ARGUMENT QUI M'AVAIT TROMPE. J'avais mesure qu'un episode cinq fois
+    # plus long rendait le meme nombre de decisions — 2 054 en M5 contre 2 195
+    # en H1 — et conclu que la longueur ne servait a rien. Mais ces deux
+    # chiffres viennent de DEUX ECHELLES DIFFERENTES. A l'interieur du M5 les
+    # decisions sont proportionnelles aux barres collectees, et la mesure ne
+    # disait rien de cela. Comparer entre echelles ce qu'il fallait comparer
+    # a echelle constante : c'est la meme faute que la mesure a 30 barres qui
+    # avait recommande un stop de 8xATR inexistant.
+    #
+    # CE QUE CA COUTAIT. Le jeu M5 offre ~15 100 occasions independantes, mais
+    # chaque epoch n'en echantillonnait que 850 — 6 %, tirees ailleurs a chaque
+    # fois. Apres dix epochs le modele avait vu 0.7 passage sur ses donnees. En
+    # H1 il voyait 2 195 decisions pour 2 314 occasions, soit la quasi-totalite
+    # du jeu A CHAQUE EPOCH. Le gain d'occasions du M5 n'avait donc jamais
+    # atteint l'optimiseur : on avait achete des donnees et laisse le budget de
+    # collecte a sa valeur d'avant.
+    #
+    # LE SYMPTOME QUI L'A TRAHI : sur exec23, le PF d'ENTRAINEMENT plafonne a
+    # 0.87-0.95 pendant dix epochs. Un modele qui n'arrive pas a gagner sur les
+    # donnees qu'il optimise n'est pas en train de sur-apprendre — il n'apprend
+    # pas du tout, faute d'echantillons.
+    #
+    # POURQUOI PLUS D'EPISODES ET PAS DES EPISODES PLUS LONGS. 336 x 576
+    # redonne exactement les 193 536 barres d'origine, mais avec 336 departs
+    # independants au lieu de 96 : moins de correlation a l'interieur d'un lot,
+    # donc un gradient moins bruite a volume egal. Les episodes tournent EN
+    # PARALLELE avec un seul forward batche par pas, et la politique fait
+    # 45 000 parametres — le surcout GPU d'un batch 336 contre 96 est nul.
+    episodes_per_epoch: int = 336
     # Idem pour la validation : 21-32 trades donnaient un Sortino purement
     # bruité (PF 3.10 puis 0.51 d'une epoch à l'autre), donc une sélection du
     # "best model" au hasard.
@@ -335,7 +437,24 @@ class PPOConfig:
     # plus rien n'est distinguable de rien. Trois fois plus d'episodes rendent
     # la mesure exploitable sans toucher a la REGLE de decision.
     val_episodes: int = 40
-    episode_length: int = 400       # ~17 jours de H1
+    # 400 barres valaient 17 jours en H1 ; en M5 elles n'en font que 33
+    # heures, soit moins qu'un seul trade median de 44 barres suivi de son
+    # successeur. Un episode doit contenir assez de trades pour que le retour
+    # cumule signifie quelque chose : 2 016 barres font une semaine de M5, donc
+    # une quarantaine de trades medians.
+    # 2016 -> 576. Mesure : des episodes cinq fois plus longs rendent
+    # EXACTEMENT le meme nombre de decisions PPO (2 054 contre 2 195 en H1),
+    # parce qu'une decision ne se cloture qu'a la fermeture de la position.
+    # Les 2 016 barres coutaient donc 19 s de collecte par epoch pour rien.
+    # 576 barres font 48 heures de M5, soit une quinzaine de trades medians par
+    # episode — assez pour que le retour cumule ait un sens.
+    # 576 -> 1 440, CONSEQUENCE MECANIQUE DU STOP, pas une seconde hypothese.
+    # Le trade median passe de 44 a 147 barres : a episodes constants, les
+    # decisions PPO tomberaient de 3 073 a ~900, et on relirait le manque
+    # d'echantillons deja diagnostique. 336 x 1 440 = 483 840 barres, soit 73 %
+    # de la fenetre d'entrainement a chaque epoch et ~2 300 decisions — le
+    # regime H1, ou le modele voyait presque tout son jeu a chaque passage.
+    episode_length: int = 1440      # 5 jours de M5
     # Fraction des états EN POSITION conservée pour la mise à jour PPO.
     # Ils sont masqués à HOLD donc sans gradient d'actor ; les garder tous
     # faisait passer la mise à jour de 40s à 7 minutes pour rien.
@@ -370,13 +489,21 @@ class PPOConfig:
     # Un episode H1 de 400 barres donne au plus 400 decisions ; 96 episodes
     # en donnent ~38 000, dont la plupart en position. Le plafond garde son
     # role : rendre les epochs comparables entre elles.
-    max_decisions_per_epoch: int = 12_000
+    # Plafond du nombre de decisions retenues pour la mise a jour PPO. Les
+    # episodes M5 etant cinq fois plus longs, la collecte en produit bien
+    # davantage ; on releve le plafond en proportion pour ne pas jeter
+    # l'essentiel de ce que la nouvelle echelle apporte.
+    max_decisions_per_epoch: int = 40_000
     # Nombre de passes PPO sur les données collectées.
     # Testé à 8 pour tenter de débloquer le KL (0.0004 contre un target de
     # 0.03) : sans effet sur le KL, resté à 0.0000, et le critique a divergé
     # (CriticL 9.6 → 1.7e6, ~500 pas d'optimisation sur le même batch).
     # Ce n'est donc pas le nombre de passes qui bride l'actor.
-    updates_per_epoch: int = 4
+    # 4 -> 8 passes sur le meme lot. Avec seulement ~2 050 echantillons par
+    # epoch, doubler les passes double les pas de gradient sans collecter une
+    # seule barre de plus. Le sur-ajustement au lot est borne par l'arret sur
+    # KL, qui coupe l'epoch des que la politique s'eloigne trop.
+    updates_per_epoch: int = 8
     tp_shrink: float = 1.0  # pas de shrink (formule explicite : atr_tp_mult contient déjà le facteur final)
 
     # Batch reduit : avec ~1700 decisions par epoch, 256 ne donnait que 6
@@ -428,7 +555,51 @@ class PPOConfig:
     gamma: float = 0.995
     lambda_gae: float = 0.95
     clip_eps: float = 0.18
-    lr: float = 3e-4
+    # ------------------------------------------------------------------
+    # REGLAGES PPO RECALCULES POUR LE M5, le 2026-09-16.
+    #
+    # LE DIAGNOSTIC, lu dans le journal d'exec21 sur onze epochs entrainees :
+    #
+    #     KL        median  0.0002   pour une cible de 0.030
+    #     clipfrac  median  0.0 %    aucune mise a jour n'atteint sa borne
+    #     lratio    median  0.015    le ratio de politique bouge a peine
+    #     advStd    median  1.34     contre ~2.24 en H1
+    #     dec       median  2 054    identique au H1 malgre des episodes 5x
+    #                                plus longs
+    #
+    # Le run utilisait 0.7 % du mouvement de politique qu'il s'autorise. Le
+    # modele ne refusait pas d'apprendre : on ne le laissait pas bouger.
+    # L'entropie tenait a 1.094 sur 1.099 apres quinze epochs, et l'ecart au
+    # point mort etait DESCENDU a 3 points sous la politique gelee.
+    #
+    # DEUX CAUSES, toutes deux propres au changement d'echelle :
+    #
+    #   1. Le signal d'avantage est 40 % plus faible (advStd 1.34 contre 2.24).
+    #      Une barre M5 porte douze fois moins de mouvement qu'une barre H1.
+    #      Or `entropy_coef` est un coefficient ABSOLU : le bonus d'entropie
+    #      pese donc 1.7 fois plus lourd, relativement, qu'il ne pesait en H1.
+    #
+    #   2. Les episodes cinq fois plus longs ne produisent PAS plus
+    #      d'echantillons. Le semi-MDP ne cloture une decision qu'a la
+    #      fermeture de la position, donc le nombre d'echantillons suit le
+    #      nombre de CYCLES DE TRADE, pas le nombre de barres. Allonger les
+    #      episodes a coute du temps de collecte sans rien apporter a
+    #      l'apprentissage.
+    #
+    # LES QUATRE CHANGEMENTS SERVENT LE MEME BUT — laisser la politique bouger
+    # — et c'est pourquoi ils partent ensemble malgre la regle habituelle d'une
+    # variable a la fois. Les separer demanderait quatre runs pour corriger un
+    # seul defaut, et le garde-fou ci-dessous borne le risque :
+    #
+    #   L'ARRET PRECOCE SUR KL REND CES CHANGEMENTS SURS PAR CONSTRUCTION. Si
+    #   la divergence depasse 1.5 x target_kl, l'epoch s'interrompt d'elle-meme
+    #   en plein milieu. On ne peut donc pas "trop" augmenter le pas : on peut
+    #   seulement gaspiller du calcul, jamais casser la politique.
+    # ------------------------------------------------------------------
+    # 3e-4 -> 1e-3. La divergence KL croit a peu pres comme le CARRE du pas,
+    # donc tripler le pas multiplie la KL par ~11 : elle passerait de 0.0002 a
+    # 0.002, soit encore quinze fois sous la cible.
+    lr: float = 1e-3
     target_kl: float = 0.03
     value_coef: float = 0.5
     # Coefficient d'entropie — plage usuelle PPO (1e-3 à 1e-2).
@@ -439,7 +610,12 @@ class PPOConfig:
     # de 1.099 a 0.495 en quinze epochs, et le resultat se degradait en
     # parallele. Le bonus ne retenait pas la politique, qui se figeait sur ce
     # qu'elle avait memorise d'un jeu de 16 708 barres.
-    entropy_coef: float = 0.030
+    # 0.030 -> 0.015. Ce coefficient avait ete DOUBLE sur exec11 pour empecher
+    # l'entropie de s'effondrer en H1 — et il avait marche. En M5 le terme de
+    # politique-gradient est 40 % plus faible tandis que celui-ci reste absolu,
+    # donc le meme reglage pousse 1.7 fois plus fort vers l'uniformite. Le
+    # ramener de moitie retablit l'equilibre qu'il avait en H1.
+    entropy_coef: float = 0.015
 
     # Nombre d'epochs sans amelioration avant arret. Voir le commentaire de
     # `patience` dans run_training_on_split.
@@ -447,15 +623,40 @@ class PPOConfig:
     patience: int = 0
     # (A) Clip très serré : 0.5 a laissé passer des gradients qui ont explosé
     # avec AMP (clip appliqué sur valeurs scaled). Maintenant 0.3 + unscale fix.
-    max_grad_norm: float = 0.3
+    # 0.3 -> 0.6. La norme observee vaut 0.90, donc chaque mise a jour etait
+    # divisee par trois AVANT meme d'etre appliquee. Avec un pas triple, ce
+    # plafond aurait absorbe l'essentiel du changement et l'aurait rendu
+    # invisible — on aurait conclu que le pas ne sert a rien.
+    max_grad_norm: float = 0.6
 
     # SAINT
-    d_model: int = 80
+    # 80 -> 8. Avec une seule tete, head_dim vaut 8, ce que
+    # saint_core._verifie_dim_tete exige pour SDPA.
+    d_model: int = 8
+    # Frequences de l'embedding numerique par colonne. 16 en faisait le second
+    # poste du reseau (29 %) ; 4 le ramene a un niveau comparable aux blocs.
+    saint_n_freq: int = 4
+    saint_heads: int = 1
+    saint_mlp_dim: int = 16
+    # LECTURE PAR COLONNES plutot que par jeton CLS. exec19 a montre le
+    # goulot : en lecture CLS, la tete recevait SEIZE nombres pour resumer 107
+    # colonnes, contre 428 chez PatchTST. L'etendue des convictions plafonnait
+    # a 0.028 apres 23 epochs — vingt fois moins que PatchTST au meme stade —
+    # et l'entropie ne descendait pas sous 1.089 sur 1.099 : le modele n'avait
+    # pas la place d'exprimer des convictions differentes selon les situations.
+    #
+    # En lisant les representations PAR COLONNE de la derniere bougie, la tete
+    # recoit 856 nombres, et les blocs d'attention — qui ne coutent que 1 984
+    # parametres — continuent de croiser les features. 26 752 parametres au
+    # total, soit 11.6 par occasion independante contre 6.8 pour exec18.
+    saint_lecture: str = "colonnes"
 
     # Profondeur du tronc — source unique : saint_core.N_BLOCS_DEFAUT.
     # 3 d'apres la configuration par defaut du FT-Transformer (Gorishniy 2021).
     # A ne PAS recopier en dur ailleurs : build_policy la deduit du checkpoint.
-    num_blocks: int = N_BLOCS_DEFAUT
+    # Deux blocs plutot que trois : a ce budget, chaque bloc pese 15 % du
+    # reseau, donc la profondeur est un choix de taille autant que de capacite.
+    num_blocks: int = 2
 
     # INTERSAMPLE ATTENTION, forme deployable — voir saint_core.ReferenceMemory.
     # Nombre d'observations de reference tirees de la fenetre de TRAIN, rangees
@@ -466,7 +667,12 @@ class PPOConfig:
     # un lot de 128 se comporteraient autrement. Une banque figee donne la meme
     # capacite — comparer l'instant present a des situations historiques — en
     # restant identique a l'entrainement et en production.
-    n_ref: int = 256
+    # MEMOIRE INTER-ECHANTILLONS DESACTIVEE POUR CE RUN. Elle est la seconde
+    # chose que SAINT apporte, et une seule question a la fois : ce run teste
+    # l'attention entre COLONNES contre l'independance des canaux. Ajouter la
+    # banque de references melangerait deux effets, ce qui a deja coute une
+    # nuit sur exec11.
+    n_ref: int = 0
 
     # Trading
     initial_capital: float = 1000.0
@@ -577,7 +783,61 @@ class PPOConfig:
     # choix du couple exact est moins solide que le choix du jeu de features,
     # dont les six premieres places du classement etaient toutes occupees par
     # les jeux larges.
-    atr_sl_mult: float = 2.0
+    # STOP 2 -> 4 xATR, impose par le changement d'echelle. Mesure du
+    # 2026-09-16, sortie sur barriere UNIQUEMENT comme l'environnement et le
+    # live :
+    #
+    #     UT   SL   friction/R   E[R] hasard   duree med   occasions   requis
+    #     M5  2.0      0.198R       -0.1684         12b      21 308   +0.1684R
+    #     M5  4.0      0.099R       -0.0892         44b       5 811   +0.0892R
+    #     M5  8.0      0.049R       -0.0425        147b       1 739   +0.0425R
+    #
+    # La friction est un montant FIXE en dollars ; l'unite de risque est la
+    # distance au stop. En M5 l'ATR vaut 54.58 $ contre 223 $ en H1, donc un
+    # stop de 2xATR y ferait payer 0.198 R par aller-retour — quatre fois plus
+    # que l'avantage que le modele sait produire. Le 4xATR ramene ce cout a
+    # 0.075 R tout en gardant 5 811 occasions independantes sur 2.5 ans, soit
+    # ~15 000 sur les neuf ans telecharges.
+    # ------------------------------------------------------------------
+    # GEOMETRIE DES BARRIERES — SL 8xATR, corrige le 2026-09-16.
+    #
+    # L'ERREUR QUE CECI REPARE. La table qui avait fait choisir 4xATR comptait
+    # les occasions de DEUX facons selon la ligne. Les mesures viennent du cache
+    # M1, soit 3.6 ans ; le jeu M5 en couvre 9.05. La ligne retenue a ete mise a
+    # l'echelle des neuf ans (5 811 -> 15 089), la ligne ecartee est restee a
+    # celle des 3.6 ans (1 739), et c'est ce 1 739 qui l'a fait tomber sous le
+    # seuil de ~4 900. A la meme echelle elle en vaut 4 516.
+    #
+    #   config         friction   horizon   occasions 9 ans   avantage requis
+    #   H1  SL 2xATR    0.047 R     13.0 h            2 314        +0.0233 R
+    #   M5  SL 4xATR    0.099 R      3.7 h           15 089        +0.0892 R
+    #   M5  SL 8xATR    0.049 R     12.2 h            4 516        +0.0425 R
+    #
+    # CE QUI DECIDE : LA DETECTABILITE, (avantage - friction) x racine(N).
+    #
+    #   avantage brut   SL 4     SL 8
+    #        0.09 R     0.10     3.19
+    #        0.11 R     2.56     4.54
+    #        0.13 R     5.01     5.88
+    #        0.15 R     7.47     7.22
+    #
+    # Le croisement tombe a 0.1456 R. L'avantage mesure du modele vaut +0.09 a
+    # +0.13 R : il est TOUT ENTIER du cote ou 8xATR gagne. A 0.09 R, le 4xATR
+    # ne laisse meme pas 1 % de son avantage brut survivre a la friction.
+    #
+    # ET SURTOUT, L'HORIZON REDEVIENT CELUI DE LA MESURE. Les +0.09 a +0.13 R
+    # ont ete mesures en H1, ou le trade median dure 13 heures. Le 4xATR en M5
+    # dure 3 h 40 : on avait mesure un avantage sur un horizon et on l'a deploye
+    # sur un autre, 3.5 fois plus court, en supposant qu'il suivrait. Rien ne le
+    # garantissait — predire quatre heures et predire douze heures sont deux
+    # problemes differents. Le 8xATR dure 12.2 h et rend la question identique a
+    # celle qu'on savait resoudre.
+    #
+    # Le M5 garde alors son seul avantage reel sur le H1 : deux fois plus
+    # d'occasions independantes, 4 516 contre 2 314, a friction et horizon
+    # inchanges. Il ne reste aucun axe sur lequel le H1 lui soit superieur.
+    # ------------------------------------------------------------------
+    atr_sl_mult: float = 8.0
     # R:R 1:2.0. Le 1.4 precedent venait de la grille de mesure_features.py,
     # qui echantillonne une entree toutes les 10 barres alors que les
     # barrieres mettent jusqu'a 240 barres a se resoudre : les fenetres de
@@ -592,7 +852,9 @@ class PPOConfig:
     #
     # Effet principal : le point mort passe de 44.0 % a 35.7 %. Les runs
     # atteignaient 33.1 % — il leur manquait 11 points, il leur en manque 3.
-    atr_tp_mult: float = 4.0
+    # R:R maintenu a 2 : l'objectif vaut le double du stop, donc 8xATR.
+    # R:R 2.0 inchange : c'est le stop qu'on fait varier, pas le rapport.
+    atr_tp_mult: float = 16.0
 
     # Microstructure — v2 (palier intermédiaire validé, 2026-05-20)
     # v3 stress était trop dur : modèle convergeait vers HOLD-always (degenerate).
@@ -744,7 +1006,11 @@ class PPOConfig:
     # bien plus violente que celle observee.
     # En OCCASIONS, pas en barres. A 5 % de selectivite sur H1, 500 occasions
     # representent des mois : on raccourcit pour que le rang suive le regime.
-    rang_fenetre: int = 200
+    # Fenetre du filtre par rang glissant, en BARRES. 200 barres valaient huit
+    # jours en H1 ; en M5 elles ne font que 17 heures, trop court pour que le
+    # quantile decrive autre chose que la seance en cours. 2 016 barres — une
+    # semaine — rendent la meme portee temporelle qu'en H1.
+    rang_fenetre: int = 2016
     # Graine dediee aux fenetres de validation. Elles etaient tirees au sort a
     # chaque epoch : une amelioration pouvait venir d'un scenario plus facile
     # plutot que d'un meilleur modele. Fixees, les epochs deviennent comparables.
@@ -846,7 +1112,10 @@ def _data_cache_path(cfg: PPOConfig) -> str:
     duplication qui avait laisse diverger l'alignement H1 et le bruit de ticks
     dans ce projet. Une seule source.
     """
-    if getattr(cfg, "timeframe_entrainement", "M1") == "H1":
+    tf = getattr(cfg, "timeframe_entrainement", "M1")
+    if tf == "M5":
+        return "data_cache_BTCUSD_M5.pkl"
+    if tf == "H1":
         return "data_cache_BTCUSD_H1.pkl"
     return f"data_cache_{cfg.symbol}_{cfg.date_from:%Y%m%d}.pkl"
 
@@ -2109,8 +2378,13 @@ def run_training_on_split(
         n_features=OBS_N_FEATURES,
         d_model=cfg.d_model,
         num_blocks=cfg.num_blocks,
-        heads=5,   # head_dim 16 : voir saint_core._verifie_dim_tete
-
+        # head_dim = d_model / heads doit etre un multiple de 8 : voir
+        # saint_core._verifie_dim_tete, qui leve a la construction plutot que
+        # de laisser CUDA rendre une erreur illisible au premier forward.
+        heads=cfg.saint_heads,
+        n_freq=cfg.saint_n_freq,
+        mlp_dim=cfg.saint_mlp_dim,
+        lecture=cfg.saint_lecture,
         dropout=0.05,
         ff_mult=2,
         max_len=cfg.lookback,
@@ -3398,6 +3672,16 @@ def run_training_on_split(
                     "pas_patch": int(cfg.pas_patch),
                     "architecture": cfg.architecture,
                     "n_features": int(OBS_N_FEATURES),
+                    # Le nombre de tetes est le SEUL element de la geometrie
+                    # SAINT qui ne se deduise pas des poids : l'attention a la
+                    # meme forme quel que soit le decoupage. Un mauvais choix
+                    # se charge sans erreur et calcule autre chose.
+                    "saint_heads": int(cfg.saint_heads),
+                    "saint_lecture": cfg.saint_lecture,
+                    "saint_n_freq": int(cfg.saint_n_freq),
+                    "saint_mlp_dim": int(cfg.saint_mlp_dim),
+                    "d_model": int(cfg.d_model),
+                    "num_blocks": int(cfg.num_blocks),
                 }, f, indent=2)
 
         # Best sur PnL PAR TRADE, et non sur le PnL TOTAL.
@@ -3761,10 +4045,10 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec16"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec25"
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec16: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec25: trois folds sans bootstrap inter-fold.")
     run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10,
                     max_folds=3, start_fold=1,
                     bootstrap_from_path=None,

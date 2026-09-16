@@ -291,7 +291,52 @@ FEATURE_COLS_LIQ_TEMPS = ["flux_taille_trade", "flux_intensite",
 # Le jeu H1 est produit par prepare_h1.py. Les 12 colonnes de prix sont
 # calculees SUR H1 ; le contexte superieur est le H4, decale de shift(1).
 FEATURE_COLS_TF = FEATURE_COLS_M1                      # calculees sur H1
-FEATURE_COLS_SUP = [c.replace("_h1", "_h4") for c in FEATURE_COLS_H1]
+# ECHELLE DE DECISION ET CONTEXTE SUPERIEUR. Les deux vont ensemble : le bloc
+# de contexte porte le nom de SON echelle, pas de celle des decisions.
+#
+#     decisions en H1  ->  contexte H4  ->  suffixe _h4
+#     decisions en M5  ->  contexte H1  ->  suffixe _h1
+#
+# Laisser le suffixe fige a "_h4" en changeant d'echelle donnerait des colonnes
+# dont le nom ment sur leur contenu, et prepare_m5 echouerait sur un desaccord
+# avec cette liste — ce qui est le bon comportement, mais mieux vaut que la
+# source de verite sache de quelle echelle on parle.
+#
+# POURQUOI LE M5 EST DEVENU L'ECHELLE DE DECISION, mesure du 2026-09-16, avec
+# sortie sur barriere UNIQUEMENT comme l'environnement et le live :
+#
+#     UT   SL   friction/R   E[R] hasard   duree med   occasions   requis
+#     M1  8.0      0.132R       -0.1136        122b      10 472   +0.1136R
+#     M5  4.0      0.099R       -0.0892         44b       5 811   +0.0892R
+#     H1  2.0      0.047R       -0.0233         13b       1 640   +0.0233R
+#
+# Le mur de ce depot n'a jamais ete l'architecture : c'est le nombre
+# d'occasions INDEPENDANTES, qui vaut la duree d'historique divisee par la
+# duree d'un trade — jamais par le nombre de barres. Il en faut ~4 900 pour
+# qu'un avantage de 0.02 R soit lisible ; le H1 en offre 2 314, le M5 ~15 000.
+#
+# Le M1 reste hors de portee a toute largeur de stop : meme a 8xATR il exige
+# +0.114 R d'avantage, davantage que tout ce que ce depot a mesure.
+TIMEFRAME = "M5"
+# LES ECHELLES SUPERIEURES SONT UNE LISTE, de la plus proche a la plus
+# lointaine. En H1 il n'y en avait qu'une, le H4 ; en M5 on lit le H1 ET le H4.
+#
+# Pourquoi plusieurs. Les periodes Ichimoku sont des nombres de BOUGIES, donc
+# chaque echelle raconte une duree differente avec les memes colonnes :
+#
+#     echelle   Tenkan 9   Kijun 26   Senkou-B 52
+#        M5      45 min      2 h 10      4 h 20
+#        H1       9 h        26 h        52 h
+#        H4      36 h         4.3 j       8.7 j
+#
+# Un trade M5 dure 44 barres, soit 3 h 40. Le M5 decrit donc ce qui se passe
+# PENDANT le trade, le H1 le mouvement qui le contient, le H4 le regime dans
+# lequel ce mouvement s'inscrit. C'est exactement la lecture que prescrivent
+# les documents Ichimoku : trouver le signal sur son unite de temps, le valider
+# en basculant sur les unites superieures.
+ECHELLES_SUP = {"H1": ["_h4"], "M5": ["_h1", "_h4"]}[TIMEFRAME]
+SUFFIXE_SUP = ECHELLES_SUP[0]       # le contexte immediat, celui du merge_asof
+FEATURE_COLS_SUP = [c.replace("_h1", SUFFIXE_SUP) for c in FEATURE_COLS_H1]
 
 # Features de la strategie "bornes d'un range" (Ichimoku / Riguet).
 # Voir features_range.py pour les definitions exactes et, surtout, pour la
@@ -328,9 +373,71 @@ FEATURE_COLS_RANGE = [c for g in _GROUPES_RANGE.values() for c in g]
 # `_pente`. Les mesures faites avant ce correctif ont ete jetees.
 from features_ichimoku import COLONNES as FEATURE_COLS_ICHIMOKU
 
+# LES MEMES STRUCTURES, LUES A L'ECHELLE SUPERIEURE.
+#
+# Les periodes Ichimoku sont des nombres de BOUGIES : Tenkan 9, Kijun 26,
+# SSB 52. Calculees en M5 elles couvrent 45 minutes, 2 h et 4 h ; calculees en
+# H1, neuf heures, un jour et deux jours. Ce ne sont pas les memes structures
+# de marche, malgre des noms identiques.
+#
+# POURQUOI CE BLOC EXISTE, mesure du 2026-09-16. L'avantage du modele (+0.09 a
+# +0.13 R) avait ete mesure en H1, sur des colonnes H1. Passe en M5 pour
+# multiplier par 6.5 le nombre d'occasions independantes, exec22 n'apprenait
+# plus rien : huit epochs entrainees, zero positive, gain nul sur sa propre
+# politique gelee — alors meme que la mecanique d'apprentissage etait reparee
+# (entropie 1.099 -> 0.996, etendue 0.53, clipfrac 18 %).
+#
+# L'hypothese est donc que le gain d'occasions du M5 se payait d'une perte
+# d'avantage : les structures qui portaient le signal avaient disparu avec le
+# changement d'echelle. Plutot que de revenir au H1 et de rendre les
+# occasions, on AJOUTE les colonnes H1 aux lignes M5 — la finesse du M5 pour
+# decider, les structures H1 la ou l'avantage a ete mesure. C'est aussi ce que
+# prescrit le livre : valider un signal en basculant sur les UT superieures.
+#
+# LE M5 PAIE LE SURCOUT. 72 colonnes de plus font passer la tete de 856 a
+# 1 400 entrees et le modele de 26 752 a ~45 000 parametres — mais avec 15 145
+# occasions independantes au lieu de 2 314, cela fait 3 parametres par
+# occasion contre 11.6. La nouvelle echelle achete la capacite d'en porter
+# davantage.
+FEATURE_COLS_RANGE_SUP = [c + SUFFIXE_SUP for c in FEATURE_COLS_RANGE]
+FEATURE_COLS_ICHIMOKU_SUP = [c + SUFFIXE_SUP for c in FEATURE_COLS_ICHIMOKU]
+
+
+def bloc_echelle(sfx):
+    """Le jeu COMPLET lu a une echelle superieure : 85 colonnes.
+
+    Douze indicateurs de base, l'ecart du prix courant a la derniere cloture de
+    cette echelle, les 25 colonnes de range et les 47 d'Ichimoku. Les memes
+    noms qu'en M5, a leur suffixe pres — et des contenus qui n'ont rien a voir,
+    puisque les periodes se comptent en bougies.
+    """
+    return ([c.replace("_h1", sfx) for c in FEATURE_COLS_H1]
+            + [c + sfx for c in FEATURE_COLS_RANGE]
+            + [c + sfx for c in FEATURE_COLS_ICHIMOKU])
+
+
+# Les echelles AU-DELA de la premiere. La premiere est deja epelee ci-dessus,
+# en trois listes separees, parce que le H1 l'etait avant que le M5 n'existe et
+# que d'autres fichiers s'y referent nommement.
+FEATURE_COLS_SUP_LOINTAINES = [c for sfx in ECHELLES_SUP[1:]
+                               for c in bloc_echelle(sfx)]
+
+# COUT EN PARAMETRES, ET POURQUOI IL EST PAYABLE. La tete lit n_features x
+# d_model, soit 260 x 8 = 2 080 entrees contre 1 400 a une seule echelle
+# superieure : le modele passe d'environ 45 000 a 58 000 parametres.
+# L'entrainement M5 offre ~15 100 occasions INDEPENDANTES, donc 3.8 parametres
+# par occasion — quand le run H1 qui avait rendu +2.2 points en test en portait
+# 11.6. Ce n'est pas la capacite qui borne ici.
+#
+# LE VRAI RISQUE EST AILLEURS : chaque colonne ajoutee est une direction de
+# plus dans laquelle un gradient de politique nourri par ~1 000 decisions par
+# epoch peut se perdre. C'est pourquoi les blocs se mesurent avant de se
+# garder, et sur la VALIDATION uniquement.
 FEATURE_COLS = (FEATURE_COLS_TF + FEATURE_COLS_SUP
                 + FEATURE_COLS_EXT + FEATURE_COLS_LIQ_TEMPS
-                + FEATURE_COLS_RANGE + FEATURE_COLS_ICHIMOKU)
+                + FEATURE_COLS_RANGE + FEATURE_COLS_ICHIMOKU
+                + FEATURE_COLS_RANGE_SUP + FEATURE_COLS_ICHIMOKU_SUP
+                + FEATURE_COLS_SUP_LOINTAINES)
 
 N_BASE_FEATURES = len(FEATURE_COLS)
 
@@ -862,6 +969,12 @@ def _verifie_dim_tete(d: int, heads: int) -> int:
     return dim_tete
 
 
+# Taille maximale du lot passe d'un coup a l'attention. La limite dure est
+# 65 535 (dimension de grille CUDA) ; on garde la moitie de marge, le decoupage
+# ne coutant rien de mesurable.
+LOT_ATTENTION_MAX = 32768
+
+
 class AxialAttention(nn.Module):
     """Attention multi-tetes sur UN axe, en pre-norm.
 
@@ -900,8 +1013,34 @@ class AxialAttention(nn.Module):
             cos, sin = _rope_tables(L, self.dim_tete, x.device, q.dtype)
             q, k = _applique_rope(q, cos, sin), _applique_rope(k, cos, sin)
 
-        o = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, dropout_p=self.p_drop if self.training else 0.0)
+        # DECOUPAGE DU LOT : UNE LIMITE CUDA, PAS UNE LIMITE DE MEMOIRE.
+        #
+        # SAINT replie un axe dans la dimension de lot avant d'appeler
+        # l'attention : sur l'axe TEMPS le lot vaut B x F, soit le nombre
+        # d'episodes multiplie par le nombre de colonnes. Une dimension de
+        # grille CUDA plafonne a 65 535, et le noyau SDPA en indexe une par
+        # (lot x tetes). A 260 colonnes, cela casse des 251 episodes joues en
+        # parallele — avec un "CUDA error: invalid configuration argument" qui
+        # ne nomme ni le lot, ni les colonnes, ni l'attention.
+        #
+        # Le plafond depend donc du PRODUIT de deux reglages qui se choisissent
+        # separement et pour des raisons sans rapport : le nombre de features et
+        # le nombre d'episodes collectes par epoch. Les lier par un plantage a
+        # l'execution ferait payer chaque enrichissement du jeu de colonnes par
+        # une reduction de la collecte, exactement quand on cherche a augmenter
+        # les deux. On tranche le lot, la limite disparait, et le resultat est
+        # identique au bit pres — l'attention ne melange jamais deux elements du
+        # lot entre eux, donc la decouper n'en change aucun.
+        if N > LOT_ATTENTION_MAX:
+            o = torch.cat([
+                torch.nn.functional.scaled_dot_product_attention(
+                    q[i:i + LOT_ATTENTION_MAX], k[i:i + LOT_ATTENTION_MAX],
+                    v[i:i + LOT_ATTENTION_MAX],
+                    dropout_p=self.p_drop if self.training else 0.0)
+                for i in range(0, N, LOT_ATTENTION_MAX)], dim=0)
+        else:
+            o = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, dropout_p=self.p_drop if self.training else 0.0)
         o = o.transpose(1, 2).reshape(N, L, D)
         return self.drop(self.proj(o))
 
@@ -1154,6 +1293,40 @@ class SAINTPolicySingleHead(nn.Module):
         drop_path: float = 0.0,
         ls_init: float = 1e-4,
         n_ref: int = 0,
+        # LARGEUR DE LA TETE. Elle valait 256 ecrit en dur, et c'etait le poste
+        # le plus lourd du reseau : a d_model 8, la tete pesait 70 144
+        # parametres sur 104 860, soit 67 %, quand les blocs d'attention entre
+        # features — la seule chose que SAINT apporte et que PatchTST ne sait
+        # pas faire — en coutaient 1 984, soit 2 %.
+        #
+        # Laisser 256 en dur imposait un budget de parametres decide une fois
+        # pour toutes, sur un jeu qui n'a que 2 314 occasions independantes. Or
+        # la reduction de ce budget est precisement ce qui a fait passer PPO de
+        # -1.4 a +2.2 points au test dans la nuit du 2026-09-16.
+        mlp_dim: int = 256,
+        # COMMENT LA TETE LIT LE TRONC. Deux lectures, et le choix decide de
+        # tout le comportement du reseau.
+        #
+        #   "cls"      le jeton CLS, resume par l'attention : 2 x d_model
+        #              nombres, quel que soit le nombre de colonnes.
+        #   "colonnes" les representations PAR COLONNE de la derniere bougie,
+        #              concatenees : n_features x d_model nombres.
+        #
+        # POURQUOI CE PARAMETRE EXISTE, mesure du 2026-09-16. Avec la lecture
+        # CLS et d_model 8, la tete recoit SEIZE nombres pour resumer 107
+        # colonnes, quand PatchTST lui en donne 428. Resultat : l'etendue des
+        # convictions plafonne a 0.028 apres 23 epochs — vingt fois moins que
+        # PatchTST au meme stade — et l'entropie ne descend pas sous 1.089 sur
+        # un maximum de 1.099. Le modele n'apprend pas moins bien : il n'a pas
+        # la place de dire des choses differentes selon les situations.
+        #
+        # Pour egaler la largeur de PatchTST en lecture CLS il faudrait
+        # d_model = 214, soit un embedding par colonne de 206 000 parametres.
+        # La lecture par colonnes donne la meme largeur pour d_model 8, en
+        # gardant les blocs d'attention qui croisent les features — lesquels ne
+        # coutent que 1 984 parametres. Ce n'etait donc jamais l'attention qui
+        # etait trop chere, c'etait la facon de la lire qui etait trop etroite.
+        lecture: str = "cls",
     ):
         super().__init__()
         self.n_features = n_features
@@ -1176,24 +1349,31 @@ class SAINTPolicySingleHead(nn.Module):
             for i in range(num_blocks)
         ])
 
-        # 2 x d_model : la tete recoit DEUX vues concatenees (cf. forward).
-        self.norm = RMSNorm(2 * d_model)
+        if lecture not in ("cls", "colonnes"):
+            raise ValueError(f"lecture inconnue : {lecture}")
+        self.lecture = lecture
+        # Largeur de ce que la tete recoit. En "cls", deux vues concatenees du
+        # jeton resume ; en "colonnes", une vue par feature.
+        dim_lecture = (2 * d_model if lecture == "cls"
+                       else n_features * d_model)
+        self.dim_lecture = dim_lecture
+        self.norm = RMSNorm(dim_lecture)
 
         self.mlp = nn.Sequential(
-            nn.Linear(2 * d_model, 256),
+            nn.Linear(dim_lecture, mlp_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(256, 256),
+            nn.Linear(mlp_dim, mlp_dim),
             nn.GELU(),
         )
 
         # Intersample attention, forme deployable : voir ReferenceMemory.
         # n_ref = 0 -> aucune memoire, le modele est strictement celui d'avant.
-        self.memoire = (ReferenceMemory(2 * d_model, n_ref, heads, dropout,
+        self.memoire = (ReferenceMemory(dim_lecture, n_ref, heads, dropout,
                                         ls_init=ls_init) if n_ref > 0 else None)
 
-        self.actor = nn.Linear(256, n_actions)
-        self.critic = nn.Linear(256, 1)
+        self.actor = nn.Linear(mlp_dim, n_actions)
+        self.critic = nn.Linear(mlp_dim, 1)
         self._init_poids()
 
     def _init_poids(self):
@@ -1249,6 +1429,18 @@ class SAINTPolicySingleHead(nn.Module):
         #   - le resume de toute la fenetre ;
         #   - la DERNIERE bougie, celle sur laquelle la decision se prend.
         # Concatenees et non additionnees, pour que le MLP puisse les ponderer.
+        if self.lecture == "colonnes":
+            # Une vue PAR COLONNE, prise sur la derniere bougie — celle sur
+            # laquelle la decision se prend. Les colonnes ont deja circule
+            # entre elles dans les blocs, donc chaque representation porte le
+            # croisement ; on ne jette pas ce croisement en le moyennant.
+            #
+            # Le jeton CLS est ecarte ici (indice 0) : il resume ce que les
+            # colonnes disent deja, et l'ajouter reviendrait a compter deux
+            # fois la meme information dans une tete qu'on cherche a garder
+            # petite.
+            return tok[:, -1, 1:, :].reshape(tok.shape[0], -1)
+
         cls = tok[:, :, 0, :]                                 # (B, T, D)
         return torch.cat([cls.mean(dim=1), cls[:, -1, :]], dim=-1)
 
@@ -1449,6 +1641,7 @@ def build_policy(device, lookback: int = 25,
                  mlp_dim: int = 128,
                  taille_patch: int = 16,
                  pas: int = 8,
+                 heads: int = 0,
                  state_dict=None):
     """Instancie la policy avec les hyperparamètres d'architecture du training.
 
@@ -1521,6 +1714,59 @@ def build_policy(device, lookback: int = 25,
             return p
         if est_saint:
             archi = "saint"
+            # GEOMETRIE SAINT DEDUITE DU FICHIER. Elle etait ecrite en dur —
+            # d_model 80, 5 tetes, n_freq 16, tete de 256 — donc un checkpoint
+            # entraine a une autre taille etait IMPOSSIBLE a recharger, en live
+            # comme en reevaluation. Troisieme exemplaire du meme defaut dans
+            # cette fonction, apres la profondeur et la taille de banque.
+            #
+            # Ce que le fichier donne :
+            #   cls              (1,1,1,d)          -> d_model
+            #   embed.freqs      (n_features, k)    -> n_freq
+            #   blocks.N.*                          -> profondeur
+            #   mlp.0.weight     (mlp_dim, entree)  -> largeur de tete ET mode
+            #                                          de lecture, car l'entree
+            #                                          vaut 2*d en lecture CLS
+            #                                          et n_features*d en
+            #                                          lecture par colonnes.
+            d_saint = int(state_dict["cls"].shape[-1])
+            n_freq = int(state_dict["embed.freqs"].shape[1])
+            mlp_dim = int(state_dict["mlp.0.weight"].shape[0])
+            entree = int(state_dict["mlp.0.weight"].shape[1])
+            lecture = "cls" if entree == 2 * d_saint else "colonnes"
+            if lecture == "colonnes" and entree != n_features * d_saint:
+                raise ValueError(
+                    f"entree de tete {entree} incompatible : ni 2*{d_saint} "
+                    f"(cls) ni {n_features}*{d_saint} (colonnes)")
+            # LE NOMBRE DE TETES SE DEDUIT DE LA QK-NORM. Les poids
+            # d'attention (qkv, proj) ont la meme forme quel que soit le
+            # decoupage en tetes, donc eux ne disent rien — mais q_norm
+            # normalise CHAQUE TETE separement, sa taille EST la dimension par
+            # tete. heads = d_model / head_dim.
+            #
+            # Le repli approximatif que j'avais mis d'abord (d_model // 8)
+            # rendait 10 tetes pour un checkpoint qui en avait 5, et le
+            # chargement echouait sur la taille des normes de la memoire. Sans
+            # memoire il aurait charge SANS ERREUR et calcule autre chose : les
+            # poids d'attention auraient ete redecoupes en dix blocs au lieu de
+            # cinq. C'est exactement le genre de panne silencieuse que ce depot
+            # collectionne.
+            if heads <= 0:
+                cle_qn = "blocks.0.attn_temps.q_norm.weight"
+                if cle_qn in state_dict:
+                    heads = max(1, d_saint // int(state_dict[cle_qn].shape[0]))
+                else:
+                    heads = max(1, d_saint // 8)
+            return SAINTPolicySingleHead(
+                n_features=n_features, d_model=d_saint,
+                num_blocks=(max(int(k.split(".")[1])
+                                for k in state_dict
+                                if k.startswith("blocks.")) + 1),
+                heads=heads, n_freq=n_freq, mlp_dim=mlp_dim,
+                lecture=lecture, dropout=0.05, ff_mult=2,
+                max_len=lookback, n_actions=N_ACTIONS,
+                n_ref=int(state_dict["memoire.bank_repr"].shape[0])
+                if "memoire.bank_repr" in state_dict else 0).to(device)
 
         cle = "memoire.bank_repr"
         n_ref = int(state_dict[cle].shape[0]) if cle in state_dict else 0

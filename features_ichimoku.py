@@ -338,8 +338,17 @@ def _chandeliers(df, atr):
 #  Assemblage
 # ==========================================================================
 
-def ajoute_features_ichimoku(df, atr_col="atr_14"):
-    """Ajoute toutes les colonnes `ich_*`. Rend (df, liste des noms)."""
+def ajoute_features_ichimoku(df, atr_col="atr_14", suffixe=""):
+    """Ajoute toutes les colonnes `ich_*`. Rend (df, liste des noms).
+
+    `suffixe` permet de calculer le MEME jeu sur une autre echelle et de le
+    joindre au premier sans collision de noms. C'est ce que prescrit le livre :
+    "valider les signaux trouves sur une unite de temps en basculant sur les UT
+    superieures". Les periodes Ichimoku sont des nombres de BOUGIES — Tenkan 9,
+    Kijun 26, SSB 52 — donc les memes colonnes calculees en M5 et en H1 ne
+    decrivent pas du tout les memes structures : 45 minutes contre neuf heures
+    pour Tenkan.
+    """
     df = ajoute_ichimoku_brut(df)
     h, l, c, o = df["high"], df["low"], df["close"], df["open"]
     atr = df[atr_col].replace(0, np.nan)
@@ -348,6 +357,7 @@ def ajoute_features_ichimoku(df, atr_col="atr_14"):
     cols = []
 
     def pose(nom, serie):
+        nom = nom + suffixe
         df[nom] = pd.Series(serie, index=df.index).replace(
             [np.inf, -np.inf], np.nan)
         cols.append(nom)
@@ -469,7 +479,7 @@ def ajoute_features_ichimoku(df, atr_col="atr_14"):
 
     # ---------- G. Chandeliers ----------
     for nom, val in _chandeliers(df, a).items():
-        pose(nom, np.asarray(val, np.float64))
+        pose(nom, np.asarray(val, np.float64))    # pose() ajoute le suffixe
 
     return df, cols
 

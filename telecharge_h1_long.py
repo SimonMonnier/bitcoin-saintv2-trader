@@ -36,7 +36,7 @@ ici : le walk-forward n'entraine que sur le passe et ne valide que sur le
 futur, donc ces annees ne servent jamais que de matiere d'entrainement pour
 des blocs posterieurs. Elles ne peuvent pas flatter un resultat.
 
-    python telecharge_h1_long.py
+    python telecharge_h1_long.py [ut]     ut = 1h, 5m, 15m...
 """
 
 import io
@@ -51,15 +51,30 @@ import pandas as pd
 from build_binance_features import _get, VISION, SYMBOL_BN, N_THREADS, CACHE_DIR
 
 MOIS_DEBUT = (2017, 8)
-SORTIE = "klines_h1_spot_BTCUSDT.pkl"
+# Unite de temps, passee en argument. Les archives Binance spot existent au
+# meme endroit pour toutes les echelles ; seul le nom du dossier change.
+#
+# POURQUOI LE M5 EXISTE ICI. Mesure du 2026-09-16, sortie sur barriere
+# uniquement comme l'environnement et le live :
+#
+#     UT   SL   friction/R   E[R] hasard   duree med   occasions   requis
+#     M5  4.0      0.099R       -0.0892         44b       5 811   +0.0892R
+#     H1  2.0      0.047R       -0.0233         13b       1 640   +0.0233R
+#
+# Le M5 a stop 4xATR est la seule configuration qui satisfasse les deux
+# conditions a la fois : un avantage requis (+0.089 R) inferieur a ce que le
+# modele produit (+0.09 a +0.13 R), et assez d'occasions INDEPENDANTES pour
+# qu'un ecart devienne lisible. Sur neuf ans il donnerait ~21 000 occasions
+# contre 2 314 en H1 — neuf fois la contrainte qui bloque ce depot.
+UT = "1h"
 
 # Colonnes du kline spot, par position (le CSV n'a pas d'entete).
 I_T, I_O, I_H, I_L, I_C, I_V, I_QV, I_NT, I_TBB = 0, 1, 2, 3, 4, 5, 7, 8, 9
 
 
 def _mois(annee, mois):
-    url = (f"{VISION}/data/spot/monthly/klines/{SYMBOL_BN}/1h/"
-           f"{SYMBOL_BN}-1h-{annee:04d}-{mois:02d}.zip")
+    url = (f"{VISION}/data/spot/monthly/klines/{SYMBOL_BN}/{UT}/"
+           f"{SYMBOL_BN}-{UT}-{annee:04d}-{mois:02d}.zip")
     try:
         z = zipfile.ZipFile(io.BytesIO(_get(url, raw=True, essais=2)))
     except Exception:
@@ -83,8 +98,8 @@ def _mois(annee, mois):
 
 def _jour(jour):
     """Le mois courant n'a pas encore d'archive mensuelle."""
-    url = (f"{VISION}/data/spot/daily/klines/{SYMBOL_BN}/1h/"
-           f"{SYMBOL_BN}-1h-{jour:%Y-%m-%d}.zip")
+    url = (f"{VISION}/data/spot/daily/klines/{SYMBOL_BN}/{UT}/"
+           f"{SYMBOL_BN}-{UT}-{jour:%Y-%m-%d}.zip")
     try:
         z = zipfile.ZipFile(io.BytesIO(_get(url, raw=True, essais=2)))
     except Exception:
@@ -106,9 +121,14 @@ def _jour(jour):
 
 
 def main() -> int:
+    global UT
+    import sys
+    if len(sys.argv) > 1:
+        UT = sys.argv[1]
     os.makedirs(CACHE_DIR, exist_ok=True)
-    f_cache = os.path.join(CACHE_DIR, "klines_h1_spot.pkl")
-    f_vides = os.path.join(CACHE_DIR, "klines_h1_spot_absents.json")
+    f_cache = os.path.join(CACHE_DIR, f"klines_{UT}_spot.pkl")
+    f_vides = os.path.join(CACHE_DIR, f"klines_{UT}_spot_absents.json")
+    sortie = f"klines_{UT}_spot_{SYMBOL_BN}.pkl"
 
     cache = pd.read_pickle(f_cache) if os.path.exists(f_cache) else pd.DataFrame()
     vides = set(json.load(open(f_vides))) if os.path.exists(f_vides) else set()
@@ -173,13 +193,18 @@ def main() -> int:
           f"{cache['time'].iloc[-1]}")
     print(f"trous > 1 h : {len(trous)}"
           + (f"  (le plus long {trous.max():.0f} h)" if len(trous) else ""))
-    cache.to_pickle(SORTIE)
-    print(f"{SORTIE} ecrit : {cache.shape}")
+    cache.to_pickle(sortie)
+    print(f"{sortie} ecrit : {cache.shape}")
 
     ans = (cache["time"].iloc[-1] - cache["time"].iloc[0]).days / 365.25
-    print(f"\n{ans:.1f} ans, contre 3.6 pour le jeu MT5 actuel.")
-    print(f"occasions sans chevauchement (une par jour, 70 % en train) : "
-          f"~{int(len(cache) * 0.70 / 24):,} contre 890.")
+    # Duree MEDIANE d'un trade a la geometrie retenue pour cette echelle,
+    # mesuree sans sortie au temps par mesure_court_terme.py.
+    duree = {"1h": 13, "5m": 44, "15m": 13, "1m": 33}.get(UT, 24)
+    print(f"\n{ans:.1f} ans en {UT}.")
+    print(f"occasions sans chevauchement (duree mediane {duree} barres, "
+          f"70 % en train) : ~{int(len(cache) * 0.70 / duree):,}")
+    print(f"  repere : 2 314 en H1 aujourd'hui, ~4 900 necessaires pour "
+          f"qu'un avantage de 0.02 R soit lisible.")
     return 0
 
 
