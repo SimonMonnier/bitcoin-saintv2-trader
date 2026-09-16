@@ -89,6 +89,22 @@ def votant_courant(df, stats, train_len: int):
     return _VOTANT
 
 
+def votant_si_actif(df):
+    """Le veto, ou None si l'entrainement n'en utilisait pas.
+
+    UN SEUL INTERRUPTEUR, celui de `training.PPOConfig`. Recopier le booleen
+    ici en ferait deux, et deux reglages qui doivent s'accorder par convention
+    finissent toujours par diverger — c'est la panne que ce depot a passe la
+    journee a reparer, du point mort a la geometrie des barrieres.
+    """
+    import training as T
+    if not getattr(T.PPOConfig(), "votant_tabm", False):
+        return None
+    from saint_core import FEATURE_COLS
+    stats = T.compute_and_save_global_norm_stats(df, FEATURE_COLS, path=None)
+    return votant_courant(df, stats, len(df))
+
+
 def checkpoint_courant(famille: str = "last", min_folds: int = 3):
     """(chemin du .pth, calib, fold) du modele a deployer.
 
@@ -944,6 +960,20 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
                 # fois par bougie fermee ET a plat — la fenetre compte en
                 # OCCASIONS, donc l'appeler a chaque sondage la remplirait
                 # trente fois trop vite, avec des doublons.
+                # LE VETO DU TROISIEME VOTANT, s'il etait actif a
+                # l'entrainement. La politique a appris a decider SOUS ce
+                # filtre : la deployer sans lui executerait une autre
+                # strategie. Le reglage est lu dans la configuration
+                # d'entrainement, jamais recopie ici — un booleen duplique
+                # finit toujours par diverger.
+                v = votant_si_actif(df_closed)
+                if v is not None:
+                    permis_a, permis_v = v.veto(len(df_closed) - 1)
+                    if not permis_a:
+                        pb = 0.0
+                    if not permis_v:
+                        ps = 0.0
+
                 decision = entry_decisions[agent_name]
                 barres = decision.thresholds
                 a_pred = decision.decide(pb, ps)

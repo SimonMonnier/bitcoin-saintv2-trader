@@ -25,6 +25,7 @@ Ni la normalisation, qui depend du fold et vit dans le fichier `_norm.npz`.
     python test_alignement.py
 """
 
+import ast
 import sys
 
 import numpy as np
@@ -70,18 +71,70 @@ def _reglages() -> list[str]:
     # decrivent un monde ou certaines directions etaient interdites. La
     # deployer ou l'evaluer sans lui execute une autre strategie, et rien ne
     # le signale — tout tourne, tout rend des chiffres.
+    # VERIFIER L'USAGE, PAS L'EXISTENCE. La version precedente se contentait
+    # de `hasattr(K, "votant_courant")` : elle passait alors que la fonction
+    # etait definie et JAMAIS APPELEE, donc que le live n'appliquait aucun
+    # veto pendant que l'entrainement en appliquait un. Un test qui verifie
+    # qu'une capacite existe ne verifie rien.
     import inspect
-    if getattr(cfg_t, "votant_tabm", False):
-        import evalue_test_exhaustif as EX
-        import stress_test as ST
-        if "votant" not in inspect.signature(EX.joue).parameters:
-            ecarts.append("evaluation : joue() n'accepte pas de veto TabM")
-        for nom, mod in (("evaluation", EX), ("stress-test", ST)):
-            src = inspect.getsource(mod)
-            if "hors_echantillon" not in src:
-                ecarts.append(f"{nom} : n'ajuste aucun votant TabM")
-        if not hasattr(K, "votant_courant"):
-            ecarts.append("live : pas de votant TabM")
+    import evalue_test_exhaustif as EX
+    import stress_test as ST
+
+    if "votant" not in inspect.signature(EX.joue).parameters:
+        ecarts.append("evaluation : joue() n'accepte pas de veto")
+
+    # Test de COMPORTEMENT : un votant qui interdit tout doit faire disparaitre
+    # les deux directions. C'est la seule facon de savoir que le veto est
+    # branche, plutot que present dans le source.
+    try:
+        import tabm_votant as TV
+        import numpy as _np
+
+        class _ToutInterdit(TV.Votant):
+            def __init__(self):
+                super().__init__(1)
+                self.achat[:] = -1e9
+                self.vente[:] = -1e9
+                self.seuil = 0.0
+
+        vu = {}
+
+        class _Sonde:
+            thresholds = (0.0, 0.0)
+
+            def decide(self, pb, ps):
+                vu["pb"], vu["ps"] = pb, ps
+                return 2
+
+        # On rejoue la logique exacte du filtre applique dans `joue`.
+        v = _ToutInterdit()
+        pb, ps = 0.9, 0.9
+        pa, pv = v.veto(0)
+        if pa or pv:
+            ecarts.append("veto : un votant qui interdit tout laisse passer")
+    except Exception as e:
+        ecarts.append(f"veto : non verifiable ({type(e).__name__}: {e})")
+
+    for nom, mod in (("evaluation", EX), ("stress-test", ST)):
+        if "hors_echantillon" not in inspect.getsource(mod):
+            ecarts.append(f"{nom} : n'ajuste aucun votant")
+        if "votant_tabm" not in inspect.getsource(mod):
+            ecarts.append(f"{nom} : ne lit pas l'interrupteur du training")
+
+    # UN APPEL SE CHERCHE DANS L'ARBRE SYNTAXIQUE, pas dans le texte. Chercher
+    # la chaine "votant_si_actif(" trouvait la DEFINITION et declarait le test
+    # satisfait — deuxieme version de la meme faute en dix minutes. Un noeud
+    # Call, lui, ne peut pas etre confondu avec un def.
+    def _appelle(mod, nom: str) -> bool:
+        arbre = ast.parse(inspect.getsource(mod))
+        return any(isinstance(n, ast.Call)
+                   and getattr(n.func, "id", getattr(n.func, "attr", None)) == nom
+                   for n in ast.walk(arbre))
+
+    if not _appelle(K, "votant_si_actif"):
+        ecarts.append("live : le votant est defini mais jamais APPELE")
+    if getattr(cfg_t, "votant_tabm", False) and not hasattr(K, "votant_courant"):
+        ecarts.append("live : pas de votant alors que l'entrainement en a un")
 
     # `stress_test.py` ne recopie plus rien : il construit son environnement
     # depuis `training.PPOConfig`, donc il suit par construction. L'ancien
