@@ -9,10 +9,18 @@ en savoir. Tout ce qui suit est **mesuré**, sauf mention explicite du contraire
 
 Agent d'apprentissage par renforcement (PPO) sur BTCUSD, entraîné en
 walk-forward sur neuf ans de bougies M5 (Binance spot), exécuté sur MetaTrader 5
-chez Vantage. Les positions sortent **uniquement sur barrières** — stop 8×ATR,
-objectif 16×ATR — jamais au temps, parce que le live n'a aucun chemin de
-fermeture au marché. **Aucun modèle n'est déployable à ce jour** : rien n'a
-jamais produit un avantage hors échantillon statistiquement significatif.
+chez Vantage. Les positions sortent **uniquement sur barrières** — jamais au
+temps, parce que le live n'a aucun chemin de fermeture au marché. Depuis le
+16 septembre la sortie est un **stop 12×ATR avec stop suiveur à 1,5 R et aucun
+objectif** ; l'objectif à 2 R subsiste comme *cible d'apprentissage* de la tête
+auxiliaire, pas comme ordre. **Aucun modèle n'est déployable à ce jour** : rien
+n'a jamais produit un avantage hors échantillon statistiquement significatif.
+
+Ce qui a changé ce jour-là, et qui est le fait le plus utile du document : à
+cette largeur de stop **la géométrie gagne sans modèle** (+0.11 R symétrique,
+2.4 σ, hors test), et **le modèle classe** (ρ de rang +0.070, 2.9 σ sur 21 985
+décisions de validation). Les deux moitiés du problème sont désormais mesurées
+positives ; ce qui manque est de les faire tenir ensemble hors échantillon.
 
 ---
 
@@ -27,8 +35,13 @@ barres. Il en faut ~4 900 pour qu'un avantage de 0.02 R soit lisible.
 config          friction   horizon   occasions 9 ans   avantage requis
 H1, SL 2xATR     0.047 R    13.0 h            2 314        +0.0233 R
 M5, SL 4xATR     0.099 R     3.7 h           15 089        +0.0892 R
-M5, SL 8xATR     0.049 R    12.2 h            4 516        +0.0425 R   <- retenu
+M5, SL 8xATR     0.049 R    12.2 h            4 516        +0.0425 R
+M5, SL 12xATR    0.021 R    34.1 h            1 709        +0.0210 R   <- retenu
 ```
+
+La ligne 12×ATR suppose la sortie au stop suiveur, pas des barrières fixes :
+l'horizon triple et les occasions chutent, mais la friction, qui est un montant
+fixe en dollars, tombe de moitié. Le produit — la détectabilité — y gagne.
 
 Le M5 à 8×ATR domine le H1 sur tous les axes : même friction, même horizon —
 donc le **même problème de prédiction**, celui sur lequel l'avantage de +0.09 à
@@ -70,6 +83,28 @@ journées entières.
 
 7. **Un seul chemin de calcul.** Deux implémentations qui doivent s'accorder par
    convention finissent toujours par diverger, sans lever d'erreur.
+
+8. **Une barre d'erreur doit venir de ce qui varie indépendamment.** Douze
+   phases décalées de 67 barres couvrent la même période : leurs moyennes sont
+   presque le même nombre, et leur écart-type mesure la *sensibilité au
+   décalage*, pas l'incertitude. Utilisé comme barre d'erreur le 16 septembre,
+   il a transformé 0.8 σ en « 3.0 σ » et fait retenir une largeur de stop sur
+   du bruit. Des années, ou des occasions espacées au-delà de la durée d'un
+   trade, sont des échantillons ; des phases n'en sont pas.
+
+9. **L'alternance achat/vente n'est pas un repère neutre.** Sur une fenêtre
+   directionnelle, le résultat dépend de *quelles dates* reçoivent un achat :
+   exactement les mêmes trades donnent **−0.0670 en alterné et +0.0283 en
+   symétrique**. Mesurer (achat + vente) / 2, qui ne peut pas en dépendre et
+   déduit au passage la dérive du sous-jacent — qu'aucun modèle ne peut
+   promettre de revoir.
+
+10. **Compter les décisions, pas les trades.** La sélectivité à 5 % jette 95 %
+    de l'information : la validation ne rend que ~150 trades, sur lesquels
+    l'erreur-type vaut 0.11 R, donc elle ne peut pas voir un avantage de
+    0.10 R. La même fenêtre porte 22 000 *décisions*, et sur celles-là le
+    classement se mesure à 2.9 σ. Quand un échantillon est trop petit, changer
+    la question avant de changer le modèle.
 
 ---
 
@@ -295,12 +330,13 @@ démontrer même s'il est réel.**
 | levier | verdict |
 |---|---|
 | sélectivité plus haute | **mort** — l'avantage meurt à 15 % (§5.4) |
-| stop plus large | **mort** — diviserait les occasions par deux |
+| stop plus large | **PRIS le 16 septembre** — 8 → 12×ATR. Le verdict « mort » reposait sur un décompte à barrières fixes ; avec le stop suiveur la friction tombe de moitié et la détectabilité gagne malgré la perte d'occasions |
 | plus d'historique BTC | **épuisé** — 9 ans, tout ce que Binance a |
 | ordres **maker** (futures 2×2 bp) | friction 0.0372 → 0.0265 R, **−29 %**, avec risque de non-exécution |
 | **multi-symbole en exécution** | **mort sur ce courtier** — voir ci-dessous |
 | **multi-symbole en entraînement** | **ouvert** — n'augmente pas les trades de test, mais régularise et teste la prémisse |
-| statistique de **rang** au lieu de la moyenne du sommet | **ouvert, gratuit** — utilise 20× plus d'information |
+| statistique de **rang** au lieu de la moyenne du sommet | **PRIS le 16 septembre, et c'est le levier qui a payé.** ρ +0.070 ± 0.024 sur 21 985 décisions, soit 2.9 σ, quand le PnL de validation du même run plafonnait à 1.3. Journalisé à chaque epoch (`mesure_rang.py`, `PPOConfig.diag_rang`) |
+| **XAUUSD** | **ouvert** — 8 ans exploitables, friction 27 % moins chère, décorrélé du BTC ; bloqué par les 4 colonnes Binance qui n'existent pas pour lui |
 
 Spreads Vantage mesurés (marchés fermés, à revérifier en séance) :
 

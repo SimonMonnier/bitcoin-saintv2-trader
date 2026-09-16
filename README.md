@@ -35,7 +35,8 @@ barres. Il en faut ~4 900 pour qu'un avantage de 0.02 R soit lisible.
 |---|---|---|---|---|
 | H1, SL 2×ATR | 0.047 R | 13.0 h | 2 314 | +0.0233 R |
 | M5, SL 4×ATR | 0.099 R | 3.7 h | 15 089 | +0.0892 R |
-| **M5, SL 8×ATR** | **0.049 R** | **12.2 h** | **4 516** | **+0.0425 R** |
+| M5, SL 8×ATR | 0.049 R | 12.2 h | 4 516 | +0.0425 R |
+| **M5, SL 12×ATR** | **0.021 R** | **34.1 h** | **1 709** | **+0.0210 R** |
 
 Le `SL 8×ATR` en M5 domine le H1 sur tous les axes : même friction, même
 horizon — donc le même problème de prédiction, celui sur lequel l'avantage de
@@ -53,7 +54,8 @@ poids et le reste du fichier `_calib.json` ; un fichier ambigu est refusé.
 | `..._exec10` à `..._exec20` | H1 | 103 colonnes, contexte H4 |
 | `..._exec22` | M5 | 103 colonnes, contexte H1 |
 | `..._exec23`, `..._exec24` | M5 | 260 colonnes, M5 + H1 + H4, SL 4×ATR |
-| `..._exec25` | M5 | idem, **SL 8×ATR / TP 16×ATR** ← courant |
+| `..._exec25` | M5 | idem, SL 8×ATR / TP 16×ATR |
+| `..._exec38` | M5 | **SL 12×ATR, stop suiveur 1,5 R, AUCUN objectif** ; objectif 2 R conservé comme cible d'apprentissage de la tête auxiliaire ← courant |
 
 ### Les modèles votent PENDANT l'entraînement
 
