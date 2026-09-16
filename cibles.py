@@ -122,7 +122,13 @@ def rendements(df, idx, cfg, borne: int = BORNE_DEFAUT, indicateur: bool = False
     c = df["close"].to_numpy(np.float64)
     atr = np.maximum(df["atr_14"].to_numpy(np.float64), 1e-9)
     n = len(c)
-    fric = (SPREAD_BPS + SLIP_ENTREE_BPS + SLIP_SORTIE_BPS) / 1e4
+    # LA FRICTION SE LIT DANS LA CONFIGURATION. Elle etait figee sur les
+    # valeurs du BTC — 1.85 point de base de spread — ce qui aurait facture au
+    # Bitcoin sur de l'or, dont le spread vaut 0.68. L'etiquette de la tete
+    # auxiliaire aurait alors decrit un trade plus cher que celui qui se joue,
+    # et rien ne l'aurait signale : deux nombres plausibles, aucune erreur.
+    fric = (float(getattr(cfg, "spread_bps", SPREAD_BPS))
+            + SLIP_ENTREE_BPS + SLIP_SORTIE_BPS) / 1e4
 
     sorties, temps = [], []
     for sens in (1, -1):

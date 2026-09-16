@@ -245,7 +245,16 @@ BEST_MODEL_SHORT_PATH = "best_saintv2_loup_short_wf1_short_wf1.pth"
 @dataclass
 class PPOConfig:
     # Données
-    symbol: str = "BTCUSD"
+    # L'OR SEUL. Le Bitcoin est ecarte de l'entrainement : sur les memes
+    # dates et la meme geometrie, l'or rend +16.5 a +20.1 R par an contre
+    # +12.5 pour le meilleur reglage du BTC, avec un avantage par trade a 3.9
+    # a 6.0 ecarts-types contre ~2.0. Son spread est trois fois plus etroit.
+    #
+    # Sa geometrie lui est propre et ne se copie pas de l'autre : son ATR
+    # relatif vaut 6.6 points de base contre 15.9, donc un stop de 6xATR y
+    # ferait 40 bps la ou il en fait 95 sur le BTC. `instruments.py` porte les
+    # valeurs ; elles sont appliquees ci-dessous.
+    symbol: str = "XAUUSD"
     timeframe: int = mt5.TIMEFRAME_M1
     htf_timeframe: int = mt5.TIMEFRAME_H1
     # Fenetre temporelle (UTC). Si date_to est None -> maintenant.
@@ -787,11 +796,15 @@ class PPOConfig:
     #
     # L'entrainement dimensionnait en continu et ne voyait jamais cela. Il
     # apprenait sur un courtier qui n'existe pas.
+    # LE CONTRAT DE L'OR VAUT CENT ONCES. Un lot minimum y represente donc
+    # 4 265 $ de notionnel contre 762 pour le BTC, et risque 2.81 % d'un
+    # compte de 1 000 EUR contre 0.73 %. C'est ce chiffre, et non la
+    # volatilite, qui fixe le nombre de positions tenables.
     lot_min: float = 0.01
     # TAILLE DU CONTRAT, en unites par lot. Elle vaut 1 sur le BTC et 100 sur
     # l'or : un lot d'or, c'est cent onces. `instruments.py` la fixe par
     # symbole ; l'ignorer ferait trader cent fois trop petit sur l'or.
-    contrat: float = 1.0
+    contrat: float = 100.0
     lot_pas: float = 0.01
     marge_frac: float = 0.001734        # marge / notionnel, mesuree
     # Niveau de marge (equity / marge utilisee) sous lequel on n'ouvre plus.
@@ -856,7 +869,11 @@ class PPOConfig:
     # bord du garde-fou de drawdown ; ou 3 % a 25 000 EUR, qui produit le meme
     # essaim pour six fois moins de creux. C'est un probleme de CAPITAL, pas
     # de budget : a 25 000 EUR le lot minimum de l'or ne pese plus que 0.11 %.
-    budget_risque: float = 1.00
+    # RETENU : 30 %. C'est la valeur la plus haute ou les deux instruments
+    # essaiment ET ou l'episode survit — a 100 % il meurt a la barre 538 sur
+    # 4 000. Le creux de 37 % reste au bord du garde-fou a 40 %, ce qui est
+    # assume : c'est le prix d'un essaim d'or a 1 000 EUR de capital.
+    budget_risque: float = 0.30
     # ------------------------------------------------------------------
 
     # 84 -> 20, ET C'EST UN GAIN, pas une reduction.
@@ -1482,7 +1499,13 @@ class PPOConfig:
     # donnait l'inverse par trade, ce qui est coherent — par trade le large
     # gagne, par an le court gagne — mais les deux ne se deduisent pas l'une
     # de l'autre.
-    atr_sl_mult: float = 6.0
+    # 6 -> 10xATR : la largeur de l'OR, derivee de son propre balayage.
+    # Son ATR relatif vaut 6.6 points de base contre 15.9 pour le BTC, donc
+    # 10xATR y fait 66 bps quand 6xATR en faisait 95 sur le Bitcoin. Le
+    # balayage donne +20.1 R/an a 6x mais 3.1 % des reouvertures franchissent
+    # le stop ; a 10x il n'y en a plus que 1.6 % pour +16.5 R/an, et la
+    # friction tombe de 0.090 a 0.054 R.
+    atr_sl_mult: float = 10.0
     # R:R 1:2.0. Le 1.4 precedent venait de la grille de mesure_features.py,
     # qui echantillonne une entree toutes les 10 barres alors que les
     # barrieres mettent jusqu'a 240 barres a se resoudre : les fenetres de
@@ -1499,11 +1522,11 @@ class PPOConfig:
     # atteignaient 33.1 % — il leur manquait 11 points, il leur en manque 3.
     # R:R maintenu a 2 : l'objectif vaut le double du stop, donc 8xATR.
     # R:R 2.0 inchange : c'est le stop qu'on fait varier, pas le rapport.
-    atr_tp_mult: float = 36.0   # inutilise tant que use_tp vaut False
+    atr_tp_mult: float = 60.0   # inutilise tant que use_tp vaut False
     # L'OBJECTIF QUE LE MODELE APPREND A ATTEINDRE, en multiples d'ATR.
     # 16 = 2 R : la largeur sur laquelle la courbe de selectivite etait
     # franchement monotone, donc celle ou le classement a du sens.
-    aux_tp_mult: float = 12.0   # 2 R, la largeur ou le classement a du sens
+    aux_tp_mult: float = 20.0   # 2 R, la largeur ou le classement a du sens
 
     # ------------------------------------------------------------------
     # LA REGLE DE SORTIE, mesuree le 2026-09-16 et changee pour cette raison.
@@ -1598,7 +1621,13 @@ class PPOConfig:
     # structurel de ce symbole, et il pese directement sur le choix du SL :
     # aller-retour = 28.65 $, soit 27.7 % d'un stop a 3xATR et 8.3 % d'un stop
     # a 10xATR.
-    spread_bps: float = 2.61
+    # 2.61 -> 0.68 : le spread de l'OR, releve chez le courtier contre 2.23
+    # pour le BTC. Garder celui du Bitcoin aurait facture a l'or une friction
+    # trois fois trop chere — et comme elle est un montant FIXE, son poids en
+    # unites de risque est ce qui decide de la largeur du stop et de la
+    # rentabilite. Une erreur ici ne leve rien : elle rend seulement le
+    # resultat faux.
+    spread_bps: float = 0.68
     slippage_bps: float = 2.0    # sortie
 
     # Distribution bimodale du spread. Le facteur vient du rapport p99/moyenne
@@ -1733,8 +1762,8 @@ class PPOConfig:
     # La case voisine de l'ancien reglage (1.5 R / 1.0 R) vaut -0.5 : cette
     # zone de la surface est instable, ce qui explique qu'un reglage non
     # mesure y ait atterri sans que rien ne le signale.
-    atr_trail_mult: float = 12.0   # 2.0 R (le stop vaut 6 ATR)   # gain en ATR pour déclencher le trailing
-    atr_trail_dist: float = 12.0   # 2.0 R   # distance du trailing (en ATR)
+    atr_trail_mult: float = 20.0   # 2.0 R (le stop vaut 10 ATR)   # gain en ATR pour déclencher le trailing
+    atr_trail_dist: float = 20.0   # 2.0 R   # distance du trailing (en ATR)
 
     # Warmup critique : N epochs où seul le critique est mis à jour
     critic_warmup_epochs: int = 5
@@ -1897,11 +1926,20 @@ def _data_cache_path(cfg: PPOConfig) -> str:
     duplication qui avait laisse diverger l'alignement H1 et le bruit de ticks
     dans ce projet. Une seule source.
     """
+    # LE CACHE SUIT LE SYMBOLE. Il etait code en dur sur BTCUSD : basculer
+    # `cfg.symbol` sur XAUUSD aurait donc charge le Bitcoin en silence, et
+    # l'entrainement aurait tourne sur le mauvais instrument sans qu'aucune
+    # erreur soit levee. `instruments.py` nomme le fichier de chacun.
     tf = getattr(cfg, "timeframe_entrainement", "M1")
+    sym = getattr(cfg, "symbol", "BTCUSD")
     if tf == "M5":
-        return "data_cache_BTCUSD_M5.pkl"
+        try:
+            import instruments as _I
+            return _I.INSTRUMENTS[sym]["cache"]
+        except Exception:
+            return f"data_cache_{sym}_M5.pkl"
     if tf == "H1":
-        return "data_cache_BTCUSD_H1.pkl"
+        return f"data_cache_{sym}_H1.pkl"
     return f"data_cache_{cfg.symbol}_{cfg.date_from:%Y%m%d}.pkl"
 
 
@@ -5954,7 +5992,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec58"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec59"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -5978,7 +6016,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec58: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec59: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
