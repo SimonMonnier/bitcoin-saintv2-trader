@@ -77,6 +77,7 @@ RE_META = re.compile(
     # un groupe de plus les decalerait tous en silence. Il est OPTIONNEL pour
     # que la veille continue de lire les journaux des runs anterieurs.
     r"\[BOTH_(wf\d+)\]\s+EPOCH (\d+)\s+META\s+(?:rho\s+" + NB + r"\s+)?"
+    r"(?:rhoAux\s+" + NB + r"\s+)?"
     r"Sortino\s+(" + NB + r").*?"
     r"AvgW\s+(" + NB + r")\$\s+AvgL\s+(" + NB + r")\$.*?H ([\d.]+).*?"
     r"sel\[train\s+([\d.]+)% val\s+([\d.]+)%\].*?"
@@ -88,6 +89,7 @@ RE_META = re.compile(
     r".*?ENV \[B\s+([\d.]+)% S\s+([\d.]+)% H\s+([\d.]+)%\]")
 
 RE_RHO = re.compile(r"META\s+rho\s+(" + NB + r")")
+RE_RHO_AUX = re.compile(r"rhoAux\s+(" + NB + r")")
 
 # Seuil sous lequel le gradient de l'acteur est considere comme NUL, donc la
 # politique reellement gelee. Mesure : pendant le warmup du critic il vaut
@@ -270,6 +272,9 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     # pas un modele qui ajoute 0.10 R d'un modele qui n'ajoute rien. Le rho
     # porte sur toutes les decisions de la fenetre, et son incertitude est
     # environ 0.024 — mesuree par bootstrap par blocs sur exec32.
+    aux = None
+    if isinstance(rho, tuple):
+        rho, aux = rho
     if rho is not None:
         if rho > 0.05:
             coul, quoi = C.VERT, "classe nettement"
@@ -279,8 +284,15 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
             coul, quoi = C.GRIS, "n'ordonne rien"
         else:
             coul, quoi = C.ROUGE, "classe A L'ENVERS"
+        sup = ""
+        if aux is not None:
+            # La tete auxiliaire est entrainee a PREDIRE le rendement, la
+            # politique a AGIR. Si la seconde colonne monte pendant que la
+            # premiere reste plate, c'est la tete qui doit trier.
+            ca = C.VERT if aux > 0.02 else (C.ROUGE if aux < -0.02 else C.GRIS)
+            sup = f"   tete auxiliaire {ca}{aux:+.4f}{C.FIN}"
         L.append(f"  classement rho {coul}{rho:+.4f}{C.FIN} "
-                 f"(+/- 0.024 env.)  -> {quoi}")
+                 f"(+/- 0.024 env.)  -> {quoi}{sup}")
 
     if reference is not None:
         n_ref, moy_ref = reference
@@ -448,8 +460,10 @@ def main() -> int:
                 # Lu par un motif separe : l'inclure dans RE_META decalerait
                 # les indices que `analyse` lit par position.
                 mr = RE_RHO.search(ligne)
+                ma = RE_RHO_AUX.search(ligne)
                 rhos[(mm.group(1), int(mm.group(2)))] = (
-                    float(mr.group(1)) if mr else None)
+                    float(mr.group(1)) if mr else None,
+                    float(ma.group(1)) if ma else None)
             if mt:
                 trains[(mt.group(1), int(mt.group(2)))] = mt.groups()
 

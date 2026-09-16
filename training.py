@@ -5172,6 +5172,8 @@ def run_training_on_split(
         # Le rho de l'epoch. Etat PLAT, celui que voit la politique avant
         # d'entrer : position 0, latent 0, detention 0, echelle de risque 1.
         _rho_ep = float(chr(110) + chr(97) + chr(110))
+        _rho_aux = float(chr(110) + chr(97) + chr(110))
+        _sa = []
         if _rang_idx is not None:
             policy.eval()
             _extra = np.zeros((cfg.lookback, 4), np.float32)
@@ -5183,18 +5185,41 @@ def run_training_on_split(
                     _o = np.stack([
                         np.concatenate([val_data.features[i - cfg.lookback:i],
                                         _extra], axis=-1) for i in _b])
-                    _lg = policy(torch.from_numpy(_o).to(device))
+                    _t = torch.from_numpy(_o).to(device)
+                    _lg = policy(_t)
                     if isinstance(_lg, tuple):
                         _lg = _lg[0]
                     _pr = torch.softmax(_lg, dim=-1).float().cpu().numpy()
                     _s.append(_pr[:, 0] - _pr[:, 1])
+                    # LA TETE AUXILIAIRE CLASSE-T-ELLE MIEUX QUE LA POLITIQUE ?
+                    #
+                    # Mesure du 2026-09-16 : une regression lineaire simple
+                    # obtient rho +0.0434 (2.0 sigma) sur cette cible, quand
+                    # le rho de la politique oscille dans le bruit. L'info est
+                    # donc dans les features et PPO ne l'extrait pas — il
+                    # optimise le rendement de ses ACTIONS, personne ne lui
+                    # demande que l'ORDRE de ses probabilites soit juste, et
+                    # c'est pourtant tout ce dont la selectivite se sert.
+                    #
+                    # La tete auxiliaire, elle, est entrainee a PREDIRE le
+                    # rendement, sur tous les etats collectes et non sur les
+                    # seuls etats de decision. Si son rho monte pendant que
+                    # celui de la politique reste plat, c'est elle qui doit
+                    # trier en production.
+                    try:
+                        _a = policy.rendement(_t).float().cpu().numpy()
+                        _sa.append(_a[:, 0] - _a[:, 1])
+                    except Exception:
+                        _sa = None
             policy.train()
             _rho_ep = _correlation_rang(np.concatenate(_s), _rang_reel)
+            if _sa:
+                _rho_aux = _correlation_rang(np.concatenate(_sa), _rang_reel)
 
         print(
             f"{tag} {epoch_str}  "
             f"{_col('META ', _C.GREY + _C.BOLD)}  "
-            f"rho {_rho_ep:>+6.4f}  "
+            f"rho {_rho_ep:>+6.4f}  rhoAux {_rho_aux:>+6.4f}  "
             f"Sortino {metric:>+6.3f}  "
             f"{_col(f'Sortino30 {s30:>+6.3f}', s30_col)}  "
             f"AvgW {_money(avg_win_train, width=8)}  AvgL {_money(avg_loss_train, width=8)}  "
@@ -5692,7 +5717,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec52"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec53"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -5716,7 +5741,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec52: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec53: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
