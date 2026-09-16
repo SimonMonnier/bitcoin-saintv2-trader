@@ -788,6 +788,10 @@ class PPOConfig:
     # L'entrainement dimensionnait en continu et ne voyait jamais cela. Il
     # apprenait sur un courtier qui n'existe pas.
     lot_min: float = 0.01
+    # TAILLE DU CONTRAT, en unites par lot. Elle vaut 1 sur le BTC et 100 sur
+    # l'or : un lot d'or, c'est cent onces. `instruments.py` la fixe par
+    # symbole ; l'ignorer ferait trader cent fois trop petit sur l'or.
+    contrat: float = 1.0
     lot_pas: float = 0.01
     marge_frac: float = 0.001734        # marge / notionnel, mesuree
     # Niveau de marge (equity / marge utilisee) sous lequel on n'ouvre plus.
@@ -2301,6 +2305,50 @@ def create_datasets_from_slices(
 # ENVIRONNEMENT
 # ======================================================================
 
+class Portefeuille:
+    """UN COMPTE. Plusieurs instruments peuvent le partager.
+
+    POURQUOI IL EXISTE. En production il n'y a qu'un compte MetaTrader : si le
+    Bitcoin tient quinze positions, l'or en voit moins de disponibles, parce
+    que les deux puisent dans la MEME equite et la MEME marge. Un
+    environnement par instrument avec chacun son capital simulerait deux
+    comptes qui n'existent pas, et le risque reel vaudrait le double de ce
+    qu'on croit.
+
+    L'equite, la marge utilisee et le risque engage se somment donc sur TOUS
+    les environnements inscrits, et la capacite d'ouverture en decoule.
+
+    A UN SEUL INSTRUMENT ce compte ne contient qu'un environnement, et chacune
+    de ces sommes se reduit a son terme unique : le comportement est alors
+    rigoureusement celui d'avant, ce que `test_concurrence.py` verifie.
+    """
+
+    def __init__(self, capital: float):
+        self.capital = float(capital)
+        self.envs: List = []
+
+    def inscrire(self, env) -> None:
+        if env not in self.envs:
+            self.envs.append(env)
+
+    def equity(self) -> float:
+        """Capital plus le latent de TOUS les instruments."""
+        lat = 0.0
+        for e in self.envs:
+            bid = e.data.close[min(max(e.idx - 1, 0), e.data.length - 1)]
+            lat += e._latent_at_bid(bid)
+        return self.capital + lat
+
+    def marge_utilisee(self) -> float:
+        return sum(e.marge_utilisee for e in self.envs)
+
+    def risque_engage(self) -> float:
+        return sum(float(e._p_risque[e._p_sens != 0].sum()) for e in self.envs)
+
+    def n_positions(self) -> int:
+        return sum(e.n_positions for e in self.envs)
+
+
 class BTCTradingEnvDiscrete(gym.Env):
     metadata = {"render_modes": []}
 
@@ -2387,7 +2435,13 @@ class BTCTradingEnvDiscrete(gym.Env):
         self.end_idx = self.start_idx + self.cfg.episode_length
         self.idx = self.start_idx
 
-        self.capital = self.cfg.initial_capital
+        # LE CAPITAL APPARTIENT AU COMPTE, pas a l'instrument. Sans compte
+        # explicite, chaque environnement en cree un pour lui seul — ce qui
+        # reproduit exactement le comportement d'avant.
+        if getattr(self, "portefeuille", None) is None:
+            self.portefeuille = Portefeuille(self.cfg.initial_capital)
+        self.portefeuille.inscrire(self)
+        self.portefeuille.capital = self.cfg.initial_capital
 
         # LES POSITIONS SONT DES EMPLACEMENTS, pas des scalaires. Un tableau
         # par champ plutot qu'une liste d'objets : les barrieres se testent
@@ -2473,8 +2527,8 @@ class BTCTradingEnvDiscrete(gym.Env):
         return self.notionnel * float(getattr(self.cfg, "marge_frac", 0.001734))
 
     def _equity_courante(self) -> float:
-        bid = self.data.close[min(self.idx, self.data.length - 1)]
-        return self.capital + self._latent_at_bid(bid)
+        """L'equite du COMPTE, tous instruments confondus."""
+        return self.portefeuille.equity()
 
     def _taille_quantifiee(self, taille: float) -> float:
         """Ce que le courtier accepterait reellement.
@@ -2486,8 +2540,15 @@ class BTCTradingEnvDiscrete(gym.Env):
         """
         if not getattr(self.cfg, "marge_realiste", False):
             return taille
-        pas = float(getattr(self.cfg, "lot_pas", 0.01))
-        mini = float(getattr(self.cfg, "lot_min", 0.01))
+        # LE LOT N'EST PAS L'UNITE. `taille` est en unites de l'instrument —
+        # bitcoins ou onces — alors que le courtier quantifie en LOTS, et un
+        # lot d'or vaut CENT onces. Quantifier a 0.01 sans passer par la
+        # taille du contrat ferait trader un centieme d'once la ou le minimum
+        # reel est une once : cent fois trop petit, et le risque annonce
+        # n'aurait aucun rapport avec le risque joue.
+        contrat = float(getattr(self.cfg, "contrat", 1.0))
+        pas = float(getattr(self.cfg, "lot_pas", 0.01)) * contrat
+        mini = float(getattr(self.cfg, "lot_min", 0.01)) * contrat
         if taille < mini:
             # Le courtier ne sait pas faire plus petit. On prend le minimum,
             # comme le fait `kairos_live`, et le risque reel depasse la cible.
@@ -2499,8 +2560,13 @@ class BTCTradingEnvDiscrete(gym.Env):
         # `peut_entrer()` puis via `_get_obs()`, et rien entre les deux ne
         # peut la changer. La cle porte l'etat dont elle depend, donc une
         # ouverture ou une fermeture l'invalide d'elle-meme.
-        cle = (self.idx, int(self._p_sens.astype(bool).sum()),
-               self._notionnel, self.capital)
+        # La cle porte l'etat du COMPTE : une ouverture sur l'autre
+        # instrument change la capacite de celui-ci, et la memo doit s'en
+        # apercevoir. Sans cela, l'or continuerait d'ouvrir sur une capacite
+        # calculee avant que le Bitcoin ne consomme le budget.
+        cle = (self.idx, self.portefeuille.n_positions(),
+               round(self.portefeuille.marge_utilisee(), 9),
+               round(self.portefeuille.risque_engage(), 9), self.capital)
         if getattr(self, "_cap_cle", None) == cle:
             return self._cap_val
         val = self._places_ouvrables(prix)
@@ -2529,10 +2595,12 @@ class BTCTradingEnvDiscrete(gym.Env):
         frac = float(getattr(self.cfg, "marge_frac", 0.001734))
         seuil = float(getattr(self.cfg, "niveau_marge_ouverture", 3.0))
         # Marge qu'une position minimale consommerait.
-        m_une = max(prix * float(getattr(self.cfg, "lot_min", 0.01)) * frac, 1e-12)
+        m_une = max(prix * float(getattr(self.cfg, "lot_min", 0.01))
+                    * float(getattr(self.cfg, "contrat", 1.0)) * frac, 1e-12)
         # On s'arrete avant que le niveau de marge ne descende sous le seuil.
         marge_max = eq / max(seuil, 1e-9)
-        par_marge = math.floor((marge_max - self.marge_utilisee) / m_une)
+        par_marge = math.floor(
+            (marge_max - self.portefeuille.marge_utilisee()) / m_une)
 
         # LE RISQUE ENGAGE, et c'est lui qui porte le cercle vertueux. La
         # somme des montants a perdre si tous les stops etaient touches reste
@@ -2549,7 +2617,12 @@ class BTCTradingEnvDiscrete(gym.Env):
             # imposerait reellement — lot minimum compris.
             taille = self._taille_quantifiee(self._compute_dynamic_size(prix))
             r_une = max(self.cfg.atr_sl_mult * atr * taille, 1e-12)
-            engage = float(self._p_risque[self._p_sens != 0].sum())
+            # LE RISQUE ENGAGE EST CELUI DU COMPTE. C'est tout l'interet
+            # du partage : quinze positions ouvertes sur le Bitcoin
+            # consomment le budget, donc l'or en voit moins de disponibles.
+            # Compter instrument par instrument autoriserait deux fois le
+            # risque voulu sans que rien ne le signale.
+            engage = self.portefeuille.risque_engage()
             par_risque = math.floor((budget * eq - engage) / r_une)
 
         return int(max(0, min(par_marge, par_risque)))
@@ -2602,9 +2675,12 @@ class BTCTradingEnvDiscrete(gym.Env):
             return False
         frac = float(getattr(self.cfg, "marge_frac", 0.001734))
         seuil = float(getattr(self.cfg, "niveau_marge_ouverture", 3.0))
-        m_une = max(prix * float(getattr(self.cfg, "lot_min", 0.01)) * frac,
-                    1e-12)
-        return (eq / max(seuil, 1e-9) - self.marge_utilisee) >= m_une
+        m_une = max(prix * float(getattr(self.cfg, "lot_min", 0.01))
+                    * float(getattr(self.cfg, "contrat", 1.0)) * frac, 1e-12)
+        # La marge deja immobilisee est celle du COMPTE : les positions de
+        # l'autre instrument la consomment aussi.
+        return (eq / max(seuil, 1e-9)
+                - self.portefeuille.marge_utilisee()) >= m_une
 
     def peut_entrer(self) -> bool:
         """Une DECISION existe quand le solde permet encore une position."""
@@ -2847,6 +2923,15 @@ class BTCTradingEnvDiscrete(gym.Env):
         size = min(size, notion_max / max(price, 1e-8))
 
         return float(max(size, 0.0))
+
+    @property
+    def capital(self) -> float:
+        """Vue sur le solde du COMPTE, partage entre instruments."""
+        return self.portefeuille.capital
+
+    @capital.setter
+    def capital(self, v) -> None:
+        self.portefeuille.capital = float(v)
 
     def _latent_at_bid(self, bid):
         """Somme des latents de TOUS les emplacements ouverts.

@@ -156,10 +156,25 @@ def _joint_echelle(m5, regle, sfx, jour_sup):
     return m5.drop(columns=["_c_sup"]), noms + ["close" + sfx + "_dev"]
 
 
-def construit(m5):
-    """Du brut M5 aux 260 colonnes. Rend (df, colonnes, colonnes ichimoku)."""
+def construit(m5, avec_flux=None):
+    """Du brut M5 aux colonnes de `saint_core`. Rend (df, colonnes, ichimoku).
+
+    `avec_flux` calcule les colonnes de carnet — part acheteuse agressive,
+    taille de trade, intensite. Elles n'existent QUE sur Binance : aucun CFD
+    ne publie `taker_buy_base` ni `nb_trades`. Elles ont ete retirees de
+    `FEATURE_COLS` le 2026-09-16 pour que l'or puisse partager exactement le
+    meme jeu de colonnes, et la mesure a montre que ca ne coutait rien.
+
+    Par defaut on les calcule si la source les porte, et on les laisse hors
+    de la liste rendue : elles restent dans le cache pour qui voudrait les
+    remesurer, sans entrer dans l'observation.
+    """
     m5 = indicateurs(m5, JOUR_M5)
-    m5 = flux(m5)
+    if avec_flux is None:
+        avec_flux = all(c in m5.columns
+                        for c in ("taker_buy_base", "quote_vol", "nb_trades"))
+    if avec_flux:
+        m5 = flux(m5)
 
     cols_sup = []
     for regle, sfx, jour_sup in ECHELLES_SUP:
@@ -174,9 +189,11 @@ def construit(m5):
     m5, cols_rng = ajoute_features_range(m5)
     m5, cols_ich = ajoute_features_ichimoku(m5)
 
-    ext = ["taker_ratio", "taker_ma5"]
-    liq = ["flux_taille_trade", "flux_intensite", "heure_sin", "heure_cos"]
-    return (m5, BASES + cols_sup + ext + liq + cols_rng + cols_ich, cols_ich)
+    # Les colonnes de carnet ne sont plus dans l'observation : la liste
+    # rendue doit donc s'accorder avec `saint_core.FEATURE_COLS`, que `main`
+    # verifie colonne par colonne.
+    liq = ["heure_sin", "heure_cos"]
+    return (m5, BASES + cols_sup + liq + cols_rng + cols_ich, cols_ich)
 
 
 def main() -> int:
