@@ -40,6 +40,29 @@ SLIP_SORTIE_BPS = 2.0
 BORNE_DEFAUT = 30 * 288  # 30 jours de M5 : borne de securite, pas une sortie
 
 
+def borne_etude(n: int) -> int:
+    """Derniere barre qu'une MESURE a le droit de regarder.
+
+    POURQUOI CETTE FONCTION EXISTE. Le 2026-09-16, le balayage qui a choisi la
+    largeur du stop a tourne sur les neuf annees d'historique — dont les
+    quinze derniers pour cent sont la fenetre de test. Une geometrie choisie
+    sur des donnees qui contiennent le test contamine le test, et rien ne l'a
+    signale : aucun fichier de mesure ne connaissait la frontiere, chacun
+    prenait `len(df)`.
+
+    La fenetre de test est a USAGE UNIQUE. Elle ne sert pas a choisir un
+    reglage, pas a departager deux variantes, pas a verifier qu'une intuition
+    tient — une seule fois, a la fin, pour un chiffre qu'on publie et qu'on ne
+    refait pas. Tout ce qui se choisit se choisit en-deca de cette borne.
+
+    Les 85 % reprennent `run_training_on_split` : train 0-70 %, validation
+    70-85 %, test au-dela. Le mesurer ici plutot que de le recopier evite la
+    faute habituelle du depot — deux descriptions du meme decoupage qui
+    doivent s'accorder par convention.
+    """
+    return int(n * 0.85)
+
+
 def _regle_cible(cfg) -> dict:
     """La geometrie que le modele apprend a CLASSER — pas celle qui est jouee.
 

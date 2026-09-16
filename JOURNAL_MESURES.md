@@ -8,6 +8,94 @@ Ordre antichronologique.
 
 ---
 
+## 16 septembre 2026, quatrième partie — trois chiffres annoncés, trois chiffres retirés
+
+Cette entrée corrige une mesure publiée quelques heures plus tôt dans ce même
+journal, et sur laquelle une décision de configuration a été prise. Elle est
+écrite en premier parce que c'est la plus importante : l'erreur n'était pas
+dans le calcul, elle était dans la **barre d'erreur**, et ce genre d'erreur ne
+se voit pas — tout tourne, tout rend des nombres plausibles.
+
+### Ce qui avait été annoncé
+
+> Stop 8 → 12×ATR : **+0.0494 ± 0.0165, soit 3.0 écarts-types, sept années
+> positives sur neuf**, et positif sur les deux moitiés de l'historique.
+
+### Ce que la mesure vaut réellement
+
+```
+   stop   E[R] sym   sigma    ecart vs 8x   sigma apparie   ann +
+     6x    -0.0096    -0.2        -0.0581            -1.3     4/9
+     8x    +0.0485    +1.0      (reference)
+    10x    +0.1086    +2.2        +0.0602            +1.4     5/9
+    12x    +0.1129    +2.4        +0.0644            +1.3     6/9
+    14x    +0.1226    +2.4        +0.0742            +1.3     6/9
+    16x    +0.1381    +2.6        +0.0896            +1.4     6/9
+    20x    +0.1030    +2.0        +0.0545            +0.9     5/9
+```
+
+366 dates d'entrée non chevauchantes, part symétrique, comparaison appariée aux
+mêmes dates, fenêtre arrêtée à 85 % de l'historique.
+
+**Il n'y a pas de pic.** De 10× à 16× les largeurs sont indiscernables. 12× est
+gardé parce qu'il est au *milieu* du plateau — choisir le maximum d'une courbe
+plate, c'est sélectionner du bruit, et c'est exactement ce que la version
+précédente faisait.
+
+### Les trois défauts, dans l'ordre de gravité
+
+**1. Le sweep voyait la fenêtre de test.** Il portait sur les neuf années,
+dont les quinze derniers pour cent sont le test. Choisir une géométrie sur des
+données qui contiennent le test contamine le test. C'est la seule règle du
+projet qui n'a pas le droit d'être enfreinte, et elle l'a été sans que rien ne
+le signale — parce que rien, dans le code, ne connaît la frontière.
+
+**2. La barre d'erreur mesurait autre chose que l'incertitude.** Elle prenait
+l'écart-type **entre phases**. Or les phases couvrent la même période décalées
+de 67 barres : leurs moyennes sont presque le même nombre. Cet écart-type
+mesure la *sensibilité au décalage*, pas l'erreur d'échantillonnage, et il la
+sous-estime d'un facteur quatre environ. D'où un « 3.0 σ » qui valait 0.8.
+
+Le repère à retenir : **une barre d'erreur doit venir de ce qui varie
+indépendamment.** Douze phases décalées de 67 barres ne sont pas douze
+échantillons ; neuf années le sont à peu près ; 366 occasions espacées de sept
+jours le sont mieux encore.
+
+**3. Les entrées à sens alterné donnent n'importe quoi sur une fenêtre
+directionnelle.** Sur la fenêtre de validation, exactement les mêmes trades
+donnent **−0.0670 en alterné et +0.0283 en symétrique**. L'alternance fait
+dépendre le résultat de *quelles dates* reçoivent un achat plutôt qu'une vente ;
+(achat + vente) / 2 ne peut pas en dépendre, et déduit au passage la dérive du
+sous-jacent, qu'aucun modèle ne peut promettre de revoir.
+
+C'est la troisième fois dans la journée que la construction de l'échantillon,
+et non le calcul, produit un résultat faux : d'abord le veto (artefact de
+phase), puis `mesure_trailing` (stop fixe comparé à un environnement adaptatif),
+maintenant le sweep du stop.
+
+### Ce que la mesure corrigée apporte quand même
+
+Elle est plus intéressante que celle qu'elle remplace. **L'avantage symétrique
+est positif à 2.4 σ** entre 10× et 16×, sur 366 occasions indépendantes, hors
+test. C'est le premier avantage de base du dépôt qui tienne à cette rigueur :
+la géométrie seule gagne, sans modèle. Le modèle n'a plus à créer un avantage,
+il a à ne pas l'abîmer.
+
+Et 6× est mesurablement mauvais, dans l'absolu comme en apparié. La largeur du
+stop n'est donc pas indifférente — c'est seulement *à l'intérieur du plateau*
+qu'elle l'est.
+
+### La fenêtre de validation n'est pas un échantillon lisible
+
+Au passage : la validation contient ~164 occasions indépendantes à cette
+géométrie. Pour lire un avantage de 0.05 R il en faut de l'ordre de 780, et
+4 900 pour 0.02 R. **Toute conclusion tirée d'un écart de validation inférieur
+à 0.2 R par trade est du bruit**, y compris les « PPO dégrade la validation »
+accumulés depuis exec24. Ces runs n'ont pas montré que PPO nuit ; ils n'ont
+rien montré.
+
+---
+
 ## 16 septembre 2026, troisième partie — on mesure ce qu'on avait choisi, et deux réponses contredisent la précédente
 
 Les réglages des trois votants n'avaient jamais été mesurés : `PART_LAISSEE`

@@ -1104,27 +1104,45 @@ class PPOConfig:
     # L'optimum de 88 points de base derive ce matin valait pour des barrieres
     # FIXES, ou la duree croit comme le carre du risque. Avec un stop suiveur
     # la position ferme bien avant que le stop initial soit atteint, et la
-    # relation change. Je l'avais signale ; la mesure le confirme.
+    # relation change. Le stop n'avait jamais ete reoptimise pour cette sortie.
     #
-    #     stop   1re moitie   2e moitie      tout   annees +
-    #       8x     +0.0008     +0.0104    +0.0051      5/9
-    #      10x     +0.0170     +0.0562    +0.0344      7/9
-    #      12x     +0.0579     +0.0388    +0.0494      7/9   <- pic
-    #      14x     +0.0438     +0.0047    +0.0264      6/9
+    # CE QUE DIT LA MESURE. 366 dates d'entree non chevauchantes (espacees de
+    # sept jours) ou toutes les largeurs se resolvent, part SYMETRIQUE
+    # (achat + vente) / 2 pour deduire la derive du sous-jacent, comparaison
+    # APPARIEE aux memes dates. Le test n'est pas ouvert : on s'arrete a 85 %
+    # de l'historique.
     #
-    # +0.0494 +/- 0.0165, soit 3.0 ecarts-types, sept annees positives sur
-    # neuf, et POSITIF SUR LES DEUX MOITIES de facon equilibree. Le 14x, lui,
-    # s'effondre sur la seconde — il capture un regime, pas une propriete.
+    #     stop   E[R] sym   sigma    ecart vs 8x   sigma apparie   ann +
+    #       6x    -0.0096    -0.2        -0.0581            -1.3     4/9
+    #       8x    +0.0485    +1.0      (reference)
+    #      10x    +0.1086    +2.2        +0.0602            +1.4     5/9
+    #      12x    +0.1129    +2.4        +0.0644            +1.3     6/9
+    #      14x    +0.1226    +2.4        +0.0742            +1.3     6/9
+    #      16x    +0.1381    +2.6        +0.0896            +1.4     6/9
+    #      20x    +0.1030    +2.0        +0.0545            +0.9     5/9
     #
-    # La raison est la friction : a 236 points de base de risque elle ne pese
-    # plus que 0.021 R par trade contre 0.031 a 8x.
+    # IL N'Y A PAS DE PIC. De 10x a 16x les largeurs sont indiscernables : les
+    # ecarts valent 0.02 a 0.03 R sous une erreur de 0.05. 12x est retenu
+    # parce qu'il est au MILIEU de ce plateau, pas parce qu'il gagne — choisir
+    # le maximum d'une courbe plate, c'est selectionner du bruit.
     #
-    # CE QUE CA COUTE : les occasions passent de 3 494 a 1 709, et la duree
-    # mediane de 16.7 h a 34.1 h. La detectabilite y gagne quand meme d'un
-    # facteur 6.8, l'avantage etant dix fois plus grand.
+    # CE QUI EST ETABLI, en revanche : 6x est mauvais (-1.3 sigma en apparie,
+    # negatif dans l'absolu), le plateau est au-dessus de 8x de facon
+    # cohérente — six mesures qui pointent toutes dans le meme sens — et
+    # surtout l'avantage symetrique y est POSITIF A 2.4 SIGMA. C'est le
+    # premier avantage de base du depot qui tienne a cette rigueur.
     #
-    # A cette largeur, LA BASE EST RENTABLE SANS MODELE. Le modele n'a plus a
-    # creer un avantage, il a a ne pas l'abimer.
+    # La raison est la friction, qui est un montant fixe en dollars : a 236
+    # points de base de risque elle pese 0.021 R par trade contre 0.031 a 8x.
+    #
+    # TROIS CHIFFRES ANNONCES D'ABORD ETAIENT FAUX — "+0.0494 +/- 0.0165, 3.0
+    # sigma, 7/9 annees" — pour trois raisons cumulees, toutes consignees dans
+    # ERREURS_ET_DECOUVERTES.md : le sweep voyait la fenetre de test ; sa
+    # barre d'erreur etait l'ecart-type ENTRE PHASES decalees de 67 barres,
+    # qui mesure la sensibilite au decalage et sous-estime l'incertitude d'un
+    # facteur quatre ; et les entrees a sens ALTERNE donnent n'importe quoi
+    # sur une fenetre directionnelle (-0.0670 en alterne contre +0.0283 en
+    # symetrique, sur exactement les memes trades).
     atr_sl_mult: float = 12.0
     # R:R 1:2.0. Le 1.4 precedent venait de la grille de mesure_features.py,
     # qui echantillonne une entree toutes les 10 barres alors que les
