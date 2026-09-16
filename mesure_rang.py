@@ -28,7 +28,8 @@ partagent leur avenir : les traiter comme independantes diviserait l'erreur
 par dix. Les blocs font plusieurs fois la duree d'un trade, donc deux blocs
 differents ne partagent presque rien.
 
-LE TEST N'EST PAS OUVERT : on mesure sur la validation du fold.
+LE TEST N'EST PAS OUVERT : les bornes du fold se derivent des memes
+fractions que `run_walkforward`, et seule sa VALIDATION est lue.
 """
 
 from __future__ import annotations
@@ -43,6 +44,10 @@ import checkpoints as CK
 import cibles as C
 import training as T
 from saint_core import FEATURE_COLS, build_policy
+
+# Les memes fractions que `run_walkforward` — derivees, jamais recopiees a la
+# main : c'est la seule facon que la fenetre mesuree soit celle du checkpoint.
+T_TRAIN, T_VAL, T_TEST = 0.55, 0.15, 0.10
 
 PAS = 6              # une observation toutes les 30 minutes
 LOT = 4096
@@ -113,13 +118,33 @@ def main() -> int:
     cfg = T.PPOConfig()
     df = T.load_mt5_data(cfg)
     n = len(df)
-    tr = int(n * 0.70)
-    va = C.borne_etude(n)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"checkpoint {complet}, folds {folds}")
-    print(f"validation [{tr:,}, {va:,})  —  le test n'est pas ouvert\n")
 
-    fold = folds[0]
+    # LA FENETRE D'UN FOLD N'EST PAS LE DECOUPAGE GLOBAL. Premiere version de
+    # ce fichier : elle prenait [0.70n, 0.85n) et annoncait "le test n'est pas
+    # ouvert". Le walk-forward decoupe en 0.55 / 0.15 / 0.10 GLISSANTS, donc
+    # pour le fold 1 cette plage est la fenetre de TEST, pas la validation.
+    # La mesure etait juste au sens du calcul et fausse au sens du protocole —
+    # exactement la faute que ce depot passe sa journee a payer.
+    #
+    # Les bornes se derivent comme dans `run_walkforward` :
+    #     depart = (fold - 1) * 0.10n
+    #     train  = [depart,          depart + 0.55n)
+    #     val    = [depart + 0.55n,  depart + 0.70n)
+    #     test   = [depart + 0.70n,  depart + 0.80n)   INTOUCHABLE
+    fold = int(sys.argv[3]) if len(sys.argv) > 3 else folds[0]
+    if fold not in folds:
+        print(f"fold {fold} absent ; disponibles : {folds}")
+        return 1
+    depart = (fold - 1) * int(n * T_TEST)
+    a_tr = depart
+    b_tr = depart + int(n * T_TRAIN)
+    tr, va = b_tr, b_tr + int(n * T_VAL)
+    print(f"checkpoint {complet}, fold {fold} parmi {folds}")
+    print(f"train      [{a_tr:,}, {b_tr:,})")
+    print(f"VALIDATION [{tr:,}, {va:,})   <- ce qui est mesure")
+    print(f"test       [{va:,}, {va + int(n * T_TEST):,})   intouche")
+    print()
     pth, calib_p, _ = CK.chemins(complet, fold)
     etat = torch.load(pth, map_location=device, weights_only=True)
     calib = json.load(open(calib_p, encoding="utf-8"))
@@ -129,8 +154,11 @@ def main() -> int:
     # l'entrainement. Les recalculer sur la validation mettrait l'observation
     # a une echelle que le reseau n'a jamais vue, et ferait passer pour une
     # incapacite du modele ce qui serait une erreur de mise a l'echelle.
-    stats = T.compute_and_save_global_norm_stats(df.iloc[:tr], FEATURE_COLS,
-                                                 path=None)
+    # Les statistiques du TRAIN DE CE FOLD, pas du debut de l'historique : le
+    # reseau a appris sur cette echelle-la, et une autre ferait passer pour
+    # une incapacite du modele ce qui serait une erreur de mise a l'echelle.
+    stats = T.compute_and_save_global_norm_stats(df.iloc[a_tr:b_tr],
+                                                 FEATURE_COLS, path=None)
     dv = df.iloc[tr:va].reset_index(drop=True)
     mu = np.asarray(stats["mean"], np.float32)
     sd = np.maximum(np.asarray(stats["std"], np.float32), 1e-8)
