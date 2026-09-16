@@ -827,42 +827,36 @@ class PPOConfig:
     # La valeur 0.10 n'est pas mesuree — c'est une limite de prudence, pas un
     # optimum. Ce qui est mesure, c'est qu'elle mord la ou la marge ne mord
     # pas. Le modele apprend a l'interieur ; il ne la choisit pas.
-    # 10 % -> 3 %, ET LE 10 % TUAIT LE COMPTE.
+    # BUDGET DE RISQUE PARTAGE, en part de l'equite du COMPTE.
     #
-    # La valeur venait de moi, sans mesure : "une limite de prudence". La
-    # mesure de portefeuille — equite continue, ordre chronologique, toutes
-    # les contraintes du courtier, entrees NEUTRES sans modele, 1.9 an :
+    # Porte a 1.00 sur demande explicite, pour que LES DEUX instruments
+    # tiennent un essaim. Ce qui suit dit ce que cette valeur coute, mesure et
+    # non suppose.
     #
-    #   budget  graine  positions   gain   par an  creux max          fin
-    #       1%       1          5    +41%     +20%        11%  fenetre finie
-    #       1%       2          5    +18%      +9%        15%  fenetre finie
-    #       3%       1         17   +130%     +55%        20%  fenetre finie
-    #       3%       2          5    +38%     +19%        18%  fenetre finie
-    #       5%       1         23   +126%     +54%        34%  fenetre finie
-    #       5%       2         11    -10%     -19%        40%   max_drawdown
-    #      10%       1         22     +8%     +15%        40%   max_drawdown
-    #      10%       2         16     +4%      +5%        40%   max_drawdown
-    #      20%       1         48    -32%    -100%        40%   max_drawdown
-    #      20%       2         36    -32%    -100%        40%   max_drawdown
+    # POURQUOI IL FAUT MONTER SI HAUT POUR L'OR. Son contrat vaut cent onces :
+    # a 1 000 EUR son lot MINIMUM risque 2.81 % du compte contre 0.73 % pour
+    # le BTC. Un essaim d'or exige donc mecaniquement de risquer la moitie du
+    # capital — ce n'est pas un reglage, c'est la taille du contrat.
     #
-    # A 10 % le compte meurt sur LES DEUX graines, a 20 % en trois secondes,
-    # a 5 % sur une graine sur deux. A 3 % les deux survivent avec 18 a 20 %
-    # de creux. La courbe ne se degrade pas doucement : elle se retourne
-    # entre 3 et 5 %.
+    # MESURE SUR EQUITE CONTINUE, deux instruments alignes, entrees neutres :
     #
-    # POURQUOI CETTE MESURE ETAIT INDISPENSABLE. Tous les autres chiffres de
-    # geometrie sont des R PAR TRADE ADDITIONNES, ce qui suppose des trades
-    # independants pris a 1 R chacun. Sous concurrence ils correlent a 0.72 a
-    # une heure d'ecart : l'addition ne peut pas voir un creux. Il a fallu une
-    # equite qui compose et qui peut mourir.
+    #   budget   capital   pos BTC   pos OR     gain    creux   barres     fin
+    #       3%    1,000$    9/25     0/1         -5%       9%    4,000      ok
+    #      10%    1,000$   36/51     0/3         -0%      17%    4,000      ok
+    #      30%    1,000$   57/107    7/16       +51%      37%    4,000      ok
+    #     100%    1,000$   22/33    36/44       -23%      43%      538  XAUUSD
+    #       3%   25,000$   42/93    14/22        -0%       6%    4,000      ok
     #
-    # Le trade est joue par l'environnement lui-meme, en un episode long —
-    # pas par un second simulateur qui aurait fini par diverger.
+    # A 100 % L'EPISODE MEURT A LA BARRE 538 sur 4 000. L'entrainement ne peut
+    # rien apprendre a cette valeur : les episodes s'arretent avant d'avoir
+    # produit des decisions, et un balayage anterieur avait deja montre que le
+    # compte meurt sur les deux graines des 10 % en mono-instrument.
     #
-    # RESERVE : 1.9 an et deux graines. La dispersion entre graines (+55 % et
-    # +19 % a 3 %) est du meme ordre que l'effet du budget. Ce qui n'est PAS
-    # dans le bruit, c'est la mort a 10 % sur les deux graines.
-    budget_risque: float = 0.03
+    # DEUX VALEURS DONNENT L'ESSAIM SANS TUER LE RUN : 30 % a 1 000 EUR, au
+    # bord du garde-fou de drawdown ; ou 3 % a 25 000 EUR, qui produit le meme
+    # essaim pour six fois moins de creux. C'est un probleme de CAPITAL, pas
+    # de budget : a 25 000 EUR le lot minimum de l'or ne pese plus que 0.11 %.
+    budget_risque: float = 1.00
     # ------------------------------------------------------------------
 
     # 84 -> 20, ET C'EST UN GAIN, pas une reduction.
