@@ -13,6 +13,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
+import checkpoints
 import flux_live
 import prepare_m5
 from saint_core import (
@@ -47,6 +48,61 @@ from saint_core import (
 BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf1_long_wf1.pth"
 BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf1_short_wf1.pth"
 # Modèle unifié (entraîné avec side="both") : décide BUY/SELL/HOLD dans un seul fichier
+# ------------------------------------------------------------------
+# LE CHECKPOINT SE RESOUT, IL NE S'ECRIT PAS EN DUR — le 2026-09-16.
+#
+# Ces constantes pointaient sur `exec11`, dix-sept runs en arriere. Un chemin
+# perime ne leve aucune erreur tant que le fichier existe : il fait seulement
+# trader un modele qui n'est plus celui qu'on croit. `checkpoints.resoud` rend
+# le run le plus RECENT dont l'observation correspond au pipeline courant, et
+# refuse tout le reste plutot que de proposer une lignee incompatible.
+#
+# LA FAMILLE PAR DEFAUT EST `last`, LA MOYENNE DES POIDS, et pas `bestprofit`.
+# Choisir un checkpoint sur son resultat de validation coute -3.3 points
+# mesures dans ce depot : la validation selectionne a l'envers, de facon
+# reproductible. La moyenne des dix derniers jeux de poids ne depend d'aucun
+# tirage particulier.
+# ------------------------------------------------------------------
+_VOTANT = None
+
+
+def votant_courant(df, stats, train_len: int):
+    """Le troisieme votant, ajuste une fois puis reutilise.
+
+    IL DOIT ETRE LA SI L'ENTRAINEMENT L'AVAIT. La politique a appris a decider
+    sous ce veto ; la deployer sans lui executerait une autre strategie que
+    celle qui a ete mesuree, sans qu'aucune erreur ne soit levee.
+
+    Ajuste sur la fenetre d'entrainement et applique au present : aucun
+    recouvrement, donc pas besoin de l'ajustement croise qui n'existe que pour
+    l'entrainement, ou PPO joue sur la fenetre meme de TabM.
+    """
+    global _VOTANT
+    if _VOTANT is None:
+        import banc_rendement_net as B
+        import evalue_tabm_test as E
+        import tabm_votant as TV
+        from saint_core import FEATURE_COLS
+        _VOTANT = TV.hors_echantillon(
+            df, 0, train_len, train_len, len(df), B.modele_tabm(),
+            E.cibles_brutes, FEATURE_COLS, stats, pas_train=E.PAS_TRAIN)
+    return _VOTANT
+
+
+def checkpoint_courant(famille: str = "last", min_folds: int = 3):
+    """(chemin du .pth, calib, fold) du modele a deployer.
+
+    `min_folds=3` refuse un run interrompu : charger le fold 1 d'un run mort
+    donnerait un modele entraine sur le tiers de l'historique, sans que rien
+    ne l'annonce. On prend le DERNIER fold, celui dont la fenetre
+    d'entrainement est la plus proche du present.
+    """
+    prefixe, folds = checkpoints.resoud(famille=famille, min_folds=min_folds)
+    fold = folds[-1]
+    pth, calib, _ = checkpoints.chemins(prefixe, fold)
+    return pth, calib, fold
+
+
 BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_exec11_wf1_both_wf1.pth"
 
 # ============================================================

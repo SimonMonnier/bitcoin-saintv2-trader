@@ -44,11 +44,14 @@ import sys
 import numpy as np
 import torch
 
+import checkpoints as CK
 import evalue_test_exhaustif as E
 import training as T
 from saint_core import EntryDecisionPolicy, FEATURE_COLS, build_policy
 
-PREFIXE = "last_saintv2_loup_duel_exec27_saint"
+# Aucun chemin en dur : `checkpoints.resoud` rend le run le plus RECENT dont
+# l'observation correspond au pipeline courant. Un prefixe passe en argument
+# le force, pour comparer deux runs entre eux.
 GRAINE = 0
 
 
@@ -120,7 +123,11 @@ SCENARIOS = [
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     sur_test = "--test" in sys.argv
-    prefixe = args[0] if args else PREFIXE
+    try:
+        prefixe, folds_dispo = CK.resoud(args[0] if args else None)
+    except FileNotFoundError as e:
+        print(f"AUCUN CHECKPOINT UTILISABLE : {e}")
+        return 1
 
     cfg_base = T.PPOConfig()
     df = T.load_mt5_data(cfg_base)
@@ -132,7 +139,7 @@ def main() -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     fenetre = "TEST" if sur_test else "validation"
-    print(f"{prefixe}  |  fenetre {fenetre}  |  "
+    print(f"{prefixe}  |  folds {folds_dispo}  |  fenetre {fenetre}  |  "
           f"SL {cfg_base.atr_sl_mult}xATR  TP {cfg_base.atr_tp_mult}xATR")
     if sur_test:
         print("\n  LA FENETRE DE TEST NE SERT QU'UNE FOIS. Choisir quoi que ce")
@@ -164,6 +171,27 @@ def main() -> int:
             val_len=val_len, test_len=test_len, stats=stats,
             calib_frac=cfg_base.calib_frac)
         donnees = test_data if sur_test else val_data
+        # LE MEME TROISIEME VOTANT QU'A L'ENTRAINEMENT. Ajuste sur la
+        # fenetre d'entrainement de CE fold, applique a la fenetre evaluee :
+        # aucun recouvrement. L'omettre evaluerait une politique qui a appris
+        # sous un filtre, sans ce filtre.
+        votant = None
+        if T.PPOConfig().votant_tabm:
+            import banc_rendement_net as _B
+            import evalue_tabm_test as _E
+            import tabm_votant as _TV
+            a_ev = start + train_len + val_len if sur_test else start + train_len
+            b_ev = a_ev + (test_len if sur_test else val_len)
+            v_glob = _TV.hors_echantillon(
+                df, start, start + train_len, a_ev, b_ev, _B.modele_tabm(),
+                _E.cibles_brutes, FEATURE_COLS, stats, pas_train=_E.PAS_TRAIN)
+            # Les indices de l'environnement partent de 0 sur SA fenetre : on
+            # decale le votant pour que `veto(env.idx - 1)` tombe juste.
+            votant = _TV.Votant(b_ev - a_ev, 0, b_ev - a_ev)
+            votant.achat = v_glob.achat[a_ev:b_ev]
+            votant.vente = v_glob.vente[a_ev:b_ev]
+            votant.seuil = v_glob.seuil
+
 
         policy = build_policy(device, lookback=int(calib.get("lookback",
                                                             cfg_base.lookback)),
@@ -184,7 +212,7 @@ def main() -> int:
             pnls = []
             for d in departs:
                 decision = EntryDecisionPolicy(calib["decision_policy"])
-                p, _ = E.joue(policy, env, decision, d, device)
+                p, _ = E.joue(policy, env, decision, d, device, votant)
                 pnls += p
             resultats[nom] += pnls
         print(f"wf{fold} : {len(departs)} episodes disjoints x "

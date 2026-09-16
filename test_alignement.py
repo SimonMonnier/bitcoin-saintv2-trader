@@ -64,23 +64,31 @@ def _reglages() -> list[str]:
     if S.TIMEFRAME != "M5":
         ecarts.append(f"saint_core.TIMEFRAME vaut {S.TIMEFRAME}, pas M5")
 
-    # Le stress-test recopie lui aussi ses reglages, dans sa propre LiveConfig.
-    try:
-        import backtest_saintv2_stress_test as B
-        cfg_b = B.LiveConfig()
-        if cfg_b.symbol != "BTCUSD":
-            ecarts.append(f"stress-test : instrument {cfg_b.symbol}, "
-                          f"pas BTCUSD")
-        for nom, a, b in (
-            ("stop (xATR)", cfg_t.atr_sl_mult, cfg_b.atr_sl_mult),
-            ("objectif (xATR)", cfg_t.atr_tp_mult, cfg_b.atr_tp_mult),
-            ("lookback", cfg_t.lookback, cfg_b.lookback),
-        ):
-            if float(a) != float(b):
-                ecarts.append(f"stress-test : {nom} — entrainement {a}, "
-                              f"backtest {b}")
-    except Exception as e:                      # MT5 absent, par exemple
-        ecarts.append(f"stress-test : non verifiable ({type(e).__name__})")
+    # LE TROISIEME VOTANT DOIT ETRE PARTOUT OU IL ETAIT A L'ENTRAINEMENT.
+    #
+    # La politique a appris a decider SOUS le veto de TabM : ses probabilites
+    # decrivent un monde ou certaines directions etaient interdites. La
+    # deployer ou l'evaluer sans lui execute une autre strategie, et rien ne
+    # le signale — tout tourne, tout rend des chiffres.
+    import inspect
+    if getattr(cfg_t, "votant_tabm", False):
+        import evalue_test_exhaustif as EX
+        import stress_test as ST
+        if "votant" not in inspect.signature(EX.joue).parameters:
+            ecarts.append("evaluation : joue() n'accepte pas de veto TabM")
+        for nom, mod in (("evaluation", EX), ("stress-test", ST)):
+            src = inspect.getsource(mod)
+            if "hors_echantillon" not in src:
+                ecarts.append(f"{nom} : n'ajuste aucun votant TabM")
+        if not hasattr(K, "votant_courant"):
+            ecarts.append("live : pas de votant TabM")
+
+    # `stress_test.py` ne recopie plus rien : il construit son environnement
+    # depuis `training.PPOConfig`, donc il suit par construction. L'ancien
+    # `backtest_saintv2_stress_test.py`, lui, portait ses propres reglages —
+    # XAUUSD, stop de 5xATR, lookback 25 — et a ete retire le 2026-09-16. Si
+    # un fichier recommence a recopier la geometrie, c'est ici qu'il faut
+    # l'ajouter, pas dans un commentaire.
     return ecarts
 
 

@@ -4,6 +4,7 @@
 # ======================================================================
 
 import os
+import re
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -96,6 +97,7 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 from saint_core import (
+    PolitiqueEnsemble,
     N_ACTIONS,
     MASK_VALUE,
     NORM_STATS_PATH,
@@ -305,7 +307,61 @@ class PPOConfig:
     # PatchTST. SAINT est donc PLUS PETIT que la configuration qui vient de
     # donner +2.2, pour 15.4 ms contre 8.7. Une seule chose change entre les
     # deux runs : croiser les colonnes, ou non.
-    architecture: str = "saint"
+    # ------------------------------------------------------------------
+    # "ensemble" : TOUS LES RESEAUX DANS LE MEME ROLLOUT, le 2026-09-16.
+    #
+    # Le vote doit exister PENDANT l'apprentissage, pas seulement a
+    # l'evaluation. Deux facons de s'y prendre, et une seule qui tient :
+    #
+    #   les entrainer separement puis voter    l'action executee ne vient
+    #                                          d'aucune des politiques mises a
+    #                                          jour ; le rapport de PPO perd
+    #                                          son sens et demande un poids
+    #                                          d'importance non borne.
+    #   un melange presente comme UNE          l'action est tiree de ce qui
+    #   politique                              est mis a jour. PPO reste exact,
+    #                                          et le gradient atteint chaque
+    #                                          membre par sa part dans la
+    #                                          probabilite de l'action choisie.
+    #
+    # C'est la seconde. `PolitiqueEnsemble` moyenne les PROBABILITES — une voix
+    # par membre — et non les logits, qui laisseraient un membre tres confiant
+    # ecraser les autres.
+    #
+    # Les membres sont opposes par construction sur la question qui separe le
+    # mieux les modeles de ce depot : SAINT ne fait que croiser les colonnes,
+    # PatchTST ne les croise jamais. Des erreurs correlees ne s'annulent pas ;
+    # c'est la condition pour qu'un vote reduise la variance.
+    #
+    # UN SEUL PASSAGE SUR LES TROIS FOLDS, et non un par architecture : les
+    # membres partagent le rollout, donc les memes barres, la meme
+    # normalisation et les memes episodes. La comparaison entre eux est
+    # APPARIEE sans effort, et le temps de calcul ne double pas.
+    # ------------------------------------------------------------------
+    architecture: str = "ensemble"
+    # Membres de l'ensemble : (architecture, lookback, taille_patch, pas).
+    # Meme lookback pour tous — la mesure de profondeur utile n'a rien trouve
+    # au-dela de 4 barres, et un lookback different ferait varier deux choses a
+    # la fois entre les votants.
+    membres: tuple = (("saint", 2, 1), ("patchtst", 2, 1))
+    # ------------------------------------------------------------------
+    # LE TROISIEME VOTANT : TabM, supervise, qui oppose son veto.
+    #
+    # Il ne peut pas etre un membre du melange — pas de gradient dans cette
+    # boucle, et des scores qui dependent de la BARRE et non de la seule
+    # observation. Il entre par le MASQUE D'ACTIONS : il ne propose rien, il
+    # interdit. C'est la regle que decrit `evalue_ensemble` — un signal n'est
+    # pas pris si autre chose le contredit — et c'est aussi la fonction du
+    # Chikou-Span dans le systeme Ichimoku.
+    #
+    # Il est ajuste EN CROISE sur la fenetre d'entrainement : chaque barre
+    # recoit le score d'un TabM qui ne l'a pas vue. Sans cela il serait un
+    # oracle sur les donnees ou PPO apprend, les deux reseaux apprendraient a
+    # lui deferer, et en production le partenaire deviendrait ordinaire.
+    #
+    # Le mettre a False retire le veto et laisse les deux reseaux voter seuls.
+    votant_tabm: bool = True
+    # ------------------------------------------------------------------
 
     # Largeur du reseau. 64/256 donnait 1.19 M de parametres pour 16 708
     # barres d'entrainement, soit 71 parametres par exemple — et le modele
@@ -1437,6 +1493,10 @@ class MarketData:
             )
 
         self.features = X
+        # Reference au dataframe source, pas une copie : le votant TabM a
+        # besoin des colonnes brutes (high, low, atr) pour recalculer ses
+        # cibles de barrieres sur exactement la meme fenetre que le rollout.
+        self.df = df
         self.close = df["close"].values.astype(np.float32)
         self.open = df["open"].values.astype(np.float32) if "open" in df.columns else self.close.copy()
         self.length = len(df)
@@ -2392,6 +2452,28 @@ def run_training_on_split(
     # policy n'est jamais interrogée en position (l'action y est forcée).
     MASK_FLAT = build_mask_from_pos_scalar(0, torch.device("cpu"), cfg.side).numpy()
 
+    # ---- Le troisieme votant, ajuste en croise sur CETTE fenetre ----
+    votant = None
+    if getattr(cfg, "votant_tabm", False):
+        try:
+            import banc_rendement_net as _B
+            import evalue_tabm_test as _E
+            import tabm_votant as _TV
+            t0 = time.time()
+            votant = _TV.ajuste(
+                train_data.df, 0, train_data.length, _B.modele_tabm(),
+                _E.cibles_brutes, FEATURE_COLS, stats,
+                pas_train=_E.PAS_TRAIN)
+            print(f"  • Troisieme votant TabM ajuste en croise "
+                  f"({_TV.K_BLOCS} blocs, {time.time()-t0:.0f}s) : "
+                  f"{100*votant.couverture():.0f} % des barres notees, "
+                  f"seuil {votant.seuil:+.4f} R")
+        except Exception as e:
+            print(f"  • Votant TabM INDISPONIBLE ({type(e).__name__}: {e}) — "
+                  f"le vote se fait a deux. Ce n'est pas la configuration "
+                  f"decrite, et il faut le savoir avant de lire le resultat.")
+            votant = None
+
     # Pools d'environnements créés UNE SEULE FOIS : le constructeur calcule les
     # quantiles de volatilité du curriculum sur tout le split (np.quantile sur
     # ~1.2M lignes), donc les instancier à chaque epoch coûterait plusieurs
@@ -2417,7 +2499,34 @@ def run_training_on_split(
           f"({100*len(departs_val)*cfg.episode_length/max(val_data.length,1):.0f} % "
           f"de la fenêtre), {len(departs_calib)} de calibration")
 
-    policy = build_policy(
+    def _un_membre(archi, taille_patch, pas):
+        """Un reseau seul, a l'architecture demandee."""
+        if archi == "patchtst":
+            return build_policy(
+                device, lookback=cfg.lookback, n_features=OBS_N_FEATURES,
+                archi="patchtst", n_ref=cfg.n_ref, num_blocks=cfg.num_blocks,
+                d_model_patch=cfg.d_model_patch, mlp_dim=cfg.mlp_dim,
+                taille_patch=taille_patch, pas=pas)
+        # Memes arguments que la branche mono-reseau plus bas : les recopier
+        # partiellement produirait deux SAINT differents selon le chemin pris.
+        return SAINTPolicySingleHead(
+            n_features=OBS_N_FEATURES, d_model=cfg.d_model,
+            num_blocks=cfg.num_blocks, heads=cfg.saint_heads,
+            n_freq=cfg.saint_n_freq, mlp_dim=cfg.saint_mlp_dim,
+            lecture=cfg.saint_lecture, dropout=0.05, ff_mult=2,
+            max_len=cfg.lookback, n_actions=N_ACTIONS,
+            n_ref=cfg.n_ref).to(device)
+
+    if cfg.architecture == "ensemble":
+        policy = PolitiqueEnsemble(
+            [_un_membre(a, tp, pp) for a, tp, pp in cfg.membres]).to(device)
+        print(f"  • Ensemble de {len(cfg.membres)} reseaux qui votent DANS le "
+              f"rollout : {', '.join(a for a, _, _ in cfg.membres)}")
+        for (a, _, _), m in zip(cfg.membres, policy.membres):
+            print(f"      {a:<10} {sum(q.numel() for q in m.parameters()):>8,} "
+                  f"parametres")
+    else:
+        policy = build_policy(
         device, lookback=cfg.lookback, n_features=OBS_N_FEATURES,
         archi=cfg.architecture, n_ref=cfg.n_ref, num_blocks=cfg.num_blocks,
         d_model_patch=cfg.d_model_patch, mlp_dim=cfg.mlp_dim,
@@ -2443,11 +2552,23 @@ def run_training_on_split(
     optimizer = optim.Adam(policy.parameters(), lr=cfg.lr, eps=1e-8)
 
     # Groupes de paramètres pour diagnostiquer d'où vient le gradient.
-    actor_head_params = [p for n, p in policy.named_parameters() if n.startswith("actor.")]
-    critic_head_params = [p for n, p in policy.named_parameters() if n.startswith("critic.")]
+    #
+    # LE PREFIXE D'ENSEMBLE EST RETIRE AVANT DE TRIER. Dans un ensemble les
+    # noms valent `membres.0.actor.*` : tester `startswith("actor.")` rendrait
+    # trois listes VIDES, donc un gradient d'acteur affiche a zero. La veille
+    # lit precisement ce chiffre pour distinguer une politique gelee d'une
+    # politique qui apprend lentement — elle aurait annonce "ACTOR GELE" sur
+    # tout un run en train d'apprendre.
+    def _sans_membre(n):
+        return re.sub(r"^membres\.\d+\.", "", n)
+
+    actor_head_params = [p for n, p in policy.named_parameters()
+                         if _sans_membre(n).startswith("actor.")]
+    critic_head_params = [p for n, p in policy.named_parameters()
+                          if _sans_membre(n).startswith("critic.")]
     trunk_params = [
         p for n, p in policy.named_parameters()
-        if not n.startswith(("actor.", "critic."))
+        if not _sans_membre(n).startswith(("actor.", "critic."))
     ]
 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -2557,6 +2678,10 @@ def run_training_on_split(
                   f"ci-dessous portent sur elle.")
 
         batch_states = []
+        # Le masque EFFECTIVEMENT applique au moment de la decision. Il ne se
+        # reconstruit plus a l'update : le veto de TabM depend de la barre, pas
+        # de la position, donc un masque refabrique ne serait pas le meme.
+        batch_masques = []
         batch_actions = []
         batch_oldlog = []
         batch_adv = []
@@ -2610,8 +2735,9 @@ def run_training_on_split(
             infos.append(i0)
 
         ep_buf = [
-            {"states": [], "actions": [], "logprobs": [], "rewards": [],
-             "values": [], "dones": [], "positions": [], "dts": []}
+            {"states": [], "masques": [], "actions": [], "logprobs": [],
+             "rewards": [], "values": [], "dones": [], "positions": [],
+             "dts": []}
             for _ in range(n_envs)
         ]
         last_reason = [None] * n_envs
@@ -2662,6 +2788,7 @@ def run_training_on_split(
             buf = ep_buf[k]
             buf["positions"].append(0)          # une décision est toujours flat
             buf["states"].append(p["state"])
+            buf["masques"].append(p["masque"])
             buf["actions"].append(p["action"])
             buf["logprobs"].append(p["logprob"])
             buf["rewards"].append(p["R"])
@@ -2685,9 +2812,22 @@ def run_training_on_split(
                 batch_np = np.stack([states[k] for k in deciding], axis=0)
                 s_tensor = torch.as_tensor(batch_np, dtype=torch.float32, device=device)
                 # Tous ces envs sont flat : un seul masque suffit.
-                masks_b = torch.from_numpy(
-                    np.repeat(MASK_FLAT[None, :], len(deciding), axis=0)
-                ).to(device)
+                # LE TROISIEME VOTANT ENTRE ICI. TabM n'a pas de gradient et
+                # ses scores dependent de la BARRE, pas seulement de
+                # l'observation : il ne peut donc pas etre un membre du
+                # melange differentiable. Il oppose un veto — il ne propose
+                # rien, il interdit — ce qui est exactement la regle que decrit
+                # `evalue_ensemble` : un signal n'est pas pris si autre chose
+                # le contredit.
+                masks_np = np.repeat(MASK_FLAT[None, :], len(deciding), axis=0)
+                if votant is not None:
+                    for bi, k in enumerate(deciding):
+                        pa, pv = votant.veto(envs[k].idx - 1)
+                        if not pa:
+                            masks_np[bi, 0] = False
+                        if not pv:
+                            masks_np[bi, 1] = False
+                masks_b = torch.from_numpy(masks_np).to(device)
 
                 with torch.no_grad():
                     logits_b, values_b = policy(s_tensor)
@@ -2738,6 +2878,7 @@ def run_training_on_split(
 
                     pending[k] = {
                         "state": states[k],
+                        "masque": masks_np[bi].copy(),
                         "action": a,
                         "logprob": float(logp_np[bi, a]),
                         "value": float(vals_np[bi]),
@@ -2833,6 +2974,7 @@ def run_training_on_split(
             )
 
             batch_states.extend(buf["states"])
+            batch_masques.extend(buf["masques"])
             batch_actions.extend(buf["actions"])
             batch_oldlog.extend(buf["logprobs"])
             batch_adv.extend(adv)
@@ -2887,6 +3029,7 @@ def run_training_on_split(
         _frac_nul = float(np.mean(np.abs(_adv_norm) < 0.05)) if len(_adv_np) else 0.0
 
         batch_states = [batch_states[i] for i in _sel]
+        batch_masques = [batch_masques[i] for i in _sel]
         batch_actions = [batch_actions[i] for i in _sel]
         batch_oldlog = [batch_oldlog[i] for i in _sel]
         batch_adv = [batch_adv[i] for i in _sel]
@@ -2897,6 +3040,12 @@ def run_training_on_split(
         # --------- tenseurs batch ---------
         states_np = np.stack(batch_states, axis=0)
         states = torch.tensor(states_np, dtype=torch.float32, device=device)
+        # Les masques qui ont AGI, alignes sur les etats. L'update les reprend
+        # tels quels au lieu de les refabriquer depuis la position : voir le
+        # commentaire au point d'usage.
+        masques = (torch.tensor(np.stack(batch_masques, axis=0),
+                                dtype=torch.bool, device=device)
+                   if batch_masques else None)
 
         # --------- banque de reference (intersample attention) ---------
         # Constituee UNE fois, a partir d'observations reelles de la fenetre de
@@ -2976,7 +3125,18 @@ def run_training_on_split(
 
                 with torch.amp.autocast(device_type=device.type, enabled=cfg.use_amp):
                     logits, value = policy(sb)
-                    mask_batch = build_action_mask_from_positions(pos_b, cfg.side)
+                    # LE MASQUE QUI A AGI, PAS UN MASQUE RECONSTRUIT.
+                    #
+                    # Il etait refabrique ici depuis la seule position. Tant
+                    # que le masque n'en dependait que, les deux coincidaient ;
+                    # le veto de TabM depend de la BARRE, donc ils divergent.
+                    # Recalculer reviendrait a comparer la probabilite nouvelle
+                    # d'une action a son ancienne probabilite SOUS UNE AUTRE
+                    # DISTRIBUTION — le rapport de PPO ne mesurerait plus rien,
+                    # et aucune erreur ne serait levee.
+                    mask_batch = (masques[ids] if masques is not None
+                                  else build_action_mask_from_positions(
+                                      pos_b, cfg.side))
                     logits_masked = logits.masked_fill(~mask_batch, MASK_VALUE)
 
                     # ──────────────────────────────────────────────────────────
@@ -3719,6 +3879,11 @@ def run_training_on_split(
                     "taille_patch": int(cfg.taille_patch),
                     "pas_patch": int(cfg.pas_patch),
                     "architecture": cfg.architecture,
+                    # Les membres, pour que le live sache ce qu'il recharge :
+                    # un ensemble se reconnait a ses cles `membres.N.`, mais
+                    # leur ORDRE et leur nature meritent d'etre ecrits en clair.
+                    "membres": [a for a, _, _ in cfg.membres]
+                    if cfg.architecture == "ensemble" else None,
                     "n_features": int(OBS_N_FEATURES),
                     # Le nombre de tetes est le SEUL element de la geometrie
                     # SAINT qui ne se deduise pas des poids : l'attention a la
@@ -4093,10 +4258,10 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec27"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec29"
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec27: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec29: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
@@ -4125,33 +4290,21 @@ if __name__ == "__main__":
     # tombee a 315 MHz, et les deux processus ecrivaient les memes checkpoints.
     # Le GPU est deja bride thermiquement a un seul run.
     # ==================================================================
-    ARCHITECTURES = (
-        # (nom, architecture, lookback, taille_patch, pas_patch)
-        ("saint", "saint", 4, 2, 1),
-        # PatchTST au meme lookback : la mesure de profondeur utile n'a rien
-        # trouve au-dela de 4 barres, et un lookback different ferait varier
-        # deux choses a la fois entre les deux votants.
-        ("patchtst", "patchtst", 4, 2, 1),
-    )
-
-    for nom, archi, lb, tp, pp in ARCHITECTURES:
-        cfg = PPOConfig(**cfg_duel.__dict__)
-        cfg.architecture = archi
-        cfg.lookback = lb
-        cfg.taille_patch = tp
-        cfg.pas_patch = pp
-        cfg.model_prefix = f"{cfg_duel.model_prefix}_{nom}"
-        print("\n" + "=" * 70)
-        print(f"  ARCHITECTURE {nom.upper()} — prefixe {cfg.model_prefix}")
-        print("=" * 70)
-        run_walkforward(cfg, train_frac=0.55, val_frac=0.15, test_frac=0.10,
-                        max_folds=3, start_fold=1,
-                        bootstrap_from_path=None,
-                        auto_chain=False)
+    # UN SEUL PASSAGE SUR LES TROIS FOLDS. La version precedente entrainait
+    # SAINT puis PatchTST a la suite — deux fois trois folds, et surtout deux
+    # politiques qui ne s'etaient jamais vues. Le vote n'existait alors qu'a
+    # l'evaluation, sur des reseaux entraines chacun a agir seul.
+    #
+    # Ils partagent maintenant le rollout : l'action executee est celle du
+    # melange, et chacun apprend a jouer SA part dans une decision commune.
+    run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10,
+                    max_folds=3, start_fold=1,
+                    bootstrap_from_path=None,
+                    auto_chain=False)
 
     print("\n" + "=" * 70)
-    print("  WALK-FORWARD TERMINÉ : 2 architectures x 3 folds.")
-    print("  Le vote a trois se lance ensuite : python evalue_ensemble.py")
+    print("  WALK-FORWARD TERMINÉ : 3 folds, tous les reseaux dans le meme "
+          "rollout.")
     print("  Fichiers générés :")
     print("    bestprofit_saintv2_loup_duel_exec2_wf1_both_wf1.pth")
     print("    bestprofit_saintv2_loup_duel_exec2_wf2_both_wf2.pth")

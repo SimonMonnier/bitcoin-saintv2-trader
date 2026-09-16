@@ -1632,6 +1632,76 @@ N_BLOCS_DEFAUT = 3
 ARCHI_DEFAUT = "patchtst"
 
 
+class PolitiqueEnsemble(nn.Module):
+    """Plusieurs reseaux qui votent, presentes comme UNE politique.
+
+    POURQUOI CETTE FORME ET PAS UNE BOUCLE DANS L'ENTRAINEMENT. Faire voter
+    trois modeles pendant l'apprentissage demande que l'action executee vienne
+    du VOTE, pas d'un reseau en particulier. Or PPO compare la probabilite
+    nouvelle a l'ancienne POUR L'ACTION TIREE : si l'action vient d'ailleurs
+    que de la politique mise a jour, le rapport ne veut plus rien dire et il
+    faut un poids d'importance non borne pour le rattraper.
+
+    En presentant le melange comme une politique unique, le probleme
+    disparait : l'action EST tiree de ce qui est mis a jour. Le gradient
+    traverse le melange et atteint chaque membre, pondere par la part qu'il
+    prend dans la probabilite de l'action choisie — un membre confiant sur un
+    bon coup en recoit davantage. C'est un melange d'experts, pas un
+    contournement, et la boucle d'entrainement n'a pas une ligne a changer.
+
+    CE QUE LE MELANGE N'EST PAS. Ce n'est pas la moyenne des logits, qui
+    reviendrait a une moyenne geometrique et laisserait un membre tres confiant
+    ecraser les autres. C'est la moyenne des PROBABILITES — chaque membre a une
+    voix, et un membre qui s'abstient (proche de l'uniforme) ne bloque rien.
+
+    LA VALEUR EST MOYENNEE AUSSI. Chaque critique evalue la meme politique de
+    comportement, celle du melange, puisque c'est elle qui genere les donnees.
+    Leur moyenne est donc un estimateur de la meme quantite, en moins bruite.
+    """
+
+    def __init__(self, membres):
+        super().__init__()
+        self.membres = nn.ModuleList(membres)
+
+    # ---- LA BOUCLE D'ENTRAINEMENT INTERROGE LA POLITIQUE SUR SA BANQUE ----
+    #
+    # `memoire`, `definit_banque` et `rafraichit_banque` appartiennent a la
+    # ReferenceMemory de SAINT. Un ensemble n'en a pas en propre : il relaie a
+    # ses membres, et rend None quand aucun n'en porte. Sans ces trois-la, un
+    # `policy.memoire` dans la boucle leve une AttributeError au milieu du
+    # premier fold — apres vingt minutes de collecte.
+
+    @property
+    def memoire(self):
+        for m in self.membres:
+            mem = getattr(m, "memoire", None)
+            if mem is not None:
+                return mem
+        return None
+
+    def definit_banque(self, *a, **kw):
+        for m in self.membres:
+            if hasattr(m, "definit_banque"):
+                m.definit_banque(*a, **kw)
+
+    def rafraichit_banque(self, *a, **kw):
+        for m in self.membres:
+            if hasattr(m, "rafraichit_banque"):
+                m.rafraichit_banque(*a, **kw)
+
+    def forward(self, x):
+        probs, valeurs = [], []
+        for m in self.membres:
+            lo, v = m(x)
+            probs.append(torch.softmax(lo, dim=-1))
+            valeurs.append(v)
+        p = torch.stack(probs, 0).mean(0).clamp_min(1e-9)
+        # On rend des LOGITS, pas des probabilites : l'appelant leur applique
+        # son masque d'actions puis un log_softmax. log(p) est un jeu de logits
+        # valide pour p, a une constante additive pres que le softmax absorbe.
+        return torch.log(p), torch.stack(valeurs, 0).mean(0)
+
+
 def build_policy(device, lookback: int = 25,
                  n_features: int = OBS_N_FEATURES,
                  n_ref: int = N_REF_DEFAUT,
@@ -1654,6 +1724,24 @@ def build_policy(device, lookback: int = 25,
     l'erreur serait soit un refus de chargement, soit pire, un modèle construit
     sans mémoire qui trade en ignorant une partie de ce qu'il a appris.
     """
+    # UN ENSEMBLE SE RECONNAIT A SES CLES `membres.N.` et se reconstruit membre
+    # par membre : chacun garde sa propre architecture, deduite de ses poids.
+    if state_dict is not None and any(
+            k.startswith("membres.") for k in state_dict):
+        n_membres = 1 + max(int(k.split(".")[1]) for k in state_dict
+                            if k.startswith("membres."))
+        membres = []
+        for i in range(n_membres):
+            pref = f"membres.{i}."
+            sous = {k[len(pref):]: v for k, v in state_dict.items()
+                    if k.startswith(pref)}
+            membres.append(build_policy(
+                device, lookback=lookback, n_features=n_features,
+                n_ref=n_ref, num_blocks=num_blocks, d_model_patch=d_model_patch,
+                mlp_dim=mlp_dim, taille_patch=taille_patch, pas=pas,
+                heads=heads, state_dict=sous))
+        return PolitiqueEnsemble(membres).to(device)
+
     # L'ARCHITECTURE elle-meme se deduit du fichier, DANS LES DEUX SENS. Le
     # parametre `pos` n'existe que dans PatchTST, `embed.weight` que dans
     # SAINT ; le fichier tranche donc seul, et `archi` ne sert plus que quand

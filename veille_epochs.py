@@ -88,6 +88,29 @@ RE_META = re.compile(
 # de grandeur separent les deux regimes, le seuil n'a donc rien de delicat.
 GRADIENT_NUL = 1e-3
 
+# LE WARMUP SE LIT SUR LE NUMERO D'EPOCH, PAS SUR UN SEUIL, corrige le
+# 2026-09-16. C'est la CONFIGURATION qui decide quelles epochs gelent l'actor,
+# donc c'est elle qu'il faut lire — pas une empreinte indirecte.
+#
+# CE QUI A RENDU LE SEUIL INTENABLE. Le gradient d'acteur pendant le warmup
+# valait 1e-5 a 1e-6 avec un reseau unique ; avec l'ensemble d'exec28 il monte
+# a 1.2e-4 puis 5.0e-4 sur les deux premieres epochs — le bonus d'entropie
+# n'est pas annule pendant le warmup, et il porte maintenant sur deux reseaux.
+# Encore un facteur deux et le seuil de 1e-3 est franchi : des epochs GELEES
+# seraient comptees comme entrainees, et la reference du hasard — celle contre
+# laquelle tout le reste se juge — serait polluee par des epochs qui ne
+# mesurent rien.
+#
+# Le numero d'epoch, lui, est exact par construction : `training.py` gele
+# l'actor tant que `epoch <= critic_warmup_epochs`. Le gradient reste affiche,
+# et sert desormais de CONTRE-VERIFICATION : si les deux se contredisent, la
+# veille le dit au lieu de choisir silencieusement.
+try:
+    from training import PPOConfig as _Cfg
+    WARMUP = int(_Cfg().critic_warmup_epochs)
+except Exception:
+    WARMUP = 5
+
 
 class Couleur:
     VERT, ROUGE, JAUNE, CYAN, GRIS, GRAS, FIN = (
@@ -185,7 +208,11 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     # apprenaient, lentement. Confondre les deux fait passer pour du tirage au
     # sort ce qui est en realite un apprentissage trop lent — deux problemes
     # qui n'appellent pas du tout la meme correction.
-    gele = g_actor < GRADIENT_NUL
+    gele = ep <= WARMUP
+    # Contre-verification : le gradient doit s'effondrer pendant le warmup et
+    # passer ensuite. Un desaccord signale que la configuration lue ici n'est
+    # plus celle du run — un run relance avec un autre warmup, par exemple.
+    desaccord = (gele != (g_actor < GRADIENT_NUL))
 
     L = []
     L.append((("MODELE DEPLOYE (moyenne des poids)  " if moyenne else "")
@@ -232,8 +259,14 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
 
     # ---- lecture des diagnostics ----
     notes = []
+    if desaccord:
+        notes.append(
+            f"DESACCORD SUR L'ETAT DE L'ACTOR : l'epoch {ep} est "
+            f"{'dans' if gele else 'hors'} le warmup ({WARMUP} epochs) mais "
+            f"son gradient vaut {g_actor:.1e}. La configuration lue par la "
+            f"veille n'est peut-etre pas celle du run.")
     if gele:
-        notes.append(f"ACTOR GELE : gradient {g_actor:.1e}, aucune mise a jour. "
+        notes.append(f"ACTOR GELE : warmup du critic, gradient {g_actor:.1e}. "
                      f"Cette epoch ne mesure aucun apprentissage — elle sert de "
                      f"reference au hasard pour les suivantes.")
     elif H > 1.09:

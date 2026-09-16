@@ -39,21 +39,32 @@ import sys
 import numpy as np
 import torch
 
+import checkpoints as CK
 import training as T
 from saint_core import EntryDecisionPolicy, FEATURE_COLS, build_policy
 
 # Memes fractions que le main de training.py.
 TRAIN_FRAC, VAL_FRAC, TEST_FRAC, N_FOLDS = 0.55, 0.15, 0.10, 3
-PREFIXE = "saintv2_loup_duel_exec12"
+# Plus de prefixe en dur : il pointait sur exec12, quinze runs en arriere, et
+# rien ne l'aurait signale — un chemin obsolete ne leve pas d'erreur tant que
+# le fichier existe, il fait seulement evaluer un modele qui n'est pas celui
+# qu'on croit. `checkpoints.resoud` rend le plus recent COMPATIBLE.
+PREFIXE = None
 QUEL = "best"
 
 
-def joue(policy, env, decision, depart, device):
+def joue(policy, env, decision, depart, device, votant=None):
     """Joue UN episode a partir d'un depart impose. Rend les PnL des trades.
 
     Le depart et le reset viennent de training.reset_au_depart : cette mesure
     doit rester identique a celle que fait l'entrainement, sinon les deux
     chiffres cesseraient d'etre comparables sans que rien ne le signale.
+
+    `votant` est le VETO de TabM, le troisieme votant. Il doit etre present ici
+    des lors qu'il l'etait a l'entrainement : la politique a appris a decider
+    SOUS ce filtre, ses probabilites decrivent un monde ou certaines directions
+    etaient interdites. L'evaluer sans lui mesurerait une autre strategie, et
+    rien ne le signalerait — les deux tournent, les deux rendent des chiffres.
     """
     etat, _ = T.reset_au_depart(env, depart)
 
@@ -63,7 +74,14 @@ def joue(policy, env, decision, depart, device):
         with torch.no_grad():
             logits, _ = policy(x)
             probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
-        action = decision.decide(float(probs[0]), float(probs[1]))
+        pb, ps = float(probs[0]), float(probs[1])
+        if votant is not None:
+            permis_a, permis_v = votant.veto(env.idx - 1)
+            if not permis_a:
+                pb = 0.0
+            if not permis_v:
+                ps = 0.0
+        action = decision.decide(pb, ps)
         env.set_risk_scale(1.0)
         # L'observation renvoyee par step() DOIT etre reinjectee. L'oublier ne
         # provoque aucune erreur : la politique voit simplement la meme barre
@@ -94,8 +112,17 @@ def resume(nom, pnls, sides=None):
 
 
 def main() -> int:
-    prefixe = sys.argv[1] if len(sys.argv) > 1 else PREFIXE
     quel = sys.argv[2] if len(sys.argv) > 2 else QUEL
+    # Le prefixe se RESOUT : le plus recent dont l'observation correspond au
+    # pipeline courant. `checkpoints` refuse une lignee incompatible au lieu
+    # de la proposer, et dit ce que "best" coute par rapport a la moyenne.
+    try:
+        complet, folds_dispo = CK.resoud(
+            sys.argv[1] if len(sys.argv) > 1 else PREFIXE, famille=quel)
+    except FileNotFoundError as e:
+        print(f"AUCUN CHECKPOINT UTILISABLE : {e}")
+        return 1
+    prefixe = complet[len(quel) + 1:]
 
     cfg_base = T.PPOConfig()
     df = T.load_mt5_data(cfg_base)
@@ -107,8 +134,8 @@ def main() -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"{n:,} barres | train {train_len:,} val {val_len:,} test {test_len:,}")
-    print(f"checkpoints : {quel}_{prefixe}_wf*   |  episodes DISJOINTS, "
-          f"sans curriculum\n")
+    print(f"checkpoints : {complet}_wf*  folds {folds_dispo}  |  episodes DISJOINTS")
+    print()
     print(f"{'fold':>6} {'PnL':>11} {'trades':>9} {'par trade':>10} "
           f"{'WR':>7} {'BE':>7} {'ecart':>8} {'+/-':>5} {'PF':>6}")
     print("-" * 78)
@@ -142,6 +169,26 @@ def main() -> int:
         policy.eval()
 
         cfg = T.PPOConfig(**cfg_base.__dict__)
+        # LE MEME TROISIEME VOTANT QU'A L'ENTRAINEMENT. Ajuste sur la
+        # fenetre d'entrainement de CE fold, applique a la fenetre evaluee :
+        # aucun recouvrement. L'omettre evaluerait une politique qui a appris
+        # sous un filtre, sans ce filtre.
+        votant = None
+        if T.PPOConfig().votant_tabm:
+            import banc_rendement_net as _B
+            import evalue_tabm_test as _E
+            import tabm_votant as _TV
+            a_ev = start + train_len + val_len if True else start + train_len
+            b_ev = a_ev + (test_len if True else val_len)
+            v_glob = _TV.hors_echantillon(
+                df, start, start + train_len, a_ev, b_ev, _B.modele_tabm(),
+                _E.cibles_brutes, FEATURE_COLS, stats, pas_train=_E.PAS_TRAIN)
+            # Les indices de l'environnement partent de 0 sur SA fenetre : on
+            # decale le votant pour que `veto(env.idx - 1)` tombe juste.
+            votant = _TV.Votant(b_ev - a_ev, 0, b_ev - a_ev)
+            votant.achat = v_glob.achat[a_ev:b_ev]
+            votant.vente = v_glob.vente[a_ev:b_ev]
+            votant.seuil = v_glob.seuil
         env = T.BTCTradingEnvDiscrete(test_data, cfg)
         departs = T.departs_disjoints(test_data.length, cfg.lookback,
                                       cfg.episode_length)
@@ -149,7 +196,7 @@ def main() -> int:
         pnls, sides = [], []
         for d in departs:
             decision = EntryDecisionPolicy(calib["decision_policy"])
-            p, s = joue(policy, env, decision, d, device)
+            p, s = joue(policy, env, decision, d, device, votant)
             pnls += p
             sides += s
         r = resume(f"wf{fold}", pnls)
