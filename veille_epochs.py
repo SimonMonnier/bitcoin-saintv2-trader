@@ -78,6 +78,11 @@ RE_META = re.compile(
     # que la veille continue de lire les journaux des runs anterieurs.
     r"\[BOTH_(wf\d+)\]\s+EPOCH (\d+)\s+META\s+(?:rho\s+" + NB + r"\s+)?"
     r"(?:rhoAux\s+" + NB + r"\s+)?"
+    # Marqueur des epochs ou la validation a ete sautee : le PnL affiche est
+    # celui de la derniere mesure reelle. Troisieme fois qu'un champ ajoute
+    # entre META et Sortino casse ce motif en silence — la veille n'affichait
+    # plus qu'une seule epoch, sans rien signaler.
+    r"(?:\[val ep\d+\]\s*)?"
     r"Sortino\s+(" + NB + r").*?"
     r"AvgW\s+(" + NB + r")\$\s+AvgL\s+(" + NB + r")\$.*?H ([\d.]+).*?"
     r"sel\[train\s+([\d.]+)% val\s+([\d.]+)%\].*?"

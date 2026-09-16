@@ -4854,6 +4854,18 @@ def run_training_on_split(
 
         # --------- validation (greedy) ---------
         policy.eval()
+
+        # L'EPOCH 1 VALIDE TOUJOURS. Sans elle il n'y a aucune mesure a
+        # reprendre les epochs suivantes, et le journal afficherait une
+        # validation vide — 0 trade, PnL nul — qu'on lirait comme un
+        # effondrement. Premiere version de ce patch : c'est exactement ce
+        # qu'elle faisait.
+        #
+        # Calcule ICI et non plus bas : la passe de CALIBRATION le lit, et
+        # elle vient avant.
+        _valide = (cfg.validation_tous_les <= 1 or epoch == 1
+                   or (epoch % cfg.validation_tous_les) == 0
+                   or epoch >= cfg.epochs)
         pbs_val: List[List[float]] = [[], []]   # convictions BUY / SELL sur le val
         val_pnl = []
         val_dd = []
@@ -4905,7 +4917,11 @@ def run_training_on_split(
             s0, i0 = reset_au_depart(e, d)
             v_states.append(s0)
             v_infos.append(i0)
-        cal_active = list(range(len(calib_envs)))
+        # LA CALIBRATION NE SERT QU'A LA VALIDATION — elle produit les barres
+        # que la passe suivante applique. La faire tourner une epoch ou la
+        # validation est sautee coutait 38 secondes pour un resultat que
+        # personne ne lit.
+        cal_active = list(range(len(calib_envs))) if _valide else []
         # PAS DE CALIBRATION — un quantile n'a pas besoin de chaque bougie.
         #
         # Cette passe ne sert qu'a estimer deux quantiles de la distribution de
@@ -4959,6 +4975,21 @@ def run_training_on_split(
                         suite.append(k)
                 cal_active = suite
 
+        # LA REPRISE SE FAIT ICI, avant tout calcul qui lit `pbs_val`.
+        #
+        # Elle etait plus bas, apres la passe de validation — mais les seuils,
+        # l'etendue et la specification de decision se calculent AVANT, et
+        # `np.quantile` sur une liste vide leve une exception. Le run s'est
+        # arrete a l'epoch 2 pour cette raison exacte : un patch qui saute une
+        # passe doit fournir ce que cette passe produisait, au moment ou c'est
+        # lu, pas plus tard.
+        if not _valide and _val_prec is not None:
+            (val_pnl, val_dd, val_trades, val_trades_side,
+             pbs_val, _val_epoch) = _val_prec
+            val_pnl, val_dd = list(val_pnl), list(val_dd)
+            val_trades, val_trades_side = list(val_trades), list(val_trades_side)
+            pbs_val = [list(pbs_val[0]), list(pbs_val[1])]
+
         # Barres issues de CETTE distribution, une par côté, budget partagé.
         #
         # Une faible amplitude ne justifie pas de supprimer le filtre.
@@ -5005,9 +5036,6 @@ def run_training_on_split(
         # alors les valeurs de la derniere mesure : le journal affiche donc la
         # validation la plus recente, jamais des zeros qu'on lirait comme un
         # effondrement.
-        _valide = (cfg.validation_tous_les <= 1
-                   or (epoch % cfg.validation_tous_les) == 0
-                   or epoch >= cfg.epochs)
         np.random.seed(cfg.val_seed + 1)
         v_states = []
         v_infos = []
@@ -5136,10 +5164,7 @@ def run_training_on_split(
         # effondrement du modele alors que rien n'aurait ete mesure. Afficher
         # la derniere valeur connue est honnete : le marqueur `(mesure a
         # l'epoch N)` dit d'ou elle vient.
-        if not _valide and _val_prec is not None:
-            (val_pnl, val_dd, val_trades, val_trades_side,
-             pbs_val, _val_epoch) = _val_prec
-        else:
+        if _valide:
             _val_epoch = epoch
             _val_prec = (list(val_pnl), list(val_dd), list(val_trades),
                          list(val_trades_side), [list(pbs_val[0]),
@@ -5850,7 +5875,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec55"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec57"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -5874,7 +5899,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec55: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec57: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
