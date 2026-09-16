@@ -961,7 +961,26 @@ class PPOConfig:
                                  # config validée +135 EUR MT5 tester
 
     # Risk management / position sizing
-    risk_per_trade: float = 0.012
+    # 1.2 % -> 0.53 %, mesure du 2026-09-16 sur l'enchainement CHRONOLOGIQUE.
+    #
+    # Avec la sortie au stop suiveur, 3 423 trades sur 7.7 ans en risque
+    # fractionnaire compose :
+    #
+    #     risque/trade   creux max   gain final
+    #         1.20 %       49.0 %      +1146 %
+    #         0.60 %       27.7 %       +338 %
+    #         0.53 %       25.0 %       +280 %   <- retenu
+    #         0.30 %       14.8 %       +121 %
+    #
+    # 0.53 % est le risque qui ramene le creux maximal a 25 %. Au-dela, le gain
+    # nominal grimpe vite mais le creux aussi : a 1.2 % il faut encaisser la
+    # moitie du capital, ce qu'aucun dimensionnement raisonnable ne suppose.
+    #
+    # LE CREUX SE LIT DANS L'ORDRE CHRONOLOGIQUE, jamais melange. Un tirage
+    # melange repartit les pertes au hasard alors qu'elles s'agglutinent dans
+    # les regimes qui ne conviennent pas a la strategie : la premiere version
+    # de cette mesure annoncait 135 R de creux la ou l'ordre reel en donne 52.
+    risk_per_trade: float = 0.0053
     # max_position_frac : SUPPRIME. Il ne servait qu au plafond de notionnel,
     # qui est desormais exprime directement par max_notional_mult. Le laisser
     # aurait laisse croire a un reglage actif alors que plus rien ne le lisait.
@@ -1080,7 +1099,33 @@ class PPOConfig:
     # d'occasions independantes, 4 516 contre 2 314, a friction et horizon
     # inchanges. Il ne reste aucun axe sur lequel le H1 lui soit superieur.
     # ------------------------------------------------------------------
-    atr_sl_mult: float = 8.0
+    # 8 -> 12xATR, mesure du 2026-09-16 sur la SORTIE AU TRAILING.
+    #
+    # L'optimum de 88 points de base derive ce matin valait pour des barrieres
+    # FIXES, ou la duree croit comme le carre du risque. Avec un stop suiveur
+    # la position ferme bien avant que le stop initial soit atteint, et la
+    # relation change. Je l'avais signale ; la mesure le confirme.
+    #
+    #     stop   1re moitie   2e moitie      tout   annees +
+    #       8x     +0.0008     +0.0104    +0.0051      5/9
+    #      10x     +0.0170     +0.0562    +0.0344      7/9
+    #      12x     +0.0579     +0.0388    +0.0494      7/9   <- pic
+    #      14x     +0.0438     +0.0047    +0.0264      6/9
+    #
+    # +0.0494 +/- 0.0165, soit 3.0 ecarts-types, sept annees positives sur
+    # neuf, et POSITIF SUR LES DEUX MOITIES de facon equilibree. Le 14x, lui,
+    # s'effondre sur la seconde — il capture un regime, pas une propriete.
+    #
+    # La raison est la friction : a 236 points de base de risque elle ne pese
+    # plus que 0.021 R par trade contre 0.031 a 8x.
+    #
+    # CE QUE CA COUTE : les occasions passent de 3 494 a 1 709, et la duree
+    # mediane de 16.7 h a 34.1 h. La detectabilite y gagne quand meme d'un
+    # facteur 6.8, l'avantage etant dix fois plus grand.
+    #
+    # A cette largeur, LA BASE EST RENTABLE SANS MODELE. Le modele n'a plus a
+    # creer un avantage, il a a ne pas l'abimer.
+    atr_sl_mult: float = 12.0
     # R:R 1:2.0. Le 1.4 precedent venait de la grille de mesure_features.py,
     # qui echantillonne une entree toutes les 10 barres alors que les
     # barrieres mettent jusqu'a 240 barres a se resoudre : les fenetres de
@@ -1097,7 +1142,92 @@ class PPOConfig:
     # atteignaient 33.1 % — il leur manquait 11 points, il leur en manque 3.
     # R:R maintenu a 2 : l'objectif vaut le double du stop, donc 8xATR.
     # R:R 2.0 inchange : c'est le stop qu'on fait varier, pas le rapport.
-    atr_tp_mult: float = 16.0
+    atr_tp_mult: float = 72.0   # inutilise tant que use_tp vaut False
+    # L'OBJECTIF QUE LE MODELE APPREND A ATTEINDRE, en multiples d'ATR.
+    # 16 = 2 R : la largeur sur laquelle la courbe de selectivite etait
+    # franchement monotone, donc celle ou le classement a du sens.
+    aux_tp_mult: float = 24.0   # 2 R, la largeur ou le classement a du sens
+
+    # ------------------------------------------------------------------
+    # LA REGLE DE SORTIE, mesuree le 2026-09-16 et changee pour cette raison.
+    #
+    # LE CONSTAT. Sur 7.7 ans de BTCUSD, entrees NON CHEVAUCHANTES espacees du
+    # p75 des durees, sens alterne achat/vente, aucun modele :
+    #
+    #     regle                        E[R]   creux max   gain total
+    #     SL/TP fixes (en place)    -0.0396      213 R       -156 R
+    #     sans TP, trail 1.5/1.5    +0.0829       52 R       +284 R
+    #
+    # La geometrie en place PERD sur des entrees neutres. Le modele devait donc
+    # compenser -0.0396 R avant de commencer a gagner. La regle sans objectif
+    # rapporte +0.0829 R toute seule — les deux tiers de l'avantage que ce
+    # depot cherchait a faire produire par un reseau.
+    #
+    # Verifie sur 12 phases d'entrees non chevauchantes, 81 700 trades :
+    # +0.0718 +/- 0.0034 R, soit 21 ecarts-types, 12 phases positives sur 12.
+    # Et la part SYMETRIQUE — derive du sous-jacent deduite — vaut +0.0638,
+    # donc ce n'est pas la hausse du Bitcoin : le short seul est positif
+    # (+0.0088) malgre un sous-jacent multiplie par 20 sur la periode.
+    #
+    # POURQUOI LE TP COUTAIT SI CHER. A 2 R il vend au douzieme du chemin les
+    # trades qui vont loin — precisement ceux qui paient. La progression est
+    # monotone : TP 2 R -> -0.029, TP 4 R -> -0.0005, pas de TP -> +0.003 a
+    # +0.067 selon la distance du trailing.
+    #
+    # CE QUE LA MESURE NE DIT PAS. Elle porte sur une course aux barrieres en
+    # numpy, pas sur cet environnement : l'ordre des extremes intra-barre, la
+    # calibration et la taille par le risque n'y sont pas. Et c'est un suivi de
+    # tendance — il vit et meurt avec l'existence de tendances. La part
+    # symetrique vaut +0.0752 sur la premiere moitie de l'historique et +0.0294
+    # sur la seconde.
+    #
+    # `use_tp = False` retire l'objectif ; le stop suiveur devient la seule
+    # sortie. Le remettre a True redonne exactement la geometrie precedente,
+    # et c'est le temoin de l'experience.
+    # OBJECTIF REMIS, MAIS A 6 R — mesure du 2026-09-16, stop ADAPTATIF 8xATR,
+    # entrees neutres, moyenne par annee sur neuf ans :
+    #
+    #     TP  2 R (ancien)     -0.0732 +/- 0.0287   1 annee positive sur 9
+    #     TP  4 R              -0.0310 +/- 0.0208
+    #     TP  6 R              -0.0042 +/- 0.0176   <- retenu
+    #     TP 10 R              +0.0073 +/- 0.0171
+    #     sans objectif        +0.0051 +/- 0.0171
+    #
+    # LA NEUTRALITE EST MONOTONE EN LA LARGEUR, et atteinte des 6 R. Au-dela,
+    # 6 R, 10 R et l'absence d'objectif sont indistinguables : rien a gagner a
+    # elargir davantage. Le coupable n'etait donc pas le take-profit en soi
+    # mais sa LARGEUR — a 2 R il vend au douzieme du chemin.
+    #
+    # POURQUOI PAS "SANS OBJECTIF", QUI MESURE PAREIL. Parce qu'une cible
+    # BORNEE garde la question prédictive bien posee. "Le prix ira-t-il 6 R en
+    # haut avant 1 R en bas" a une reponse binaire a horizon defini, que les
+    # features savent traiter. "Jusqu'ou ira la tendance avant de se retourner"
+    # a une queue droite enorme dominee par la persistance du mouvement — et
+    # c'est ce qui a APLATI la courbe de classement du modele : elle passait de
+    # +0.56 au sommet a -0.12 au tout-venant sous l'ancienne geometrie, elle est
+    # plate a +0.02 partout sans objectif.
+    #
+    # On cherche donc les deux proprietes ensemble : la neutralite de la
+    # nouvelle geometrie et la predictibilite de l'ancienne.
+    #
+    # CE QUI N'EST PAS MESURE : que 6 R restaure effectivement le classement.
+    # Le balayage de pente a manque d'echantillons par phase et n'a rien rendu
+    # d'exploitable. C'est le pari de ce run, pas son acquis.
+    # LA SORTIE N'A PAS D'OBJECTIF ; l'objectif sert de CIBLE a predire.
+    #
+    # exec35 a mesure que les deux proprietes recherchees — une geometrie
+    # neutre et une cible classable — ne se reunissent pas en jouant sur la
+    # largeur du take-profit : a 6 R la geometrie devient neutre (-0.0042
+    # contre -0.0732 a 2 R) mais le gain d'apprentissage tombe a exactement
+    # zero. La predictibilite de l'ancienne geometrie venait de ce qui la
+    # faisait perdre.
+    #
+    # Elles se reunissent des qu'on cesse de les confondre : la POSITION court
+    # jusqu'au stop suiveur, sans objectif, et le MODELE apprend a predire si
+    # le trade aurait touche 2 R. Voir `cibles._regle_cible` pour la mesure qui
+    # rend ce decouplage legitime — correlation de rang +0.892 entre les deux.
+    use_tp: bool = False
+    # ------------------------------------------------------------------
 
     # Microstructure — v2 (palier intermédiaire validé, 2026-05-20)
     # v3 stress était trop dur : modèle convergeait vers HOLD-always (degenerate).
@@ -1189,10 +1319,24 @@ class PPOConfig:
 
     # Break-even & trailing stop — DÉSACTIVÉ pour aligner sur le backtest no_be_trail
     # et sur le MQL5 (SaintV2_WF3 sans BE/trail).
-    use_be_trail: bool    = False  # mettre à True pour réactiver
-    atr_be_mult: float    = 1.0   # gain en ATR pour déclencher le break-even
-    atr_trail_mult: float = 1.5   # gain en ATR pour déclencher le trailing
-    atr_trail_dist: float = 1.0   # distance du trailing (en ATR)
+    # LE TRAILING EST DESORMAIS LA SORTIE PRINCIPALE, pas un ajustement.
+    # Sans lui ET sans take-profit, un trade n'aurait plus aucune sortie autre
+    # que son stop initial : chaque position irait a -1 R ou courrait jusqu'a
+    # la fin de l'episode. Les deux reglages vont ensemble.
+    #
+    # L'ancienne mesure du depot — "avec BE/trail PF 0.98, sans PF 1.85" —
+    # declenchait a 1.0 et 1.5 ATR, dimensionnes pour un stop de 5xATR. Avec un
+    # stop de 8xATR cela declenche apres 12 % du chemin vers le stop : le
+    # moindre bruit scratche la position. Ce n'etait pas une mesure du
+    # trailing, c'etait une mesure d'un trailing mal dimensionne.
+    use_be_trail: bool    = True
+    # PAS DE BREAK-EVEN. Mesure : avec un trailing large il fait passer la part
+    # symetrique de +0.0638 a +0.0167, et surtout il la rend instable — +0.0280
+    # sur la premiere moitie de l'historique, -0.0262 sur la seconde. Un seuil
+    # hors d'atteinte le neutralise sans toucher au code.
+    atr_be_mult: float    = 1e9
+    atr_trail_mult: float = 18.0   # 1.5 R (le stop vaut 12 ATR)   # gain en ATR pour déclencher le trailing
+    atr_trail_dist: float = 18.0   # 1.5 R   # distance du trailing (en ATR)
 
     # Warmup critique : N epochs où seul le critique est mis à jour
     critic_warmup_epochs: int = 5
@@ -2115,12 +2259,20 @@ class BTCTradingEnvDiscrete(gym.Env):
                 # vaut -1, une cible à R:R 2 vaut +2, partout et toujours.
                 self.risk_amount = float(sl_dist * self.current_size)
 
+                # UN tp_price NUL VEUT DIRE "PAS D'OBJECTIF". Le test des
+                # barrieres plus bas est deja garde par `self.tp_price > 0`,
+                # donc il suffit de ne pas le poser — aucune branche a ajouter,
+                # et le chemin du stop reste rigoureusement le meme.
+                if not getattr(self.cfg, "use_tp", True):
+                    tp_dist = 0.0
                 if side == 1:
                     self.sl_price = max(1e-8, exec_price - sl_dist)
-                    self.tp_price = max(1e-8, exec_price + tp_dist)
+                    self.tp_price = (max(1e-8, exec_price + tp_dist)
+                                     if tp_dist > 0 else 0.0)
                 else:
                     self.sl_price = max(1e-8, exec_price + sl_dist)
-                    self.tp_price = max(1e-8, exec_price - tp_dist)
+                    self.tp_price = (max(1e-8, exec_price - tp_dist)
+                                     if tp_dist > 0 else 0.0)
 
                 self.break_even_done = False
                 self.trail_active    = False
@@ -3206,10 +3358,34 @@ def run_training_on_split(
         cibles_aux = None
         if cfg.aux_coef > 0.0 and batch_barres:
             try:
-                import evalue_tabm_test as _E
+                # LA CIBLE SE LIT DANS LA CONFIGURATION, elle ne se recopie pas.
+                #
+                # Elle venait de `evalue_tabm_test.cibles_brutes`, qui calcule un
+                # trade a take-profit FIXE de 2 R avec plafond de detention. Le
+                # jour ou l'environnement est passe au stop suiveur SANS
+                # objectif, l'etiquette est restee la meme : la tete apprenait a
+                # predire le resultat d'un trade que personne ne fait. Rien ne
+                # l'a signale — les deux fonctions tournaient et rendaient des
+                # nombres.
+                #
+                # `cibles.rendements` lit la regle de sortie dans PPOConfig :
+                # changer l'environnement change l'etiquette, sans rien a
+                # synchroniser. Les deux distributions n'ont d'ailleurs rien a
+                # voir — l'ancienne est bimodale a -1/+2, la nouvelle a une
+                # mediane a -1.01 et une queue jusqu'a +13 R, pour une variance
+                # de 3.21 au lieu de 1.94.
+                # `_CIB` et non `_C` : ce dernier est la classe de couleurs du
+                # module, et l'importer sous ce nom dans cette fonction le rend
+                # LOCAL — toutes les references a `_C.MAGENTA` plus bas
+                # tombaient alors sur le module `cibles`.
+                import cibles as _CIB
                 idx = np.asarray(batch_barres, dtype=np.int64)
                 idx = np.clip(idx, 0, train_data.length - 1)
-                ra, rv = _E.cibles_brutes(train_data.df, idx)
+                # `indicateur=True` : la tete apprend a predire l'atteinte de
+                # 2 R, pas le rendement de la sortie au trailing. Les deux se
+                # suivent au rang 0.892, et seule la premiere est classable.
+                ra, rv = _CIB.rendements(train_data.df, idx, cfg,
+                                         indicateur=True)
                 y = np.stack([ra, rv], axis=1).astype(np.float32)
                 ok = np.isfinite(y).all(axis=1)
                 cibles_aux = (
@@ -4455,10 +4631,31 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec32"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec37"
+
+    # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
+    # fois la meme faute : une regle de sortie changee dans la config pendant
+    # que l'etiquette de la tete auxiliaire continuait de decrire l'ancien
+    # trade. Les deux tournaient, les deux rendaient des nombres, et rien ne
+    # signalait qu'elles ne parlaient plus du meme trade.
+    #
+    # Les deux lignes se lisent de la MEME source que l'environnement et que
+    # l'etiquette — `cibles._regle` et `cibles._regle_cible`. Elles ne peuvent
+    # donc pas diverger de ce qui tourne : si elles se contredisent a l'ecran,
+    # c'est la configuration qui se contredit.
+    import cibles as _CIB
+    _so, _ci = _CIB._regle(cfg_duel), _CIB._regle_cible(cfg_duel)
+    print(f"SORTIE    stop {_so['sl']:g}xATR = 1 R | objectif "
+          f"{(str(_so['tp'] / _so['sl']) + ' R') if _so['tp'] else 'AUCUN'} | "
+          f"trailing " + (f"depuis {_so['ts'] / _so['sl']:.2f} R, "
+                          f"distance {_so['td'] / _so['sl']:.2f} R"
+                          if _so["ts"] is not None else "inactif"))
+    print(f"CIBLE     stop {_ci['sl']:g}xATR = 1 R | objectif "
+          f"{_ci['tp'] / _ci['sl']:.2f} R — ce que la tete auxiliaire apprend "
+          f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec32: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec37: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #

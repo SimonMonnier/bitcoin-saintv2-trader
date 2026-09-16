@@ -30,6 +30,15 @@ import sys
 
 import numpy as np
 
+# LA CIBLE SUIT LA REGLE DE SORTIE DE L'ENVIRONNEMENT, lue dans la
+# configuration. La courbe precedente visait un take-profit fixe a 2 R
+# alors que l'environnement n'en a plus : elle decrivait un trade que
+# personne ne fait, et c'est elle qui avait fait ramener la rampe de
+# selectivite de 40 a 10 epochs.
+import cibles as CIB
+from training import PPOConfig as _Cfg
+CFG = _Cfg()
+
 PARTS = (0.10, 0.20, 0.30, 0.40, 0.50, 0.65, 0.80, 1.00)
 GEOMETRIES_TABM = ((4, 128), (8, 128), (8, 256), (16, 256), (8, 512))
 
@@ -57,7 +66,7 @@ def _scores(df, tr, va, stats, cols, E, n_membres=8, d_cache=256):
                 -5.0, 5.0)
 
     i_tr = np.arange(0, tr - E.HOLD - 2, E.PAS_TRAIN)
-    ra, rv = E.cibles_brutes(df, i_tr)
+    ra, rv = CIB.rendements(df, i_tr, CFG)
     bon = np.isfinite(ra) & np.isfinite(rv)
     i_tr, ra, rv = i_tr[bon], ra[bon], rv[bon]
     m_a = fab().fit(X[i_tr], ra)
@@ -112,7 +121,7 @@ def mesure_selectivite(df, tr, va, stats, cols, E, n_phases: int = 12) -> None:
     X = np.clip(np.nan_to_num((X - stats["mean"]) / (stats["std"] + 1e-8)),
                 -5.0, 5.0)
     i_tr = np.arange(0, tr - E.HOLD - 2, E.PAS_TRAIN)
-    ra, rv = E.cibles_brutes(df, i_tr)
+    ra, rv = CIB.rendements(df, i_tr, CFG)
     bon = np.isfinite(ra) & np.isfinite(rv)
     i_tr, ra, rv = i_tr[bon], ra[bon], rv[bon]
     m_a = fab().fit(X[i_tr], ra)
@@ -128,7 +137,7 @@ def mesure_selectivite(df, tr, va, stats, cols, E, n_phases: int = 12) -> None:
         i = np.arange(tr + ph * pas_phase, tr + va - E.HOLD - 2, E.HOLD)
         if len(i) < 20:
             continue
-        ya, yv = E.cibles_brutes(df, i)
+        ya, yv = CIB.rendements(df, i, CFG)
         bon = np.isfinite(ya) & np.isfinite(yv)
         i, ya, yv = i[bon], ya[bon], yv[bon]
         if len(i) < 20:
@@ -185,7 +194,7 @@ def mesure_part_phases(df, tr, va, stats, cols, E, n_phases: int = 12) -> None:
     X = np.clip(np.nan_to_num((X - stats["mean"]) / (stats["std"] + 1e-8)),
                 -5.0, 5.0)
     i_tr = np.arange(0, tr - E.HOLD - 2, E.PAS_TRAIN)
-    ra, rv = E.cibles_brutes(df, i_tr)
+    ra, rv = CIB.rendements(df, i_tr, CFG)
     bon = np.isfinite(ra) & np.isfinite(rv)
     i_tr, ra, rv = i_tr[bon], ra[bon], rv[bon]
     m_a = fab().fit(X[i_tr], ra)
@@ -200,7 +209,7 @@ def mesure_part_phases(df, tr, va, stats, cols, E, n_phases: int = 12) -> None:
         i = np.arange(tr + ph * pas_phase, tr + va - E.HOLD - 2, E.HOLD)
         if len(i) < 20:
             continue
-        ya, yv = E.cibles_brutes(df, i)
+        ya, yv = CIB.rendements(df, i, CFG)
         bon = np.isfinite(ya) & np.isfinite(yv)
         i, ya, yv = i[bon], ya[bon], yv[bon]
         if len(i) < 20:
