@@ -189,7 +189,7 @@ class LiveConfig:
     # Meme valeur que training.PPOConfig.risk_per_trade : le modele doit
     # trader le risque sous lequel il a appris.
     risk_volume: bool = True
-    risk_per_trade: float = 0.012
+    risk_per_trade: float = 0.0053   # training.PPOConfig.risk_per_trade
     leverage: float = 100.0   # aligné sur training.py (BTCUSD)
     fee_rate: float = 0.0   # ce courtier ne facture pas de commission sur BTCUSD
     # GEOMETRIE DES BARRIERES — doit valoir celle de training.PPOConfig.
@@ -198,8 +198,9 @@ class LiveConfig:
     # mesure, pour deux fois plus d'occasions independantes. Un stop different
     # ici executerait une autre strategie que celle qui a ete mesuree, sans
     # qu'aucune erreur ne soit levee.
-    atr_sl_mult: float = 8.0     # SL = 8.0 x ATR   — training.PPOConfig.atr_sl_mult
-    atr_tp_mult: float = 16.0    # TP = 16.0 x ATR  — R:R 1:2.0, identique au training
+    atr_sl_mult: float = 12.0    # SL = 12 x ATR    — training.PPOConfig.atr_sl_mult
+    atr_tp_mult: float = 72.0    # inutilise tant que use_tp vaut False
+    use_tp: bool = False         # training.PPOConfig.use_tp
 
     spread_bps: float = 0.0
     slippage_bps: float = 0.0
@@ -217,13 +218,23 @@ class LiveConfig:
     #   "short" : uniquement agent SHORT (pas de long)
     side: str = "both"
 
-    # ======= BREAK-EVEN + TRAILING (en ATR) =======
-    # INACTIFS : l'appel a update_sl_be_trailing_live est commente dans la
-    # boucle (training.use_be_trail = False, et le backtest donne PF 0.98 avec
-    # contre 1.70 sans). Ces valeurs ne servent que si on le reactive.
-    breakeven_atr_mult: float = 1.0
-    trailing_start_atr_mult: float = 1.5
-    trailing_dist_atr_mult: float = 1.0
+    # ======= STOP SUIVEUR — DESORMAIS LA SEULE SORTIE =======
+    # Il etait inactif, et son appel commente dans la boucle, au motif que le
+    # backtest donnait PF 0.98 avec contre 1.70 sans. Cette mesure declenchait
+    # a 1.0 et 1.5 ATR sur un stop de 5xATR : le trailing s'armait apres 20 %
+    # du chemin vers le stop, donc le moindre bruit scratchait la position. Ce
+    # n'etait pas une mesure du trailing, c'etait une mesure d'un trailing mal
+    # dimensionne.
+    #
+    # Les seuils se lisent en multiples du RISQUE, pas de l'ATR : le stop vaut
+    # 12 ATR, donc 1.5 R de mouvement favorable font 18 ATR.
+    #
+    # Le break-even reste neutralise par un seuil hors d'atteinte : la mesure
+    # le donne perdant des qu'un trailing large est actif, et surtout instable
+    # — +0.0280 sur la premiere moitie de l'historique, -0.0262 sur la seconde.
+    breakeven_atr_mult: float = 1e9   # training.PPOConfig.atr_be_mult
+    trailing_start_atr_mult: float = 18.0   # 1.5 R — atr_trail_mult
+    trailing_dist_atr_mult: float = 18.0    # 1.5 R — atr_trail_dist
 
     # ======= SORTIE PAR LE TEMPS =======
     # Le live n'a AUCUN chemin de fermeture au marche : une position n'en sort
@@ -1100,10 +1111,13 @@ def live_loop(cfg: LiveConfig, should_continue):
 
                 df_closed = df_merged_full.iloc[:-1].reset_index(drop=True)
 
-                # BE + TRAILING DÉSACTIVÉS — signal brut SL/TP fixes uniquement.
-                # Aligné avec backtest_saintv2_no_be_trail.py qui montre que le
-                # BE/trail coupe trop tôt les wins (PF 0.98 avec → 1.70 sans).
-                # update_sl_be_trailing_live(cfg, df_closed, position)
+                # CET APPEL EST OBLIGATOIRE, pas optionnel. Depuis que
+                # `use_tp` vaut False, aucun objectif n'est pose chez le
+                # courtier : le stop suiveur est la SEULE sortie. Le
+                # recommenter laisserait chaque position ouverte jusqu'a son
+                # stop initial, soit la pire version de la strategie — on
+                # garderait les pertes entieres en abandonnant les gains.
+                update_sl_be_trailing_live(cfg, df_closed, position)
 
                 time.sleep(cfg.poll_interval)
                 continue  # On NE prend PAS de nouvelles positions tant qu'on est déjà en trade.

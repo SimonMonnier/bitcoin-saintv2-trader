@@ -2242,14 +2242,26 @@ def compute_sl_tp(cfg, entry_price: float, side: int, entry_atr: float):
     sl_dist = cfg.atr_sl_mult * eff_atr
     tp_dist = cfg.atr_tp_mult * eff_atr * cfg.tp_shrink
 
+    # UN tp NUL VEUT DIRE "PAS D'OBJECTIF", et MT5 l'entend exactement ainsi :
+    # un champ `tp` a zero dans la requete ne pose aucun ordre limite. La regle
+    # de sortie de l'entrainement n'en pose plus depuis le 2026-09-16 ; poser
+    # un objectif ici ferait tourner en production une strategie que le modele
+    # n'a jamais vue — il vendrait au douzieme du chemin les trades qui paient.
+    #
+    # ATTENTION, LA CONTREPARTIE EST DURE : sans objectif, le stop suiveur est
+    # la seule sortie. L'appel a `update_sl_be_trailing_live` DOIT tourner dans
+    # la boucle, sinon la position n'a plus que son stop initial.
+    if not getattr(cfg, "use_tp", True):
+        tp_dist = 0.0
+
     if side == 1:
         sl = entry_price - sl_dist
-        tp = entry_price + tp_dist
+        tp = entry_price + tp_dist if tp_dist > 0 else 0.0
     else:
         sl = entry_price + sl_dist
-        tp = entry_price - tp_dist
+        tp = entry_price - tp_dist if tp_dist > 0 else 0.0
 
-    return max(sl, 1e-8), max(tp, 1e-8)
+    return max(sl, 1e-8), (max(tp, 1e-8) if tp_dist > 0 else 0.0)
 
 
 def compute_entry_atr(df_closed: pd.DataFrame) -> float:

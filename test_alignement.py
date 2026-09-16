@@ -56,12 +56,57 @@ def _reglages() -> list[str]:
     ecarts = []
     for nom, a, b in (
         ("stop (xATR)", cfg_t.atr_sl_mult, cfg_l.atr_sl_mult),
-        ("objectif (xATR)", cfg_t.atr_tp_mult, cfg_l.atr_tp_mult),
         ("lookback", cfg_t.lookback, cfg_l.lookback),
         ("risque par trade", cfg_t.risk_per_trade, cfg_l.risk_per_trade),
+        # LES SEUILS DU TRAILING SE COMPARENT EN UNITES DE RISQUE. Les
+        # comparer en ATR passerait le jour ou seul le stop change : 18 ATR
+        # font 1.5 R sur un stop de 12, et 2.25 R sur un stop de 8. C'est
+        # exactement ce qui s'est produit le 2026-09-16, ou le live est reste
+        # a 8xATR pendant trois changements de geometrie.
+        ("declenchement du trailing (R)",
+         cfg_t.atr_trail_mult / cfg_t.atr_sl_mult,
+         cfg_l.trailing_start_atr_mult / cfg_l.atr_sl_mult),
+        ("distance du trailing (R)",
+         cfg_t.atr_trail_dist / cfg_t.atr_sl_mult,
+         cfg_l.trailing_dist_atr_mult / cfg_l.atr_sl_mult),
     ):
         if float(a) != float(b):
             ecarts.append(f"live : {nom} — entrainement {a}, live {b}")
+
+    # L'OBJECTIF NE SE COMPARE QUE S'IL EXISTE. Le comparer en xATR quand les
+    # deux cotes ne posent pas d'objectif validerait deux nombres sans effet,
+    # et masquerait le seul ecart qui compte : un cote qui en pose et pas
+    # l'autre.
+    tp_t = bool(getattr(cfg_t, "use_tp", True))
+    tp_l = bool(getattr(cfg_l, "use_tp", True))
+    if tp_t != tp_l:
+        ecarts.append(f"live : objectif — entrainement {'oui' if tp_t else 'non'}, "
+                      f"live {'oui' if tp_l else 'non'}")
+    elif tp_t and float(cfg_t.atr_tp_mult) != float(cfg_l.atr_tp_mult):
+        ecarts.append(f"live : objectif (xATR) — entrainement "
+                      f"{cfg_t.atr_tp_mult}, live {cfg_l.atr_tp_mult}")
+
+    # Le break-even est neutralise des deux cotes par un seuil hors d'atteinte
+    # plutot que par un interrupteur ; on verifie qu'il l'est VRAIMENT, sinon
+    # le live scratcherait a l'entree des positions que le training laisse
+    # courir.
+    # "Neutralise" et "absent" sont la MEME chose ici, et c'est ce qu'il faut
+    # comparer : un seuil de 1e9 ATR ne se declenche jamais. Comparer la
+    # presence du reglage plutot que son effet faisait echouer le test alors
+    # que les deux cotes etaient d'accord.
+    def _be_actif(seuil, active=True) -> bool:
+        return bool(active) and float(seuil) < 1e8
+
+    be_t = _be_actif(cfg_t.atr_be_mult, getattr(cfg_t, "use_be_trail", False))
+    be_l = _be_actif(cfg_l.breakeven_atr_mult)
+    if be_t != be_l:
+        ecarts.append(f"live : break-even — entrainement "
+                      f"{'actif' if be_t else 'neutralise'}, "
+                      f"live {'actif' if be_l else 'neutralise'}")
+    elif be_t and float(cfg_t.atr_be_mult) / cfg_t.atr_sl_mult !=             float(cfg_l.breakeven_atr_mult) / cfg_l.atr_sl_mult:
+        ecarts.append(f"live : break-even (R) — entrainement "
+                      f"{cfg_t.atr_be_mult / cfg_t.atr_sl_mult}, "
+                      f"live {cfg_l.breakeven_atr_mult / cfg_l.atr_sl_mult}")
     if S.TIMEFRAME != "M5":
         ecarts.append(f"saint_core.TIMEFRAME vaut {S.TIMEFRAME}, pas M5")
 
@@ -133,6 +178,18 @@ def _reglages() -> list[str]:
 
     if not _appelle(K, "votant_si_actif"):
         ecarts.append("live : le votant est defini mais jamais APPELE")
+
+    # SANS OBJECTIF, LE STOP SUIVEUR EST LA SEULE SORTIE. Son appel etait
+    # commente dans la boucle — la fonction existait, le reglage existait, et
+    # aucune position n'etait jamais suivie. Le laisser commente pendant que
+    # `use_tp` vaut False donnerait la pire version de la strategie : pertes
+    # entieres au stop initial, gains abandonnes.
+    if not tp_l and not _appelle(K, "update_sl_be_trailing_live"):
+        ecarts.append("live : pas d'objectif ET pas de stop suiveur appele — "
+                      "les positions n'auraient que leur stop initial")
+    if getattr(cfg_t, "use_be_trail", False) and not _appelle(
+            K, "update_sl_be_trailing_live"):
+        ecarts.append("live : l'entrainement suit le stop, le live ne l'appelle pas")
     if getattr(cfg_t, "votant_tabm", False) and not hasattr(K, "votant_courant"):
         ecarts.append("live : pas de votant alors que l'entrainement en a un")
 
