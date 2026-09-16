@@ -611,6 +611,49 @@ class PPOConfig:
     # 45 000 parametres — le surcout GPU d'un batch 336 contre 96 est nul.
     # 336 -> 84 : le produit avec `episode_length` est conserve a 483 840
     # barres. On allonge les episodes sans changer ce qu'une epoch consomme.
+    # PLUSIEURS POSITIONS SIMULTANEES, mesure du 2026-09-16.
+    #
+    # LE CONSTAT. L'acteur ne recoit de gradient que sur les barres ou il PEUT
+    # entrer : en position, le masque ne laisse que HOLD et log pi(HOLD) vaut
+    # exactement 0. Releve dans le journal : `dec` vaut ~500 par epoch pour
+    # 483 840 barres collectees, soit 0.1 %. Entre deux trades enchaines la
+    # politique n'est plate qu'UNE barre. Le plafond configure vaut 40 000 et
+    # n'est jamais approche.
+    #
+    # C'est le diagnostic que la veille repete a chaque epoch : "APPREND MAIS
+    # RESTE PLAT — le gradient passe mais l'entropie tient a 1.093 sur 1.099".
+    # Avec 500 echantillons par epoch, une politique ne peut pas se
+    # differencier.
+    #
+    # CE QUE LA CONCURRENCE ACHETE, ET CE QU'ELLE N'ACHETE PAS.
+    #
+    #     K   trades   N effectif   decisions vues par l'acteur
+    #     1       49         49.0                           45
+    #     4      182         65.0                          182
+    #     8      420         77.2                          383
+    #    20     1245        104.3                        1 154
+    #
+    # Le gradient est multiplie par K, exactement. L'INFORMATION, non : deux
+    # trades de meme sens ouverts a une heure d'ecart correlent a 0.72, et
+    # encore a 0.31 apres 24 h. Multiplier les trades par 25 ne multiplie les
+    # occasions independantes que par 2.1, donc la detectabilite par 1.46.
+    #
+    # C'est donc un levier D'APPRENTISSAGE, pas de rentabilite. Et c'est le
+    # seul qui soit gratuit en calcul : allonger la collecte donnerait le meme
+    # gradient en payant K fois plus de barres, alors qu'ici le nombre de
+    # barres ne bouge pas.
+    #
+    # LE RISQUE NE SUIT PAS LE NOMBRE. K positions de meme sens subissent le
+    # meme mouvement : la variance du portefeuille vaut K(1+(K-1)rho) fois
+    # celle d'une seule, soit ~30 fois a K=8 avec rho 0.45. `_compute_dynamic_size`
+    # divise donc la taille par racine de ce facteur, pour que le risque total
+    # reste `risk_per_trade` quel que soit K.
+    #
+    # A K=1 tout ce chemin doit rendre EXACTEMENT l'environnement d'avant.
+    # `test_concurrence.py` le verifie sur 613 trades et six scenarios, en
+    # comparant recompense par recompense et centime par centime.
+    positions_max: int = 1
+
     episodes_per_epoch: int = 84
     # Idem pour la validation : 21-32 trades donnaient un Sortino purement
     # bruité (PF 3.10 puis 0.51 d'une epoch à l'autre), donc une sélection du
@@ -2050,14 +2093,35 @@ class BTCTradingEnvDiscrete(gym.Env):
         self.idx = self.start_idx
 
         self.capital = self.cfg.initial_capital
-        self.position = 0
-        self.entry_price = 0.0
-        self.current_size = 0.0
 
-        self.sl_price = 0.0
-        self.tp_price = 0.0
-        self.entry_idx = -1
-        self.entry_atr = 0.0
+        # LES POSITIONS SONT DES EMPLACEMENTS, pas des scalaires. Un tableau
+        # par champ plutot qu'une liste d'objets : les barrieres se testent
+        # alors en une operation vectorielle sur tous les emplacements, ce qui
+        # rend le cout par barre insensible a K.
+        #
+        # `_p_sens` a 0 marque un emplacement LIBRE. C'est la seule source de
+        # verite sur l'occupation — aucun compteur separe, qui finirait par
+        # diverger sans lever d'erreur.
+        k = max(int(getattr(self.cfg, "positions_max", 1)), 1)
+        self._K = k
+        self._p_sens = np.zeros(k, dtype=np.int64)
+        self._p_entree = np.zeros(k, dtype=np.float64)
+        self._p_taille = np.zeros(k, dtype=np.float64)
+        self._p_sl = np.zeros(k, dtype=np.float64)
+        self._p_tp = np.zeros(k, dtype=np.float64)
+        self._p_atr = np.zeros(k, dtype=np.float64)
+        self._p_idx = np.full(k, -1, dtype=np.int64)
+        self._p_risque = np.zeros(k, dtype=np.float64)
+        self._p_spread = np.full(k, float(self.cfg.spread_bps), dtype=np.float64)
+        self._p_be = np.zeros(k, dtype=bool)
+        self._p_trail = np.zeros(k, dtype=bool)
+        # Recompense attribuee a chaque emplacement pendant la barre courante.
+        self._r_slots = np.zeros(k, dtype=np.float64)
+        self._realise_slots = np.zeros(k, dtype=np.float64)
+        self._latent_prec = np.zeros(k, dtype=np.float64)
+        self._slots_fermes: List[int] = []
+        self._slot_ouvert = -1
+
         self.risk_amount = 0.0
         # Spread du trade en cours — réé-échantillonné à chaque ouverture
         self.current_trade_spread_bps = float(self.cfg.spread_bps)
@@ -2071,15 +2135,10 @@ class BTCTradingEnvDiscrete(gym.Env):
         # {entry_idx, exit_idx, side, entry_price, exit_price, pnl, hit_sl, hit_tp, hold_bars}
         self.trades_meta: List[Dict] = []
 
-        self.bars_in_position = 0
         self.risk_scale = 1.0
         self.last_risk_scale = 1.0
 
         self.max_dd = 0.0
-
-        # Gestion dynamique du SL
-        self.break_even_done = False
-        self.trail_active    = False
 
         obs = self._get_obs()
         return obs, {
@@ -2088,6 +2147,92 @@ class BTCTradingEnvDiscrete(gym.Env):
             "drawdown": 0.0,
             "done_reason": None
         }
+
+    # ------------------------------------------------------------------
+    # VUES SCALAIRES SUR LES EMPLACEMENTS. Une trentaine d'endroits — le live,
+    # les evaluateurs, le journal, l'observation — lisent `env.position` ou
+    # `env.current_size`. Les exposer en lecture seule, derivees des
+    # emplacements, evite deux etats a tenir d'accord : c'est la faute que ce
+    # depot paie en boucle des qu'une valeur est recopiee au lieu d'etre lue.
+    #
+    # A K=1 chacune rend exactement ce que l'attribut rendait avant.
+    @property
+    def _actifs(self):
+        return self._p_sens != 0
+
+    @property
+    def n_positions(self) -> int:
+        return int(np.count_nonzero(self._p_sens))
+
+    def peut_entrer(self) -> bool:
+        """Y a-t-il un emplacement libre ? C'est la definition d'une DECISION."""
+        return self.n_positions < self._K
+
+    @property
+    def position(self) -> int:
+        """Sens NET. A K=1, le sens de l'unique position."""
+        a = self._actifs
+        if not a.any():
+            return 0
+        net = float((self._p_sens[a] * self._p_taille[a]).sum())
+        return 0 if net == 0.0 else (1 if net > 0 else -1)
+
+    @property
+    def current_size(self) -> float:
+        a = self._actifs
+        return float(np.abs(self._p_taille[a]).sum()) if a.any() else 0.0
+
+    @property
+    def entry_price(self) -> float:
+        """Prix d'entree moyen PONDERE PAR LA TAILLE. A K=1, le prix exact."""
+        a = self._actifs
+        t = self._p_taille[a]
+        return float((self._p_entree[a] * t).sum() / t.sum()) if t.sum() > 0 else 0.0
+
+    @property
+    def entry_atr(self) -> float:
+        a = self._actifs
+        t = self._p_taille[a]
+        return float((self._p_atr[a] * t).sum() / t.sum()) if t.sum() > 0 else 0.0
+
+    @property
+    def entry_idx(self) -> int:
+        a = self._actifs
+        return int(self._p_idx[a].min()) if a.any() else -1
+
+    @property
+    def bars_in_position(self) -> int:
+        """Detention de la position la PLUS ANCIENNE encore ouverte."""
+        a = self._actifs
+        return int(self.idx - self._p_idx[a].min()) if a.any() else 0
+
+    @property
+    def sl_price(self) -> float:
+        a = np.flatnonzero(self._actifs)
+        return float(self._p_sl[a[0]]) if len(a) else 0.0
+
+    @property
+    def tp_price(self) -> float:
+        a = np.flatnonzero(self._actifs)
+        return float(self._p_tp[a[0]]) if len(a) else 0.0
+
+    @property
+    def break_even_done(self) -> bool:
+        a = np.flatnonzero(self._actifs)
+        return bool(self._p_be[a[0]]) if len(a) else False
+
+    @property
+    def trail_active(self) -> bool:
+        a = np.flatnonzero(self._actifs)
+        return bool(self._p_trail[a[0]]) if len(a) else False
+
+    def _latent_slot(self, bid, i: int) -> float:
+        if self._p_sens[i] == 0:
+            return 0.0
+        q = execution_quote(bid, -int(self._p_sens[i]), float(self._p_spread[i]))
+        return (self._p_sens[i] * (q - self._p_entree[i])
+                - self.cfg.fee_rate * q) * self._p_taille[i]
+    # ------------------------------------------------------------------
 
     def _get_obs(self):
         start = self.idx - self.lookback
@@ -2184,6 +2329,26 @@ class BTCTradingEnvDiscrete(gym.Env):
         if not np.isfinite(sl_dist) or sl_dist <= 0.0:
             return 0.0
 
+        # LE RISQUE VISE EST CELUI DU PORTEFEUILLE, pas celui d'une ligne.
+        #
+        # K positions de meme sens subissent le MEME mouvement : leur variance
+        # commune vaut K(1 + (K-1)rho) fois celle d'une seule. Mesure du
+        # 2026-09-16 : deux trades de meme sens ouverts a une heure d'ecart
+        # correlent a 0.72, et encore a 0.31 apres 24 h — soit rho de l'ordre
+        # de 0.45 sur la duree de vie typique d'une position.
+        #
+        # Garder `risk_per_trade` comme risque TOTAL impose donc de diviser
+        # chaque ligne par la racine de ce facteur. Sans cela, passer K de 1 a
+        # 8 multiplierait le risque reel par 5.8 en silence, et le run suivant
+        # paraitrait meilleur ou pire pour une raison qui n'a rien a voir avec
+        # l'apprentissage.
+        #
+        # A K=1 le facteur vaut exactement 1 et l'expression est celle d'avant.
+        k = int(getattr(self, "_K", 1))
+        if k > 1:
+            rho = float(getattr(self.cfg, "correlation_positions", 0.45))
+            scale = scale / math.sqrt(k * (1.0 + (k - 1) * rho))
+
         size = (self.capital * self.cfg.risk_per_trade * scale) / sl_dist
 
         # Plafond de NOTIONNEL, exprime directement en multiples du capital.
@@ -2205,47 +2370,79 @@ class BTCTradingEnvDiscrete(gym.Env):
         return float(max(size, 0.0))
 
     def _latent_at_bid(self, bid):
-        if self.position == 0:
+        """Somme des latents de TOUS les emplacements ouverts.
+
+        A K=1 c'est le calcul d'avant, terme pour terme : un seul emplacement,
+        son propre spread, sa propre taille.
+        """
+        a = np.flatnonzero(self._p_sens != 0)
+        if not len(a):
             return 0.0
-        quote = execution_quote(bid, -self.position, self.current_trade_spread_bps)
-        return (self.position * (quote - self.entry_price)
-                - self.cfg.fee_rate * quote) * self.current_size
+        return float(sum(self._latent_slot(bid, int(i)) for i in a))
 
     def _close_position(self, exit_price, hit_sl=False, hit_tp=False,
-                        hit_temps=False, terminal_reason=None):
-        pnl = self.position * (exit_price - self.entry_price) * self.current_size
-        fee = self.cfg.fee_rate * exit_price * self.current_size
+                        hit_temps=False, terminal_reason=None, slot=None):
+        """Ferme UN emplacement. `slot=None` prend le plus ancien ouvert.
+
+        Le defaut sur le plus ancien garde le comportement d'avant a K=1, ou
+        il n'y en a qu'un — et donne une regle explicite plutot qu'un ordre
+        accidentel quand il y en a plusieurs.
+        """
+        if slot is None:
+            a = np.flatnonzero(self._p_sens != 0)
+            if not len(a):
+                return 0.0
+            slot = int(a[np.argmin(self._p_idx[a])])
+        sens = int(self._p_sens[slot])
+        if sens == 0:
+            return 0.0
+        taille = float(self._p_taille[slot])
+        pnl = sens * (exit_price - self._p_entree[slot]) * taille
+        fee = self.cfg.fee_rate * exit_price * taille
         realized = pnl - fee
 
         self.capital += realized
         self.last_realized_pnl = realized
         self.trades_pnl.append(realized)
-        self.trades_side.append(int(self.position))
+        self.trades_side.append(sens)
         self.trades_meta.append({
-            "entry_idx": int(self.entry_idx),
+            "entry_idx": int(self._p_idx[slot]),
             "exit_idx": int(self.idx),
-            "side": int(self.position),
-            "entry_price": float(self.entry_price),
+            "side": sens,
+            "entry_price": float(self._p_entree[slot]),
             "exit_price": float(exit_price),
             "pnl": float(realized),
             "hit_sl": bool(hit_sl),
             "hit_tp": bool(hit_tp),
             "hit_temps": bool(hit_temps),
             "terminal_reason": terminal_reason,
-            "hold_bars": int(self.idx - self.entry_idx),
+            "hold_bars": int(self.idx - self._p_idx[slot]),
         })
 
-        self.position = 0
-        self.current_size = 0.0
-        self.entry_price = 0.0
-        self.sl_price = 0.0
-        self.tp_price = 0.0
-        self.entry_idx = -1
-        self.entry_atr = 0.0
-        self.risk_scale = 1.0
-        self.last_risk_scale = 1.0
-        self.break_even_done = False
-        self.trail_active    = False
+        # Le terme de recompense du trade realise s'exprime en unites du
+        # risque DE CE TRADE, pas d'un risque global : sans cela un trade
+        # ouvert petit et un trade ouvert grand n'auraient pas la meme echelle.
+        self._r_slots[slot] += float(np.clip(
+            realized / max(float(self._p_risque[slot]), 1e-8), -3.0, 3.0))
+        # Le montant brut sert au terme de marquage : l'argent realise a quitte
+        # le latent de l'emplacement pour rejoindre le capital, donc il doit
+        # etre recompte dans la variation d'equity DE CET EMPLACEMENT.
+        self._realise_slots[slot] += realized
+        self._slots_fermes.append(int(slot))
+
+        self._p_sens[slot] = 0
+        self._p_taille[slot] = 0.0
+        self._p_entree[slot] = 0.0
+        self._p_sl[slot] = 0.0
+        self._p_tp[slot] = 0.0
+        self._p_idx[slot] = -1
+        self._p_atr[slot] = 0.0
+        self._p_risque[slot] = 0.0
+        self._p_be[slot] = False
+        self._p_trail[slot] = False
+        if self.n_positions == 0:
+            self.risk_scale = 1.0
+            self.last_risk_scale = 1.0
         return realized
 
     def step(self, action: int):
@@ -2278,16 +2475,23 @@ class BTCTradingEnvDiscrete(gym.Env):
 
         # Même marquage au close exécutable aux deux bornes; les mèches
         # bruitées servent uniquement aux triggers, jamais au reward latent.
-        prev_equity = self.capital + self._latent_at_bid(
-            self.data.close[self.idx - 1] if self.idx > 0 else price)
+        bid_prec = self.data.close[self.idx - 1] if self.idx > 0 else price
+        prev_equity = self.capital + self._latent_at_bid(bid_prec)
+
+        # LATENT DE DEPART PAR EMPLACEMENT. Il sert a repartir la recompense :
+        # chaque decision ne doit recevoir que ce que SA position a produit,
+        # sinon un trade gagnant crediterait le trade perdant ouvert a cote et
+        # l'apprentissage porterait sur une moyenne que personne ne joue.
+        self._latent_prec = np.array(
+            [self._latent_slot(bid_prec, i) for i in range(self._K)],
+            dtype=np.float64)
+        self._r_slots[:] = 0.0
+        self._realise_slots[:] = 0.0
+        self._slots_fermes = []
+        self._slot_ouvert = -1
 
         realized_trade = 0.0
         hit_sl = hit_tp = hit_temps = False
-
-        if old_pos != 0:
-            self.bars_in_position += 1
-        else:
-            self.bars_in_position = 0
 
         # Plus de mode "close" : fermeture uniquement par SL/TP/break-even/trailing
         manual_close = False
@@ -2295,78 +2499,97 @@ class BTCTradingEnvDiscrete(gym.Env):
         # --------- OUVERTURE DIRECTE (pas de confirmation dans l'env) ---------
         # La confirmation signal→pause→re-signal est gérée dans kairos_live.py uniquement.
         # En training, le reward shaping pénalise déjà les mauvaises entrées.
-        if not manual_close and action in (0, 1) and old_pos == 0:
+        # UN EMPLACEMENT LIBRE SUFFIT, la ou l'ancienne condition exigeait
+        # d'etre entierement plat. A K=1 les deux coincident exactement.
+        _libres = np.flatnonzero(self._p_sens == 0)
+        if not manual_close and action in (0, 1) and len(_libres):
             side = 1 if action == 0 else -1
             size = self._compute_dynamic_size(prix_execution)
             if size > 0.0:
-                self.current_size = size
-                self.position = side
+                j = int(_libres[0])
+                self._p_taille[j] = size
+                self._p_sens[j] = side
                 # Échantillonne le spread pour ce trade (variabilité réaliste)
-                self.current_trade_spread_bps = self._sample_trade_spread_bps()
+                spread = self._sample_trade_spread_bps()
+                self._p_spread[j] = spread
+                self.current_trade_spread_bps = spread
                 exec_price = self._apply_micro(prix_execution, side, is_entry=True)
-                self.entry_price = exec_price
-                self.entry_idx = self.idx
+                self._p_entree[j] = exec_price
+                self._p_idx[j] = self.idx
 
                 atr_raw = float(self.data.atr14[self.idx - 1]) if self.idx - 1 >= 0 else 0.0
                 # MEME plancher que saint_core.effective_atr — le dupliquer ici
                 # avec une autre valeur ferait diverger l'entrainement du live.
                 fallback = ATR_PLANCHER_FRAC * exec_price
-                self.entry_atr = max(atr_raw, fallback, 1e-8)
+                entry_atr = max(atr_raw, fallback, 1e-8)
+                self._p_atr[j] = entry_atr
 
-                sl_dist = self.cfg.atr_sl_mult * self.entry_atr
-                tp_dist = self.cfg.atr_tp_mult * self.entry_atr * self.cfg.tp_shrink
+                sl_dist = self.cfg.atr_sl_mult * entry_atr
+                tp_dist = self.cfg.atr_tp_mult * entry_atr * self.cfg.tp_shrink
 
                 # Montant réellement en jeu si le stop est touché. C'est l'unité
                 # dans laquelle la récompense du trade sera exprimée : un stop
                 # vaut -1, une cible à R:R 2 vaut +2, partout et toujours.
-                self.risk_amount = float(sl_dist * self.current_size)
+                self._p_risque[j] = float(sl_dist * size)
+                self.risk_amount = float(sl_dist * size)
 
                 # UN tp_price NUL VEUT DIRE "PAS D'OBJECTIF". Le test des
-                # barrieres plus bas est deja garde par `self.tp_price > 0`,
-                # donc il suffit de ne pas le poser — aucune branche a ajouter,
-                # et le chemin du stop reste rigoureusement le meme.
+                # barrieres plus bas est deja garde par `tp > 0`, donc il
+                # suffit de ne pas le poser — aucune branche a ajouter, et le
+                # chemin du stop reste rigoureusement le meme.
                 if not getattr(self.cfg, "use_tp", True):
                     tp_dist = 0.0
                 if side == 1:
-                    self.sl_price = max(1e-8, exec_price - sl_dist)
-                    self.tp_price = (max(1e-8, exec_price + tp_dist)
+                    self._p_sl[j] = max(1e-8, exec_price - sl_dist)
+                    self._p_tp[j] = (max(1e-8, exec_price + tp_dist)
                                      if tp_dist > 0 else 0.0)
                 else:
-                    self.sl_price = max(1e-8, exec_price + sl_dist)
-                    self.tp_price = (max(1e-8, exec_price - tp_dist)
+                    self._p_sl[j] = max(1e-8, exec_price + sl_dist)
+                    self._p_tp[j] = (max(1e-8, exec_price - tp_dist)
                                      if tp_dist > 0 else 0.0)
 
-                self.break_even_done = False
-                self.trail_active    = False
+                self._p_be[j] = False
+                self._p_trail[j] = False
+                self._slot_ouvert = j
 
         # --------- BREAK-EVEN + TRAILING STOP ---------
         # Désactivé par défaut (cfg.use_be_trail=False) pour aligner sur le
         # backtest "no_be_trail" et sur le MQL5 SaintV2_WF3 (sans BE/trail).
         # Permet d'isoler la qualité du signal d'entrée pur (SL/TP fixes uniquement).
-        if (self.cfg.use_be_trail and not manual_close and self.position != 0
-                and self.current_size > 0 and self.entry_atr > 1e-8
-                and self.idx > self.entry_idx):
-            # Le SL de cette bougie ne peut utiliser que les bougies déjà closes.
-            fav_bid = self.data.high[self.idx - 1] if self.position == 1 else self.data.low[self.idx - 1]
-            fav_price = execution_quote(fav_bid, -self.position, self.current_trade_spread_bps)
-            fav_move  = self.position * (fav_price - self.entry_price)
+        # CHAQUE EMPLACEMENT SUIT SON PROPRE STOP. Deux positions ouvertes a
+        # des prix differents n'ont ni le meme point mort ni le meme
+        # declenchement ; un stop commun melangerait les deux et suivrait le
+        # mouvement d'une position que l'autre n'a pas vecu.
+        if self.cfg.use_be_trail and not manual_close:
+            for j in np.flatnonzero(self._p_sens != 0):
+                j = int(j)
+                sens = int(self._p_sens[j])
+                atr_j = float(self._p_atr[j])
+                if (self._p_taille[j] <= 0 or atr_j <= 1e-8
+                        or self.idx <= self._p_idx[j]):
+                    continue
+                # Le SL de cette bougie ne peut utiliser que les bougies déjà closes.
+                fav_bid = (self.data.high[self.idx - 1] if sens == 1
+                           else self.data.low[self.idx - 1])
+                fav_price = execution_quote(fav_bid, -sens, float(self._p_spread[j]))
+                fav_move = sens * (fav_price - self._p_entree[j])
 
-            # Break-even : déplace SL à l'entrée quand gain >= atr_be_mult × ATR
-            if not self.break_even_done and fav_move >= self.cfg.atr_be_mult * self.entry_atr:
-                if self.position == 1:
-                    self.sl_price = max(self.sl_price, self.entry_price)
-                else:
-                    self.sl_price = min(self.sl_price, self.entry_price)
-                self.break_even_done = True
+                # Break-even : déplace SL à l'entrée quand gain >= atr_be_mult × ATR
+                if not self._p_be[j] and fav_move >= self.cfg.atr_be_mult * atr_j:
+                    if sens == 1:
+                        self._p_sl[j] = max(self._p_sl[j], self._p_entree[j])
+                    else:
+                        self._p_sl[j] = min(self._p_sl[j], self._p_entree[j])
+                    self._p_be[j] = True
 
-            # Trailing stop : suit le prix à atr_trail_dist × ATR quand gain >= atr_trail_mult × ATR
-            if fav_move >= self.cfg.atr_trail_mult * self.entry_atr:
-                trail_sl = fav_price - self.position * self.cfg.atr_trail_dist * self.entry_atr
-                if self.position == 1:
-                    self.sl_price = max(self.sl_price, trail_sl)
-                else:
-                    self.sl_price = min(self.sl_price, trail_sl)
-                self.trail_active = True
+                # Trailing stop : suit le prix à atr_trail_dist × ATR quand gain >= atr_trail_mult × ATR
+                if fav_move >= self.cfg.atr_trail_mult * atr_j:
+                    trail_sl = fav_price - sens * self.cfg.atr_trail_dist * atr_j
+                    if sens == 1:
+                        self._p_sl[j] = max(self._p_sl[j], trail_sl)
+                    else:
+                        self._p_sl[j] = min(self._p_sl[j], trail_sl)
+                    self._p_trail[j] = True
 
         # --------- SL/TP AUTO ---------
         # LONG ferme au BID, SHORT à l'ASK. SL/TP sont déjà des prix
@@ -2381,50 +2604,69 @@ class BTCTradingEnvDiscrete(gym.Env):
         #
         # Cela supprime au passage un angle mort : une position a fort notionnel
         # restait sans protection pendant sa premiere minute.
-        if not manual_close and self.position != 0 and self.current_size > 0 and self.entry_price > 0:
-            exit_price = None
+        # LES EMPLACEMENTS SONT TESTES DANS L'ORDRE, du plus ancien au plus
+        # recent. L'ordre compte parce que chaque fermeture tire un slippage :
+        # le fixer rend la trajectoire reproductible, et a K=1 il reproduit
+        # exactement la sequence d'avant.
+        if not manual_close and self._p_sens.any():
             open_bid = getattr(self.data, 'open', self.data.close)[self.idx]
-            open_quote = execution_quote(open_bid, -self.position, self.current_trade_spread_bps)
+            ouverts = np.flatnonzero(self._p_sens != 0)
+            ouverts = ouverts[np.argsort(self._p_idx[ouverts], kind="stable")]
+            for j in ouverts:
+                j = int(j)
+                sens = int(self._p_sens[j])
+                if self._p_taille[j] <= 0 or self._p_entree[j] <= 0:
+                    continue
+                spread_j = float(self._p_spread[j])
+                sl_j, tp_j = float(self._p_sl[j]), float(self._p_tp[j])
+                exit_price = None
+                h_sl = h_tp = h_temps = False
+                open_quote = execution_quote(open_bid, -sens, spread_j)
 
-            if self.position == 1:  # LONG
-                if self.sl_price > 0 and low_bar <= self.sl_price:
-                    exit_price = min(self.sl_price, open_quote)
-                    hit_sl = True
-                elif self.tp_price > 0 and high_bar >= self.tp_price:
-                    exit_price = self.tp_price
-                    hit_tp = True
-            else:                    # SHORT
-                if self.sl_price > 0 and execution_quote(high_bar, 1, self.current_trade_spread_bps) >= self.sl_price:
-                    exit_price = max(self.sl_price, open_quote)
-                    hit_sl = True
-                elif self.tp_price > 0 and execution_quote(low_bar, 1, self.current_trade_spread_bps) <= self.tp_price:
-                    exit_price = self.tp_price
-                    hit_tp = True
+                if sens == 1:  # LONG
+                    if sl_j > 0 and low_bar <= sl_j:
+                        exit_price = min(sl_j, open_quote)
+                        h_sl = True
+                    elif tp_j > 0 and high_bar >= tp_j:
+                        exit_price = tp_j
+                        h_tp = True
+                else:          # SHORT
+                    if sl_j > 0 and execution_quote(high_bar, 1, spread_j) >= sl_j:
+                        exit_price = max(sl_j, open_quote)
+                        h_sl = True
+                    elif tp_j > 0 and execution_quote(low_bar, 1, spread_j) <= tp_j:
+                        exit_price = tp_j
+                        h_tp = True
 
-            # Ni SL ni TP : cloture AU MARCHE au plafond de detention.
-            # INACTIF par defaut (max_holding_bars = 0) : le live ne sait pas
-            # fermer au marche, donc l'environnement ne le fait pas non plus.
-            if (exit_price is None and self.cfg.max_holding_bars > 0
-                    and self.bars_in_position >= self.cfg.max_holding_bars):
-                exit_price = self._apply_micro(price, -self.position, is_entry=False)
-                hit_temps = True
+                # Ni SL ni TP : cloture AU MARCHE au plafond de detention.
+                # INACTIF par defaut (max_holding_bars = 0) : le live ne sait
+                # pas fermer au marche, donc l'environnement non plus.
+                if (exit_price is None and self.cfg.max_holding_bars > 0
+                        and (self.idx - int(self._p_idx[j]))
+                        >= self.cfg.max_holding_bars):
+                    exit_price = self._apply_micro(price, -sens, is_entry=False)
+                    h_temps = True
 
-            if exit_price is not None:
-                # SL/sortie au marché: slippage adverse. TP: niveau cible,
-                # sans amélioration favorable systématique inventée.
-                slip_max = self.cfg.slippage_bps / 10_000.0
-                if slip_max > 0 and not hit_tp:
-                    slip_amount = exit_price * np.random.uniform(0.0, slip_max)
-                    # Une sortie au marche (temps ecoule) traverse le spread :
-                    # elle est DEFAVORABLE comme un SL, jamais favorable comme
-                    # un TP ou le momentum joue pour nous.
-                    contre = hit_sl or hit_temps
-                    if self.position == 1:   # LONG
-                        exit_price += (-slip_amount if contre else slip_amount)
-                    else:                     # SHORT
-                        exit_price += (slip_amount if contre else -slip_amount)
+                if exit_price is not None:
+                    # SL/sortie au marché: slippage adverse. TP: niveau cible,
+                    # sans amélioration favorable systématique inventée.
+                    slip_max = self.cfg.slippage_bps / 10_000.0
+                    if slip_max > 0 and not h_tp:
+                        slip_amount = exit_price * np.random.uniform(0.0, slip_max)
+                        # Une sortie au marche (temps ecoule) traverse le
+                        # spread : elle est DEFAVORABLE comme un SL, jamais
+                        # favorable comme un TP ou le momentum joue pour nous.
+                        contre = h_sl or h_temps
+                        if sens == 1:   # LONG
+                            exit_price += (-slip_amount if contre else slip_amount)
+                        else:           # SHORT
+                            exit_price += (slip_amount if contre else -slip_amount)
 
-                realized_trade = self._close_position(exit_price, hit_sl, hit_tp, hit_temps)
+                    realized_trade += self._close_position(
+                        exit_price, h_sl, h_tp, h_temps, slot=j)
+                    hit_sl = hit_sl or h_sl
+                    hit_tp = hit_tp or h_tp
+                    hit_temps = hit_temps or h_temps
 
         # Les fenêtres sont des épisodes FINIS: toute position restante est
         # liquidée et comptée avant de calculer la dernière récompense.
@@ -2438,11 +2680,18 @@ class BTCTradingEnvDiscrete(gym.Env):
             done_reason = "max_drawdown"
         elif marked_equity < self.cfg.initial_capital * self.cfg.min_capital_frac:
             done_reason = "min_capital"
-        if done_reason is not None and self.position != 0:
-            exit_price = self._apply_micro(price, -self.position, is_entry=False)
-            slip = np.random.uniform(0.0, self.cfg.slippage_bps) / 10000.0 if self.cfg.slippage_bps > 0 else 0.0
-            exit_price *= 1.0 - self.position * slip
-            realized_trade += self._close_position(exit_price, terminal_reason=done_reason)
+        if done_reason is not None and self._p_sens.any():
+            restants = np.flatnonzero(self._p_sens != 0)
+            restants = restants[np.argsort(self._p_idx[restants], kind="stable")]
+            for j in restants:
+                j = int(j)
+                sens = int(self._p_sens[j])
+                exit_price = self._apply_micro(price, -sens, is_entry=False)
+                slip = (np.random.uniform(0.0, self.cfg.slippage_bps) / 10000.0
+                        if self.cfg.slippage_bps > 0 else 0.0)
+                exit_price *= 1.0 - sens * slip
+                realized_trade += self._close_position(
+                    exit_price, terminal_reason=done_reason, slot=j)
 
         # ==================================================================
         # REWARD SHAPING Ω — LONG + SHORT AVEC BONUS MOMENTUM CONFIRMÉ
@@ -2516,6 +2765,25 @@ class BTCTradingEnvDiscrete(gym.Env):
             reward = float(np.clip(reward, -3.5, 3.5))
 
         # ==================================================================
+        # LA RECOMPENSE SE REPARTIT ENTRE LES EMPLACEMENTS.
+        #
+        # POURQUOI. Une decision PPO couvre la vie d'une position : elle
+        # accumule les recompenses de l'ouverture a la fermeture. Avec
+        # plusieurs positions ouvertes, une recompense scalaire crediterait
+        # chaque decision de ce que les AUTRES ont produit — un trade gagnant
+        # paierait le trade perdant ouvert a cote, et l'acteur apprendrait une
+        # moyenne que personne ne joue.
+        #
+        # La part de chaque emplacement est son propre mouvement de marquage,
+        # plus son propre resultat realise (ajoute dans `_close_position`, en
+        # unites du risque DE CE TRADE). Une correction additive repartit
+        # ensuite le reste — plafonnements, penalite de drawdown, ecart entre
+        # rendement logarithmique et arithmetique — a parts egales entre les
+        # emplacements concernes.
+        #
+        # A K=1 c'est une identite : un seul emplacement, donc il recoit
+        # `reward` exactement, quel que soit le detail du calcul ci-dessus.
+        # ==================================================================
         # Finalisation
         # ==================================================================
         self.peak_capital = max(self.peak_capital, equity)
@@ -2526,12 +2794,63 @@ class BTCTradingEnvDiscrete(gym.Env):
         if dd > self.cfg.max_drawdown:
             reward -= 0.2
 
+        # CHAQUE POSITION CALCULE SA PROPRE RECOMPENSE. Elle n'est pas une
+        # part d'un total.
+        #
+        # La premiere version repartissait : chaque emplacement recevait son
+        # marquage, puis une correction additive egale ramenait la somme a la
+        # recompense globale. Le controle de signe l'a prise en defaut — un
+        # trade gagnant de +0.91 $ accumulait -0.118 de recompense, parce que
+        # la correction lui faisait porter les pertes des positions ouvertes a
+        # cote. Une decision aurait appris le resultat de ses voisines.
+        #
+        # Ici la formule est celle de la recompense globale, appliquee a la
+        # variation d'equity DE CET EMPLACEMENT seul. A K=1 l'emplacement
+        # unique porte toute la variation, donc sa part vaut `reward`
+        # EXACTEMENT, terme pour terme — c'est ce que `test_concurrence.py`
+        # verifie sur 613 trades.
+        #
+        # La somme sur les emplacements ne vaut alors plus exactement la
+        # recompense globale, et c'est voulu : celle-ci est une grandeur de
+        # PORTEFEUILLE, avec ses propres plafonnements. Les deux ne decrivent
+        # pas la meme chose et n'ont aucune raison de coincider a plusieurs.
+        _concernes = set(int(j) for j in np.flatnonzero(self._p_sens != 0))
+        _concernes.update(self._slots_fermes)
+        if self._slot_ouvert >= 0:
+            _concernes.add(int(self._slot_ouvert))
+        if _concernes:
+            _pen = 0.2 / len(_concernes) if dd > self.cfg.max_drawdown else 0.0
+            _clip = (hasattr(self.cfg, "current_epoch")
+                     and self.cfg.current_epoch >= 10)
+            for j in range(self._K):
+                if j not in _concernes:
+                    self._r_slots[j] = 0.0
+                    continue
+                d_j = (self._latent_slot(price, j) - self._latent_prec[j]
+                       + self._realise_slots[j])
+                lr = math.log(max(prev_equity_clamped + d_j, 1e-8)
+                              / prev_equity_clamped)
+                self._r_slots[j] += 10.0 * max(min(lr, 0.05), -0.05) - _pen
+                if _clip:
+                    self._r_slots[j] = float(
+                        np.clip(self._r_slots[j], -3.5, 3.5))
+        else:
+            self._r_slots[:] = 0.0
+
+
         self.idx += 1
         done = done_reason is not None
 
         obs = self._get_obs()
 
         return obs, float(reward), done, False, {
+            # La repartition par emplacement, pour que la boucle de collecte
+            # attribue a chaque decision ce que SA position a produit. A K=1
+            # ce tableau a un seul element, egal a `reward`.
+            "r_slots": self._r_slots.copy(),
+            "slots_fermes": list(self._slots_fermes),
+            "slot_ouvert": int(self._slot_ouvert),
+            "n_positions": self.n_positions,
             "capital": self.capital,
             "drawdown": self.max_dd,
             "done_reason": done_reason,
