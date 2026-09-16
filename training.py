@@ -149,7 +149,39 @@ CONF_THRESHOLD = 0.40  # Ancien seuil ABSOLU de production. Conservé pour les
 # que live / backtests / MQL5 appliquent exactement la même barre.
 SELECTIVITE_START = 0.50   # epoch 1 : on trade la moitié des occasions (feedback)
 SELECTIVITE_FIN = 0.05     # régime : les 5 % les plus favorables
-SELECTIVITE_RAMP_EPOCHS = 40
+# 40 -> 10, LE 2026-09-16 : la rampe passait tout le run dans la zone perdante.
+#
+# COURBE MESUREE sur la validation, 12 phases, seuils calibres sur le train.
+# E[R] des occasions retenues selon la selectivite :
+#
+#     select.   trades/ph      E[R]   err-type   en points de winrate
+#        5 %           5    +0.5591     0.4430        +18.6
+#       10 %           9    +0.2023     0.1508         +6.7
+#       15 %          15    +0.0226     0.1243         +0.8
+#       20 %          21    +0.0598     0.0929         +2.0
+#       30 %          50    -0.1221     0.0382         -4.1   <- t = -3.2
+#       50 %         117    -0.0992     0.0287         -3.3
+#      100 %         195    -0.0877     0.0167         -2.9
+#
+# L'avantage est CONCENTRE au sommet et meurt vers 15 %. Au-dela de 30 % il
+# est significativement NEGATIF : les occasions peu convaincantes ne sont pas
+# neutres, elles perdent.
+#
+# CE QUE LA RAMPE FAISAIT. Partant de 50 % et arrivant a 5 % en QUARANTE
+# epochs — la duree totale du run — la politique passait la quasi-totalite de
+# son apprentissage entre 50 et 15 %, c'est-a-dire dans la zone mesuree
+# perdante, et n'atteignait le regime utile qu'a la toute derniere epoch.
+#
+# PIRE : LA MOYENNE DES POIDS PORTE SUR LES DIX DERNIERES EPOCHS, donc sur la
+# plage 17 % -> 5 %, dont l'esperance mesuree tourne autour de zero. Le modele
+# DEPLOYE etait la moyenne de politiques entrainees dans un regime neutre,
+# jamais dans celui ou l'avantage se trouve.
+#
+# A 10 epochs, le regime utile est atteint a l'epoch 11 et les trente
+# suivantes — les dix moyennees comprises — s'y deroulent entierement. La
+# rampe garde sa raison d'etre, donner du retour au critic au demarrage, mais
+# cesse d'occuper le run.
+SELECTIVITE_RAMP_EPOCHS = 10
 
 
 def selective_threshold(samples, fraction: float) -> float:
@@ -411,6 +443,38 @@ class PPOConfig:
     # d'inutilite ; c'est simplement la seule preuve disponible, et dans ce
     # depot la charge revient au mecanisme.
     votant_tabm: bool = False
+
+    # ------------------------------------------------------------------
+    # TETE AUXILIAIRE SUPERVISEE, le 2026-09-16.
+    #
+    # LE CONSTAT QUI L'A FAIT NAITRE. Sur deux runs et deux geometries,
+    # l'apprentissage PPO DEGRADE la validation de facon significative —
+    # -1.95 pt a -2.1 sigma sur exec24, -3.47 a -2.2 sur exec31 — sans que le
+    # cote entrainement bouge (-1.5, -0.0, +0.4, +2.5, -0.0). Ce n'est donc pas
+    # du sur-ajustement : le gradient pousse la politique vers un endroit qui
+    # n'aide ni l'un ni l'autre.
+    #
+    # LE DIAGNOSTIC. On entraine la politique a AGIR, puis on s'en sert comme
+    # CLASSEUR : a l'evaluation on jette 95 % de ses decisions et on garde les
+    # 5 % ou sa probabilite est la plus haute. Rien dans l'objectif de PPO ne
+    # recompense un bon ORDRE de ces probabilites — seulement une bonne action
+    # en moyenne. Cela explique le plus vieux fait non explique du depot : une
+    # regression logistique atteint 0.6271 d'AUC, aucune politique entrainee
+    # n'a depasse 0.5707. Le modele supervise, lui, REGRESSE le rendement
+    # realise : il est entraine exactement a classer.
+    #
+    # LA CIBLE est le rendement NET en unites de risque d'un achat et d'une
+    # vente a cette barre, aux barrieres de l'environnement — les memes
+    # etiquettes que celles de TabM, calculees par evalue_tabm_test.
+    #
+    # LE COEFFICIENT. A 1.0 les deux pertes pesent du meme ordre : l'erreur
+    # quadratique sur une cible dans [-1, +2] vaut ~1, la perte d'acteur ~0.05.
+    # C'est donc la tete auxiliaire qui mene le tronc, ce qui est VOULU : c'est
+    # elle qui porte le signal dense, PPO ne voyant que ~2 000 decisions par
+    # epoch. Le mettre a 0.0 retire la tete et redonne exactement le run
+    # precedent — c'est le temoin de l'experience.
+    aux_coef: float = 1.0
+    # ------------------------------------------------------------------
     # ------------------------------------------------------------------
 
     # Largeur du reseau. 64/256 donnait 1.19 M de parametres pour 16 708
@@ -2757,6 +2821,7 @@ def run_training_on_split(
         # reconstruit plus a l'update : le veto de TabM depend de la barre, pas
         # de la position, donc un masque refabrique ne serait pas le meme.
         batch_masques = []
+        batch_barres = []
         batch_actions = []
         batch_oldlog = []
         batch_adv = []
@@ -2810,7 +2875,8 @@ def run_training_on_split(
             infos.append(i0)
 
         ep_buf = [
-            {"states": [], "masques": [], "actions": [], "logprobs": [],
+            {"states": [], "masques": [], "barres": [], "actions": [],
+             "logprobs": [],
              "rewards": [], "values": [], "dones": [], "positions": [],
              "dts": []}
             for _ in range(n_envs)
@@ -2864,6 +2930,7 @@ def run_training_on_split(
             buf["positions"].append(0)          # une décision est toujours flat
             buf["states"].append(p["state"])
             buf["masques"].append(p["masque"])
+            buf["barres"].append(p["barre"])
             buf["actions"].append(p["action"])
             buf["logprobs"].append(p["logprob"])
             buf["rewards"].append(p["R"])
@@ -2954,6 +3021,10 @@ def run_training_on_split(
                     pending[k] = {
                         "state": states[k],
                         "masque": masks_np[bi].copy(),
+                        # L'indice de barre : la tete auxiliaire a besoin de
+                        # l'etiquette de CETTE occasion, et elle se calcule sur
+                        # le dataframe, pas sur l'observation normalisee.
+                        "barre": envs[k].idx - 1,
                         "action": a,
                         "logprob": float(logp_np[bi, a]),
                         "value": float(vals_np[bi]),
@@ -3050,6 +3121,7 @@ def run_training_on_split(
 
             batch_states.extend(buf["states"])
             batch_masques.extend(buf["masques"])
+            batch_barres.extend(buf["barres"])
             batch_actions.extend(buf["actions"])
             batch_oldlog.extend(buf["logprobs"])
             batch_adv.extend(adv)
@@ -3105,6 +3177,7 @@ def run_training_on_split(
 
         batch_states = [batch_states[i] for i in _sel]
         batch_masques = [batch_masques[i] for i in _sel]
+        batch_barres = [batch_barres[i] for i in _sel]
         batch_actions = [batch_actions[i] for i in _sel]
         batch_oldlog = [batch_oldlog[i] for i in _sel]
         batch_adv = [batch_adv[i] for i in _sel]
@@ -3121,6 +3194,31 @@ def run_training_on_split(
         masques = (torch.tensor(np.stack(batch_masques, axis=0),
                                 dtype=torch.bool, device=device)
                    if batch_masques else None)
+
+        # ETIQUETTES DE LA TETE AUXILIAIRE : le rendement net d'un achat et
+        # d'une vente a chaque barre decidee. Calculees ICI et pas une fois
+        # pour toute la fenetre — ~2 000 indices par epoch coutent une seconde,
+        # les 521 692 de la fenetre en couteraient des centaines.
+        #
+        # Les occasions dont la course ne se resout pas dans le plafond
+        # rendent NaN ; elles sont masquees plutot que remplies par zero, un
+        # zero etant une prediction et non une absence.
+        cibles_aux = None
+        if cfg.aux_coef > 0.0 and batch_barres:
+            try:
+                import evalue_tabm_test as _E
+                idx = np.asarray(batch_barres, dtype=np.int64)
+                idx = np.clip(idx, 0, train_data.length - 1)
+                ra, rv = _E.cibles_brutes(train_data.df, idx)
+                y = np.stack([ra, rv], axis=1).astype(np.float32)
+                ok = np.isfinite(y).all(axis=1)
+                cibles_aux = (
+                    torch.tensor(np.nan_to_num(y), device=device),
+                    torch.tensor(ok, device=device))
+            except Exception as e:
+                print(f"  ! tete auxiliaire sans etiquettes ({type(e).__name__}"
+                      f": {e}) — cette epoch n'entraine que PPO")
+                cibles_aux = None
 
         # --------- banque de reference (intersample attention) ---------
         # Constituee UNE fois, a partir d'observations reelles de la fenetre de
@@ -3167,6 +3265,7 @@ def run_training_on_split(
 
         epoch_actor_loss = []
         epoch_critic_loss = []
+        epoch_aux_loss = []
         epoch_entropy = []
         epoch_entropy_flat = []
         epoch_grad_norm = []
@@ -3315,6 +3414,27 @@ def run_training_on_split(
                     else:
                         loss = actor_loss + cfg.value_coef * critic_loss - entropy_bonus
 
+                    # TETE AUXILIAIRE : regression du rendement net realise.
+                    #
+                    # ELLE S'ENTRAINE DES LE WARMUP, contrairement a l'actor.
+                    # Le warmup existe pour que le critic se stabilise avant
+                    # que la politique ne bouge ; la tete auxiliaire, elle, ne
+                    # depend d'aucune politique — sa cible est ce que le marche
+                    # a FAIT, pas ce que l'agent aurait gagne. Rien ne justifie
+                    # de la retarder, et cinq epochs de signal dense gratuit
+                    # valent d'etre prises.
+                    #
+                    # Les occasions non resolues sont MASQUEES et non mises a
+                    # zero : un zero serait une prediction, pas une absence.
+                    aux_loss = torch.zeros((), device=device)
+                    if cibles_aux is not None:
+                        y_b, ok_b = cibles_aux[0][ids], cibles_aux[1][ids]
+                        if ok_b.any():
+                            pred = policy.rendement(sb)
+                            aux_loss = ((pred - y_b).pow(2).mean(dim=1)
+                                        * ok_b).sum() / ok_b.sum()
+                            loss = loss + cfg.aux_coef * aux_loss
+
                 # GARDE-FOU 5 : check la loss finale
                 if not torch.isfinite(loss):
                     print(f"  {_col('⚠ Loss non-finite, skip batch', _C.RED)}")
@@ -3379,6 +3499,7 @@ def run_training_on_split(
 
                 epoch_actor_loss.append(actor_loss.item())
                 epoch_critic_loss.append(critic_loss.item())
+                epoch_aux_loss.append(aux_loss.item())
                 epoch_entropy.append(entropy.item())
                 epoch_entropy_flat.append(entropy_flat.item())
                 epoch_kl.append(approx_kl)
@@ -3841,6 +3962,7 @@ def run_training_on_split(
             f"{_col(f'Sortino30 {s30:>+6.3f}', s30_col)}  "
             f"AvgW {_money(avg_win_train, width=8)}  AvgL {_money(avg_loss_train, width=8)}  "
             f"ActorL {np.mean(epoch_actor_loss):>+7.4f}  "
+            f"AuxL {np.mean(epoch_aux_loss) if epoch_aux_loss else float(chr(110)+chr(97)+chr(110)):>7.4f}  "
             f"CriticL {np.mean(epoch_critic_loss):>7.4f}  "
             f"H {np.mean(epoch_entropy):>5.3f}  "
             f"Hflat {np.mean(epoch_entropy_flat):>5.3f}/1.099  "
@@ -4333,10 +4455,10 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec30"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec32"
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec30: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec32: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #

@@ -21,7 +21,7 @@ CE QU'IL NE MESURE PAS. La capacite des deux reseaux PPO : elle ne se lit pas
 sur une sonde supervisee, il faut un run. Le fichier rapporte seulement le
 budget, pour que le choix soit fait les yeux ouverts.
 
-    python mesure_votants.py [phases|part|tabm|budget]
+    python mesure_votants.py [selectivite|phases|part|tabm|budget]
 """
 
 from __future__ import annotations
@@ -75,6 +75,94 @@ def _scores(df, tr, va, stats, cols, E, n_membres=8, d_cache=256):
     sa_tr = np.concatenate([m_a.predict(X[i_tr]), m_v.predict(X[i_tr])])
     return (m_a.predict(X[i_va]), m_v.predict(X[i_va]), ya, yv, sa_tr,
             len(i_va))
+
+
+SELECTIVITES = (0.02, 0.05, 0.10, 0.15, 0.20, 0.30, 0.50, 1.00)
+
+
+def mesure_selectivite(df, tr, va, stats, cols, E, n_phases: int = 12) -> None:
+    """L'avantage est-il CONCENTRE au sommet du classement, ou ETALE ?
+
+    CE QUE CETTE COURBE DECIDE. On ne retient que les 5 % de decisions les plus
+    confiantes. Le bruit de mesure vient entierement du nombre de trades :
+    a ~250 par epoch et par fold, l'erreur-type du winrate vaut 3.05 points,
+    et il en faut 1.4 a 2.7 pour voir l'avantage espere. Il manque donc un
+    facteur trois a six en TRADES.
+
+    Monter la selectivite de 5 a 20 % les multiplie par quatre — gratuitement,
+    SI l'avantage survit a la dilution. Deux formes possibles :
+
+        concentre   E[R] s'effondre des qu'on descend le classement : la
+                    selectivite basse est justifiee, et il faut trouver les
+                    trades ailleurs.
+        etale       E[R] tient jusqu'a 20 ou 30 % : quatre fois plus de trades
+                    pour le meme avantage, et l'experience devient decisive.
+
+    LE CRITERE EST LA DETECTABILITE, E[R] x racine(N), pas E[R] seul. Un
+    filtre qui double l'esperance en divisant les trades par dix fait reculer
+    ce qu'on peut prouver.
+
+    Chaque direction a son propre seuil, comme dans l'environnement qui calibre
+    `valB` et `valS` separement. Et tout est moyenne sur les phases : une
+    grille d'entrees unique ne vaut rien, meme correctement non chevauchante.
+    """
+    import banc_rendement_net as B
+    fab = B.modele_tabm()
+    X = df[cols].to_numpy(np.float32)
+    X = np.clip(np.nan_to_num((X - stats["mean"]) / (stats["std"] + 1e-8)),
+                -5.0, 5.0)
+    i_tr = np.arange(0, tr - E.HOLD - 2, E.PAS_TRAIN)
+    ra, rv = E.cibles_brutes(df, i_tr)
+    bon = np.isfinite(ra) & np.isfinite(rv)
+    i_tr, ra, rv = i_tr[bon], ra[bon], rv[bon]
+    m_a = fab().fit(X[i_tr], ra)
+    m_v = fab().fit(X[i_tr], rv)
+    # Les seuils viennent de la fenetre D'APPRENTISSAGE, jamais de celle qu'on
+    # mesure : les calibrer sur la validation reviendrait a choisir le filtre
+    # d'apres ce qu'il filtre.
+    sa_tr, sv_tr = m_a.predict(X[i_tr]), m_v.predict(X[i_tr])
+
+    pas_phase = max(1, E.HOLD // n_phases)
+    res = {q: {"er": [], "n": []} for q in SELECTIVITES}
+    for ph in range(n_phases):
+        i = np.arange(tr + ph * pas_phase, tr + va - E.HOLD - 2, E.HOLD)
+        if len(i) < 20:
+            continue
+        ya, yv = E.cibles_brutes(df, i)
+        bon = np.isfinite(ya) & np.isfinite(yv)
+        i, ya, yv = i[bon], ya[bon], yv[bon]
+        if len(i) < 20:
+            continue
+        sa, sv = m_a.predict(X[i]), m_v.predict(X[i])
+        for q in SELECTIVITES:
+            ta = float(np.quantile(sa_tr, 1.0 - q))
+            tv = float(np.quantile(sv_tr, 1.0 - q))
+            pris = np.concatenate([ya[sa >= ta], yv[sv >= tv]])
+            if len(pris) < 5:
+                continue
+            res[q]["er"].append(float(pris.mean()))
+            res[q]["n"].append(len(pris))
+
+    # Un point de winrate vaut (R:R + 1) / 100 en R : on convertit pour parler
+    # la meme langue que la veille et le point mort.
+    par_point = (E.RR + 1) / 100.0
+    print(f"{n_phases} phases | 1 point de winrate = {par_point:.4f} R\n")
+    print(f"{'select.':>8} {'trades/ph':>10} {'E[R]':>9} {'err-type':>9} "
+          f"{'en points':>10} {'detectabilite':>14}")
+    print("-" * 66)
+    for q in SELECTIVITES:
+        er = np.array(res[q]["er"])
+        if len(er) < 3:
+            print(f"{q:>8.0%} {'trop peu de phases':>10}")
+            continue
+        n = float(np.mean(res[q]["n"]))
+        m = er.mean()
+        err = er.std(ddof=1) / np.sqrt(len(er))
+        print(f"{q:>8.0%} {n:>10.0f} {m:>+9.4f} {err:>9.4f} "
+              f"{m/par_point:>+9.2f}p {m*np.sqrt(n):>+14.3f}")
+    print()
+    print("Une selectivite utile releve E[R] SANS effondrer le compte.")
+    print("La derniere colonne tranche : c'est ce qu'on pourra prouver.")
 
 
 def mesure_part_phases(df, tr, va, stats, cols, E, n_phases: int = 12) -> None:
@@ -244,7 +332,9 @@ def main() -> int:
     df, tr, va, stats, cols, E = _fenetres()
     print(f"train {tr:,} barres | validation {va:,} | plafond {E.HOLD} "
           f"| SL {E.SL_MULT}xATR R:R {E.RR}\n")
-    if quoi == "phases":
+    if quoi == "selectivite":
+        mesure_selectivite(df, tr, va, stats, cols, E)
+    elif quoi == "phases":
         mesure_part_phases(df, tr, va, stats, cols, E)
     elif quoi == "tabm":
         mesure_tabm(df, tr, va, stats, cols, E)

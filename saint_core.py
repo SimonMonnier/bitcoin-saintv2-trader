@@ -1374,6 +1374,41 @@ class SAINTPolicySingleHead(nn.Module):
 
         self.actor = nn.Linear(mlp_dim, n_actions)
         self.critic = nn.Linear(mlp_dim, 1)
+        # ------------------------------------------------------------------
+        # TETE AUXILIAIRE : le rendement net d'un ACHAT et d'une VENTE.
+        #
+        # POURQUOI ELLE EXISTE, mesure du 2026-09-16. Sur deux runs et deux
+        # geometries, l'apprentissage PPO DEGRADE la validation de facon
+        # significative — -1.95 pt a -2.1 sigma sur exec24, -3.47 a -2.2 sur
+        # exec31 — sans que le cote entrainement bouge. Ce n'est donc pas du
+        # sur-ajustement : le gradient pousse la politique vers un endroit qui
+        # n'aide ni l'un ni l'autre.
+        #
+        # Le diagnostic : ON ENTRAINE LA POLITIQUE A AGIR, PUIS ON S'EN SERT
+        # COMME CLASSEUR. PPO maximise le rendement des actions prises ; a
+        # l'evaluation on jette 95 % des decisions et on garde les 5 % ou sa
+        # probabilite est la plus haute. Rien dans l'objectif de PPO ne
+        # recompense un bon ORDRE de ces probabilites — seulement une bonne
+        # action en moyenne. Une politique peut etre optimale au sens de PPO
+        # avec une confiance dont l'ordre ne veut rien dire.
+        #
+        # Cela explique le plus vieux fait non explique du depot : une
+        # regression logistique atteint 0.6271 d'AUC, aucune politique
+        # entrainee n'a depasse 0.5707. Le modele supervise REGRESSE le
+        # rendement realise, donc il est entraine exactement a classer.
+        #
+        # CE QUE CETTE TETE CHANGE. Elle regresse le rendement net en unites de
+        # risque, un scalaire par direction. Le gradient devient DENSE — il
+        # porte sur toutes les decisions, pas seulement celles qui ont ete
+        # tradees — et a FAIBLE VARIANCE, une regression sur cible continue au
+        # lieu d'un avantage multiplie par une log-probabilite. Et il optimise
+        # exactement la quantite qu'on lit au moment de decider.
+        #
+        # PPO N'EST PAS RETIRE. Les deux pertes partagent le tronc ; si la tete
+        # auxiliaire porte tout, la comparaison entre ses scores et ceux de la
+        # politique le dira.
+        self.tete_aux = nn.Linear(mlp_dim, 2)
+
         self._init_poids()
 
     def _init_poids(self):
@@ -1456,6 +1491,13 @@ class SAINTPolicySingleHead(nn.Module):
         logits = self.actor(h)
         value = self.critic(h).squeeze(-1)
         return logits, value
+
+    def rendement(self, x: torch.Tensor) -> torch.Tensor:
+        """Rendement net attendu (achat, vente), en unites de risque. (B, 2)."""
+        h = self.encode(x)
+        if self.memoire is not None:
+            h = self.memoire(h)
+        return self.tete_aux(self.mlp(self.norm(h)))
 
     def definit_banque(self, obs: torch.Tensor):
         """Fixe les references. UNIQUEMENT des observations de la fenetre train."""
@@ -1552,6 +1594,10 @@ class PatchTSTPolicy(nn.Module):
         )
         self.actor = nn.Linear(mlp_dim, n_actions)
         self.critic = nn.Linear(mlp_dim, 1)
+        # Meme tete auxiliaire que SAINT : voir le commentaire la-bas. Les
+        # deux membres doivent predire la MEME quantite pour que leur
+        # moyenne ait un sens.
+        self.tete_aux = nn.Linear(mlp_dim, 2)
 
         # MEME INTERFACE QUE SAINT. L'entrainement interroge `policy.memoire`
         # et appelle `rafraichit_banque()` a chaque epoch : sans ces deux
@@ -1611,6 +1657,10 @@ class PatchTSTPolicy(nn.Module):
     def forward(self, x: torch.Tensor):
         h = self.mlp(self.encode(x))
         return self.actor(h), self.critic(h).squeeze(-1)
+
+    def rendement(self, x: torch.Tensor) -> torch.Tensor:
+        """Rendement net attendu (achat, vente), en unites de risque. (B, 2)."""
+        return self.tete_aux(self.mlp(self.encode(x)))
 
 
 N_REF_DEFAUT = 256
@@ -1688,6 +1738,14 @@ class PolitiqueEnsemble(nn.Module):
         for m in self.membres:
             if hasattr(m, "rafraichit_banque"):
                 m.rafraichit_banque(*a, **kw)
+
+    def rendement(self, x):
+        """La moyenne des rendements predits par les membres. (B, 2).
+
+        Meme logique que pour la valeur : chaque membre estime la meme
+        quantite, leur moyenne l'estime en moins bruite.
+        """
+        return torch.stack([m.rendement(x) for m in self.membres], 0).mean(0)
 
     def forward(self, x):
         probs, valeurs = [], []
