@@ -343,6 +343,20 @@ class PPOConfig:
     # Meme lookback pour tous — la mesure de profondeur utile n'a rien trouve
     # au-dela de 4 barres, et un lookback different ferait varier deux choses a
     # la fois entre les votants.
+    # LA GEOMETRIE DE PATCHTST N'EST PAS ARBITRAIRE, elle est CONTRAINTE.
+    # `mesure_lookback_utile` n'a rien trouve au-dela de 4 barres de passe, et
+    # a lookback 4 il ne reste presque aucun choix :
+    #
+    #     patch 2 pas 1 -> 3 patchs   <- retenu, le maximum d'information
+    #     patch 2 pas 2 -> 2 patchs
+    #     patch 3 pas 1 -> 2 patchs
+    #     patch 4 quelconque -> 1 patch, degenere
+    #
+    # Il faut l'assumer : a cette profondeur PatchTST n'est plus un decoupage
+    # en segments, c'est un MLP PAR COLONNE. Ce qu'on lui demande dans le vote
+    # reste intact — etre le pole qui NE CROISE JAMAIS les colonnes, face a un
+    # SAINT qui ne fait que les croiser — mais le nom promet davantage que ce
+    # que la profondeur permet.
     membres: tuple = (("saint", 2, 1), ("patchtst", 2, 1))
     # ------------------------------------------------------------------
     # LE TROISIEME VOTANT : TabM, supervise, qui oppose son veto.
@@ -360,7 +374,43 @@ class PPOConfig:
     # lui deferer, et en production le partenaire deviendrait ordinaire.
     #
     # Le mettre a False retire le veto et laisse les deux reseaux voter seuls.
-    votant_tabm: bool = True
+    # MESURE DU 2026-09-16, ET ELLE DIT NON. Balayage du taux de veto sur la
+    # validation, 12 phases, comparaison APPARIEE de chaque phase a elle-meme
+    # sans veto :
+    #
+    #     part   trades/ph   ecart au temoin   err-type      t
+    #     0.20        24          +0.2321        0.1570    1.48   (7 phases)
+    #     0.30        50          -0.0317        0.0343   -0.92
+    #     0.40        90          -0.0029        0.0352   -0.08
+    #     0.50       117          -0.0097        0.0281   -0.35   <- en place
+    #     0.65       148          -0.0150        0.0178   -0.84
+    #     0.80       169          -0.0069        0.0126   -0.55
+    #
+    # Aucun taux n'ajoute quoi que ce soit : |t| < 1 partout ou les douze
+    # phases sont exploitables. Le seul positif, 0.20, ne tient que sur sept
+    # phases et 24 trades chacune — et il est le meilleur d'un balayage de
+    # huit valeurs, donc son t de 1.48 ne vaut rien.
+    #
+    # CE QUE LA CORRECTION DE PHASE A CHANGE. Sur une seule grille d'entrees,
+    # le veto a 0.50 affichait -0.13 d'ecart et les directions REFUSEES
+    # rendaient +0.19 : un filtre qui semblait marcher a l'envers. Moyenne sur
+    # douze phases, l'ecart tombe a -0.0097 +/- 0.0281. L'inversion etait un
+    # artefact de phase — exactement le piege mesure le 15 septembre, ou E[R]
+    # allait de +0.158 a -0.071 selon la grille, pour les memes donnees.
+    #
+    # POURQUOI ON LE COUPE PLUTOT QUE DE LE GARDER "AU CAS OU". Six mecanismes
+    # ont deja ete ecartes ici sur ce critere — attention entre groupes,
+    # meta-etiquetage, taille par conviction. Garder celui-ci parce qu'il est
+    # seduisant reviendrait a laisser une influence non mesuree decider a la
+    # place de la mesure, et a rendre illisible le run qui teste le vote a deux.
+    #
+    # CE QUE LA MESURE NE DIT PAS : elle juge le veto comme filtre AUTONOME sur
+    # des barrieres. Son role dans l'ensemble serait d'ecarter les directions
+    # que les reseaux PPO prendraient mal — une interaction que cette sonde ne
+    # voit pas. L'absence de valeur autonome n'est donc pas une preuve
+    # d'inutilite ; c'est simplement la seule preuve disponible, et dans ce
+    # depot la charge revient au mecanisme.
+    votant_tabm: bool = False
     # ------------------------------------------------------------------
 
     # Largeur du reseau. 64/256 donnait 1.19 M de parametres pour 16 708
@@ -405,7 +455,10 @@ class PPOConfig:
     # features moyennees, avec un transformer decoratif. C'est la description
     # de TabM, qui rend +3.8 points en quelques minutes.
     d_model_patch: int = 4
-    mlp_dim: int = 32
+    # 32 -> 8, meme raison : voir saint_mlp_dim. PatchTST porte le tiers du
+    # budget, il doit suivre la meme reduction sous peine de devenir le membre
+    # dominant par accident.
+    mlp_dim: int = 8
 
     # PPO Training
     # BUDGET FIXE, PAS D'ARRET PRECOCE. Mesure du 2026-09-15 : le checkpoint
@@ -741,7 +794,29 @@ class PPOConfig:
     # poste du reseau (29 %) ; 4 le ramene a un niveau comparable aux blocs.
     saint_n_freq: int = 4
     saint_heads: int = 1
-    saint_mlp_dim: int = 16
+    # 16 -> 4, LE 2026-09-16 : la capacite avait double sans mesure.
+    #
+    # La tete pese 92 a 98 % du reseau et lit `n_features x d_model`, donc
+    # passer de 103 a 260 colonnes l'a multipliee par 2.5 — et ajouter un
+    # second reseau encore par 1.6. Budget mesure, pour 4 516 occasions
+    # independantes :
+    #
+    #     mlp SAINT / patch    SAINT    PatchTST    total   par occasion
+    #          16 / 32        62 548     35 776    98 324       21.8
+    #           8 / 16        45 412     18 016    63 428       14.0
+    #           4 /  8        36 892      9 328    46 220       10.2   <-
+    #
+    # Le seul ancrage empirique est le regime H1 qui avait rendu +2.2 en test :
+    # 26 752 parametres pour 2 314 occasions, soit 11.6. A 21.8 on etait a
+    # presque le double, sans qu'aucune mesure ne justifie que ce soit payable
+    # — alors que la seule chose qui ait jamais deplace un resultat cote modele
+    # dans ce depot est la REDUCTION de taille (493 796 -> 15 680 avait fait
+    # passer PPO de -1.4 a +2.2).
+    #
+    # 10.2 encadre 11.6 par en dessous, du cote qui a marche. C'est un ancrage
+    # herite, pas une mesure : la capacite ne se tranche pas sur une sonde
+    # supervisee, il faut un run.
+    saint_mlp_dim: int = 4
     # LECTURE PAR COLONNES plutot que par jeton CLS. exec19 a montre le
     # goulot : en lecture CLS, la tete recevait SEIZE nombres pour resumer 107
     # colonnes, contre 428 chez PatchTST. L'etendue des convictions plafonnait
@@ -4258,10 +4333,10 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec29"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec30"
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec29: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec30: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
