@@ -1312,51 +1312,56 @@ class PPOConfig:
     # d'occasions independantes, 4 516 contre 2 314, a friction et horizon
     # inchanges. Il ne reste aucun axe sur lequel le H1 lui soit superieur.
     # ------------------------------------------------------------------
-    # 8 -> 12xATR, mesure du 2026-09-16 sur la SORTIE AU TRAILING.
+    # 12 -> 6xATR. LA QUESTION A CHANGE AVEC LA CONCURRENCE, et la reponse
+    # avec elle.
     #
-    # L'optimum de 88 points de base derive ce matin valait pour des barrieres
-    # FIXES, ou la duree croit comme le carre du risque. Avec un stop suiveur
-    # la position ferme bien avant que le stop initial soit atteint, et la
-    # relation change. Le stop n'avait jamais ete reoptimise pour cette sortie.
+    # Le balayage du matin comparait le rendement PAR TRADE, une position a
+    # la fois. Le nombre de trades y etait plafonne par l'occupation — a 5 %
+    # de selectivite une position etait ouverte 91 % du temps — donc
+    # raccourcir la duree n'achetait rien et seule l'esperance comptait. 12x
+    # gagnait, et c'etait juste sous cette contrainte.
     #
-    # CE QUE DIT LA MESURE. 366 dates d'entree non chevauchantes (espacees de
-    # sept jours) ou toutes les largeurs se resolvent, part SYMETRIQUE
-    # (achat + vente) / 2 pour deduire la derive du sous-jacent, comparaison
-    # APPARIEE aux memes dates. Le test n'est pas ouvert : on s'arrete a 85 %
-    # de l'historique.
+    # Les positions simultanees font sauter ce plafond. Ce qui compte n'est
+    # plus le rendement par trade mais le rendement PAR AN :
     #
-    #     stop   E[R] sym   sigma    ecart vs 8x   sigma apparie   ann +
-    #       6x    -0.0096    -0.2        -0.0581            -1.3     4/9
-    #       8x    +0.0485    +1.0      (reference)
-    #      10x    +0.1086    +2.2        +0.0602            +1.4     5/9
-    #      12x    +0.1129    +2.4        +0.0644            +1.3     6/9
-    #      14x    +0.1226    +2.4        +0.0742            +1.3     6/9
-    #      16x    +0.1381    +2.6        +0.0896            +1.4     6/9
-    #      20x    +0.1030    +2.0        +0.0545            +0.9     5/9
+    #   stop  friction  duree  trades/an  E[R] sym      +/-   R/an  lot min
+    #     3x    0.078R   2.8h        874   +0.0476  0.0160  +41.6    0.64%
+    #     4x    0.059R   4.7h        418   +0.0658  0.0237  +27.5    0.85%
+    #     6x    0.039R   9.8h        144   +0.0865  0.0417  +12.5    1.28%
+    #     8x    0.029R  16.4h         75   +0.1447  0.0582  +10.8    1.70%
+    #    12x    0.020R  34.1h         40   +0.2106  0.0748   +8.4    2.55%
+    #    16x    0.015R  55.2h         30   +0.2660  0.0843   +8.1    3.40%
     #
-    # IL N'Y A PAS DE PIC. De 10x a 16x les largeurs sont indiscernables : les
-    # ecarts valent 0.02 a 0.03 R sous une erreur de 0.05. 12x est retenu
-    # parce qu'il est au MILIEU de ce plateau, pas parce qu'il gagne — choisir
-    # le maximum d'une courbe plate, c'est selectionner du bruit.
+    # Le rendement par trade monte toujours avec la largeur — la mesure du
+    # matin n'etait pas fausse. Mais le rendement annuel fait l'inverse : on
+    # perd un tiers par trade et on en gagne vingt fois plus.
     #
-    # CE QUI EST ETABLI, en revanche : 6x est mauvais (-1.3 sigma en apparie,
-    # negatif dans l'absolu), le plateau est au-dessus de 8x de facon
-    # cohérente — six mesures qui pointent toutes dans le meme sens — et
-    # surtout l'avantage symetrique y est POSITIF A 2.4 SIGMA. C'est le
-    # premier avantage de base du depot qui tienne a cette rigueur.
+    # POURQUOI PAS 3x, QUI RAPPORTE CINQ FOIS PLUS. Parce que c'est un pari
+    # sur le spread. A 3x la friction pese 0.078 R par trade, quatre fois
+    # plus qu'a 12x, et l'avantage annuel s'effondre avec elle :
     #
-    # La raison est la friction, qui est un montant fixe en dollars : a 236
-    # points de base de risque elle pese 0.021 R par trade contre 0.031 a 8x.
+    #   stop      x1    x1.5      x2      x3   (multiplicateur de friction)
+    #     3x   +41.6    +8.5   -24.6   -90.9
+    #     4x   +27.5   +15.6    +3.7   -20.0
+    #     6x   +12.5    +9.7    +7.0    +1.5
+    #     8x   +10.8    +9.8    +8.7    +6.6
     #
-    # TROIS CHIFFRES ANNONCES D'ABORD ETAIENT FAUX — "+0.0494 +/- 0.0165, 3.0
-    # sigma, 7/9 annees" — pour trois raisons cumulees, toutes consignees dans
-    # ERREURS_ET_DECOUVERTES.md : le sweep voyait la fenetre de test ; sa
-    # barre d'erreur etait l'ecart-type ENTRE PHASES decalees de 67 barres,
-    # qui mesure la sensibilite au decalage et sous-estime l'incertitude d'un
-    # facteur quatre ; et les entrees a sens ALTERNE donnent n'importe quoi
-    # sur une fenetre directionnelle (-0.0670 en alterne contre +0.0283 en
-    # symetrique, sur exactement les memes trades).
-    atr_sl_mult: float = 12.0
+    # Or la friction supposee est probablement optimiste : 2.24 points de
+    # base de spread releves sur MT5 contre 1.85 supposes, et les 3 points de
+    # slippage sont une hypothese, pas une mesure. 6x est positif sous TOUTES
+    # les hypotheses testees, jusqu'a trois fois la friction supposee.
+    #
+    # CE QU'ON GAGNE EN PLUS. La duree passe de 34 h a 9.8 h, donc plus aucun
+    # trade n'est ampute par l'episode de 20 jours. Et le lot minimum du
+    # courtier n'impose plus que 1.28 % de risque au lieu de 2.55 % — a
+    # 1 000 EUR de capital, c'est la difference entre jouable et pas.
+    #
+    # RESERVE. Ces lignes ne sont PAS APPARIEES : chaque largeur utilise son
+    # propre echantillon non chevauchant. La comparaison appariee du matin
+    # donnait l'inverse par trade, ce qui est coherent — par trade le large
+    # gagne, par an le court gagne — mais les deux ne se deduisent pas l'une
+    # de l'autre.
+    atr_sl_mult: float = 6.0
     # R:R 1:2.0. Le 1.4 precedent venait de la grille de mesure_features.py,
     # qui echantillonne une entree toutes les 10 barres alors que les
     # barrieres mettent jusqu'a 240 barres a se resoudre : les fenetres de
@@ -1373,11 +1378,11 @@ class PPOConfig:
     # atteignaient 33.1 % — il leur manquait 11 points, il leur en manque 3.
     # R:R maintenu a 2 : l'objectif vaut le double du stop, donc 8xATR.
     # R:R 2.0 inchange : c'est le stop qu'on fait varier, pas le rapport.
-    atr_tp_mult: float = 72.0   # inutilise tant que use_tp vaut False
+    atr_tp_mult: float = 36.0   # inutilise tant que use_tp vaut False
     # L'OBJECTIF QUE LE MODELE APPREND A ATTEINDRE, en multiples d'ATR.
     # 16 = 2 R : la largeur sur laquelle la courbe de selectivite etait
     # franchement monotone, donc celle ou le classement a du sens.
-    aux_tp_mult: float = 24.0   # 2 R, la largeur ou le classement a du sens
+    aux_tp_mult: float = 12.0   # 2 R, la largeur ou le classement a du sens
 
     # ------------------------------------------------------------------
     # LA REGLE DE SORTIE, mesuree le 2026-09-16 et changee pour cette raison.
@@ -1566,8 +1571,8 @@ class PPOConfig:
     # sur la premiere moitie de l'historique, -0.0262 sur la seconde. Un seuil
     # hors d'atteinte le neutralise sans toucher au code.
     atr_be_mult: float    = 1e9
-    atr_trail_mult: float = 18.0   # 1.5 R (le stop vaut 12 ATR)   # gain en ATR pour déclencher le trailing
-    atr_trail_dist: float = 18.0   # 1.5 R   # distance du trailing (en ATR)
+    atr_trail_mult: float = 9.0    # 1.5 R (le stop vaut 6 ATR)   # gain en ATR pour déclencher le trailing
+    atr_trail_dist: float = 9.0    # 1.5 R   # distance du trailing (en ATR)
 
     # Warmup critique : N epochs où seul le critique est mis à jour
     critic_warmup_epochs: int = 5
@@ -5517,7 +5522,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec46"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec47"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -5541,7 +5546,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec46: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec47: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #

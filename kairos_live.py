@@ -198,8 +198,8 @@ class LiveConfig:
     # mesure, pour deux fois plus d'occasions independantes. Un stop different
     # ici executerait une autre strategie que celle qui a ete mesuree, sans
     # qu'aucune erreur ne soit levee.
-    atr_sl_mult: float = 12.0    # SL = 12 x ATR    — training.PPOConfig.atr_sl_mult
-    atr_tp_mult: float = 72.0    # inutilise tant que use_tp vaut False
+    atr_sl_mult: float = 6.0     # SL = 6 x ATR     — training.PPOConfig.atr_sl_mult
+    atr_tp_mult: float = 36.0    # inutilise tant que use_tp vaut False
     use_tp: bool = False         # training.PPOConfig.use_tp
 
     spread_bps: float = 0.0
@@ -233,8 +233,8 @@ class LiveConfig:
     # le donne perdant des qu'un trailing large est actif, et surtout instable
     # — +0.0280 sur la premiere moitie de l'historique, -0.0262 sur la seconde.
     breakeven_atr_mult: float = 1e9   # training.PPOConfig.atr_be_mult
-    trailing_start_atr_mult: float = 18.0   # 1.5 R — atr_trail_mult
-    trailing_dist_atr_mult: float = 18.0    # 1.5 R — atr_trail_dist
+    trailing_start_atr_mult: float = 9.0    # 1.5 R — atr_trail_mult
+    trailing_dist_atr_mult: float = 9.0     # 1.5 R — atr_trail_dist
 
     # ======= SORTIE PAR LE TEMPS =======
     # Le live n'a AUCUN chemin de fermeture au marche : une position n'en sort
