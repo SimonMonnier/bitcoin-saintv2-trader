@@ -545,7 +545,21 @@ class PPOConfig:
     # s'arreter d'apres elle. On fixe donc le budget a l'avance. 40 epochs est
     # choisi parce que les trois folds d'exec12 avaient plateau entre 30 et 35
     # — c'est un budget lu sur la DYNAMIQUE d'entrainement, jamais sur le test.
-    epochs: int = 40
+    # 40 -> 90. Deux raisons, et aucune n'est un reglage.
+    #
+    # Un episode peut desormais s'arreter sur RUINE — solde insuffisant pour
+    # le lot minimum, ou appel de marge. Les episodes courts ne couvrent plus
+    # la fenetre, donc une epoch voit moins de marche qu'avant a budget egal.
+    #
+    # Et la capacite depend de l'equity, donc la politique doit apprendre une
+    # boucle : decider, gagner ou perdre, voir sa capacite changer, decider a
+    # nouveau. Une boucle s'apprend sur des passages repetes, pas sur
+    # quarante.
+    #
+    # La moyenne des poids porte sur les dernieres epochs (`n_moyenne_poids`),
+    # donc allonger le run ne selectionne rien sur la validation : il n'y a
+    # pas de choix a faire, seulement plus de passages.
+    epochs: int = 90
     # Nombre d'epochs finales dont les poids sont moyennes. La moyenne remplace
     # le "meilleur checkpoint" : elle ne depend d'aucun tirage particulier.
     n_moyenne_poids: int = 10
@@ -676,11 +690,15 @@ class PPOConfig:
     # 32 est simplement au-dessus de ce qu'il autorise a l'equity de depart
     # (9 positions a 1 000 EUR). Le cout suit l'occupation reelle, pas le
     # plafond : les operations sont vectorielles sur un tableau de 32.
-    # 32 -> 64. LE PLAFOND NE DOIT PAS MORDRE, sinon il masque le cercle :
-    # a 32, la capacite saturait des 2 000 $ d'equity et gagner davantage
-    # n'ouvrait plus rien. A 64, le budget de risque decide jusqu'a environ
-    # 2 600 $ aux prix de cette fenetre. Le cout suit l'occupation reelle et
-    # non le plafond, les operations etant vectorielles sur le tableau.
+    # IL N'Y A PLUS DE PLAFOND. `positions_max` n'est qu'une ALLOCATION
+    # INITIALE : les tableaux d'emplacements doublent de taille quand ils se
+    # remplissent, donc le nombre de positions n'est borne que par ce que le
+    # solde permet.
+    #
+    # Tout plafond fixe masquait le cercle vertueux. A 32 la capacite saturait
+    # des 2 000 $ d'equity, a 64 des 4 000 $ : au-dela, gagner n'ouvrait plus
+    # rien et le modele n'avait plus rien a apprendre de sa reussite. La
+    # limite doit venir du solde, et seulement de lui.
     positions_max: int = 64
 
     # ------------------------------------------------------------------
@@ -2309,11 +2327,14 @@ class BTCTradingEnvDiscrete(gym.Env):
         sont deja ouvertes. Le modele doit l'apprendre, donc il le voit
         (quatrieme colonne du bloc d'etat de l'observation).
         """
-        libres = self._K - self.n_positions
-        if libres <= 0:
-            return 0
+        # Le nombre d'emplacements libres n'est PAS une limite : les
+        # tableaux doublent a la demande. Ce qui limite, c'est le solde, et
+        # cette fonction doit donc dire ce que le SOLDE permet — pas ce que
+        # l'allocation courante contient. La borner par la taille du tableau
+        # la ferait mentir des que l'equity depasse ce qui a ete alloue, et
+        # c'est exactement ce que le modele doit voir changer quand il gagne.
         if not getattr(self.cfg, "marge_realiste", False):
-            return libres
+            return max(self._K - self.n_positions, 0)
         eq = self._equity_courante()
         if eq <= 0:
             return 0
@@ -2331,6 +2352,7 @@ class BTCTradingEnvDiscrete(gym.Env):
         # capacite, perdre la reduit. La marge, elle, est trop large pour
         # border quoi que ce soit a ce levier.
         budget = float(getattr(self.cfg, "budget_risque", 0.0))
+        par_risque = float("inf")
         if budget > 0.0:
             atr_raw = (float(self.data.atr14[self.idx - 1])
                        if self.idx - 1 >= 0 else 0.0)
@@ -2341,10 +2363,35 @@ class BTCTradingEnvDiscrete(gym.Env):
             r_une = max(self.cfg.atr_sl_mult * atr * taille, 1e-12)
             engage = float(self._p_risque[self._p_sens != 0].sum())
             par_risque = math.floor((budget * eq - engage) / r_une)
-        else:
-            par_risque = libres
 
-        return int(max(0, min(libres, par_marge, par_risque)))
+        return int(max(0, min(par_marge, par_risque)))
+
+    def _agrandir(self) -> None:
+        """Double le nombre d'emplacements. Il n'y a pas de plafond.
+
+        Les tableaux sont une allocation, pas une limite : quand ils se
+        remplissent alors que le solde autorise davantage, ils doublent. Un
+        plafond fixe masquerait le cercle vertueux des que l'equity depasse
+        ce qu'il permet.
+        """
+        k = self._K
+        self._K = k * 2
+        def _e(a, v=0):
+            return np.concatenate([a, np.full(k, v, dtype=a.dtype)])
+        self._p_sens = _e(self._p_sens)
+        self._p_entree = _e(self._p_entree)
+        self._p_taille = _e(self._p_taille)
+        self._p_sl = _e(self._p_sl)
+        self._p_tp = _e(self._p_tp)
+        self._p_atr = _e(self._p_atr)
+        self._p_idx = _e(self._p_idx, -1)
+        self._p_risque = _e(self._p_risque)
+        self._p_spread = _e(self._p_spread, float(self.cfg.spread_bps))
+        self._p_be = _e(self._p_be, False)
+        self._p_trail = _e(self._p_trail, False)
+        self._r_slots = _e(self._r_slots)
+        self._realise_slots = _e(self._realise_slots)
+        self._latent_prec = _e(self._latent_prec)
 
     def peut_entrer(self) -> bool:
         """Une DECISION existe quand le solde permet encore une position."""
@@ -2463,9 +2510,18 @@ class BTCTradingEnvDiscrete(gym.Env):
         # apprendre une contrainte qu'il ne voit pas : sans cette colonne il
         # proposerait des entrees que le solde refuse, et n'aurait aucun moyen
         # de distinguer un refus d'une occasion manquee.
+        # LA PART DE CAPACITE ENCORE LIBRE, et non un compte divise par un
+        # plafond : le plafond n'existe plus, et diviser par une taille de
+        # tableau qui double ferait changer l'echelle de l'observation en
+        # cours d'episode — le reseau verrait la meme situation sous deux
+        # valeurs differentes.
+        #
+        # `libres / (libres + tenues)` vaut 1 quand rien n'est ouvert et tend
+        # vers 0 quand le solde sature. Elle ne depend d'aucune constante.
         if getattr(self.cfg, "marge_realiste", False):
-            risk_feature = self.places_ouvrables(
-                max(current_price, 1e-8)) / float(self._K)
+            _libres = self.places_ouvrables(max(current_price, 1e-8))
+            _tenues = self.n_positions
+            risk_feature = _libres / max(_libres + _tenues, 1)
         else:
             risk_feature = float(self.last_risk_scale)
 
@@ -2728,6 +2784,12 @@ class BTCTradingEnvDiscrete(gym.Env):
         # En training, le reward shaping pénalise déjà les mauvaises entrées.
         # UN EMPLACEMENT LIBRE SUFFIT, la ou l'ancienne condition exigeait
         # d'etre entierement plat. A K=1 les deux coincident exactement.
+        # Plus de place dans le tableau alors que le solde en permet ? On
+        # agrandit. Le solde reste seul juge.
+        if (not manual_close and action in (0, 1)
+                and self.n_positions >= self._K
+                and self.places_ouvrables(prix_execution) > 0):
+            self._agrandir()
         _libres = np.flatnonzero(self._p_sens == 0)
         if not manual_close and action in (0, 1) and len(_libres):
             side = 1 if action == 0 else -1
@@ -2917,6 +2979,15 @@ class BTCTradingEnvDiscrete(gym.Env):
             done_reason = "episode_end"
         elif _niveau < float(getattr(self.cfg, "niveau_marge_liquidation", 0.5)):
             done_reason = "appel_de_marge"
+        elif (getattr(self.cfg, "marge_realiste", False)
+              and self._p_sens.sum() == 0 and not self._p_sens.any()
+              and self.places_ouvrables(price) <= 0):
+            # LA RUINE. Aucune position ouverte, et le solde n'en permet plus
+            # aucune : le compte ne peut plus rien faire. Laisser tourner
+            # l'episode enseignerait qu'on survit a la ruine en attendant, ce
+            # qui est faux — un compte qui ne peut plus prendre le lot
+            # minimum est termine.
+            done_reason = "solde_insuffisant"
         elif marked_dd > self.cfg.max_drawdown:
             done_reason = "max_drawdown"
         elif marked_equity < self.cfg.initial_capital * self.cfg.min_capital_frac:
@@ -5407,7 +5478,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec43"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec44"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -5431,7 +5502,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec43: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec44: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #

@@ -157,7 +157,12 @@ def trajectoire(cfg, depart=3000, graine=GRAINE, n_pas=N_PAS):
             # ce qu'une position a accumule suit le signe de ce qu'elle a
             # rapporte. Une position gagnante creditee negativement voudrait
             # dire que l'attribution s'est trompee de voisin.
-            cum = rec.setdefault("cumul", [0.0] * len(rs))
+            # Le nombre d'emplacements DOUBLE quand ils se remplissent — il
+            # n'y a plus de plafond — donc le cumul ne peut pas etre dimensionne
+            # une fois pour toutes au premier pas.
+            cum = rec.setdefault("cumul", [])
+            while len(cum) < len(rs):
+                cum.append(0.0)
             for j in range(len(rs)):
                 cum[j] += float(rs[j])
             for j in info.get("slots_fermes", []):
