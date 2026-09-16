@@ -37,7 +37,7 @@ import cibles as C
 import training as T
 from saint_core import FEATURE_COLS
 
-BUDGETS = (0.03, 0.05, 0.10, 0.20)
+BUDGETS = (0.05, 0.10, 0.20, 0.30)
 GRAINES = (1, 2)
 TAUX_ENTREE = 1.0      # on tente une entree a chaque barre ; le solde arbitre
 

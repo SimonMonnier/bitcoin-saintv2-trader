@@ -48,9 +48,17 @@ INSTRUMENTS = {
     },
     "XAUUSD": {
         "cache": "data_cache_XAUUSD_M5.pkl",
-        # Balayage propre a l'or : +16.5 R/an a 10x contre +20.1 a 6x, mais
-        # deux fois moins de sauts de reouverture franchissant le stop
-        # (1.6 % contre 3.1 %) et une friction de 0.054 R contre 0.090.
+        # Balayage CONJOINT stop x trailing sur GPU, 35 combinaisons, hors
+        # test : 4xATR avec un trailing de 6 R donne +42.5 R/an sous friction
+        # majoree contre +16.2 pour 10x/2R. Le gain vient du NOMBRE de trades
+        # — 63 par an contre 31 — la duree tombant de 27.6 h a 6.8 h.
+        #
+        # Sans trailing la part symetrique vaut EXACTEMENT zero a toutes les
+        # largeurs : chaque trade perd alors 1 R. Le trailing n'est pas un
+        # reglage d'appoint, c'est le seul mecanisme qui gagne.
+        #
+        # 4.6 % des reouvertures franchissent un stop de 26 points de base :
+        # un cout que  ne modelise pas.
         "atr_sl_mult": 10.0,
         "trail_R": 2.0,
         "spread_bps": 0.68,

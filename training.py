@@ -873,7 +873,7 @@ class PPOConfig:
     # essaiment ET ou l'episode survit — a 100 % il meurt a la barre 538 sur
     # 4 000. Le creux de 37 % reste au bord du garde-fou a 40 %, ce qui est
     # assume : c'est le prix d'un essaim d'or a 1 000 EUR de capital.
-    budget_risque: float = 0.30
+    budget_risque: float = 0.03
     # ------------------------------------------------------------------
 
     # 84 -> 20, ET C'EST UN GAIN, pas une reduction.
@@ -1499,12 +1499,35 @@ class PPOConfig:
     # donnait l'inverse par trade, ce qui est coherent — par trade le large
     # gagne, par an le court gagne — mais les deux ne se deduisent pas l'une
     # de l'autre.
-    # 6 -> 10xATR : la largeur de l'OR, derivee de son propre balayage.
-    # Son ATR relatif vaut 6.6 points de base contre 15.9 pour le BTC, donc
-    # 10xATR y fait 66 bps quand 6xATR en faisait 95 sur le Bitcoin. Le
-    # balayage donne +20.1 R/an a 6x mais 3.1 % des reouvertures franchissent
-    # le stop ; a 10x il n'y en a plus que 1.6 % pour +16.5 R/an, et la
-    # friction tombe de 0.090 a 0.054 R.
+    # 10xATR, RETABLI apres un detour instructif.
+    #
+    # Le balayage conjoint stop x trailing designait 4xATR avec un trailing de
+    # 6 R : +42.5 R par an sous friction majoree contre +16.2 pour 10x/2R,
+    # deux fois et demie mieux. Applique, puis mesure sur le CHEMIN DE
+    # L'EQUITE — lot minimum, marge, appel de marge, ordre chronologique :
+    #
+    #   stop  trail  budget  pos  trades  tenue   gain  creux           fin
+    #     4x     6R      3%    5     890  0.77a   +76%   40%   max_drawdown
+    #     6x     3R      3%    3     546  0.94a   +33%   40%   max_drawdown
+    #     6x     2R      3%    3     287  0.36a   -15%   40%   max_drawdown
+    #    10x     2R      3%    2     257  1.14a   +39%   28%    fenetre finie
+    #    10x   1.5R      3%    2     345  1.14a   +45%   20%    fenetre finie
+    #
+    # SEUL LE 10x SURVIT A LA FENETRE. Le 4x/6R gagne +76 % en neuf mois puis
+    # rend 40 % et s'arrete ; son profil est "beaucoup de pertes a -1 R,
+    # quelques gains tres gros", et la serie de pertes arrive avant les gains.
+    #
+    # L'ERREUR DE METHODE QUI A CONDUIT LA, et elle touchait tous les
+    # balayages de geometrie de ce depot : le "R par an sur entrees non
+    # chevauchantes" ADDITIONNE des R comme si leur ordre n'importait pas. Il
+    # importe — une serie de pertes tue un compte avant que les gains
+    # n'arrivent, et une somme ne peut pas le voir. Toute geometrie doit
+    # desormais passer par `mesure_portefeuille` avant d'etre retenue.
+    #
+    # Le trailing reste a 2 R : le balayage le place sur un plateau de cinq
+    # declenchements, ce qui est plus de donnees qu'un seul chemin d'equite.
+    # Mais 1.5 R y donne +45 % pour 20 % de creux contre +39 % pour 28 % —
+    # a departager sur plusieurs graines, ce qui n'est pas fait.
     atr_sl_mult: float = 10.0
     # R:R 1:2.0. Le 1.4 precedent venait de la grille de mesure_features.py,
     # qui echantillonne une entree toutes les 10 barres alors que les
