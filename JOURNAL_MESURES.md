@@ -8,6 +8,243 @@ Ordre antichronologique.
 
 ---
 
+## 16 septembre 2026, seconde partie — le vote entre dans l'entraînement, et quatre repères faux
+
+Suite de l'entrée précédente, même journée. Le fil conducteur est le même :
+**des chiffres justes comparés au mauvais repère**. Quatre fois de suite, à
+quatre endroits sans rapport.
+
+---
+
+### Gamma était réglé pour une barre qui n'existe plus
+
+`gamma` est exprimé **par barre**, et la récompense — une plus-value latente
+payée à chaque barre — est accumulée en `gamma^dt`. Deux changements ont modifié
+son sens sans que personne n'y touche : H1 → M5, puis SL 4 → 8×ATR.
+
+Mesure sur 11 971 courses résolues, SL 8×ATR / R:R 2.0 :
+
+```
+            n    duree med   duree moy   R moyen
+GAINS    3993      254 b       476 b     +2.00 R
+PERTES   7978      146 b       315 b     -1.02 R
+```
+
+**Un gain dure 1.74 fois plus longtemps qu'une perte** — c'est mécanique, le
+take-profit est deux fois plus loin que le stop. L'escompte frappe donc les
+gains plus fort que les pertes :
+
+```
+gamma      poids gain   poids perte   R:R effectif
+0.995        0.567         0.711          1.56      -20.2 %
+0.999        0.883         0.931          1.86       -5.1 %
+0.9999       0.987         0.993          1.95       -0.5 %
+```
+
+À 0.995 le point mort **vu par l'agent** monte à 39.1 % quand l'environnement
+en applique 33.8 % : on lui demandait 5.3 points de winrate de trop, et on le
+poussait à fuir les configurations lentes à se résoudre — c'est-à-dire les
+gagnantes. Porté à **0.9999**, ce qui laisse un escompte réel à l'échelle de
+l'épisode (0.865 sur 1 440 barres) sans quoi le critique perdrait son ancrage.
+
+En H1 le réglage était sain : 13 barres, `0.995^13 = 0.937`, moins de 2 % de
+distorsion. Ce n'était pas la valeur qui était fausse, c'est qu'elle n'a pas
+suivi l'échelle.
+
+---
+
+### La référence du hasard n'est pas comparable d'un run à l'autre
+
+Trois runs, même warmup, même politique gelée :
+
+```
+exec25   -2.46 pt   ecart-type 4.27   (n=5)
+exec27   -0.14 pt   ecart-type 5.41   (n=5)
+exec29   -2.03 pt   ecart-type 2.61   (n=3)
+```
+
+Il serait tentant de lire dans le passage de −2.46 à −0.14 l'effet d'un
+correctif. **C'est faux** : pendant le warmup la politique est gelée, donc rien
+de ce qu'on change à l'optimiseur ne peut toucher les trades qu'elle prend.
+Avec un écart-type de 5.41 sur cinq epochs, l'erreur-type de la référence vaut
+±2.4 pt — les trois chiffres sont à un écart-type les uns des autres.
+
+**Seule la comparaison interne — entraîné contre gelé, dans le même run — est
+valide.** Le bruit vient du nombre de trades : 169 à 275 par epoch, parce qu'un
+trade de 12 h ne tient pas souvent dans 321 jours de validation.
+
+---
+
+### Le vote existe maintenant PENDANT l'entraînement
+
+Il n'existait qu'à l'évaluation, sur des réseaux entraînés chacun à agir
+**seul**. Un modèle qui apprend à décider tout seul, puis qu'on met dans un
+comité, n'a jamais appris à jouer sa part dans une décision commune.
+
+Deux façons de le faire, une seule qui tient :
+
+| | |
+|---|---|
+| entraîner séparément puis voter | l'action exécutée ne vient d'**aucune** des politiques mises à jour ; le rapport de PPO perd son sens et réclame un poids d'importance non borné |
+| présenter le mélange comme **une** politique | l'action est tirée de ce qui est mis à jour. PPO reste exact, et le gradient atteint chaque membre par sa part dans la probabilité de l'action choisie |
+
+C'est la seconde. `PolitiqueEnsemble` moyenne les **probabilités** — une voix
+par membre — et non les logits, qui laisseraient un membre très confiant
+écraser les autres. La boucle d'entraînement n'a pas une ligne à changer, et
+les trois folds ne se font qu'**une** fois au lieu d'un passage par
+architecture.
+
+**Le troisième votant n'entre pas par la même porte.** TabM n'a pas de gradient
+dans cette boucle, et ses scores dépendent de la **barre** et non de la seule
+observation : il ne peut pas être un membre du mélange. Il entre par le
+**masque d'actions** — il ne propose rien, il interdit. C'est la règle que
+décrit `evalue_ensemble`, et la fonction du Chikou-Span dans le système
+Ichimoku.
+
+Son ajustement est **croisé**, et c'est le point délicat : le rollout se joue
+sur la fenêtre même qui servirait à l'ajuster. Il y serait un **oracle**, les
+deux réseaux apprendraient à lui déférer, et en production le partenaire
+deviendrait ordinaire. Chaque barre reçoit donc le score d'un TabM qui ne l'a
+pas vue — trois blocs **contigus**, parce que des lignes voisines partagent
+leurs barres de résultat et qu'un tirage au hasard mélangerait apprentissage et
+notation par recouvrement. Mesuré : **100 % des barres notées, 12 s par fold**,
+seuil −0.1069 R, ~50 % des directions laissées passer.
+
+---
+
+### Quatre défauts silencieux, trouvés en câblant le vote
+
+**1. Le masque de l'update n'était pas celui qui avait agi.** Le pass de mise à
+jour **reconstruisait** le masque depuis la position. Tant qu'il n'en dépendait
+que, les deux coïncidaient ; le veto dépend de la **barre**, donc ils divergent.
+PPO aurait comparé la probabilité nouvelle d'une action à son ancienne
+probabilité **sous une autre distribution** — plus rien de mesuré, et aucune
+erreur levée. Le masque voyage désormais avec l'échantillon.
+
+**2. Le gradient de l'acteur affiché à zéro.** Le tri des paramètres testait
+`startswith("actor.")` quand les noms valent maintenant `membres.0.actor.*` :
+trois listes vides. La veille aurait annoncé « ACTOR GELÉ » sur tout un run en
+train d'apprendre.
+
+**3. Le seuil de détection du warmup devenait intenable.** Le gradient de
+warmup valait 1e-5 à 1e-6 avec un réseau unique ; avec l'ensemble il monte à
+**5.0e-4** — le bonus d'entropie n'est pas annulé pendant le warmup et porte
+maintenant sur deux réseaux. Encore un facteur deux et le seuil de 1e-3 était
+franchi : des epochs **gelées** comptées comme entraînées, donc la référence du
+hasard polluée par des epochs qui ne mesurent rien. Le warmup se lit désormais
+sur le **numéro d'epoch**, exact par construction ; le gradient reste affiché et
+sert de contre-vérification.
+
+**4. Le plafond d'entropie n'est plus ln 3.** Le veto masque une direction
+avant le softmax : quand il interdit l'achat, la politique choisit entre vendre
+et attendre, donc son maximum vaut ln 2. Sur exec29 l'entropie de warmup
+affiche **0.573** là où elle valait 1.099 — lue contre ln 3, elle ressemblerait
+à une politique déjà fortement différenciée alors qu'elle décide au hasard. Le
+plafond attendu, le veto laissant passer une part *p* de chaque direction
+indépendamment :
+
+```
+les deux permises   p²         -> ln 3
+une seule           2p(1-p)    -> ln 2
+aucune              (1-p)²     -> 0
+```
+
+À p = 0.50 cela fait **0.621**, et 0.573 en représente 92 % : quasi uniforme,
+exactement ce qu'on attend d'un warmup.
+
+---
+
+### Ce que la collecte réparée a révélé sur exec24
+
+```
+politique GELEE   n=5  ecart moyen  -5.34 pt   ecart-type 0.80
+ENTRAINEE         n=3  ecart moyen  -7.29 pt   ecart-type 1.49
+gain  -1.95 +/- 0.93  (-2.1 ecarts-types)
+```
+
+La collecte réparée n'a pas rendu le modèle meilleur : **elle a rendu la mesure
+assez fine pour montrer qu'il était plus mauvais que le hasard.** L'écart-type
+de la référence passe de 1.97 à 0.80, et ce que le bruit cachait était une
+dégradation. Décomposé :
+
+```
+sens    etat      trades      WR      vs gele
+LONG    gele        1442   31.9%
+LONG    entraine    1122   34.2%      +2.3 pt  (+1.2 ecart-type)
+SHORT   gele        1767   32.4%
+SHORT   entraine     931   26.5%      -5.9 pt  (-3.2 ecarts-types)
+```
+
+L'amélioration des longs n'est pas significative. **Le modèle casse les
+shorts**, et avec assurance : le seuil de sélection des shorts monte de 0.393 à
+0.440 puis 0.520 pendant que celui des longs reste à 0.37–0.385. Les 5 % de
+shorts retenus sont de plus en plus confiants et de plus en plus faux —
+signature d'un motif trouvé à l'entraînement qui **s'inverse** en validation,
+pas d'une distribution aplatie où la sélection redeviendrait aléatoire.
+
+Mesuré **à SL 4×ATR uniquement**, c'est-à-dire sur l'horizon où l'avantage
+n'avait jamais été mesuré.
+
+---
+
+### Un seul chemin de calcul pour l'entraînement, le live et les backtests
+
+Le live et l'entraînement construisaient leurs colonnes par deux chemins :
+`merge_m1_h1` d'un côté, `prepare_m5.construit` de l'autre. Rien ne vérifiait
+qu'ils s'accordaient, et ils avaient cessé de le faire — le live était resté en
+M1, lookback 96, stop 2×ATR, checkpoints `exec11`.
+
+`flux_live.py` récupère les bougies au format exact du jeu et les passe au
+**même** `construit`. `test_alignement.py` le vérifie : **260/260 colonnes
+identiques** à 3e-06 près, la seule différence attendue étant le stockage en
+float32. Il contrôle aussi les réglages de tout fichier qui les **recopie**, et
+la présence du veto partout où il était à l'entraînement.
+
+Deux points que cela tranche : les bougies viennent de **Binance et non de
+MT5** — quatre colonnes n'existent pas dans un flux CFD — et la **dernière
+bougie est toujours jetée**, l'API rendant celle en formation en dernière
+ligne.
+
+`checkpoints.py` résout le modèle à charger au lieu de l'écrire en dur, au
+**numéro d'exec** et non à la date du fichier qu'un `touch` fausserait. Deux
+garde-fous ont servi immédiatement : sans le filtre de compatibilité, « le plus
+récent complet » rendait `exec20` et ses 107 colonnes contre 264 au pipeline ; et
+un champ `n_features` absent ne vaut pas autorisation, sans quoi `exec13`
+passait aussi. La famille par défaut est `last`, la moyenne des poids —
+demander « le meilleur » rend quand même la moyenne, en disant pourquoi.
+
+---
+
+### Le ménage
+
+865 Mo et 70 fichiers suivis en moins (116 → 46). Tout ce qui servait l'échelle
+de décision **M1** est parti avec elle — écartée par mesure, elle exige +0.114 R
+d'avantage — ainsi que le *basis*, le flux à la minute et un doublon exact de
+71 Mo. Le code et la documentation supprimés restent dans l'historique.
+
+Un repointage important au passage : `mesure_court_terme.py` lisait le cache M1
+de 3.6 ans quand le jeu en couvre 9.05, et rendait donc un nombre d'occasions
+2.6 fois trop bas comparé à un seuil **absolu**. C'est l'oubli exact qui avait
+fait écarter le stop de 8×ATR. Il part maintenant du M5 : plus de mise à
+l'échelle, donc plus d'oubli possible.
+
+---
+
+### Ce que cette seconde partie ne dit PAS
+
+- Que le vote améliore quoi que ce soit. exec29 en est au warmup au moment
+  d'écrire ; aucune epoch entraînée n'a été lue.
+- Que gamma était la cause du blocage. C'est un biais réel et chiffré, corrigé
+  pour cette raison — pas parce qu'un résultat l'exigeait.
+- Que les shorts sont perdus. La dégradation à −3.2 écarts-types a été mesurée
+  à SL 4×ATR, sur un horizon où l'avantage n'avait jamais été mesuré.
+- Que le stress-test dise quoi que ce soit : il n'a encore produit **aucun
+  chiffre**, tué en mémoire deux fois en partageant la carte avec
+  l'entraînement.
+- Que la fenêtre de test dise quoi que ce soit. Elle n'a pas été touchée.
+
+---
+
 ## 16 septembre 2026 — cinq défauts de mesure, et la géométrie choisie sur une table incohérente
 
 Journée entière passée à corriger des **instruments**, pas des modèles. Aucune

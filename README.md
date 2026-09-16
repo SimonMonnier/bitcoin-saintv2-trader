@@ -55,6 +55,68 @@ poids et le reste du fichier `_calib.json` ; un fichier ambigu est refusé.
 | `..._exec23`, `..._exec24` | M5 | 260 colonnes, M5 + H1 + H4, SL 4×ATR |
 | `..._exec25` | M5 | idem, **SL 8×ATR / TP 16×ATR** ← courant |
 
+### Les trois modèles votent PENDANT l'entraînement
+
+Le vote n'existait qu'à l'évaluation, sur des réseaux entraînés chacun à agir
+**seul**. Un modèle qui apprend à décider tout seul, puis qu'on met dans un
+comité, n'a jamais appris à jouer sa part dans une décision commune.
+
+| votant | nature | ce qu'il apporte |
+|---|---|---|
+| **SAINT** | PPO, attention sur les features | ne fait que **croiser** les colonnes |
+| **PatchTST** | PPO, canaux indépendants | ne les croise **jamais** |
+| **TabM** | supervisé, MLP ensemble | un veto, pas une proposition |
+
+Les deux réseaux PPO sont opposés par construction sur la question qui sépare
+le mieux les modèles de ce dépôt. Des erreurs corrélées ne s'annulent pas :
+c'est la condition pour qu'un vote réduise la variance.
+
+**Pourquoi un mélange et pas trois entraînements séparés.** Si on entraîne
+séparément puis qu'on fait voter, l'action exécutée ne vient d'**aucune** des
+politiques mises à jour : le rapport de PPO perd son sens et réclame un poids
+d'importance non borné. En présentant le mélange comme une seule politique,
+l'action est tirée de ce qui est mis à jour — PPO reste exact, et le gradient
+atteint chaque membre par sa part dans la probabilité de l'action choisie.
+`PolitiqueEnsemble` moyenne les **probabilités**, une voix par membre, et non
+les logits qui laisseraient un membre très confiant écraser les autres.
+
+**TabM entre par une autre porte.** Il n'a pas de gradient dans cette boucle,
+et ses scores dépendent de la **barre** et non de la seule observation. Il
+passe donc par le **masque d'actions** : il ne propose rien, il interdit. C'est
+la fonction du Chikou-Span dans le système Ichimoku — un signal n'est pas pris
+si autre chose le contredit.
+
+Son ajustement est **croisé** : le rollout se joue sur la fenêtre même qui
+servirait à l'ajuster, où il serait un **oracle**. Les deux réseaux
+apprendraient à lui déférer, et en production le partenaire deviendrait
+ordinaire. Chaque barre reçoit donc le score d'un TabM qui ne l'a pas vue —
+trois blocs **contigus**, parce que des lignes voisines partagent leurs barres
+de résultat. Coût mesuré : 12 s par fold, 100 % des barres notées.
+
+> Le veto change le **plafond d'entropie**. Quand il interdit une direction, la
+> politique choisit entre deux actions et non trois : le maximum vaut ln 2 et
+> non ln 3. Le plafond attendu est `p²·ln3 + 2p(1-p)·ln2`, soit **0.621** à
+> p = 0.50. Lire une entropie de 0.573 contre ln 3 ferait croire à une
+> politique fortement différenciée alors qu'elle décide au hasard.
+
+### Le checkpoint se résout, il ne s'écrit pas en dur
+
+`checkpoints.py` rend le run le plus récent — au **numéro d'exec**, pas à la
+date du fichier qu'un `touch` fausserait — dont l'observation correspond au
+pipeline courant. `kairos_live` pointait sur `exec11`, dix-sept runs en
+arrière, et rien ne l'aurait signalé : un chemin périmé ne lève pas d'erreur
+tant que le fichier existe.
+
+Deux garde-fous qui ont servi immédiatement : sans le filtre de compatibilité,
+« le plus récent complet » rendait `exec20` et ses 107 colonnes contre 264 au
+pipeline ; et un champ `n_features` absent ne vaut **pas** autorisation, sans
+quoi `exec13` passait aussi.
+
+La famille par défaut est **`last`**, la moyenne des poids. Demander « le
+meilleur » rend quand même la moyenne, en disant pourquoi : choisir un
+checkpoint sur son résultat de validation coûte −3.3 points mesurés ici. Le
+« meilleur » checkpoint est le plus mauvais déployable.
+
 ### Le vrai sujet ouvert
 
 Une régression logistique atteint **0.6271 d'AUC** sur ces colonnes. Aucune
@@ -547,19 +609,45 @@ qui a fait choisir chaque valeur, sont dans les commentaires de `training.py`.
 | `max_grad_norm` | 0.6 | la norme observée vaut 0.90 : à 0.3 chaque mise à jour était divisée par trois |
 | `clip_eps` | 0.18 | standard PPO |
 | `target_kl` | 0.03 | arrêt précoce à 1.5× — rend sûr d'augmenter le pas |
-| `gamma` | 0.995 | semi-MDP : l'escompte est `γ^Δt`, Δt en barres |
+| `gamma` | 0.9999 | semi-MDP : l'escompte est `γ^Δt`, Δt en barres. À 0.995 il coûtait 20 % du R:R — voir ci-dessous |
 | `lambda_gae` | 0.95 | standard |
 | `critic_warmup_epochs` | 5 | l'actor est gelé, ces epochs servent de référence au hasard |
 | `n_moyenne_poids` | 10 | remplace le choix du meilleur checkpoint, qui coûtait −3.3 points |
 | `patience` | 0 | pas d'arrêt précoce : il sélectionnerait sur la validation |
 | `lookback` | 4 | mesuré : le passé n'apporte rien au-delà |
-| `architecture` | `saint` | attention sur deux axes, features et temps |
+| `architecture` | `ensemble` | SAINT **et** PatchTST dans le même rollout, présentés comme une seule politique |
+| `membres` | saint, patchtst | opposés par construction : l'un ne fait que croiser les colonnes, l'autre ne les croise jamais |
+| `votant_tabm` | True | troisième votant, supervisé, qui oppose son veto via le masque d'actions |
 | `d_model` / `num_blocks` | 8 / 2 | ~45 000 paramètres pour ~4 500 occasions |
 | `saint_heads` / `saint_n_freq` | 1 / 4 | `d_model // heads` doit être multiple de 8 |
 | `saint_mlp_dim` | 16 | la tête pèse 92–98 % du réseau ; c'est elle qu'il faut contenir |
 | `saint_lecture` | `colonnes` | lit chaque colonne, au lieu d'un CLS agrégé |
 | `max_drawdown` | 0.4 | force l'apprentissage prudent |
 | `tick_noise_bps` | 3.0 | extension des wicks. **Doit rester ≪ `atr_sl_mult` × ATR**, sinon le bruit déclenche le SL avant le marché |
+
+#### Pourquoi gamma est passé de 0.995 à 0.9999
+
+`gamma` est exprimé **par barre**, et la récompense — une plus-value latente
+payée à chaque barre — est accumulée en `gamma^dt`. Deux changements ont modifié
+son sens sans que personne n'y touche : H1 → M5, puis SL 4 → 8×ATR.
+
+Mesure sur 11 971 courses résolues à SL 8×ATR / R:R 2.0 : **un gain dure
+254 barres en médiane, une perte 146** — 1.74 fois plus, mécaniquement, le
+take-profit étant deux fois plus loin que le stop. L'escompte frappe donc les
+gains plus fort que les pertes.
+
+| gamma | poids gain | poids perte | R:R effectif | |
+|---|---|---|---|---|
+| 0.995 | 0.567 | 0.711 | 1.56 | **−20.2 %** |
+| 0.999 | 0.883 | 0.931 | 1.86 | −5.1 % |
+| **0.9999** | 0.987 | 0.993 | **1.95** | −0.5 % |
+
+À 0.995 le point mort **vu par l'agent** montait à 39.1 % quand l'environnement
+en applique 33.8 % : on lui demandait 5.3 points de winrate de trop, et on le
+poussait à fuir les configurations lentes à se résoudre — c'est-à-dire les
+gagnantes. En H1 le réglage était sain (13 barres, `0.995^13 = 0.937`, moins de
+2 % de distorsion) : ce n'était pas la valeur qui était fausse, c'est qu'elle
+n'a pas suivi l'échelle.
 
 ---
 

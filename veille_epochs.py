@@ -88,6 +88,41 @@ RE_META = re.compile(
 # de grandeur separent les deux regimes, le seuil n'a donc rien de delicat.
 GRADIENT_NUL = 1e-3
 
+# LE PLAFOND D'ENTROPIE N'EST PLUS ln 3, corrige le 2026-09-16.
+#
+# CE QUI A CHANGE. Le veto de TabM masque une direction avant le softmax :
+# quand il interdit l'achat, la politique choisit entre VENDRE et ATTENDRE,
+# donc son entropie maximale vaut ln 2 et non ln 3. Sur exec29 l'entropie de
+# warmup affiche 0.573 la ou elle valait 1.099 — et lue contre ln 3 elle
+# ressemblerait a une politique DEJA fortement differenciee, alors qu'elle
+# decide encore au hasard.
+#
+# C'est la meme faute que le point mort calcule sur la mauvaise fenetre :
+# un chiffre juste, compare au mauvais repere.
+#
+# LE PLAFOND ATTENDU, le veto laissant passer une part p de chaque direction
+# independamment :
+#
+#     les deux permises   p^2          -> ln 3
+#     une seule           2 p (1-p)    -> ln 2
+#     aucune              (1-p)^2      -> 0, il ne reste qu'ATTENDRE
+#
+# A p = 0.50 cela fait 0.621. C'est une esperance, pas une borne : une epoch
+# peut la depasser si le veto a moins mordu que prevu. Elle sert de repere,
+# comme 1.099 servait de repere avant.
+def _plafond_entropie() -> float:
+    try:
+        from training import PPOConfig as _C
+        if not getattr(_C(), "votant_tabm", False):
+            return math.log(3)
+        from tabm_votant import PART_LAISSEE as p
+    except Exception:
+        return math.log(3)
+    return (p * p * math.log(3) + 2 * p * (1 - p) * math.log(2))
+
+
+H_MAX = _plafond_entropie()
+
 # LE WARMUP SE LIT SUR LE NUMERO D'EPOCH, PAS SUR UN SEUIL, corrige le
 # 2026-09-16. C'est la CONFIGURATION qui decide quelles epochs gelent l'actor,
 # donc c'est elle qu'il faut lire — pas une empreinte indirecte.
@@ -246,7 +281,7 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     # tirage. Les enterrer dans une note conditionnelle les rendait invisibles
     # exactement quand elles importaient le plus.
     d_ent = "" if ent_prec is None else f" ({H - ent_prec:+.3f})"
-    L.append(f"  politique  H {H:.3f}/1.099{d_ent}   etendue {et_val:.4f} "
+    L.append(f"  politique  H {H:.3f}/{H_MAX:.3f}{d_ent}   etendue {et_val:.4f} "
              f"({et_val/TREMBLEMENT_SEUIL:.0f}x le tremblement)   "
              f"KL {kl:+.4f}   clipfrac {clipfrac:.1f}%   "
              f"g_actor {g_actor:.1e}")
@@ -269,10 +304,10 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
         notes.append(f"ACTOR GELE : warmup du critic, gradient {g_actor:.1e}. "
                      f"Cette epoch ne mesure aucun apprentissage — elle sert de "
                      f"reference au hasard pour les suivantes.")
-    elif H > 1.09:
+    elif H > 0.99 * H_MAX:
         notes.append(f"APPREND MAIS RESTE PLAT : le gradient passe "
                      f"({g_actor:.1e}) mais l'entropie tient a {H:.3f} sur "
-                     f"1.099. La politique se differencie trop lentement pour "
+                     f"{H_MAX:.3f}. La politique se differencie trop lentement pour "
                      f"que le filtre ait un sens — c'est un probleme de pas "
                      f"d'apprentissage ou d'echelle, pas de tirage.")
     # Mesure du 2026-09-15 sur les 5 epochs gelees d'exec12, qui partagent le
