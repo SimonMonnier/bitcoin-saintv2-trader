@@ -61,14 +61,14 @@ from features_range import ajoute_features_range
 
 SOURCE = "klines_h1_spot_BTCUSDT.pkl"
 SORTIE = "data_cache_BTCUSD_H1.pkl"
-# Jeu enrichi des 47 colonnes couvrant TOUTES les strategies Ichimoku,
-# pas seulement le range : Chikou-Span (le filtre du systeme), replis sur
-# plat Kijun, cassures de plus hauts, espace tradable, boussole du nuage
-# et les 14 structures en chandeliers. Ecrit A PART tant que le gain
-# n'est pas mesure : ajouter 47 colonnes a 56 sur 55 000 barres
-# d'entrainement n'est pas neutre, et ce depot a deja paye assez cher
-# les changements adoptes avant mesure.
-SORTIE_COMPLET = "data_cache_BTCUSD_H1_complet.pkl"
+# LE JEU "COMPLET" A FUSIONNE AVEC LE JEU TOUT COURT, le 2026-09-16.
+#
+# Les 47 colonnes Ichimoku avaient ete ecrites A PART le temps que leur gain
+# soit mesure — ce depot ayant deja paye cher les changements adoptes avant
+# mesure. Le gain a ete mesure (+1.6 -> +3.8 points hors echantillon) et les
+# colonnes sont entrees dans FEATURE_COLS ; les deux fichiers etaient depuis
+# octet pour octet identiques. Un doublon exact de 71 Mo qui ne documente plus
+# aucune distinction.
 JOUR_H1, JOUR_H4 = 24, 6
 SEMAINE_H1 = 168
 
@@ -208,20 +208,19 @@ def main() -> int:
     print(f"\nATR median {atr_med:.2f} $  |  friction {fric:.2f} $  "
           f"=  {fric/atr_med:.3f} R par ATR")
 
-    # Le jeu COMPLET garde les deux blocs, le jeu de reference n'a
-    # que les colonnes en service. Les deux partagent exactement les
-    # memes lignes, donc toute comparaison entre eux est APPARIEE
-    # barre a barre — c'est ce qui permet de lire un ecart sans que
-    # la difference de periode vienne s'y melanger.
-    complet = h1.replace([np.inf, -np.inf], np.nan)
-    complet = complet.dropna(subset=cols_ich).reset_index(drop=True)
-    complet.to_pickle(SORTIE_COMPLET)
+    # Les colonnes ich_* ont leur propre echauffement, plus long que celui des
+    # autres : on retire ici les lignes ou elles manquent. Sans cela le dropna
+    # sur FEATURE_COLS le ferait plus tard, ailleurs, et sans le dire.
+    h1 = h1.replace([np.inf, -np.inf], np.nan)
+    avant = len(h1)
+    h1 = h1.dropna(subset=cols_ich).reset_index(drop=True)
     print()
-    print(f'{SORTIE_COMPLET} ecrit : {complet.shape}')
-    print(f'  +{len(cols_ich)} colonnes ich_*, {len(h1)-len(complet)} lignes perdues au warmup supplementaire')
+    print(f'  +{len(cols_ich)} colonnes ich_*, {avant - len(h1)} lignes '
+          f'perdues au warmup supplementaire')
 
     h1.to_pickle(SORTIE)
-    print(f"\n{SORTIE} ecrit : {h1.shape}")
+    print()
+    print(f"{SORTIE} ecrit : {h1.shape}")
 
     n_tr = int(len(h1) * 0.70)
     print(f"\nDIMENSIONNEMENT : {len(h1):,} barres, {n_tr:,} en entrainement.")

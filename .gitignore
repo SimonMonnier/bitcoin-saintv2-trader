@@ -73,3 +73,14 @@ meta.log
 meta.err
 conviction.log
 conviction.err
+
+# ---------------------------------------------------------------------------
+# Artefacts de run. Un run ecrit trois fichiers par checkpoint — .pth, _norm.npz
+# et _calib.json — et ils ne valent que pris ensemble : le .pth seul ne se
+# charge pas, le _calib.json seul ne decrit rien. Les .pth etant deja ignores,
+# suivre les deux autres accumulait des orphelins a chaque exec (quatorze au
+# 2026-09-16, pour des architectures qui n'existent plus).
+# ---------------------------------------------------------------------------
+*_norm.npz
+*_calib.json
+run_saintv2_*.json

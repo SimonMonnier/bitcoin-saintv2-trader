@@ -47,7 +47,7 @@ from saint_core import FEATURE_COLS, ATR_PLANCHER_FRAC
 
 warnings.filterwarnings("ignore")
 
-CACHE = "data_cache_BTCUSD_H1_complet.pkl"
+CACHE = "data_cache_BTCUSD_H1.pkl"   # le jeu "complet" a fusionne avec lui
 SL_MULT, RR, PAS = 2.0, 2.0, 24
 N_BLOCS = 6
 PHASES = list(range(0, 24, 3))          # 8 phases

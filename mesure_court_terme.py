@@ -39,11 +39,25 @@ coup a la vente, sur les 70 % initiaux seulement.
 import numpy as np
 import pandas as pd
 
-from mesure_features import (SPREAD_BPS, SLIP_ENTREE_BPS, SLIP_SORTIE_BPS,
-                             CACHE)
+from mesure_features import SPREAD_BPS, SLIP_ENTREE_BPS, SLIP_SORTIE_BPS
+
+# LA SOURCE EST LE M5, PLUS LE CACHE M1 — corrige le 2026-09-16.
+#
+# Cette mesure tournait sur `data_cache_BTCUSD_20221215.pkl`, qui couvre 3.6
+# ans, alors que le jeu d'entrainement en couvre 9.05. Le nombre d'occasions
+# rendu etait donc systematiquement 2.6 fois trop bas — et comme il se compare
+# a un seuil absolu (~4 900 occasions pour qu'un avantage de 0.02 R soit
+# lisible), la comparaison n'avait de sens qu'a condition de remettre chaque
+# ligne a l'echelle a la main. C'est exactement ce qui a ete oublie une fois :
+# la ligne retenue mise a 9 ans, la ligne ecartee laissee a 3.6, et le stop de
+# 8xATR abandonne pour 1 739 occasions quand il en vaut 4 516.
+#
+# On perd la ligne M1, qui n'a plus lieu d'etre : meme a 8xATR elle exige
+# +0.114 R d'avantage, davantage que tout ce que ce depot a mesure.
+CACHE = "klines_5m_spot_BTCUSDT.pkl"
 from saint_core import ATR_PLANCHER_FRAC
 
-ECHELLES = (("M1", None, 1), ("M5", "5min", 5), ("M15", "15min", 15),
+ECHELLES = (("M5", None, 5), ("M15", "15min", 15),
             ("M30", "30min", 30), ("H1", "1h", 60))
 SL_MULTS = (2.0, 4.0, 8.0)
 RR = 2.0
@@ -125,7 +139,7 @@ def main() -> int:
     brut = brut.iloc[:int(len(brut) * 0.70)].reset_index(drop=True)
     minutes = (brut["time"].iloc[-1] - brut["time"].iloc[0]).total_seconds() / 60
     ans = minutes / (365.25 * 24 * 60)
-    print(f"{len(brut):,} bougies M1, {ans:.1f} ans (70 % initiaux, "
+    print(f"{len(brut):,} bougies M5, {ans:.1f} ans (70 % initiaux, "
           f"test intouche)")
     print(f"SORTIE SUR BARRIERE UNIQUEMENT — aucune cloture au temps, comme "
           f"l'environnement et le live")

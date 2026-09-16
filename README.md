@@ -50,8 +50,6 @@ poids et le reste du fichier `_calib.json` ; un fichier ambigu est refusé.
 
 | Préfixe | Échelle | Observation |
 |---------|---------|-------------|
-| `saintv2_loup_*` (sans exec) | M1 | modèles OR, architecture d'avant la réduction SAINTv2 |
-| `..._exec5_...` | M1 | 30 colonnes, `taker_1m_ma5` |
 | `..._exec10` à `..._exec20` | H1 | 103 colonnes, contexte H4 |
 | `..._exec22` | M5 | 103 colonnes, contexte H1 |
 | `..._exec23`, `..._exec24` | M5 | 260 colonnes, M5 + H1 + H4, SL 4×ATR |
@@ -77,6 +75,21 @@ sortent que par SL/TP chez le courtier. Tant que ce n'est pas écrit, toute règ
 de sortie temporelle côté entraînement simulerait une stratégie inexécutable ;
 c'est pourquoi `max_holding_bars` vaut 0, et pourquoi toutes les mesures de
 géométrie se font **sans plafond de durée**.
+
+### Ce qui a été retiré, et où le retrouver
+
+Le 2026-09-16, 31 scripts et 5 rapports datés ont été supprimés, ainsi que
+865 Mo de données. Tout ce qui portait sur l'**échelle de décision M1** — le
+cache de 627 Mo et les seize scripts qui le lisaient — est parti avec elle :
+même à un stop de 8×ATR le M1 exige +0.114 R d'avantage, davantage que tout ce
+que ce dépôt a mesuré. Sont partis aussi le *basis* (aucun écart au-dessus du
+bruit de phase), le flux à la minute (`taker_1m_ma5` n'est plus dans
+`FEATURE_COLS`), la taille par conviction (+0.3), et le doublon exact
+`data_cache_BTCUSD_H1_complet.pkl`.
+
+Les fichiers de code et de documentation étaient suivis par git : `git log --
+<fichier>` puis `git show <commit>^:<fichier>` les rend intacts. Les `.pkl` ne
+l'étaient pas, mais chacun se régénère depuis son script de téléchargement.
 
 ### Où est écrit ce qu'on a appris
 
@@ -366,10 +379,14 @@ bosse régulière à sommet unique, retour à zéro quand la série devient un r
 15min +0.0027 | 30min +0.0017 | 60min +0.0004 | 120min -0.0000
 ```
 
-> Ces mesures sont reproductibles : `mesure_features.py`, `mesure_binance_extra.py`,
-> `mesure_flux_1m.py`. Chacune porte dans son en-tête le biais de sélection
-> qu'elle subit — on lit le meilleur d'une grille sur la même fenêtre de
-> validation, donc les chiffres sont des bornes optimistes.
+> Ces mesures datent de l'échelle M1, et leurs scripts ont été retirés le
+> 2026-09-16 avec le cache qu'ils lisaient — `git log` les rend, et leurs
+> conclusions sont dans `JOURNAL_MESURES.md`. Les outils encore en service sont
+> `mesure_court_terme.py`, `mesure_features_ichimoku.py`,
+> `mesure_lookback_utile.py` et les `evalue_*.py`. Chacun porte dans son
+> en-tête le biais de sélection qu'il subit — on lit le meilleur d'une grille
+> sur la même fenêtre de validation, donc les chiffres sont des bornes
+> optimistes.
 
 **MetaTrader ne peut fournir aucune de ces grandeurs** : son `tick_volume`
 compte les changements de prix, pas les montants échangés, et il n'a ni flux
@@ -615,7 +632,7 @@ Par défaut backteste `bestprofit_saintv2_loup_duel_wf1_both_wf1.pth` en mode `s
 ### Variante `no_be_trail` (sans break-even / trailing)
 
 ```powershell
-python backtest_saintv2_no_be_trail.py
+python backtest_saintv2_stress_test.py
 ```
 
 **Fichier identique** à `backtest_saintv2_stress_test.py` mais avec l'appel à
@@ -708,7 +725,6 @@ multi-agent-btcusd/
 ├── build_binance_features.py        # ⭐ Récupère Binance (funding, metrics 5 min) et
 │                                    #    résout l'alignement horaire broker/UTC (DST
 │                                    #    américain). À lancer AVANT le training.
-├── telecharge_flux_1m.py            # Archives klines 1 MINUTE → features de flux.
 │                                    #    Seule source variant à l'échelle de la décision.
 ├── export_binance_for_mql5.py       # .pkl → binaire lu par l'EA (WebRequest est
 │                                    #    désactivé dans le Strategy Tester)
@@ -718,19 +734,15 @@ multi-agent-btcusd/
 ├── kairos_theme.py                  # Palette, typographie, feuille de style QSS
 ├── kairos_widgets.py                # Jauge winrate, sparkline, témoin d'état, tuiles
 ├── suivi_live.ps1                   # Fenêtre de suivi du training en direct (lecture seule)
-├── relais_exec5.py                  # Enchaîne un run sur le suivant à une epoch donnée
 │                                    #    ⚠️ voir le piège os.kill documenté dedans
 │
 ├── (mesures — chacune documente son propre biais de sélection)
-├── mesure_features.py               # Largeur du jeu × grille SL/R:R
-├── mesure_binance_extra.py          # Apport des colonnes Binance non branchées
-├── mesure_flux_1m.py                # Apport du flux 1 min, avec contrôle d'alignement bloquant
-├── mesure_sltp.py / mesure_minimal.py / mesure_binaire.py / mesure_lookback.py
-├── diag_auc.py / diag_conviction.py # Sonde logistique vs politique entraînée
+├── mesure_features.py               # Constantes de friction, partagées par les mesures
+├── mesure_court_terme.py            # Occasions et friction par géométrie, sans sortie au temps
+├── mesure_features_ichimoku.py      # Apport des 47 colonnes Ichimoku
+├── mesure_lookback_utile.py         # Profondeur de passé réellement utilisée
 │
 ├── backtest_saintv2_stress_test.py  # Backtest institutionnel (BE/trail on)
-├── backtest_saintv2_no_be_trail.py  # Variante sans BE/trail (comparaison)
-├── backtest_saintv2_multi_agent.py  # Backtest multi-agent (wf1 + wf2 + wf3)
 ├── export_to_onnx.py                # .pth → .onnx + stats binaires pour MT5
 ├── SaintV2_WF3.mq5                  # EA MQL5 pour le Strategy Tester
 ├── requirements.txt                 # Dépendances Python
@@ -738,7 +750,7 @@ multi-agent-btcusd/
 ├── README.md                        # Ce fichier
 │
 ├── _archive_21features/             # Ancien pipeline (21 features + ticks) :
-│                                    #    checkpoints, caches et build_tick_features.py.
+│                                    #    checkpoints et caches.
 │                                    #    Conservé pour traçabilité, plus alimenté.
 │
 ├── (générés avant training)
@@ -892,7 +904,7 @@ Le `TradingAgent` route automatiquement vers `live_loop_multi()` quand `multi_ag
 Un fichier dédié reproduit la même logique :
 
 ```powershell
-python backtest_saintv2_multi_agent.py
+python backtest_saintv2_stress_test.py
 ```
 
 Affichage par-agent dans les logs (couleur cyan/jaune/magenta) + résumé final qui détaille les stats de chaque agent séparément. CSV exporté : `backtest_trades_multi_agent_no_be_trail.csv` avec colonne `agent`.
