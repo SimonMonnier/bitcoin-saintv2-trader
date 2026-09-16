@@ -780,7 +780,30 @@ class PPOConfig:
     #
     # La couverture du marche par epoch baisse, mais le run compte 90 epochs
     # et les departs sont tires au hasard : la couverture cumulee augmente.
-    episodes_per_epoch: int = 20
+    # PLAFOND d'episodes, pas une consigne : le nombre reellement joue se
+    # deduit de `cible_decisions` a chaque epoch. Voir ci-dessous.
+    episodes_per_epoch: int = 40
+
+    # ------------------------------------------------------------------
+    # LE BUDGET D'UNE EPOCH SE COMPTE EN DECISIONS, ET IL S'AJUSTE SEUL.
+    #
+    # Une decision est le seul endroit ou l'acteur recoit du gradient, et son
+    # nombre par episode depend de la GEOMETRIE : a 12xATR un trade dure 34 h
+    # et un episode de 20 jours en produit ~180 ; a 6xATR il dure 10 h et en
+    # produit ~600. Fixer le nombre d'episodes revient donc a laisser le cout
+    # d'une epoch varier d'un facteur trois a chaque changement de stop.
+    #
+    # C'est arrive : exec46 sortait une epoch en 306 s avec 3 620 decisions ;
+    # le meme reglage a 6xATR en demandait ~12 000, soit ~17 minutes par
+    # epoch, donc 76 heures pour 90 epochs et trois folds. Rien n'etait casse
+    # — le budget etait exprime dans la mauvaise unite.
+    #
+    # Ici on vise un nombre de DECISIONS et on en deduit les episodes, a
+    # partir de ce que l'epoch precedente a reellement produit. Le cout d'une
+    # epoch devient constant, quelle que soit la geometrie, et aucun
+    # changement futur ne le refera deriver.
+    cible_decisions: int = 4000
+    # ------------------------------------------------------------------
     # Idem pour la validation : 21-32 trades donnaient un Sortino purement
     # bruité (PF 3.10 puis 0.51 d'une epoch à l'autre), donc une sélection du
     # "best model" au hasard.
@@ -3596,6 +3619,15 @@ def run_training_on_split(
     train_envs = [
         BTCTradingEnvDiscrete(train_data, cfg) for _ in range(cfg.episodes_per_epoch)
     ]
+    # Nombre d'episodes REELLEMENT joues. Il part d'une estimation — la duree
+    # mediane d'un trade donne l'ordre de grandeur des decisions par episode —
+    # puis se corrige des la premiere epoch avec le compte reel.
+    #
+    # Partir du plafond ferait payer plein tarif la seule epoch qui n'a pas
+    # encore de mesure, et c'est justement celle qu'on regarde le plus.
+    _dec_par_ep = max(cfg.episode_length / max(cfg.atr_sl_mult * 1.7, 1.0), 1.0)
+    n_episodes_courant = [max(1, min(cfg.episodes_per_epoch,
+                                     int(round(cfg.cible_decisions / _dec_par_ep))))]
 
     # MESURE EXHAUSTIVE, pas échantillonnée. Voir departs_disjoints : la
     # validation, la calibration et le test couvrent désormais leur fenêtre
@@ -3878,7 +3910,10 @@ def run_training_on_split(
         # un forward batch 1 contre 0.028 ms pour env.step() — 99.6% du coût est
         # du lancement de kernels à vide, et un batch 16 coûte le même temps
         # qu'un batch 1. Batcher les épisodes divise donc le temps par ~N.
-        envs = train_envs
+        # On ne joue que le nombre d'episodes qu'exige la cible de
+        # decisions. Les autres environnements existent — les instancier
+        # coute des minutes — mais ne sont pas parcourus.
+        envs = train_envs[:max(1, min(n_episodes_courant[0], len(train_envs)))]
         n_envs = len(envs)
 
         states: List[np.ndarray] = []
@@ -3949,7 +3984,8 @@ def run_training_on_split(
         # l'attribue.
         en_attente: Dict[int, Dict] = {}
         sampling_audit = {"decisions": 0, "forced_actions": 0,
-                          "remapped_actions": 0, "max_logprob_error": 0.0}
+                          "remapped_actions": 0, "max_logprob_error": 0.0,
+                          "episodes_joues": len(envs)}
 
         def _verse(k: int, p: Dict, done_flag: bool) -> None:
             """Verse une décision terminée au buffer de l'env k."""
@@ -4605,6 +4641,17 @@ def run_training_on_split(
                                   "on_policy": not cfg.legacy_off_policy_curriculum,
                                   **sampling_audit}) + "\n")
         print(f"[PPO SAMPLING] epoch={epoch} {sampling_audit}")
+
+        # AJUSTEMENT DU BUDGET. La geometrie decide du nombre de decisions
+        # qu'un episode produit ; on en deduit combien d'episodes il faut
+        # pour atteindre la cible. Borne entre 1 et le plafond, et lissee de
+        # moitie pour qu'une epoch atypique ne fasse pas osciller le budget.
+        _joues = max(sampling_audit.get("episodes_joues", 1), 1)
+        _par_ep = max(sampling_audit["decisions"] / _joues, 1e-9)
+        _vise = int(round(cfg.cible_decisions / _par_ep))
+        _vise = max(1, min(_vise, cfg.episodes_per_epoch))
+        n_episodes_courant[0] = max(1, (n_episodes_courant[0] + _vise) // 2)
+
 
         # ---- Recalibration du seuil sur la conviction réellement observée ----
         # Le quantile (1 − sélectivité) de max(p_BUY, p_SELL) est, par
@@ -5563,7 +5610,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec48"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec49"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -5587,7 +5634,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec48: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec49: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
