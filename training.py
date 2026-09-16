@@ -517,6 +517,33 @@ class PPOConfig:
     # changements simultanes rendraient le resultat inattribuable.
     tri_par_tete_aux: bool = True
 
+    # LA VALIDATION COMPLETE NE TOURNE PLUS A CHAQUE EPOCH.
+    #
+    # Decomposition mesuree du temps d'une epoch :
+    #
+    #   temps[collecte 105s  maj PPO 112s  calibration 38s  validation 182s]
+    #
+    # La validation est le premier poste, 45 % du total, et elle ne depend pas
+    # du nombre de decisions : c'est un cout fixe de parcours de la fenetre.
+    #
+    # Or on a mesure le meme jour que son PnL est ILLISIBLE : ~150 trades,
+    # erreur-type de 0.11 R sur leur moyenne, donc incapable de distinguer un
+    # modele qui ajoute 0.10 R d'un modele qui n'ajoute rien. On payait 45 %
+    # de chaque epoch pour un chiffre dont on a demontre qu'il ne dit rien.
+    #
+    # Le `rho` de classement, lui, coute DEUX forwards — 30 millisecondes —
+    # et c'est la metrique qu'on lit reellement. Il reste a chaque epoch.
+    #
+    # Ce choix ne selectionne rien : le modele deploye est la MOYENNE DES
+    # POIDS des dernieres epochs, qui ne depend d'aucune validation. Les
+    # familles "best" et "bestprofit" en dependent, elles, et sont mises a
+    # jour moins souvent — ce sont de toute facon des choix faits sur la
+    # validation, que ce depot mesure a -3.3 points contre la moyenne.
+    #
+    # La DERNIERE epoch valide toujours, pour que le run se termine sur une
+    # mesure complete.
+    validation_tous_les: int = 3
+
     diag_rang: bool = True
     diag_rang_pas: int = 12    # une decision suivie toutes les heures
     # ------------------------------------------------------------------
@@ -3959,6 +3986,11 @@ def run_training_on_split(
     # distribution rend les deux accessibles quel que soit un biais constant.
     calib_thr_val = [0.0, 0.0]      # [BUY, SELL]
 
+    # Derniere validation COMPLETE, reprise telle quelle les epochs ou elle
+    # est sautee. Voir `validation_tous_les`.
+    _val_prec = None
+    _val_epoch = 0
+
     # Somme courante des poids des dernieres epochs, et son compteur.
     somme_poids, n_moyennes = None, 0
     stats_precedentes = None
@@ -4968,6 +5000,14 @@ def run_training_on_split(
         # ---------- PASSE 2 : validation réelle, rang glissant ----------
         # Fenetre posterieure a celle de calibration, graine distincte mais
         # constante d'une epoch a l'autre.
+        #
+        # Sautee une epoch sur `validation_tous_les`. Les compteurs gardent
+        # alors les valeurs de la derniere mesure : le journal affiche donc la
+        # validation la plus recente, jamais des zeros qu'on lirait comme un
+        # effondrement.
+        _valide = (cfg.validation_tous_les <= 1
+                   or (epoch % cfg.validation_tous_les) == 0
+                   or epoch >= cfg.epochs)
         np.random.seed(cfg.val_seed + 1)
         v_states = []
         v_infos = []
@@ -4976,7 +5016,7 @@ def run_training_on_split(
             v_states.append(s0)
             v_infos.append(i0)
 
-        v_active = list(range(n_val))
+        v_active = list(range(n_val)) if _valide else []
 
         # Même principe qu'au rollout : la policy n'est sollicitée que sur les
         # envs flat. En position l'action est forcée, le forward serait jeté.
@@ -5088,6 +5128,22 @@ def run_training_on_split(
                         "hit_sl": int(tm["hit_sl"]), "hit_tp": int(tm["hit_tp"]),
                         "hold_bars": tm["hold_bars"],
                     })
+
+        # QUAND LA VALIDATION EST SAUTEE, on reprend la derniere mesure.
+        #
+        # Sans cela les compteurs seraient vides et le journal afficherait des
+        # zeros — 0 trade, PnL nul, Sortino nul — qu'on lirait comme un
+        # effondrement du modele alors que rien n'aurait ete mesure. Afficher
+        # la derniere valeur connue est honnete : le marqueur `(mesure a
+        # l'epoch N)` dit d'ou elle vient.
+        if not _valide and _val_prec is not None:
+            (val_pnl, val_dd, val_trades, val_trades_side,
+             pbs_val, _val_epoch) = _val_prec
+        else:
+            _val_epoch = epoch
+            _val_prec = (list(val_pnl), list(val_dd), list(val_trades),
+                         list(val_trades_side), [list(pbs_val[0]),
+                                                 list(pbs_val[1])], epoch)
 
         # Recalibration pour l'epoch SUIVANTE, sur la fenêtre de validation.
         # Même garde-fou : filtrer une distribution plate revient à tirer au sort.
@@ -5287,6 +5343,7 @@ def run_training_on_split(
             f"{tag} {epoch_str}  "
             f"{_col('META ', _C.GREY + _C.BOLD)}  "
             f"rho {_rho_ep:>+6.4f}  rhoAux {_rho_aux:>+6.4f}  "
+            + ("" if _valide else f"[val ep{_val_epoch}] ") +
             f"Sortino {metric:>+6.3f}  "
             f"{_col(f'Sortino30 {s30:>+6.3f}', s30_col)}  "
             f"AvgW {_money(avg_win_train, width=8)}  AvgL {_money(avg_loss_train, width=8)}  "
@@ -5793,7 +5850,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec54"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec55"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -5817,7 +5874,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec54: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec55: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
