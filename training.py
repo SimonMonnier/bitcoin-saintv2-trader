@@ -761,7 +761,26 @@ class PPOConfig:
     budget_risque: float = 0.10
     # ------------------------------------------------------------------
 
-    episodes_per_epoch: int = 84
+    # 84 -> 20, ET C'EST UN GAIN, pas une reduction.
+    #
+    # Le budget d'une epoch ne se compte pas en barres mais en DECISIONS :
+    # c'est le seul endroit ou l'acteur recoit du gradient. Avant la
+    # concurrence il fallait 483 840 barres pour en produire 580, parce que
+    # la politique etait en position 99.9 % du temps. Avec plusieurs
+    # positions, un episode de 5 760 barres en produit ~200.
+    #
+    #     84 episodes -> ~17 000 decisions, mise a jour PPO 29 fois plus
+    #                    lourde qu'a K=1, soit 4 a 12 minutes par epoch
+    #     20 episodes -> ~4 000 decisions, sept fois le gradient d'avant
+    #                    pour le meme temps d'epoch
+    #
+    # On garde donc sept fois plus de gradient qu'a K=1 en divisant par
+    # quatre les barres parcourues. Le cout d'une epoch reste celui d'avant ;
+    # ce qui change est ce qu'on en tire.
+    #
+    # La couverture du marche par epoch baisse, mais le run compte 90 epochs
+    # et les departs sont tires au hasard : la couverture cumulee augmente.
+    episodes_per_epoch: int = 20
     # Idem pour la validation : 21-32 trades donnaient un Sortino purement
     # bruité (PF 3.10 puis 0.51 d'une epoch à l'autre), donc une sélection du
     # "best model" au hasard.
@@ -5498,7 +5517,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec45"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec46"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -5522,7 +5541,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec45: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec46: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
