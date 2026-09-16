@@ -2854,36 +2854,52 @@ class BTCTradingEnvDiscrete(gym.Env):
         # des prix differents n'ont ni le meme point mort ni le meme
         # declenchement ; un stop commun melangerait les deux et suivrait le
         # mouvement d'une position que l'autre n'a pas vecu.
-        if self.cfg.use_be_trail and not manual_close:
-            for j in np.flatnonzero(self._p_sens != 0):
-                j = int(j)
-                sens = int(self._p_sens[j])
-                atr_j = float(self._p_atr[j])
-                if (self._p_taille[j] <= 0 or atr_j <= 1e-8
-                        or self.idx <= self._p_idx[j]):
-                    continue
+        # EN UNE PASSE VECTORIELLE. La version en boucle appelait
+        # `execution_quote` une fois par position ouverte et par barre —
+        # releve au profileur : 98 appels par barre a 35 positions, et c'est
+        # le premier poste de cout de l'environnement. La fonction n'est
+        # qu'une multiplication, donc tout se met en tableau sans changer un
+        # seul resultat : le temoin a K=1 le verifie au centime.
+        #
+        # L'ordre est conserve : break-even d'abord, puis trailing, qui lit
+        # donc le stop DEJA remonte par le break-even.
+        if self.cfg.use_be_trail and not manual_close and self._p_sens.any():
+            sens = self._p_sens
+            vif = ((sens != 0) & (self._p_taille > 0) & (self._p_atr > 1e-8)
+                   & (self.idx > self._p_idx))
+            if vif.any():
                 # Le SL de cette bougie ne peut utiliser que les bougies déjà closes.
-                fav_bid = (self.data.high[self.idx - 1] if sens == 1
-                           else self.data.low[self.idx - 1])
-                fav_price = execution_quote(fav_bid, -sens, float(self._p_spread[j]))
-                fav_move = sens * (fav_price - self._p_entree[j])
+                haut = float(self.data.high[self.idx - 1])
+                bas = float(self.data.low[self.idx - 1])
+                fav_bid = np.where(sens == 1, haut, bas)
+                # execution_quote(fav_bid, -sens, spread) : le cote vendu paie.
+                fav_price = fav_bid * np.where(
+                    sens == -1, 1.0 + np.maximum(self._p_spread, 0.0) / 1e4, 1.0)
+                fav_move = sens * (fav_price - self._p_entree)
 
                 # Break-even : déplace SL à l'entrée quand gain >= atr_be_mult × ATR
-                if not self._p_be[j] and fav_move >= self.cfg.atr_be_mult * atr_j:
-                    if sens == 1:
-                        self._p_sl[j] = max(self._p_sl[j], self._p_entree[j])
-                    else:
-                        self._p_sl[j] = min(self._p_sl[j], self._p_entree[j])
-                    self._p_be[j] = True
+                m_be = vif & (~self._p_be) & (
+                    fav_move >= self.cfg.atr_be_mult * self._p_atr)
+                if m_be.any():
+                    self._p_sl = np.where(
+                        m_be & (sens == 1),
+                        np.maximum(self._p_sl, self._p_entree), self._p_sl)
+                    self._p_sl = np.where(
+                        m_be & (sens == -1),
+                        np.minimum(self._p_sl, self._p_entree), self._p_sl)
+                    self._p_be |= m_be
 
                 # Trailing stop : suit le prix à atr_trail_dist × ATR quand gain >= atr_trail_mult × ATR
-                if fav_move >= self.cfg.atr_trail_mult * atr_j:
-                    trail_sl = fav_price - sens * self.cfg.atr_trail_dist * atr_j
-                    if sens == 1:
-                        self._p_sl[j] = max(self._p_sl[j], trail_sl)
-                    else:
-                        self._p_sl[j] = min(self._p_sl[j], trail_sl)
-                    self._p_trail[j] = True
+                m_tr = vif & (fav_move >= self.cfg.atr_trail_mult * self._p_atr)
+                if m_tr.any():
+                    trail_sl = fav_price - sens * self.cfg.atr_trail_dist * self._p_atr
+                    self._p_sl = np.where(
+                        m_tr & (sens == 1),
+                        np.maximum(self._p_sl, trail_sl), self._p_sl)
+                    self._p_sl = np.where(
+                        m_tr & (sens == -1),
+                        np.minimum(self._p_sl, trail_sl), self._p_sl)
+                    self._p_trail |= m_tr
 
         # --------- SL/TP AUTO ---------
         # LONG ferme au BID, SHORT à l'ASK. SL/TP sont déjà des prix
@@ -2904,44 +2920,48 @@ class BTCTradingEnvDiscrete(gym.Env):
         # exactement la sequence d'avant.
         if not manual_close and self._p_sens.any():
             open_bid = getattr(self.data, 'open', self.data.close)[self.idx]
-            ouverts = np.flatnonzero(self._p_sens != 0)
-            ouverts = ouverts[np.argsort(self._p_idx[ouverts], kind="stable")]
-            for j in ouverts:
+            # LA DETECTION EST VECTORIELLE, la fermeture ne boucle que sur
+            # les emplacements qui TOUCHENT — une poignee par barre, la ou
+            # l'ancienne version parcourait toutes les positions ouvertes et
+            # appelait `execution_quote` pour chacune.
+            sens_a = self._p_sens
+            vivant = (sens_a != 0) & (self._p_taille > 0) & (self._p_entree > 0)
+            spread_f = 1.0 + np.maximum(self._p_spread, 0.0) / 1e4
+            est_long = sens_a == 1
+            sl_pose = self._p_sl > 0
+            tp_pose = self._p_tp > 0
+
+            touche_sl = vivant & sl_pose & np.where(
+                est_long, low_bar <= self._p_sl,
+                high_bar * spread_f >= self._p_sl)
+            touche_tp = vivant & tp_pose & (~touche_sl) & np.where(
+                est_long, high_bar >= self._p_tp,
+                low_bar * spread_f <= self._p_tp)
+            touche_temps = (vivant & (~touche_sl) & (~touche_tp)
+                            & (self.cfg.max_holding_bars > 0)
+                            & ((self.idx - self._p_idx)
+                               >= self.cfg.max_holding_bars))
+
+            a_fermer = np.flatnonzero(touche_sl | touche_tp | touche_temps)
+            # L'ordre reste celui des entrees : chaque fermeture tire un
+            # slippage, donc l'ordre fixe la trajectoire aleatoire.
+            a_fermer = a_fermer[np.argsort(self._p_idx[a_fermer], kind="stable")]
+            for j in a_fermer:
                 j = int(j)
-                sens = int(self._p_sens[j])
-                if self._p_taille[j] <= 0 or self._p_entree[j] <= 0:
-                    continue
-                spread_j = float(self._p_spread[j])
-                sl_j, tp_j = float(self._p_sl[j]), float(self._p_tp[j])
-                exit_price = None
-                h_sl = h_tp = h_temps = False
-                open_quote = execution_quote(open_bid, -sens, spread_j)
-
-                if sens == 1:  # LONG
-                    if sl_j > 0 and low_bar <= sl_j:
-                        exit_price = min(sl_j, open_quote)
-                        h_sl = True
-                    elif tp_j > 0 and high_bar >= tp_j:
-                        exit_price = tp_j
-                        h_tp = True
-                else:          # SHORT
-                    if sl_j > 0 and execution_quote(high_bar, 1, spread_j) >= sl_j:
-                        exit_price = max(sl_j, open_quote)
-                        h_sl = True
-                    elif tp_j > 0 and execution_quote(low_bar, 1, spread_j) <= tp_j:
-                        exit_price = tp_j
-                        h_tp = True
-
-                # Ni SL ni TP : cloture AU MARCHE au plafond de detention.
-                # INACTIF par defaut (max_holding_bars = 0) : le live ne sait
-                # pas fermer au marche, donc l'environnement non plus.
-                if (exit_price is None and self.cfg.max_holding_bars > 0
-                        and (self.idx - int(self._p_idx[j]))
-                        >= self.cfg.max_holding_bars):
+                sens = int(sens_a[j])
+                h_sl = bool(touche_sl[j])
+                h_tp = bool(touche_tp[j])
+                h_temps = bool(touche_temps[j])
+                open_quote = open_bid * (float(spread_f[j]) if sens == -1 else 1.0)
+                if h_sl:
+                    exit_price = (min(float(self._p_sl[j]), open_quote) if sens == 1
+                                  else max(float(self._p_sl[j]), open_quote))
+                elif h_tp:
+                    exit_price = float(self._p_tp[j])
+                else:
                     exit_price = self._apply_micro(price, -sens, is_entry=False)
-                    h_temps = True
 
-                if exit_price is not None:
+                if True:
                     # SL/sortie au marché: slippage adverse. TP: niveau cible,
                     # sans amélioration favorable systématique inventée.
                     slip_max = self.cfg.slippage_bps / 10_000.0
@@ -5478,7 +5498,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec44"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec45"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -5502,7 +5522,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec44: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec45: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
