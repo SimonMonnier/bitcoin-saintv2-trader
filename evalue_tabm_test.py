@@ -51,10 +51,28 @@ from saint_core import FEATURE_COLS
 TRAIN_FRAC, VAL_FRAC, TEST_FRAC, N_FOLDS = 0.55, 0.15, 0.10, 3
 # Reglages de l'environnement, repris tels quels pour que la cible apprise
 # decrive le trade que l'execution fera reellement.
-SL_MULT, RR, HOLD = 2.0, 2.0, 30
-PAS_TRAIN = 6          # un echantillon toutes les 6 barres : le chevauchement
-                       # correle les exemples d'entrainement sans les biaiser,
-                       # contrairement a l'evaluation ou il est interdit.
+#
+# PORTES AU M5 LE 2026-09-16, et c'est la raison d'etre de ce bloc.
+#
+# Ces trois nombres etaient restes a la geometrie H1 — SL 2xATR, plafond de
+# detention de 30 barres — pendant que l'environnement etait passe au M5 avec
+# un stop de 8xATR. TabM apprenait donc a predire un trade que personne ne
+# faisait, et son vote dans `evalue_ensemble.py` portait sur un autre marche
+# que celui des deux reseaux PPO. Rien n'aurait leve d'erreur : les colonnes
+# sont les memes, seules les CIBLES differaient.
+#
+# HOLD = 1 440 BARRES, soit cinq jours, et non la duree mediane. Mesure sur
+# 11 971 courses a SL 8xATR : le trade gagnant median dure 254 barres et la
+# moyenne monte a 476, tiree par une queue longue. Un plafond serre couperait
+# donc les GAGNANTS d'abord — c'est exactement l'erreur deja payee ici, ou une
+# mesure plafonnee a 30 barres avait recommande un stop de 8xATR dont la duree
+# affichee n'etait que le plafond lui-meme.
+#
+# PAS_TRAIN = 144, soit le dixieme du plafond, comme les 6 barres valaient le
+# cinquieme des 30 en H1. Le chevauchement correle les exemples d'entrainement
+# sans les biaiser ; a l'evaluation il reste interdit.
+SL_MULT, RR, HOLD = 8.0, 2.0, 1440
+PAS_TRAIN = 144
 # La selectivite n'est PAS fixee : elle se choisit fold par fold sur la
 # fenetre de validation, puis s'applique au test sans etre revue.
 #

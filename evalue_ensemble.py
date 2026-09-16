@@ -54,8 +54,18 @@ from saint_core import EntryDecisionPolicy, FEATURE_COLS, build_policy
 SELECTIVITE = 0.05
 # (nom, prefixe du checkpoint). "last" est le modele MOYENNE : le training
 # ecrit ce fichier apres le tour de moyenne des poids.
-RESEAUX = [("patchtst", "last_saintv2_loup_duel_exec18"),
-           ("saint", "last_saintv2_loup_duel_exec20")]
+# LES DEUX RESEAUX VIENNENT DU MEME RUN, donc de la meme observation.
+#
+# Ils pointaient sur exec18 et exec20, tous deux a 107 features en H1, quand le
+# run courant en portait 264. Un vote entre observations differentes ne vote
+# sur rien : les lignees de poids ne sont pas interchangeables, et rien dans le
+# code ne l'aurait signale — le modele aurait trade, en lisant autre chose que
+# ce sur quoi il a appris.
+#
+# `training.py` entraine desormais les deux architectures a la suite dans le
+# meme processus, avec les memes fenetres et la meme normalisation par fold.
+RESEAUX = [("patchtst", "last_saintv2_loup_duel_exec27_patchtst"),
+           ("saint", "last_saintv2_loup_duel_exec27_saint")]
 
 
 def charge(prefixe, fold, lookback, device):

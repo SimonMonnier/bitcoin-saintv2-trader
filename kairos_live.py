@@ -1,4 +1,4 @@
-﻿import os
+import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import time
@@ -13,6 +13,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
+import flux_live
+import prepare_m5
 from saint_core import (
     MASK_VALUE,
     NORM_STATS_PATH,
@@ -76,18 +78,35 @@ MULTI_AGENT_MAGICS: Dict[str, int] = {
 @dataclass
 class LiveConfig:
     symbol: str = "BTCUSD"
-    timeframe: int = mt5.TIMEFRAME_M1
-    htf_timeframe: int = mt5.TIMEFRAME_H1   # identique au training
 
-    # DOIT valoir training.PPOConfig.lookback : le reseau PatchTST est bati
-    # pour un nombre de segments donne, et build_policy le deduit du
-    # checkpoint. Une valeur differente ici ferait charger un reseau d'une
-    # autre forme, ou nourrirait le bon reseau avec une fenetre tronquee.
-    lookback: int = 96
+    # ------------------------------------------------------------------
+    # LES COLONNES NE VIENNENT PLUS DE MT5, le 2026-09-16.
+    #
+    # Quatre des 260 colonnes — part acheteuse agressive, taille moyenne de
+    # trade, intensite — n'existent tout simplement pas dans un flux CFD :
+    # MT5 ne publie ni `taker_buy_base`, ni `quote_vol`, ni `nb_trades`. Le
+    # modele a appris sur le spot Binance ; lui donner autre chose en
+    # production serait le faire lire un marche qu'il n'a jamais vu.
+    #
+    # Les bougies viennent donc de `flux_live`, et passent par le MEME
+    # `prepare_m5.construit` que le jeu d'entrainement — un seul chemin au lieu
+    # de deux implementations qui devaient s'accorder par convention.
+    # `test_alignement.py` compare les 260 colonnes valeur par valeur sur des
+    # horodatages communs, au lieu de le supposer.
+    #
+    # MT5 ne sert plus qu'a EXECUTER. L'ecart entre le prix Binance et le prix
+    # du courtier est exactement ce que la friction represente dans la mesure.
+    # ------------------------------------------------------------------
 
-    # nombre de bougies pour recalculer les indicateurs
-    n_bars_m1: int = 50000
-    n_bars_h1: int = 20000
+    # DOIT valoir training.PPOConfig.lookback. La valeur est aussi ecrite dans
+    # le fichier `_calib.json` du checkpoint et relue au chargement : le
+    # lookback n'est PAS deductible des poids — n'importe quelle profondeur se
+    # reconstruit en ajustant le pas — donc c'est le fichier qui fait foi.
+    lookback: int = 4
+
+    # Bougies d'echauffement demandees a chaque cycle. Le bloc H4 reclame
+    # ~280 bougies H4, soit 13 400 barres M5 ; voir flux_live.ECHAUFFEMENT.
+    n_bars_m5: int = 16_000
 
     # config training (R:R 1:2.0)
     tp_shrink: float = 1.0  # pas de shrink (formule explicite : atr_tp_mult contient déjà le facteur final)
@@ -101,8 +120,14 @@ class LiveConfig:
     risk_per_trade: float = 0.012
     leverage: float = 100.0   # aligné sur training.py (BTCUSD)
     fee_rate: float = 0.0   # ce courtier ne facture pas de commission sur BTCUSD
-    atr_sl_mult: float = 2.0     # SL = 2.0 x ATR   — training.PPOConfig.atr_sl_mult
-    atr_tp_mult: float = 4.0     # TP = 4.0 x ATR   — R:R 1:2.0, identique au training
+    # GEOMETRIE DES BARRIERES — doit valoir celle de training.PPOConfig.
+    # Mesure du 2026-09-16 : a cette echelle le 8xATR laisse une friction de
+    # 0.049 R et un horizon de 12.2 h, ceux du H1 ou l'avantage du modele a ete
+    # mesure, pour deux fois plus d'occasions independantes. Un stop different
+    # ici executerait une autre strategie que celle qui a ete mesuree, sans
+    # qu'aucune erreur ne soit levee.
+    atr_sl_mult: float = 8.0     # SL = 8.0 x ATR   — training.PPOConfig.atr_sl_mult
+    atr_tp_mult: float = 16.0    # TP = 16.0 x ATR  — R:R 1:2.0, identique au training
 
     spread_bps: float = 0.0
     slippage_bps: float = 0.0
@@ -203,37 +228,35 @@ def get_calib_threshold(agent_name: str):
 # DATA LIVE : M1 + H1 => MERGE + FEATURES
 # ============================================================
 
+_HISTORIQUE: "flux_live.Historique | None" = None
+
+
 def fetch_ohlc_with_indicators(cfg: LiveConfig) -> pd.DataFrame:
-    rates_m1 = mt5.copy_rates_from_pos(
-        cfg.symbol, cfg.timeframe, 0, cfg.n_bars_m1
-    )
-    rates_h1 = mt5.copy_rates_from_pos(
-        cfg.symbol, cfg.htf_timeframe, 0, cfg.n_bars_h1
-    )
+    """Les bougies du live, passees par la chaine de l'ENTRAINEMENT.
 
-    if rates_m1 is None or rates_h1 is None:
-        raise RuntimeError("MT5 n'a renvoyé aucune donnée M1 ou H1 (live).")
+    Un seul chemin de calcul pour les deux : `prepare_m5.construit`. Les
+    colonnes du live sont donc identiques a celles du jeu par construction, et
+    non par convention — c'est ce que `test_alignement.py` verifie.
 
-    # Argent : MEME source que l'or (MT5), donc meme horodatage et meme fuseau.
-    # Plus aucun appel REST, plus de detection de decalage horaire, plus de
-    # risque de divergence entre l'historique et le live — tout ce qui rendait
-    # le pipeline Binance fragile disparait ici.
-    #
-    # On ne demande que la fenetre utile : lookback + marge pour les moyennes
-    # glissantes des indicateurs.
-    t_to = datetime.now() + timedelta(minutes=2)
-    t_from = t_to - timedelta(minutes=cfg.lookback + 400)
-    feats_ext = charge_source_externe(t_from, t_to)
-    if feats_ext is None or len(feats_ext) == 0:
+    L'historique est garde entre deux cycles : un cycle dure cinq minutes, et
+    recharger seize mille bougies a chaque fois couterait seize appels pour une
+    ligne nouvelle.
+    """
+    global _HISTORIQUE
+    if _HISTORIQUE is None:
+        _HISTORIQUE = flux_live.Historique(n=cfg.n_bars_m5)
+        brut = _HISTORIQUE.d
+    else:
+        brut = _HISTORIQUE.actualise()
+
+    df, colonnes, _ = prepare_m5.construit(brut.copy())
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=colonnes + ["atr_14"]).reset_index(drop=True)
+    if len(df) < cfg.lookback + 1:
         raise RuntimeError(
-            f"Source externe absente : {SOURCE_EXT_NOM}. Deux des dix "
-            f"features en dependent, tourner sans elles ferait decider le "
-            f"modele sur un vecteur qu'il n'a jamais vu."
-        )
-    _si = mt5.symbol_info(cfg.symbol)
-    point = float(_si.point) if _si is not None else 1.0
-
-    return merge_m1_h1(rates_m1, rates_h1, feats_ext=feats_ext, point=point)
+            f"apres echauffement il ne reste que {len(df)} barres exploitables, "
+            f"il en faut {cfg.lookback + 1}. Augmenter n_bars_m5.")
+    return df
 
 
 def build_live_obs(

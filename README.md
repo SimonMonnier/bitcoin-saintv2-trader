@@ -68,7 +68,54 @@ fold 2 d'exec18 affichait +8.14 en validation pour −0.9 en test. C'est pourquo
 le choix du meilleur checkpoint a été remplacé par la **moyenne des dix
 derniers jeux de poids**, qui ne dépend d'aucun tirage particulier.
 
-### Divergence connue entre l'entraînement et le live
+### Le live et l'entraînement calculent les mêmes colonnes — et c'est vérifié
+
+Jusqu'au 2026-09-16 ils passaient par **deux chemins différents** : `merge_m1_h1`
+d'un côté, `prepare_m5.construit` de l'autre. Deux implémentations de la même
+chose, qui devaient s'accorder par convention et que rien ne vérifiait. Elles
+avaient cessé de s'accorder : le live était resté en M1, lookback 96, stop
+2×ATR, checkpoints `exec11`, pendant que l'entraînement passait au M5, 260
+colonnes, lookback 4 et 8×ATR. Chargé tel quel, le modèle n'aurait levé aucune
+erreur — il aurait tradé, en lisant autre chose que ce sur quoi il a appris.
+
+Il n'y a plus qu'un chemin. `flux_live.py` récupère les bougies M5 au format
+exact de `klines_5m_spot_BTCUSDT.pkl`, et `kairos_live` les passe au **même**
+`prepare_m5.construit` que le jeu d'entraînement.
+
+`test_alignement.py` le vérifie plutôt que de le supposer : il récupère des
+bougies **par le chemin du live**, sur une fenêtre finissant dans le jeu, et
+compare les 260 colonnes valeur par valeur. Il contrôle aussi les réglages —
+stop, objectif, lookback, risque par trade — de tout fichier qui les **recopie**.
+
+> Les bougies viennent de **Binance, pas de MT5**. Quatre des 260 colonnes —
+> part acheteuse agressive, taille moyenne de trade, intensité — n'existent pas
+> dans un flux CFD : MT5 ne publie ni `taker_buy_base`, ni `quote_vol`, ni
+> `nb_trades`. MT5 ne sert plus qu'à **exécuter**, et l'écart de prix entre les
+> deux est exactement ce que la friction représente.
+
+> La **dernière bougie est toujours jetée** : l'API rend celle en formation en
+> dernière ligne, et la garder injecterait cinq minutes de futur à chaque
+> décision, sans qu'aucune erreur ne soit levée.
+
+### Les backtests : un seul moteur, jamais deux
+
+`evalue_test_exhaustif.py`, `evalue_ensemble.py` et `stress_test.py`
+construisent tous leur environnement depuis `training.PPOConfig` et
+`BTCTradingEnvDiscrete`. Ils suivent donc l'entraînement **par construction** :
+il n'y a rien à maintenir en double.
+
+`stress_test.py` remplace `backtest_saintv2_stress_test.py`, qui
+réimplémentait l'environnement au-dessus de MT5 — sa propre lecture des
+bougies, son propre moteur d'ordres, ses propres réglages recopiés à la main.
+Ils avaient dérivé jusqu'à l'absurde : instrument **XAUUSD**, stop de 5×ATR
+annoté « optimum mesuré sur l'or », lookback 25. Le nouveau ne réimplémente
+rien : il prend le vrai moteur et dégrade ce qu'il consomme — spread doublé,
+glissement triplé, mèches étendues, ATR faussé de 10 %, micro-gaps, pics de
+news, puis tout ensemble. Il tourne sur la **validation** par défaut ; la
+fenêtre de test ne sert qu'une fois, et `--test` le dit en clair avant de
+partir.
+
+### Divergence restante entre l'entraînement et le live
 
 `kairos_live.py` n'a **aucun chemin de fermeture au marché** — les positions ne
 sortent que par SL/TP chez le courtier. Tant que ce n'est pas écrit, toute règle
@@ -439,7 +486,7 @@ jours de trous en 2022). Coût : 2.28 M → 1.97 M bougies.
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│           2. VALIDATION (backtest_saintv2_stress_test.py)        │
+│           2. VALIDATION (stress_test.py)                        │
 │                                                                  │
 │  Charge bestprofit_* → Simule sur OOS data avec                  │
 │  stress-test V3 (slippage ±20bps, gaps, news spikes,             │
@@ -620,7 +667,7 @@ Pour relancer en partant des checkpoints existants : `training.py` détecte auto
 ### 2. Backtest stress-test
 
 ```powershell
-python backtest_saintv2_stress_test.py
+python stress_test.py
 ```
 
 Par défaut backteste `bestprofit_saintv2_loup_duel_wf1_both_wf1.pth` en mode `side="both"` avec `min_confidence=0.0` (argmax pur). Modifie `LiveConfig(...)` à la fin du fichier pour tester :
@@ -632,10 +679,10 @@ Par défaut backteste `bestprofit_saintv2_loup_duel_wf1_both_wf1.pth` en mode `s
 ### Variante `no_be_trail` (sans break-even / trailing)
 
 ```powershell
-python backtest_saintv2_stress_test.py
+python stress_test.py
 ```
 
-**Fichier identique** à `backtest_saintv2_stress_test.py` mais avec l'appel à
+**Fichier identique** à `stress_test.py` mais avec l'appel à
 `update_sl_be_trailing_backtest()` **commenté** (ligne ~980). Les positions
 ne ferment qu'au SL ou TP fixe.
 
@@ -742,7 +789,9 @@ multi-agent-btcusd/
 ├── mesure_features_ichimoku.py      # Apport des 47 colonnes Ichimoku
 ├── mesure_lookback_utile.py         # Profondeur de passé réellement utilisée
 │
-├── backtest_saintv2_stress_test.py  # Backtest institutionnel (BE/trail on)
+├── stress_test.py                   # Degrade l'execution dans le VRAI moteur
+├── flux_live.py                     # Bougies M5 en direct, format du jeu
+├── test_alignement.py               # Le live calcule-t-il les memes colonnes ?
 ├── export_to_onnx.py                # .pth → .onnx + stats binaires pour MT5
 ├── SaintV2_WF3.mq5                  # EA MQL5 pour le Strategy Tester
 ├── requirements.txt                 # Dépendances Python
@@ -904,7 +953,7 @@ Le `TradingAgent` route automatiquement vers `live_loop_multi()` quand `multi_ag
 Un fichier dédié reproduit la même logique :
 
 ```powershell
-python backtest_saintv2_stress_test.py
+python stress_test.py
 ```
 
 Affichage par-agent dans les logs (couleur cyan/jaune/magenta) + résumé final qui détaille les stats de chaque agent séparément. CSV exporté : `backtest_trades_multi_agent_no_be_trail.csv` avec colonne `agent`.

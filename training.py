@@ -552,7 +552,55 @@ class PPOConfig:
     # A SURVEILLER : un gamma plus haut augmente la variance des avantages et
     # l'echelle des cibles du critique. Si CriticL s'envole ou si quasi0
     # remonte, c'est le premier suspect.
-    gamma: float = 0.995
+    # ------------------------------------------------------------------
+    # GAMMA EST EXPRIME PAR BARRE, et on a change deux fois ce que vaut une
+    # barre sans y toucher : H1 -> M5, puis SL 4 -> 8xATR. Corrige le
+    # 2026-09-16.
+    #
+    # CE QUE GAMMA FAIT ICI. La recompense est une plus-value latente payee a
+    # CHAQUE barre, accumulee en `p["R"] += gamma**dt * reward`. Une barre
+    # tardive du trade compte donc moins qu'une barre precoce — alors que rien
+    # dans la strategie ne justifie de preferer un gain tot dans le trade : ce
+    # sont les BARRIERES qui decident, pas la date.
+    #
+    # LA MESURE, 11 971 courses resolues sur le M5 a SL 8xATR / R:R 2.0 :
+    #
+    #             n    duree med   R moyen
+    #     GAINS   3993     254 b    +2.00 R
+    #     PERTES  7978     146 b    -1.02 R
+    #
+    # UN GAIN DURE 1.74 FOIS PLUS LONGTEMPS QU'UNE PERTE — c'est mecanique, le
+    # take-profit est deux fois plus loin que le stop. L'escompte frappe donc
+    # les gains plus fort que les pertes, et le R:R que l'agent optimise n'est
+    # pas celui que l'environnement paie :
+    #
+    #     gamma      poids gain   poids perte   R:R effectif
+    #     0.995        0.567         0.711          1.56      -20.2 %
+    #     0.999        0.883         0.931          1.86       -5.1 %
+    #     0.9999       0.987         0.993          1.95       -0.5 %
+    #
+    # A 0.995 le point mort VU PAR L'AGENT monte a 39.1 % quand celui que
+    # l'environnement applique vaut 33.8 % : on lui demandait 5.3 points de
+    # winrate de plus que ce qu'il fallait vraiment, et on le poussait a fuir
+    # les configurations lentes a se resoudre — c'est-a-dire les gagnantes.
+    #
+    # (Le poids est calcule en supposant la plus-value accumulee uniformement
+    # sur la duree, soit (1-g^dt)/(dt(1-g)). C'est une approximation au premier
+    # ordre ; elle ne change ni le signe ni l'ordre de grandeur, qui tiennent au
+    # seul rapport 254/146.)
+    #
+    # POURQUOI 0.9999 ET PAS 1.0. Gamma garde un role legitime : l'escompte du
+    # bootstrap gamma^dt, qui dit jusqu'ou l'agent planifie au-dela du trade en
+    # cours. A 0.9999 il vaut 0.982 sur un trade median et 0.865 sur un episode
+    # de 1 440 barres — l'agent prefere encore, faiblement, gagner tot dans
+    # l'episode. A 1.0 il n'y aurait plus aucune preference temporelle et le
+    # critique perdrait son ancrage.
+    #
+    # EN H1 CE REGLAGE ETAIT SAIN : un trade durait 13 barres, 0.995^13 = 0.937,
+    # la distorsion etait sous les 2 %. Ce n'est pas la valeur qui etait fausse,
+    # c'est qu'elle n'a pas suivi l'echelle.
+    # ------------------------------------------------------------------
+    gamma: float = 0.9999
     lambda_gae: float = 0.95
     clip_eps: float = 0.18
     # ------------------------------------------------------------------
@@ -4045,17 +4093,65 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec25"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec27"
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec25: trois folds sans bootstrap inter-fold.")
-    run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10,
-                    max_folds=3, start_fold=1,
-                    bootstrap_from_path=None,
-                    auto_chain=False)
+    print("Walk-forward exec27: trois folds sans bootstrap inter-fold.")
+    # ==================================================================
+    # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
+    #
+    # `evalue_ensemble.py` fait voter trois modeles choisis pour se tromper
+    # DIFFEREMMENT :
+    #
+    #     TabM       supervise, regression du rendement net, MLP ensemble
+    #     PatchTST   PPO, canaux INDEPENDANTS : ne croise jamais les colonnes
+    #     SAINT      PPO, attention sur les features : ne fait que les croiser
+    #
+    # Les deux reseaux PPO sont opposes par construction sur la question qui
+    # separe le mieux les modeles de ce depot. C'est la condition pour qu'un
+    # vote reduise la variance : des erreurs correlees ne s'annulent pas.
+    #
+    # POURQUOI ILS DOIVENT PARTIR ENSEMBLE. Un vote n'a de sens que si les
+    # votants lisent la MEME observation. Jusqu'ici l'ensemble pointait sur
+    # exec18 (PatchTST) et exec20 (SAINT), tous deux a 107 features en H1,
+    # pendant que le run courant en portait 264 : il n'y avait plus aucun
+    # PatchTST sur l'observation en service, donc plus de vote possible.
+    # Les entrainer dans le meme processus garantit qu'ils partagent le jeu,
+    # la geometrie, la normalisation par fold et les fenetres — donc que la
+    # comparaison est APPARIEE barre a barre.
+    #
+    # SEQUENTIEL, PAS PARALLELE. Deux entrainements simultanes sur cette carte
+    # ont deja ete essayes : la temperature est montee a 89 C, l'horloge est
+    # tombee a 315 MHz, et les deux processus ecrivaient les memes checkpoints.
+    # Le GPU est deja bride thermiquement a un seul run.
+    # ==================================================================
+    ARCHITECTURES = (
+        # (nom, architecture, lookback, taille_patch, pas_patch)
+        ("saint", "saint", 4, 2, 1),
+        # PatchTST au meme lookback : la mesure de profondeur utile n'a rien
+        # trouve au-dela de 4 barres, et un lookback different ferait varier
+        # deux choses a la fois entre les deux votants.
+        ("patchtst", "patchtst", 4, 2, 1),
+    )
+
+    for nom, archi, lb, tp, pp in ARCHITECTURES:
+        cfg = PPOConfig(**cfg_duel.__dict__)
+        cfg.architecture = archi
+        cfg.lookback = lb
+        cfg.taille_patch = tp
+        cfg.pas_patch = pp
+        cfg.model_prefix = f"{cfg_duel.model_prefix}_{nom}"
+        print("\n" + "=" * 70)
+        print(f"  ARCHITECTURE {nom.upper()} — prefixe {cfg.model_prefix}")
+        print("=" * 70)
+        run_walkforward(cfg, train_frac=0.55, val_frac=0.15, test_frac=0.10,
+                        max_folds=3, start_fold=1,
+                        bootstrap_from_path=None,
+                        auto_chain=False)
 
     print("\n" + "=" * 70)
-    print("  WALK-FORWARD TERMINÉ : 3 folds entraînés, indépendance préservée.")
+    print("  WALK-FORWARD TERMINÉ : 2 architectures x 3 folds.")
+    print("  Le vote a trois se lance ensuite : python evalue_ensemble.py")
     print("  Fichiers générés :")
     print("    bestprofit_saintv2_loup_duel_exec2_wf1_both_wf1.pth")
     print("    bestprofit_saintv2_loup_duel_exec2_wf2_both_wf2.pth")

@@ -42,7 +42,10 @@ from mesure_features import (barrieres, SPREAD_BPS, SLIP_ENTREE_BPS,
 
 warnings.filterwarnings("ignore")
 
-SL_MULT, RR = 2.0, 2.0
+# La geometrie suit l'echelle, elle n'est plus une constante de module : le
+# M5 trade a 8xATR, le H1 a 2xATR. Les laisser confondues faisait apprendre a
+# TabM une cible que l'environnement n'execute pas.
+SL_MULT, RR = 8.0, 2.0
 FRAC_CALIB = 0.30        # part finale du train reservee au calibrage de marge
 
 # ------------------------------------------------------------------
@@ -68,21 +71,29 @@ FRAC_CALIB = 0.30        # part finale du train reservee au calibrage de marge
 # resolue, et allonger le pas ne ferait que reduire un echantillon deja mince.
 # ------------------------------------------------------------------
 CACHE_H1 = "data_cache_BTCUSD_H1.pkl"
+CACHE_M5 = "data_cache_BTCUSD_M5.pkl"
 
-MODE = "h1"              # regle par configure() ; l'entrainement est en H1
-CACHE_UTILISE = CACHE_H1
-PAS = 24
+# M5 : le pas vaut 288 barres — une journee — parce que la course est un
+# SL 8xATR / TP 16xATR dont la duree mediane vaut 179 barres. Douze phases
+# espacees de 24 barres couvrent la journee sans qu'aucune ne se chevauche
+# elle-meme.
+MODE = "m5"              # regle par configure() ; l'entrainement est en M5
+CACHE_UTILISE = CACHE_M5
+PAS = 288
 N_BLOCS = 6
-PHASES = list(range(0, 24, 2))
-MIN_TRAIN, MIN_VAL = 500, 80
+PHASES = list(range(0, 288, 24))
+MIN_TRAIN, MIN_VAL = 600, 100
 
 
-def configure(mode="h1"):
+def configure(mode="m5"):
     """Fixe l'echelle. `barrieres` lit MF.MAX_HOLD : il faut le reregler AUSSI,
     sinon la course des barrieres durerait 240 heures au lieu de 24."""
     global MODE, CACHE_UTILISE, PAS, N_BLOCS, PHASES, MIN_TRAIN, MIN_VAL
     MODE = mode
-    if mode == "h1":
+    if mode == "m5":
+        CACHE_UTILISE, PAS, N_BLOCS = CACHE_M5, 288, 6
+        PHASES, MIN_TRAIN, MIN_VAL = list(range(0, 288, 24)), 600, 100
+    elif mode == "h1":
         CACHE_UTILISE, PAS, N_BLOCS = CACHE_H1, 24, 6
         PHASES, MIN_TRAIN, MIN_VAL = list(range(0, 24, 2)), 500, 80
     else:
