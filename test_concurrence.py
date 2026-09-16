@@ -53,9 +53,17 @@ SCENARIOS = [
 ]
 
 
+# La reference a ete figee AVANT que le courtier ne soit modelise. Depuis, le
+# lot minimum de 0.01 arrondit les tailles et change donc K=1 — volontairement.
+# `MARGE` a False rend le dimensionnement continu d'avant : c'est le TEMOIN
+# qui prouve que le refactor n'a rien change d'autre que le realisme.
+MARGE = False
+
+
 def _cfg(k=1):
     cfg = T.PPOConfig()
     cfg.positions_max = k
+    cfg.marge_realiste = MARGE
     return cfg
 
 
@@ -217,7 +225,11 @@ def compare(a, b) -> list[str]:
 
 
 def main() -> int:
+    global MARGE
     quoi = sys.argv[1] if len(sys.argv) > 1 else "verifie"
+    if "--marge" in sys.argv:
+        MARGE = True
+        sys.argv.remove("--marge")
 
     if quoi == "enregistre":
         tout = tous_scenarios(1)

@@ -652,7 +652,58 @@ class PPOConfig:
     # A K=1 tout ce chemin doit rendre EXACTEMENT l'environnement d'avant.
     # `test_concurrence.py` le verifie sur 613 trades et six scenarios, en
     # comparant recompense par recompense et centime par centime.
-    positions_max: int = 1
+    # 1 -> 8. PLAFOND DE TABLEAU, pas nombre de positions : le nombre reel
+    # est ce que le solde permet, recalcule a chaque barre par
+    # `places_ouvrables`, et le modele le voit dans son observation.
+    #
+    # 8 est le GENOU DU COUT, mesure : jusque-la les operations sur
+    # emplacements restent vectorielles et la barre ne coute pas plus cher.
+    #
+    #     K   trades   decisions   x dec   secondes
+    #     1      613       5,364    1.0x       14.0
+    #     8    2,480      21,768    4.1x       14.1   <- gratuit
+    #    16    2,760      24,257    4.5x       16.5
+    #    64    3,337      29,313    5.5x       29.4
+    #
+    # Le gradient de l'acteur est multiplie par K ; l'information, elle, ne
+    # l'est pas — 25 fois plus de trades ne valent que 2.1 fois plus
+    # d'occasions independantes, parce que deux positions de meme sens
+    # ouvertes a une heure d'ecart correlent a 0.72. C'est donc un levier
+    # d'APPRENTISSAGE, et c'est comme tel qu'il faut le juger.
+    positions_max: int = 8
+
+    # ------------------------------------------------------------------
+    # LE COURTIER, TEL QU'IL EST. Releve sur Vantage BTCUSD le 2026-09-16 :
+    #
+    #     contrat 1 BTC | lot min 0.01 | pas 0.01 | levier compte 500
+    #     marge pour 1 lot : 131.17 EUR a 75 654, soit 0.173 % du notionnel
+    #
+    # `positions_max` n'est donc PAS le nombre de positions : c'est la taille
+    # du tableau, un plafond de memoire. Le nombre REEL est ce que le solde
+    # permet, et il change a chaque barre — c'est ce que le modele doit
+    # apprendre, pas une constante qu'on lui impose.
+    #
+    # DEUX CONTRAINTES, ET CE N'EST PAS CELLE QU'ON CROIT QUI MORD.
+    #
+    # La marge est large : a 0.173 % du notionnel, 1 000 EUR autorisent des
+    # centaines de lots minimums. Ce qui borne vraiment, c'est le LOT MINIMUM.
+    # A 12xATR la taille visee vaut 0.0045 BTC, soit moins de la moitie du
+    # minimum de 0.01 : le courtier impose donc 2.2 fois la taille voulue, et
+    # le risque reel est de 1.19 % par trade au lieu des 0.53 % configures.
+    #
+    # L'entrainement dimensionnait en continu et ne voyait jamais cela. Il
+    # apprenait sur un courtier qui n'existe pas.
+    lot_min: float = 0.01
+    lot_pas: float = 0.01
+    marge_frac: float = 0.001734        # marge / notionnel, mesuree
+    # Niveau de marge (equity / marge utilisee) sous lequel on n'ouvre plus.
+    # Les courtiers appellent la marge vers 100 % et liquident vers 50 %.
+    niveau_marge_ouverture: float = 3.0
+    niveau_marge_liquidation: float = 0.5
+    # Mettre a False redonne le dimensionnement continu d'avant, qui sert de
+    # temoin : c'est la seule facon de mesurer ce que la contrainte coute.
+    marge_realiste: bool = True
+    # ------------------------------------------------------------------
 
     episodes_per_epoch: int = 84
     # Idem pour la validation : 21-32 trades donnaient un Sortino purement
@@ -2164,9 +2215,66 @@ class BTCTradingEnvDiscrete(gym.Env):
     def n_positions(self) -> int:
         return int(np.count_nonzero(self._p_sens))
 
+    @property
+    def notionnel(self) -> float:
+        a = self._actifs
+        return float((self._p_entree[a] * self._p_taille[a]).sum()) if a.any() else 0.0
+
+    @property
+    def marge_utilisee(self) -> float:
+        return self.notionnel * float(getattr(self.cfg, "marge_frac", 0.001734))
+
+    def _equity_courante(self) -> float:
+        bid = self.data.close[min(self.idx, self.data.length - 1)]
+        return self.capital + self._latent_at_bid(bid)
+
+    def _taille_quantifiee(self, taille: float) -> float:
+        """Ce que le courtier accepterait reellement.
+
+        Le lot minimum n'est pas un detail d'execution : a 12xATR la taille
+        visee vaut 0.0045 BTC contre un minimum de 0.01, donc le courtier
+        impose 2.2 fois la position voulue. L'ignorer, c'est s'entrainer sur
+        un courtier qui n'existe pas.
+        """
+        if not getattr(self.cfg, "marge_realiste", False):
+            return taille
+        pas = float(getattr(self.cfg, "lot_pas", 0.01))
+        mini = float(getattr(self.cfg, "lot_min", 0.01))
+        if taille < mini:
+            # Le courtier ne sait pas faire plus petit. On prend le minimum,
+            # comme le fait `kairos_live`, et le risque reel depasse la cible.
+            return mini
+        return math.floor(taille / pas + 1e-9) * pas
+
+    def places_ouvrables(self, prix: float) -> int:
+        """Combien de positions le SOLDE permet encore, ici et maintenant.
+
+        C'est le K reel. Il ne se configure pas, il se calcule : il tombe
+        quand l'equity baisse, quand le prix monte, ou quand des positions
+        sont deja ouvertes. Le modele doit l'apprendre, donc il le voit
+        (quatrieme colonne du bloc d'etat de l'observation).
+        """
+        libres = self._K - self.n_positions
+        if libres <= 0:
+            return 0
+        if not getattr(self.cfg, "marge_realiste", False):
+            return libres
+        eq = self._equity_courante()
+        if eq <= 0:
+            return 0
+        frac = float(getattr(self.cfg, "marge_frac", 0.001734))
+        seuil = float(getattr(self.cfg, "niveau_marge_ouverture", 3.0))
+        # Marge qu'une position minimale consommerait.
+        m_une = max(prix * float(getattr(self.cfg, "lot_min", 0.01)) * frac, 1e-12)
+        # On s'arrete avant que le niveau de marge ne descende sous le seuil.
+        marge_max = eq / max(seuil, 1e-9)
+        dispo = marge_max - self.marge_utilisee
+        return int(max(0, min(libres, math.floor(dispo / m_une))))
+
     def peut_entrer(self) -> bool:
-        """Y a-t-il un emplacement libre ? C'est la definition d'une DECISION."""
-        return self.n_positions < self._K
+        """Une DECISION existe quand le solde permet encore une position."""
+        prix = float(self.data.close[min(self.idx, self.data.length - 1)])
+        return self.places_ouvrables(prix) > 0
 
     @property
     def position(self) -> int:
@@ -2257,7 +2365,20 @@ class BTCTradingEnvDiscrete(gym.Env):
         )
 
         pos_feature  = float(self.position)
-        risk_feature = float(self.last_risk_scale)
+        # LA QUATRIEME COLONNE PORTE LA CAPACITE RESTANTE, plus l'echelle de
+        # risque. Celle-ci valait 1.0 en permanence — `set_risk_scale(1.0)` a
+        # chaque pas — donc elle n'apportait rien : une constante ne porte pas
+        # d'information, elle agit comme un biais.
+        #
+        # A la place, la part des places encore ouvrables. Le modele ne peut
+        # apprendre une contrainte qu'il ne voit pas : sans cette colonne il
+        # proposerait des entrees que le solde refuse, et n'aurait aucun moyen
+        # de distinguer un refus d'une occasion manquee.
+        if getattr(self.cfg, "marge_realiste", False):
+            risk_feature = self.places_ouvrables(
+                max(current_price, 1e-8)) / float(self._K)
+        else:
+            risk_feature = float(self.last_risk_scale)
 
         extra_vec = np.array(
             [pos_feature, unrealized_atr, bars_held_norm, risk_feature],
@@ -2504,7 +2625,11 @@ class BTCTradingEnvDiscrete(gym.Env):
         _libres = np.flatnonzero(self._p_sens == 0)
         if not manual_close and action in (0, 1) and len(_libres):
             side = 1 if action == 0 else -1
-            size = self._compute_dynamic_size(prix_execution)
+            size = self._taille_quantifiee(self._compute_dynamic_size(prix_execution))
+            # LE SOLDE PEUT REFUSER L'ORDRE. C'est un refus, pas une erreur :
+            # en live l'ordre part et le serveur le rejette faute de marge.
+            if size > 0.0 and self.places_ouvrables(prix_execution) <= 0:
+                size = 0.0
             if size > 0.0:
                 j = int(_libres[0])
                 self._p_taille[j] = size
@@ -2674,8 +2799,17 @@ class BTCTradingEnvDiscrete(gym.Env):
         marked_peak = max(self.peak_capital, marked_equity)
         marked_dd = (marked_peak - marked_equity) / (marked_peak + 1e-8)
         done_reason = None
+        # L'APPEL DE MARGE EXISTE, et il ne previent pas. Quand l'equity
+        # tombe sous une fraction de la marge immobilisee, le courtier
+        # liquide — il ne demande pas l'avis du modele. Ne pas le simuler
+        # laisserait l'agent apprendre qu'il peut porter n'importe quelle
+        # exposition tant que le prix finit par revenir.
+        _mu = self.marge_utilisee
+        _niveau = (marked_equity / _mu) if _mu > 1e-12 else float("inf")
         if self.idx + 1 >= self.end_idx:
             done_reason = "episode_end"
+        elif _niveau < float(getattr(self.cfg, "niveau_marge_liquidation", 0.5)):
+            done_reason = "appel_de_marge"
         elif marked_dd > self.cfg.max_drawdown:
             done_reason = "max_drawdown"
         elif marked_equity < self.cfg.initial_capital * self.cfg.min_capital_frac:
@@ -2836,6 +2970,22 @@ class BTCTradingEnvDiscrete(gym.Env):
                         np.clip(self._r_slots[j], -3.5, 3.5))
         else:
             self._r_slots[:] = 0.0
+
+        # A UNE SEULE POSITION, LA PART EST LA RECOMPENSE PAR AFFECTATION.
+        #
+        # Le calcul par emplacement est algebriquement le meme que le calcul
+        # global, mais il n'emprunte pas le meme chemin de flottants : l'ecart
+        # est de l'ordre de 1e-16 par barre. Mesure du 2026-09-16 — il suffit
+        # a faire diverger la perte auxiliaire (2.0666 contre 2.0662), donc le
+        # tirage des mini-lots, donc le seuil de calibration, donc quatre
+        # trades de validation. Le lot collecte etait pourtant identique :
+        # 580 decisions et un ecart-type d'avantage de 1.67 des deux cotes.
+        #
+        # Une affectation supprime la question. Elle ne cache rien : a K=1 il
+        # n'y a qu'une position, donc sa part EST le total, et c'est la
+        # definition, pas une approximation.
+        if self._K == 1:
+            self._r_slots[0] = reward
 
 
         self.idx += 1
@@ -3517,15 +3667,28 @@ def run_training_on_split(
         #     (état de décision, action, R = Σ γ^i r_i, Δt = durée)
         # ce qui est la formulation semi-MDP standard pour des actions de durée
         # variable. Le GAE en tient compte via γ^Δt.
-        pending: List[Optional[Dict]] = [None] * n_envs
+        # UNE DECISION PAR EMPLACEMENT, et non plus une par environnement.
+        #
+        # Une decision PPO couvre la vie d'une position : elle nait quand
+        # l'agent peut entrer, et se ferme quand SA position se ferme. Avec
+        # plusieurs positions ouvertes il y a donc plusieurs decisions en
+        # cours dans le meme environnement, chacune accumulant la recompense
+        # de SON emplacement — `info["r_slots"]`, calculee sur la variation
+        # d'equity de cette position seule.
+        #
+        # A K=1 le dictionnaire n'a jamais plus d'une entree et la sequence
+        # est celle d'avant : meme etat de decision, meme recompense
+        # accumulee, meme drapeau de fin.
+        pending: List[Dict[int, Dict]] = [dict() for _ in range(n_envs)]
+        # Decision prise a cette barre, pas encore rattachee : on ne connait
+        # son emplacement qu'APRES le pas, puisque c'est l'environnement qui
+        # l'attribue.
+        en_attente: Dict[int, Dict] = {}
         sampling_audit = {"decisions": 0, "forced_actions": 0,
                           "remapped_actions": 0, "max_logprob_error": 0.0}
 
-        def _cloture(k: int, done_flag: bool) -> None:
-            """Ferme la décision en cours de l'env k et la verse au buffer."""
-            p = pending[k]
-            if p is None:
-                return
+        def _verse(k: int, p: Dict, done_flag: bool) -> None:
+            """Verse une décision terminée au buffer de l'env k."""
             buf = ep_buf[k]
             buf["positions"].append(0)          # une décision est toujours flat
             buf["states"].append(p["state"])
@@ -3537,17 +3700,17 @@ def run_training_on_split(
             buf["values"].append(p["value"])
             buf["dones"].append(done_flag)
             buf["dts"].append(max(p["dt"], 1))
-            pending[k] = None
+
+        def _cloture(k: int, slot: int, done_flag: bool) -> None:
+            p = pending[k].pop(slot, None)
+            if p is not None:
+                _verse(k, p, done_flag)
 
         while active:
-            # 1) Les positions qui viennent de se clore terminent leur décision.
-            for k in active:
-                if pending[k] is not None and infos[k].get("position", 0) == 0:
-                    _cloture(k, False)
-
-            # 2) Nouvelle décision pour les envs sans décision en cours.
-            #    Ce sont les seuls à nécessiter un forward.
-            deciding = [k for k in active if pending[k] is None]
+            # 1) Un environnement decide des qu'il lui reste un emplacement
+            #    libre — c'est la definition d'une decision. A K=1 cela revient
+            #    exactement a "etre plat".
+            deciding = [k for k in active if envs[k].peut_entrer()]
             actions_env = {k: 2 for k in active}
 
             if deciding:
@@ -3618,7 +3781,7 @@ def run_training_on_split(
                         sampling_audit["max_logprob_error"],
                         abs(float(np.log(normalized_p[a])) - float(logp_np[bi, a])))
 
-                    pending[k] = {
+                    en_attente[k] = {
                         "state": states[k],
                         "masque": masks_np[bi].copy(),
                         # L'indice de barre : la tete auxiliaire a besoin de
@@ -3661,18 +3824,52 @@ def run_training_on_split(
                 # critique a chaque epoch.
                 reward_normalizer.update(reward)   # garde la statistique pour le log
 
-                p = pending[k]
-                if p is not None:
-                    p["R"] += (cfg.gamma ** p["dt"]) * reward
+                # CHAQUE DECISION ACCUMULE LA RECOMPENSE DE SON EMPLACEMENT.
+                # Lui donner la recompense globale la crediterait de ce que
+                # les autres positions ont produit. A K=1 les deux coincident
+                # exactement — `r_slots[0]` vaut `reward`, verifie par
+                # `test_concurrence.py`.
+                rs = info.get("r_slots")
+                for slot, p in pending[k].items():
+                    r_p = float(rs[slot]) if rs is not None else reward
+                    p["R"] += (cfg.gamma ** p["dt"]) * r_p
                     p["dt"] += 1
+
+                # La decision prise avant ce pas se rattache maintenant a
+                # l'emplacement que l'environnement lui a donne. Sans
+                # emplacement — action d'attente, ou ouverture refusee faute
+                # de taille — elle ne dure qu'une barre et ne rapporte rien :
+                # la crediter du mouvement des positions ouvertes a cote lui
+                # ferait apprendre leur resultat.
+                nouveau = en_attente.pop(k, None)
+                j_ouvert = int(info.get("slot_ouvert", -1))
+                if nouveau is not None:
+                    nouveau["dt"] = 1
+                    if j_ouvert >= 0 and rs is not None:
+                        nouveau["R"] += float(rs[j_ouvert])
+                        pending[k][j_ouvert] = nouveau
+                    elif j_ouvert >= 0:
+                        nouveau["R"] += reward
+                        pending[k][j_ouvert] = nouveau
 
                 states[k] = ns
                 infos[k] = info
 
                 if done:
                     last_reason[k] = info.get("done_reason")
-                    _cloture(k, True)
+                    for slot in list(pending[k]):
+                        _cloture(k, slot, True)
+                    if nouveau is not None and j_ouvert < 0:
+                        _verse(k, nouveau, True)
                 else:
+                    # Les emplacements fermes a cette barre terminent leur
+                    # decision. La version d'avant le faisait en tete de la
+                    # boucle suivante ; le faire ici ne change ni le contenu
+                    # ni le drapeau, et evite de relire `infos`.
+                    for slot in info.get("slots_fermes", []):
+                        _cloture(k, int(slot), False)
+                    if nouveau is not None and j_ouvert < 0:
+                        _verse(k, nouveau, False)
                     still_active.append(k)
 
             active = still_active
@@ -5102,7 +5299,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec39"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec41"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -5126,7 +5323,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec39: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec41: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
