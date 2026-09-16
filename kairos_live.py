@@ -233,8 +233,8 @@ class LiveConfig:
     # le donne perdant des qu'un trailing large est actif, et surtout instable
     # — +0.0280 sur la premiere moitie de l'historique, -0.0262 sur la seconde.
     breakeven_atr_mult: float = 1e9   # training.PPOConfig.atr_be_mult
-    trailing_start_atr_mult: float = 9.0    # 1.5 R — atr_trail_mult
-    trailing_dist_atr_mult: float = 9.0     # 1.5 R — atr_trail_dist
+    trailing_start_atr_mult: float = 12.0   # 2.0 R — atr_trail_mult
+    trailing_dist_atr_mult: float = 12.0    # 2.0 R — atr_trail_dist
 
     # ======= SORTIE PAR LE TEMPS =======
     # Le live n'a AUCUN chemin de fermeture au marche : une position n'en sort

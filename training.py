@@ -1571,8 +1571,49 @@ class PPOConfig:
     # sur la premiere moitie de l'historique, -0.0262 sur la seconde. Un seuil
     # hors d'atteinte le neutralise sans toucher au code.
     atr_be_mult: float    = 1e9
-    atr_trail_mult: float = 9.0    # 1.5 R (le stop vaut 6 ATR)   # gain en ATR pour déclencher le trailing
-    atr_trail_dist: float = 9.0    # 1.5 R   # distance du trailing (en ATR)
+    # 1.5 R -> 2.0 R, ET LE TRAILING N'AVAIT JAMAIS ETE CALIBRE.
+    #
+    # Les valeurs 1.5 / 1.5 venaient de `mesure_trailing`, dont le resultat a
+    # ete RETIRE le meme jour : elle comparait un stop FIXE de 94 points de
+    # base a un environnement a stop ADAPTATIF, et le +0.0829 R annonce
+    # valait +0.0001 une fois corrige. La mesure est tombee, les parametres
+    # etaient restes.
+    #
+    # Balayage a 6xATR, entrees non chevauchantes, hors test, rendement PAR
+    # AN en unites de risque :
+    #
+    #   decl.   d=0.5  d=1.0  d=1.5  d=2.0
+    #    0.5R   +22.8  +12.2   +9.8   +7.7
+    #    1.0R   +10.9   +5.9   +7.6   +7.7
+    #    1.5R    +7.3   +2.5   +7.3  +10.1   <- l'ancien reglage, dans un creux
+    #    2.0R    +7.9   +7.1  +12.0  +12.2
+    #    3.0R    +2.0   +7.5  +12.1  +11.7
+    #
+    # LE PIC A +22.8 EST UN MIRAGE. Il fait 783 trades par an de 3.5 h
+    # chacun, donc la friction le devore. Avec une friction une fois et
+    # demie plus chere — hypothese raisonnable, le spread releve sur MT5
+    # valant 2.24 points de base contre 1.85 supposes :
+    #
+    #   decl.   d=0.5  d=1.0  d=1.5  d=2.0
+    #    0.5R    +7.9   +5.9   +6.6   +5.8
+    #    1.5R    +3.6   -0.5   +4.8   +8.3
+    #    2.0R    +5.1   +4.7   +9.8  +10.5
+    #    3.0R    +0.0   +5.8  +10.4  +10.3
+    #
+    # Le vrai optimum est un PLATEAU, pas un pic : quatre cases voisines —
+    # declenchement 2.0 a 3.0 R, distance 1.5 a 2.0 R — s'accordent a +12 de
+    # base et +10 sous friction majoree. Choisir dans un plateau concordant
+    # n'est pas selectionner du bruit ; choisir le +22.8 isole l'aurait ete.
+    #
+    # Detail du reglage retenu : 91 trades par an, E[R] +0.1349 +/- 0.0590,
+    # duree mediane 11.4 h. L'ancien reglage donnait +4.8 sous la meme
+    # hypothese de friction, donc on double.
+    #
+    # La case voisine de l'ancien reglage (1.5 R / 1.0 R) vaut -0.5 : cette
+    # zone de la surface est instable, ce qui explique qu'un reglage non
+    # mesure y ait atterri sans que rien ne le signale.
+    atr_trail_mult: float = 12.0   # 2.0 R (le stop vaut 6 ATR)   # gain en ATR pour déclencher le trailing
+    atr_trail_dist: float = 12.0   # 2.0 R   # distance du trailing (en ATR)
 
     # Warmup critique : N epochs où seul le critique est mis à jour
     critic_warmup_epochs: int = 5
@@ -5522,7 +5563,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec47"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec48"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -5546,7 +5587,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec47: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec48: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
