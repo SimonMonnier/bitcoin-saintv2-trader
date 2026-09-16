@@ -479,6 +479,44 @@ class PPOConfig:
     # DIAGNOSTIC DE CLASSEMENT. Purement informatif : rien ne s'en sert pour
     # selectionner un checkpoint, decider ou arreter. Le mettre a False
     # supprime la ligne `rho` du journal et la passe avant qui la produit.
+    # LE TRI SE FAIT PAR LA TETE AUXILIAIRE, pas par la politique.
+    #
+    # LE CONSTAT, mesure le 2026-09-16 sur 11 094 occasions de validation,
+    # entrainement sur le train, test intouche :
+    #
+    #   apprenant                        rho valid.     +/-  sigma   E[R] sommet 5%
+    #   moindres carres (rendement)        +0.0432  0.0216   +2.0          +0.4082
+    #   logistique sklearn                 +0.0504  0.0232   +2.2          +0.3044
+    #   TEMOIN poids au hasard             +0.0029  0.0194   +0.1          +0.0791
+    #
+    # Une regression LINEAIRE classe a 2 sigma pendant que le rho de la
+    # politique oscille dans le bruit. L'information est donc dans les
+    # features et PPO ne l'extrait pas : il optimise le rendement de ses
+    # ACTIONS, et personne ne lui demande que l'ORDRE de ses probabilites soit
+    # juste — or c'est tout ce dont la selectivite a 5 % se sert.
+    #
+    # C'est le plus vieux chiffre du depot qui se confirme : une logistique
+    # obtenait 0.6271 d'AUC contre 0.5707 pour la politique.
+    #
+    # La tete auxiliaire, elle, est entrainee a PREDIRE le rendement — donc a
+    # l'ordonner — sur tous les etats collectes et non sur les seuls etats de
+    # decision. Mesure sur exec32 : rho +0.0686 pour elle contre +0.0696 pour
+    # la politique, a egalite, alors qu'elle n'est qu'une couche lineaire de
+    # deux sorties. Un modele de quelques dizaines de parametres egale tout le
+    # reseau : le reseau n'apporte rien au classement.
+    #
+    # CE QUE CELA NE CHANGE PAS. Le rollout continue d'echantillonner les
+    # actions de la politique, donc PPO reste exact et on-policy. Seule la
+    # SELECTION — le seuil de conviction applique en validation, au test et en
+    # production — lit desormais la tete. La perte de la tete ne change pas
+    # non plus : mesure faite, le carre sur le rendement continu bat la cible
+    # binaire sur le rendement du sommet (+0.41 contre +0.28), qui est le seul
+    # chiffre qui compte.
+    #
+    # `aux_coef` n'est deliberement PAS touche dans le meme run : deux
+    # changements simultanes rendraient le resultat inattribuable.
+    tri_par_tete_aux: bool = True
+
     diag_rang: bool = True
     diag_rang_pas: int = 12    # une decision suivie toutes les heures
     # ------------------------------------------------------------------
@@ -4863,6 +4901,18 @@ def run_training_on_split(
                     probs_np = torch.softmax(
                         logits_b.masked_fill(~masks_b, MASK_VALUE), dim=-1
                     ).cpu().numpy()
+                    # LA BARRE SE CALIBRE SUR LE SCORE QUI LA FRANCHIRA.
+                    # Calibrer un quantile sur les probabilites de la politique
+                    # puis juger la tete auxiliaire avec ne voudrait rien dire :
+                    # deux distributions differentes, donc un quantile qui ne
+                    # selectionne plus la fraction visee. Meme calcul des deux
+                    # cotes, toujours.
+                    if getattr(cfg, "tri_par_tete_aux", False):
+                        try:
+                            _a = policy.rendement(st).float().cpu().numpy()
+                            probs_np = 1.0 / (1.0 + np.exp(-np.clip(_a, -30, 30)))
+                        except Exception:
+                            pass
                     for bi, k in enumerate(cal_active):
                         pbs_val[0].append(float(probs_np[bi, 0]))
                         pbs_val[1].append(float(probs_np[bi, 1]))
@@ -4946,6 +4996,20 @@ def run_training_on_split(
                     logits_mb = logits_b.masked_fill(~masks_b, MASK_VALUE)
                     probs_np = torch.softmax(logits_mb, dim=-1).cpu().numpy()
 
+                    # LE SCORE DE TRI VIENT DE LA TETE AUXILIAIRE. Les deux
+                    # sorties predisent le rendement net d'un achat et d'une
+                    # vente ; on les passe par une sigmoide pour qu'elles
+                    # vivent dans [0, 1] comme les probabilites, puisque la
+                    # barre calibree et `EntryDecisionPolicy` raisonnent sur
+                    # des rangs. La monotonie suffit : un rang ne depend pas
+                    # de l'echelle.
+                    if getattr(cfg, "tri_par_tete_aux", False):
+                        try:
+                            _aux = policy.rendement(st).float().cpu().numpy()
+                            probs_np = 1.0 / (1.0 + np.exp(-np.clip(_aux, -30, 30)))
+                        except Exception:
+                            pass
+
                     for bi, k in enumerate(deciding):
                         # On retient le MEILLEUR CÔTÉ, puis on exige seulement
                         # que sa conviction franchisse la barre calibrée.
@@ -4957,6 +5021,9 @@ def run_training_on_split(
                         # trade même avec un seuil nul. Ce n'est pas ce qu'on
                         # veut mesurer : une stratégie qui ne trade que 5 % du
                         # temps a forcément p(HOLD) majoritaire en moyenne.
+                        # MEME SOURCE QUE LA CALIBRATION, forcement : la
+                        # barre et la valeur jugee doivent sortir du meme
+                        # calcul, sinon le quantile ne veut rien dire.
                         pb, ps = float(probs_np[bi, 0]), float(probs_np[bi, 1])
                         # Chaque côté est jugé sur SA barre. Si les deux passent,
                         # on retient le plus net par rapport à la sienne, pas le
@@ -5492,6 +5559,15 @@ def run_training_on_split(
                 logits_b, _ = policy(st)
                 logits_mb = logits_b.masked_fill(~masks_b, MASK_VALUE)
                 probs_np = torch.softmax(logits_mb, dim=-1).cpu().numpy()
+                # MEME SCORE DE TRI QU'EN VALIDATION. Mesurer le test avec un
+                # autre tri que celui qui a servi a calibrer les barres
+                # mesurerait une strategie que personne ne deploierait.
+                if getattr(cfg, "tri_par_tete_aux", False):
+                    try:
+                        _a = policy.rendement(st).float().cpu().numpy()
+                        probs_np = 1.0 / (1.0 + np.exp(-np.clip(_a, -30, 30)))
+                    except Exception:
+                        pass
                 for bi, k in enumerate(deciding):
                     # MÊME règle qu'en validation et qu'en production : meilleur
                     # côté, puis barre calibrée. Utiliser ici le seuil absolu
@@ -5717,7 +5793,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec53"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec54"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -5741,7 +5817,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec53: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec54: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #

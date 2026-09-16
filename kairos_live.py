@@ -201,6 +201,10 @@ class LiveConfig:
     atr_sl_mult: float = 6.0     # SL = 6 x ATR     — training.PPOConfig.atr_sl_mult
     atr_tp_mult: float = 36.0    # inutilise tant que use_tp vaut False
     use_tp: bool = False         # training.PPOConfig.use_tp
+    # Le tri par la tete auxiliaire — training.PPOConfig.tri_par_tete_aux.
+    # Doit valoir la meme chose qu'a l'entrainement, sinon on deploierait un
+    # tri different de celui sur lequel les barres ont ete calibrees.
+    tri_par_tete_aux: bool = True
 
     spread_bps: float = 0.0
     slippage_bps: float = 0.0
@@ -965,6 +969,29 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
                     logits_d_m = logits_d.masked_fill(~mask_d, MASK_VALUE)
                     probs = torch.softmax(logits_d_m, dim=-1)
                     pb, ps = float(probs[0]), float(probs[1])
+
+                    # LE TRI VIENT DE LA TETE AUXILIAIRE, comme a
+                    # l'entrainement. Mesure du 2026-09-16 : une regression
+                    # lineaire classe a 2 sigma pendant que le rho de la
+                    # politique oscille dans le bruit — PPO optimise le
+                    # rendement de ses ACTIONS, jamais l'ORDRE de ses
+                    # probabilites, et c'est pourtant tout ce dont la
+                    # selectivite se sert.
+                    #
+                    # La sigmoide ramene la prediction dans [0, 1] comme les
+                    # probabilites, parce que la barre calibree raisonne sur
+                    # des rangs : seule la monotonie compte.
+                    #
+                    # SI LE CHECKPOINT N'A PAS DE TETE, on retombe sur les
+                    # probabilites — un modele d'avant cette date reste
+                    # jouable, avec le tri sous lequel il a ete calibre.
+                    if getattr(cfg, "tri_par_tete_aux", True):
+                        try:
+                            _a = policy.rendement(s)[0]
+                            _a = torch.sigmoid(_a.clamp(-30, 30))
+                            pb, ps = float(_a[0]), float(_a[1])
+                        except Exception:
+                            pass
 
                 # Une instance par agent, jamais partagee : son historique
                 # glissant est propre a ce flux de decisions. Appelee une seule

@@ -77,6 +77,18 @@ def _reglages() -> list[str]:
     # deux cotes ne posent pas d'objectif validerait deux nombres sans effet,
     # et masquerait le seul ecart qui compte : un cote qui en pose et pas
     # l'autre.
+    # LE SCORE DE TRI DOIT ETRE LE MEME DES DEUX COTES. Les barres de
+    # selectivite sont calibrees sur la distribution du score : trier en
+    # production avec un autre score que celui qui a servi a les calibrer ne
+    # selectionnerait plus la fraction visee, et rien ne le signalerait.
+    tri_t = bool(getattr(cfg_t, "tri_par_tete_aux", False))
+    tri_l = bool(getattr(cfg_l, "tri_par_tete_aux", False))
+    if tri_t != tri_l:
+        ecarts.append(
+            f"live : score de tri — entrainement "
+            f"{'tete auxiliaire' if tri_t else 'politique'}, live "
+            f"{'tete auxiliaire' if tri_l else 'politique'}")
+
     tp_t = bool(getattr(cfg_t, "use_tp", True))
     tp_l = bool(getattr(cfg_l, "use_tp", True))
     if tp_t != tp_l:
