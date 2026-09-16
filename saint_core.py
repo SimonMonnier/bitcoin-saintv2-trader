@@ -245,10 +245,25 @@ FEATURE_COLS_H1 = [
 # temps propre de 5 minutes. A 120 min la serie est redevenue une variable de
 # regime et vaut exactement zero, comme ls_ratio_top. Le remplacement garde le
 # compte a 30 features, donc le meme cout GPU.
-FEATURE_COLS_EXT = [
-    "taker_ratio",       # flux agressif acheteur/vendeur, agrege 5 min (metrics)
-    "taker_ma5",         # le meme, moyenne causale sur 5 barres (klines)
-]
+# RETIRE LE 2026-09-16 : ces colonnes n'existent QUE sur Binance.
+#
+# `taker_ratio` et `taker_ma5` viennent du flux agressif acheteur/vendeur, que
+# seul un carnet d'ordres crypto publie. Elles n'ont pas d'equivalent sur l'or,
+# le Nasdaq ou n'importe quel CFD : les garder condamnait le modele a un seul
+# instrument.
+#
+# CE QUE LEUR RETRAIT COUTE, mesure avant de decider — meme apprenant lineaire,
+# meme fenetre, meme cible, entrainement sur le train et mesure sur la
+# validation :
+#
+#   jeu de features               colonnes      rho     +/-   E[R] sommet 5%
+#   260 colonnes (avec)                260  +0.0432  0.0216          +0.4082
+#   256 colonnes (sans)                256  +0.0426  0.0216          +0.3956
+#
+# Six dix-millemes de rho, et 0.013 R sur le sommet contre une erreur-type de
+# 0.13. Le retrait est gratuit, et il ouvre un second instrument dont
+# l'avantage mesure est de 50 % superieur a celui du BTC.
+FEATURE_COLS_EXT = []
 
 # LIQUIDITE ET TEMPS. J'avais exclu les features d'heure sur BTCUSD en invoquant
 # une mesure a -0.0022 ; la mesure comparative dit le contraire sous cette
@@ -267,8 +282,11 @@ FEATURE_COLS_EXT = [
 #   - intensite                  : rang du nombre de trades sur une semaine
 #     glissante, soit le regime d'activite, en rang pour rester stationnaire
 #     entre 2017 et 2026 ou les volumes absolus n'ont aucune commune mesure.
-FEATURE_COLS_LIQ_TEMPS = ["flux_taille_trade", "flux_intensite",
-                          "heure_sin", "heure_cos"]
+# `flux_taille_trade` et `flux_intensite` derivent de `quote_vol` et
+# `nb_trades`, deux champs que seul Binance publie — retires le 2026-09-16
+# pour la meme raison que FEATURE_COLS_EXT. `heure_sin`/`heure_cos` se
+# calculent a partir de l'horodatage seul et restent.
+FEATURE_COLS_LIQ_TEMPS = ["heure_sin", "heure_cos"]
 
 # ============================================================
 #  ECHELLE DE DECISION — H1 depuis exec10
