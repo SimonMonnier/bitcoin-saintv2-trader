@@ -8,6 +8,131 @@ Ordre antichronologique.
 
 ---
 
+## 16 septembre 2026, troisième partie — on mesure ce qu'on avait choisi, et deux réponses contredisent la précédente
+
+Les réglages des trois votants n'avaient jamais été mesurés : `PART_LAISSEE`
+posé à 0.50 par moi une heure plus tôt, `n_membres` et `d_cache` hérités du
+régime H1, la géométrie de PatchTST recopiée du bloc SAINT. `mesure_votants.py`
+les balaie **sur la validation uniquement**.
+
+---
+
+### Le veto de TabM n'ajoute rien, à aucun taux
+
+Comparaison **appariée** de chaque phase à elle-même sans veto, 12 phases
+espacées de 120 barres, chacune internement sans chevauchement :
+
+```
+reference sans veto : E[R] -0.0862 +/- 0.0565 selon la phase
+
+  part  phases  trades/ph  ecart au temoin  err-type       t
+  0.20       7         24          +0.2321    0.1570    1.48
+  0.30      12         50          -0.0317    0.0343   -0.92
+  0.40      12         90          -0.0029    0.0352   -0.08
+  0.50      12        117          -0.0097    0.0281   -0.35
+  0.65      12        148          -0.0150    0.0178   -0.84
+  0.80      12        169          -0.0069    0.0126   -0.55
+```
+
+`|t| < 1` partout où les douze phases sont exploitables. Le seul positif, 0.20,
+ne tient que sur sept phases et 24 trades chacune — et il est le **meilleur
+d'un balayage de huit valeurs**, donc son t de 1.48 ne vaut rien.
+
+Le veto est coupé. Six mécanismes ont déjà été écartés ici sur ce critère :
+attention entre groupes, méta-étiquetage, taille par conviction, lookback,
+SAINT complet, conviction. Garder celui-ci parce qu'il est séduisant
+reviendrait à laisser une influence non mesurée décider à la place de la
+mesure — et à rendre illisible le run censé tester le vote à deux.
+
+### La correction de phase a démoli une lecture intermédiaire, la mienne
+
+Sur une **seule** grille d'entrées — 98 entrées non chevauchantes, espacées du
+plafond de 1 440 barres — le tableau disait tout autre chose :
+
+```
+  part     seuil  permises  E[R] permis  E[R] refuse    ecart
+  0.50   -0.2909       126      -0.1216      +0.0099  -0.1315
+  0.65   -0.5263       153      -0.1497      +0.1924  -0.3421
+  0.80   -0.7337       173      -0.1399      +0.4166  -0.5565
+```
+
+Les directions **refusées** rendaient davantage que les permises, et de plus en
+plus à mesure que le filtre serrait : un filtre qui marche à l'envers. Je
+l'avais lu comme tel et j'allais le rapporter.
+
+Moyenné sur douze phases, l'écart à 0.50 tombe à **−0.0097 ± 0.0281**.
+L'inversion était un artefact de phase. C'est exactement le piège mesuré le
+15 septembre — E[R] de +0.158 à −0.071 selon la grille, pour le même jeu, le
+même protocole et les mêmes données — et je venais de le retomber dedans avec
+le fichier qui le documente ouvert.
+
+**La leçon opérationnelle : une grille d'entrées unique ne vaut rien, même
+quand elle est correctement non chevauchante.** L'absence de recouvrement
+protège du double comptage, pas du choix de la phase.
+
+---
+
+### La capacité avait doublé sans mesure
+
+La tête pèse 92 à 98 % du réseau et lit `n_features × d_model`. Passer de 103 à
+260 colonnes l'a multipliée par 2.5 ; ajouter un second réseau, encore par 1.6.
+
+```
+mlp SAINT / patch    SAINT    PatchTST    total   par occasion (4 516)
+     16 / 32        62 548     35 776    98 324       21.8
+      8 / 16        45 412     18 016    63 428       14.0
+      4 /  8        36 892      9 328    46 220       10.2
+```
+
+Le seul ancrage empirique est le régime H1 qui avait rendu **+2.2 en test** :
+26 752 paramètres pour 2 314 occasions, soit **11.6 par occasion**. À 21.8 on
+était au double, sans qu'aucune mesure ne justifie que ce soit payable — alors
+que la seule chose qui ait jamais déplacé un résultat côté modèle dans ce dépôt
+est la **réduction** de taille (493 796 → 15 680 avait fait passer PPO de −1.4 à
++2.2).
+
+Retenu : **10.2**, qui encadre 11.6 par en dessous, du côté qui a marché. C'est
+un ancrage hérité, **pas une mesure** : la capacité ne se tranche pas sur une
+sonde supervisée, il faut un run.
+
+---
+
+### La géométrie de PatchTST est contrainte, pas arbitraire
+
+Correction de ce que j'avais écrit une heure plus tôt. `mesure_lookback_utile`
+n'a rien trouvé au-delà de 4 barres de passé, et à lookback 4 il ne reste
+presque aucun choix :
+
+```
+patch 2 pas 1 -> 3 patchs   <- retenu, le maximum d'information
+patch 2 pas 2 -> 2 patchs
+patch 3 pas 1 -> 2 patchs
+patch 4 quelconque -> 1 patch, degenere
+```
+
+Ce qu'il faut assumer en revanche : **à cette profondeur PatchTST n'est plus un
+découpage en segments, c'est un MLP par colonne.** Ce qu'on lui demande dans le
+vote reste intact — être le pôle qui ne croise jamais les colonnes, face à un
+SAINT qui ne fait que les croiser — mais le nom promet davantage que la
+profondeur ne permet.
+
+---
+
+### Ce que cette troisième partie ne dit PAS
+
+- Que le veto soit inutile dans l'ensemble. La sonde le juge comme filtre
+  **autonome** sur des barrières ; son rôle serait d'écarter les directions que
+  les réseaux PPO prendraient mal, une interaction qu'elle ne voit pas.
+  L'absence de valeur autonome n'est pas une preuve — c'est la seule preuve
+  disponible, et ici la charge revient au mécanisme.
+- Que 10.2 paramètres par occasion soit le bon chiffre. C'est le voisinage du
+  seul régime qui ait produit un résultat positif, rien de plus.
+- Que le vote à deux vaille mieux que le vote à trois. Aucun des deux n'a été
+  mesuré de bout en bout.
+- Que la fenêtre de test dise quoi que ce soit. Elle n'a pas été touchée.
+
+---
+
 ## 16 septembre 2026, seconde partie — le vote entre dans l'entraînement, et quatre repères faux
 
 Suite de l'entrée précédente, même journée. Le fil conducteur est le même :
@@ -93,6 +218,10 @@ par membre — et non les logits, qui laisseraient un membre très confiant
 écraser les autres. La boucle d'entraînement n'a pas une ligne à changer, et
 les trois folds ne se font qu'**une** fois au lieu d'un passage par
 architecture.
+
+> **Corrigé le jour même, voir l'entrée « troisième partie » plus haut :** le
+> veto de TabM a été mesuré et ne vaut rien, à aucun taux. Il est coupé. Ce qui
+> suit décrit ce qui a été construit et pourquoi, pas ce qui tourne.
 
 **Le troisième votant n'entre pas par la même porte.** TabM n'a pas de gradient
 dans cette boucle, et ses scores dépendent de la **barre** et non de la seule

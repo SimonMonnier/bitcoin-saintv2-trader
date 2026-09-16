@@ -55,17 +55,17 @@ poids et le reste du fichier `_calib.json` ; un fichier ambigu est refusé.
 | `..._exec23`, `..._exec24` | M5 | 260 colonnes, M5 + H1 + H4, SL 4×ATR |
 | `..._exec25` | M5 | idem, **SL 8×ATR / TP 16×ATR** ← courant |
 
-### Les trois modèles votent PENDANT l'entraînement
+### Les modèles votent PENDANT l'entraînement
 
 Le vote n'existait qu'à l'évaluation, sur des réseaux entraînés chacun à agir
 **seul**. Un modèle qui apprend à décider tout seul, puis qu'on met dans un
 comité, n'a jamais appris à jouer sa part dans une décision commune.
 
-| votant | nature | ce qu'il apporte |
-|---|---|---|
-| **SAINT** | PPO, attention sur les features | ne fait que **croiser** les colonnes |
-| **PatchTST** | PPO, canaux indépendants | ne les croise **jamais** |
-| **TabM** | supervisé, MLP ensemble | un veto, pas une proposition |
+| votant | nature | ce qu'il apporte | état |
+|---|---|---|---|
+| **SAINT** | PPO, attention sur les features | ne fait que **croiser** les colonnes | actif |
+| **PatchTST** | PPO, canaux indépendants | ne les croise **jamais** | actif |
+| **TabM** | supervisé, MLP ensemble | un veto, pas une proposition | **coupé — mesure nulle** |
 
 Les deux réseaux PPO sont opposés par construction sur la question qui sépare
 le mieux les modèles de ce dépôt. Des erreurs corrélées ne s'annulent pas :
@@ -93,11 +93,54 @@ ordinaire. Chaque barre reçoit donc le score d'un TabM qui ne l'a pas vue —
 trois blocs **contigus**, parce que des lignes voisines partagent leurs barres
 de résultat. Coût mesuré : 12 s par fold, 100 % des barres notées.
 
-> Le veto change le **plafond d'entropie**. Quand il interdit une direction, la
-> politique choisit entre deux actions et non trois : le maximum vaut ln 2 et
-> non ln 3. Le plafond attendu est `p²·ln3 + 2p(1-p)·ln2`, soit **0.621** à
-> p = 0.50. Lire une entropie de 0.573 contre ln 3 ferait croire à une
-> politique fortement différenciée alors qu'elle décide au hasard.
+**Le veto a été mesuré, puis coupé.** Comparaison appariée de chaque phase à
+elle-même sans veto, 12 phases, sur la validation :
+
+| part | trades/phase | écart au témoin | err-type | t |
+|---|---|---|---|---|
+| 0.30 | 50 | −0.0317 | 0.0343 | −0.92 |
+| 0.50 | 117 | −0.0097 | 0.0281 | −0.35 |
+| 0.80 | 169 | −0.0069 | 0.0126 | −0.55 |
+
+`|t| < 1` partout. Six mécanismes ont déjà été écartés ici sur ce critère ;
+celui-ci les rejoint. `votant_tabm = False`, et le code reste en place —
+`tabm_votant.py`, l'ajustement croisé, le veto dans le masque — pour qu'une
+mesure ultérieure puisse le rallumer sans tout réécrire.
+
+> **Ce que la mesure ne dit pas** : elle juge le veto comme filtre **autonome**
+> sur des barrières, pas son interaction avec les réseaux PPO. L'absence de
+> valeur autonome n'est pas une preuve d'inutilité — c'est la seule preuve
+> disponible, et ici la charge revient au mécanisme.
+
+> **Quand le veto est actif, il change le plafond d'entropie.** La politique
+> choisit alors entre deux actions et non trois : le maximum vaut `p²·ln3 +
+> 2p(1-p)·ln2`, soit **0.621** à p = 0.50 au lieu de 1.099. Lire une entropie
+> de 0.573 contre ln 3 ferait croire à une politique fortement différenciée
+> alors qu'elle décide au hasard. La veille calcule ce plafond depuis la
+> configuration au lieu de le coder en dur.
+
+### La capacité se règle sur le seul régime qui ait marché
+
+La tête pèse 92 à 98 % du réseau et lit `n_features × d_model` : passer de 103 à
+260 colonnes l'a multipliée par 2.5, et ajouter un second réseau encore par 1.6.
+
+| mlp SAINT / patch | SAINT | PatchTST | total | par occasion (4 516) |
+|---|---|---|---|---|
+| 16 / 32 | 62 548 | 35 776 | 98 324 | 21.8 |
+| 8 / 16 | 45 412 | 18 016 | 63 428 | 14.0 |
+| **4 / 8** | 36 892 | 9 328 | **46 220** | **10.2** |
+
+Le seul ancrage empirique est le régime H1 qui avait rendu **+2.2 en test** :
+11.6 paramètres par occasion. À 21.8 on était au double, alors que la seule
+chose qui ait jamais déplacé un résultat côté modèle ici est la **réduction**
+de taille. C'est un ancrage hérité, **pas une mesure** : la capacité ne se
+tranche pas sur une sonde supervisée, il faut un run.
+
+> **PatchTST à lookback 4 est un MLP par colonne**, et il faut l'assumer.
+> `mesure_lookback_utile` n'a rien trouvé au-delà de 4 barres de passé, et à
+> cette profondeur `patch 2 / pas 1` est la seule géométrie qui donne trois
+> patchs — tout le reste dégénère à un ou deux. Son rôle dans le vote reste
+> intact, mais le nom promet plus que la profondeur ne permet.
 
 ### Le checkpoint se résout, il ne s'écrit pas en dur
 
@@ -617,10 +660,11 @@ qui a fait choisir chaque valeur, sont dans les commentaires de `training.py`.
 | `lookback` | 4 | mesuré : le passé n'apporte rien au-delà |
 | `architecture` | `ensemble` | SAINT **et** PatchTST dans le même rollout, présentés comme une seule politique |
 | `membres` | saint, patchtst | opposés par construction : l'un ne fait que croiser les colonnes, l'autre ne les croise jamais |
-| `votant_tabm` | True | troisième votant, supervisé, qui oppose son veto via le masque d'actions |
+| `votant_tabm` | **False** | troisième votant coupé : écart au témoin de −0.01 ± 0.03 sur 12 phases |
 | `d_model` / `num_blocks` | 8 / 2 | ~45 000 paramètres pour ~4 500 occasions |
 | `saint_heads` / `saint_n_freq` | 1 / 4 | `d_model // heads` doit être multiple de 8 |
-| `saint_mlp_dim` | 16 | la tête pèse 92–98 % du réseau ; c'est elle qu'il faut contenir |
+| `saint_mlp_dim` | 4 | la tête pèse 92–98 % du réseau ; ramène la capacité à 10.2 param./occasion |
+| `mlp_dim` | 8 | idem côté PatchTST, sous peine qu'il devienne dominant par accident |
 | `saint_lecture` | `colonnes` | lit chaque colonne, au lieu d'un CLS agrégé |
 | `max_drawdown` | 0.4 | force l'apprentissage prudent |
 | `tick_noise_bps` | 3.0 | extension des wicks. **Doit rester ≪ `atr_sl_mult` × ATR**, sinon le bruit déclenche le SL avant le marché |
@@ -878,6 +922,9 @@ multi-agent-btcusd/
 ├── mesure_lookback_utile.py         # Profondeur de passé réellement utilisée
 │
 ├── stress_test.py                   # Degrade l'execution dans le VRAI moteur
+├── mesure_votants.py                # Balaye les reglages des votants, par phases
+├── tabm_votant.py                   # Le veto supervise, ajuste en croise
+├── checkpoints.py                   # Quel checkpoint charger, et pourquoi
 ├── flux_live.py                     # Bougies M5 en direct, format du jeu
 ├── test_alignement.py               # Le live calcule-t-il les memes colonnes ?
 ├── export_to_onnx.py                # .pth → .onnx + stats binaires pour MT5
