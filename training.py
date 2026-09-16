@@ -1,4 +1,4 @@
-﻿# ======================================================================
+# ======================================================================
 # PPO + SAINTv2 — SCALPING BTCUSD M1 (SINGLE-HEAD + ACTION MASK + H1)
 # Version "Loup Ω" LONG / SHORT / CLOSE
 # ======================================================================
@@ -474,6 +474,14 @@ class PPOConfig:
     # epoch. Le mettre a 0.0 retire la tete et redonne exactement le run
     # precedent — c'est le temoin de l'experience.
     aux_coef: float = 1.0
+
+    # ------------------------------------------------------------------
+    # DIAGNOSTIC DE CLASSEMENT. Purement informatif : rien ne s'en sert pour
+    # selectionner un checkpoint, decider ou arreter. Le mettre a False
+    # supprime la ligne `rho` du journal et la passe avant qui la produit.
+    diag_rang: bool = True
+    diag_rang_pas: int = 12    # une decision suivie toutes les heures
+    # ------------------------------------------------------------------
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
 
@@ -2678,6 +2686,34 @@ def map_agent_action_to_env_action(
 # TRAINING PPO (sur un split donné)
 # ======================================================================
 
+def _correlation_rang(a: np.ndarray, b: np.ndarray) -> float:
+    """Rho de Spearman, egalites traitees par rangs moyens.
+
+    Les egalites ne sont pas un detail : une politique saturee rend la meme
+    probabilite sur des milliers de barres, et leur donner des rangs
+    arbitraires fabriquerait de la correlation a partir de l'ordre du tableau.
+    """
+    def _rg(x):
+        o = np.argsort(x, kind="mergesort")
+        r = np.empty(len(x), float)
+        r[o] = np.arange(len(x), dtype=float)
+        xs = x[o]
+        i = 0
+        while i < len(xs):
+            j = i
+            while j + 1 < len(xs) and xs[j + 1] == xs[i]:
+                j += 1
+            if j > i:
+                r[o[i:j + 1]] = (i + j) / 2.0
+            i = j + 1
+        return r
+    ra, rb = _rg(np.asarray(a, float)), _rg(np.asarray(b, float))
+    ra = ra - ra.mean()
+    rb = rb - rb.mean()
+    d = ra.std() * rb.std() * len(ra)
+    return float((ra * rb).sum() / d) if d > 0 else 0.0
+
+
 def run_training_on_split(
     train_data: MarketData,
     calib_data: MarketData,
@@ -2807,6 +2843,45 @@ def run_training_on_split(
     print(f"  • Mesure exhaustive : {len(departs_val)} épisodes de validation "
           f"({100*len(departs_val)*cfg.episode_length/max(val_data.length,1):.0f} % "
           f"de la fenêtre), {len(departs_calib)} de calibration")
+
+    # ------------------------------------------------------------------
+    # LE CLASSEMENT, mesure de diagnostic ajoutee le 2026-09-16.
+    #
+    # POURQUOI. La validation rend ~150 trades par epoch et l'erreur-type sur
+    # leur moyenne vaut 0.11 R. Elle ne peut donc pas distinguer un modele qui
+    # ajoute 0.10 R d'un modele qui n'ajoute rien, et le PnL affiche plus haut
+    # oscille en consequence : sur exec37, -7, 0, +44, +11, +117, +1, +58, -71
+    # dollars d'une epoch a l'autre, sans que rien n'ait appris ni desappris.
+    #
+    # La selectivite jette 95 % de l'information. Le reseau produit une
+    # opinion a CHAQUE barre ; n'en regarder que le sommet, c'est mesurer la
+    # moyenne d'un echantillon de 150 quand on en a 11 000. On ne demande donc
+    # plus "combien gagne-t-il" mais "CLASSE-T-IL" — la seule chose dont la
+    # selectivite a besoin, et une question a laquelle un grand echantillon
+    # repond. Mesure sur exec32 : rho +0.0696 +/- 0.0238, soit 2.9 ecarts-
+    # types, la ou le PnL de validation du meme run ne depassait pas 1.3.
+    #
+    # LE COUT EST NUL PAR EPOCH. Le rendement reel ne depend pas du modele :
+    # il se calcule une fois ici, et chaque epoch n'ajoute qu'une passe avant
+    # sur 11 000 observations. Ce qui suit est du diagnostic : rien ne s'en
+    # sert pour selectionner, decider ou arreter.
+    _rang_idx = _rang_reel = None
+    if getattr(cfg, "diag_rang", True):
+        import cibles as _CIB
+        _pas = max(int(getattr(cfg, "diag_rang_pas", 12)), 1)
+        _i = np.arange(cfg.lookback,
+                       val_data.length - _CIB.BORNE_DEFAUT - 2, _pas)
+        if len(_i) >= 500:
+            _ra, _rv = _CIB.rendements(val_data.df, _i, cfg)
+            _ok = np.isfinite(_ra) & np.isfinite(_rv)
+            if _ok.sum() >= 500:
+                _rang_idx = _i[_ok]
+                # Part SYMETRIQUE : (achat - vente) / 2. La derive du
+                # sous-jacent s'annule, donc un rho positif dit que le modele
+                # distingue les moments, pas qu'il a profite d'une hausse.
+                _rang_reel = ((_ra - _rv) / 2.0)[_ok]
+                print(f"  • Classement : {len(_rang_idx):,} decisions de "
+                      f"validation suivies (une toutes les {_pas*5} min)")
 
     def _un_membre(archi, taille_patch, pas):
         """Un reseau seul, a l'architecture demandee."""
@@ -4149,9 +4224,32 @@ def run_training_on_split(
         _npos = sum(1 for x in blocs_ecart if np.isfinite(x) and x > 0)
         _nval = sum(1 for x in blocs_ecart if np.isfinite(x))
 
+        # Le rho de l'epoch. Etat PLAT, celui que voit la politique avant
+        # d'entrer : position 0, latent 0, detention 0, echelle de risque 1.
+        _rho_ep = float(chr(110) + chr(97) + chr(110))
+        if _rang_idx is not None:
+            policy.eval()
+            _extra = np.zeros((cfg.lookback, 4), np.float32)
+            _extra[:, 3] = 1.0
+            _s = []
+            with torch.no_grad():
+                for _d in range(0, len(_rang_idx), 8192):
+                    _b = _rang_idx[_d:_d + 8192]
+                    _o = np.stack([
+                        np.concatenate([val_data.features[i - cfg.lookback:i],
+                                        _extra], axis=-1) for i in _b])
+                    _lg = policy(torch.from_numpy(_o).to(device))
+                    if isinstance(_lg, tuple):
+                        _lg = _lg[0]
+                    _pr = torch.softmax(_lg, dim=-1).float().cpu().numpy()
+                    _s.append(_pr[:, 0] - _pr[:, 1])
+            policy.train()
+            _rho_ep = _correlation_rang(np.concatenate(_s), _rang_reel)
+
         print(
             f"{tag} {epoch_str}  "
             f"{_col('META ', _C.GREY + _C.BOLD)}  "
+            f"rho {_rho_ep:>+6.4f}  "
             f"Sortino {metric:>+6.3f}  "
             f"{_col(f'Sortino30 {s30:>+6.3f}', s30_col)}  "
             f"AvgW {_money(avg_win_train, width=8)}  AvgL {_money(avg_loss_train, width=8)}  "
@@ -4649,7 +4747,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec37"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec38"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -4673,7 +4771,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec37: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec38: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
