@@ -670,7 +670,18 @@ class PPOConfig:
     # d'occasions independantes, parce que deux positions de meme sens
     # ouvertes a une heure d'ecart correlent a 0.72. C'est donc un levier
     # d'APPRENTISSAGE, et c'est comme tel qu'il faut le juger.
-    positions_max: int = 8
+    # 8 -> 32. LE PLAFOND NE DOIT PLUS MORDRE, sinon il masque le cercle
+    # vertueux : a 8, l'equity pouvait doubler sans qu'une seule position de
+    # plus soit permise. C'est desormais le budget de risque qui decide, et
+    # 32 est simplement au-dessus de ce qu'il autorise a l'equity de depart
+    # (9 positions a 1 000 EUR). Le cout suit l'occupation reelle, pas le
+    # plafond : les operations sont vectorielles sur un tableau de 32.
+    # 32 -> 64. LE PLAFOND NE DOIT PAS MORDRE, sinon il masque le cercle :
+    # a 32, la capacite saturait des 2 000 $ d'equity et gagner davantage
+    # n'ouvrait plus rien. A 64, le budget de risque decide jusqu'a environ
+    # 2 600 $ aux prix de cette fenetre. Le cout suit l'occupation reelle et
+    # non le plafond, les operations etant vectorielles sur le tableau.
+    positions_max: int = 64
 
     # ------------------------------------------------------------------
     # LE COURTIER, TEL QU'IL EST. Releve sur Vantage BTCUSD le 2026-09-16 :
@@ -703,6 +714,33 @@ class PPOConfig:
     # Mettre a False redonne le dimensionnement continu d'avant, qui sert de
     # temoin : c'est la seule facon de mesurer ce que la contrainte coute.
     marge_realiste: bool = True
+
+    # LE CERCLE VERTUEUX, et pourquoi la marge seule ne le produit pas.
+    #
+    # Gagner augmente l'equity, donc la capacite, donc le nombre de positions
+    # tenables — et perdre la reduit. C'est la boucle que le modele doit
+    # apprendre. Encore faut-il qu'une contrainte la porte.
+    #
+    # Ce n'est PAS la marge. A 1:500 et 0.173 % du notionnel, 1 000 EUR
+    # autorisent deja 254 lots minimums : le plafond du tableau mordrait
+    # toujours en premier, l'equity pourrait doubler sans rien changer, et la
+    # boucle serait invisible. Mesure faite : plafond 32, marge 254, donc la
+    # marge n'a jamais decide.
+    #
+    # Ce qui borne vraiment, c'est LE RISQUE ENGAGE. La somme des montants a
+    # perdre si tous les stops etaient touches ne doit pas depasser une part
+    # de l'equity. Cette part est un montant, donc elle grandit quand on gagne
+    # et retrecit quand on perd — exactement la boucle recherchee, et sur une
+    # echelle economique plutot que sur un artefact de levier.
+    #
+    # A 1 000 EUR : 10 % font 100 EUR, un lot minimum risque ~11 EUR a
+    # 12xATR, donc 9 positions. A 2 000 EUR, 18. A 500 EUR, 4. La capacite
+    # suit l'equity lineairement, dans les deux sens.
+    #
+    # La valeur 0.10 n'est pas mesuree — c'est une limite de prudence, pas un
+    # optimum. Ce qui est mesure, c'est qu'elle mord la ou la marge ne mord
+    # pas. Le modele apprend a l'interieur ; il ne la choisit pas.
+    budget_risque: float = 0.10
     # ------------------------------------------------------------------
 
     episodes_per_epoch: int = 84
@@ -2172,6 +2210,8 @@ class BTCTradingEnvDiscrete(gym.Env):
         self._latent_prec = np.zeros(k, dtype=np.float64)
         self._slots_fermes: List[int] = []
         self._slot_ouvert = -1
+        self._notionnel = 0.0
+        self._cap_cle, self._cap_val = None, 0
 
         self.risk_amount = 0.0
         # Spread du trade en cours — réé-échantillonné à chaque ouverture
@@ -2217,8 +2257,10 @@ class BTCTradingEnvDiscrete(gym.Env):
 
     @property
     def notionnel(self) -> float:
-        a = self._actifs
-        return float((self._p_entree[a] * self._p_taille[a]).sum()) if a.any() else 0.0
+        """Somme des notionnels ouverts, tenue a jour a l'ouverture et a la
+        fermeture plutot que recalculee : elle est lue plusieurs fois par
+        barre et ne change que deux fois par trade."""
+        return float(self._notionnel)
 
     @property
     def marge_utilisee(self) -> float:
@@ -2247,6 +2289,19 @@ class BTCTradingEnvDiscrete(gym.Env):
         return math.floor(taille / pas + 1e-9) * pas
 
     def places_ouvrables(self, prix: float) -> int:
+        # Memorisee pour la barre : la boucle de collecte la demande via
+        # `peut_entrer()` puis via `_get_obs()`, et rien entre les deux ne
+        # peut la changer. La cle porte l'etat dont elle depend, donc une
+        # ouverture ou une fermeture l'invalide d'elle-meme.
+        cle = (self.idx, int(self._p_sens.astype(bool).sum()),
+               self._notionnel, self.capital)
+        if getattr(self, "_cap_cle", None) == cle:
+            return self._cap_val
+        val = self._places_ouvrables(prix)
+        self._cap_cle, self._cap_val = cle, val
+        return val
+
+    def _places_ouvrables(self, prix: float) -> int:
         """Combien de positions le SOLDE permet encore, ici et maintenant.
 
         C'est le K reel. Il ne se configure pas, il se calcule : il tombe
@@ -2268,8 +2323,28 @@ class BTCTradingEnvDiscrete(gym.Env):
         m_une = max(prix * float(getattr(self.cfg, "lot_min", 0.01)) * frac, 1e-12)
         # On s'arrete avant que le niveau de marge ne descende sous le seuil.
         marge_max = eq / max(seuil, 1e-9)
-        dispo = marge_max - self.marge_utilisee
-        return int(max(0, min(libres, math.floor(dispo / m_une))))
+        par_marge = math.floor((marge_max - self.marge_utilisee) / m_une)
+
+        # LE RISQUE ENGAGE, et c'est lui qui porte le cercle vertueux. La
+        # somme des montants a perdre si tous les stops etaient touches reste
+        # sous une part de l'EQUITY COURANTE : gagner l'augmente donc la
+        # capacite, perdre la reduit. La marge, elle, est trop large pour
+        # border quoi que ce soit a ce levier.
+        budget = float(getattr(self.cfg, "budget_risque", 0.0))
+        if budget > 0.0:
+            atr_raw = (float(self.data.atr14[self.idx - 1])
+                       if self.idx - 1 >= 0 else 0.0)
+            atr = max(atr_raw, ATR_PLANCHER_FRAC * prix, 1e-8)
+            # Le risque d'une position de plus, a la taille que le courtier
+            # imposerait reellement — lot minimum compris.
+            taille = self._taille_quantifiee(self._compute_dynamic_size(prix))
+            r_une = max(self.cfg.atr_sl_mult * atr * taille, 1e-12)
+            engage = float(self._p_risque[self._p_sens != 0].sum())
+            par_risque = math.floor((budget * eq - engage) / r_une)
+        else:
+            par_risque = libres
+
+        return int(max(0, min(libres, par_marge, par_risque)))
 
     def peut_entrer(self) -> bool:
         """Une DECISION existe quand le solde permet encore une position."""
@@ -2333,6 +2408,20 @@ class BTCTradingEnvDiscrete(gym.Env):
     def trail_active(self) -> bool:
         a = np.flatnonzero(self._actifs)
         return bool(self._p_trail[a[0]]) if len(a) else False
+
+    def _latents_par_slot(self, bid) -> np.ndarray:
+        """Le latent de CHAQUE emplacement, en une operation.
+
+        `execution_quote` n'est qu'une multiplication — un long sort au BID,
+        un short paie l'ASK — donc elle se met en tableau sans rien changer au
+        resultat. Les emplacements libres rendent zero, leur sens valant 0.
+        """
+        sens = self._p_sens.astype(np.float64)
+        q = float(bid) * np.where(self._p_sens == -1,
+                                  1.0 + np.maximum(self._p_spread, 0.0) / 1e4,
+                                  1.0)
+        return ((sens * (q - self._p_entree) - self.cfg.fee_rate * q)
+                * self._p_taille)
 
     def _latent_slot(self, bid, i: int) -> float:
         if self._p_sens[i] == 0:
@@ -2493,13 +2582,26 @@ class BTCTradingEnvDiscrete(gym.Env):
     def _latent_at_bid(self, bid):
         """Somme des latents de TOUS les emplacements ouverts.
 
-        A K=1 c'est le calcul d'avant, terme pour terme : un seul emplacement,
-        son propre spread, sa propre taille.
+        EN UNE OPERATION VECTORIELLE, parce que c'est le chemin chaud : la
+        premiere version bouclait en Python sur les emplacements, et comme
+        `peut_entrer()` et `_get_obs()` l'appellent chacun a chaque barre et
+        pour chaque environnement, la collecte s'est effondree des K=8.
+        `execution_quote` n'est qu'une multiplication — un long sort au BID,
+        un short paie l'ASK — donc elle se met en tableau sans rien changer
+        au resultat.
+
+        A K=1 c'est le calcul d'avant, terme pour terme.
         """
-        a = np.flatnonzero(self._p_sens != 0)
-        if not len(a):
+        a = self._p_sens != 0
+        if not a.any():
             return 0.0
-        return float(sum(self._latent_slot(bid, int(i)) for i in a))
+        sens = self._p_sens[a]
+        # execution_quote(bid, -sens, spread) : le cote vendu paie le spread.
+        q = float(bid) * np.where(sens == -1,
+                                  1.0 + np.maximum(self._p_spread[a], 0.0) / 1e4,
+                                  1.0)
+        return float(((sens * (q - self._p_entree[a])
+                       - self.cfg.fee_rate * q) * self._p_taille[a]).sum())
 
     def _close_position(self, exit_price, hit_sl=False, hit_tp=False,
                         hit_temps=False, terminal_reason=None, slot=None):
@@ -2551,6 +2653,8 @@ class BTCTradingEnvDiscrete(gym.Env):
         self._realise_slots[slot] += realized
         self._slots_fermes.append(int(slot))
 
+        self._notionnel = max(0.0, self._notionnel
+                              - float(self._p_entree[slot]) * taille)
         self._p_sens[slot] = 0
         self._p_taille[slot] = 0.0
         self._p_entree[slot] = 0.0
@@ -2603,9 +2707,11 @@ class BTCTradingEnvDiscrete(gym.Env):
         # chaque decision ne doit recevoir que ce que SA position a produit,
         # sinon un trade gagnant crediterait le trade perdant ouvert a cote et
         # l'apprentissage porterait sur une moyenne que personne ne joue.
-        self._latent_prec = np.array(
-            [self._latent_slot(bid_prec, i) for i in range(self._K)],
-            dtype=np.float64)
+        # VECTORISE : c'est une fois par barre et par environnement, donc une
+        # boucle Python sur K y coute directement K fois plus cher. La
+        # premiere version en faisait une, et la collecte s'effondrait des que
+        # le plafond montait.
+        self._latent_prec = self._latents_par_slot(bid_prec)
         self._r_slots[:] = 0.0
         self._realise_slots[:] = 0.0
         self._slots_fermes = []
@@ -2675,6 +2781,7 @@ class BTCTradingEnvDiscrete(gym.Env):
 
                 self._p_be[j] = False
                 self._p_trail[j] = False
+                self._notionnel += exec_price * size
                 self._slot_ouvert = j
 
         # --------- BREAK-EVEN + TRAILING STOP ---------
@@ -2956,11 +3063,12 @@ class BTCTradingEnvDiscrete(gym.Env):
             _pen = 0.2 / len(_concernes) if dd > self.cfg.max_drawdown else 0.0
             _clip = (hasattr(self.cfg, "current_epoch")
                      and self.cfg.current_epoch >= 10)
+            _lat = self._latents_par_slot(price)
             for j in range(self._K):
                 if j not in _concernes:
                     self._r_slots[j] = 0.0
                     continue
-                d_j = (self._latent_slot(price, j) - self._latent_prec[j]
+                d_j = (_lat[j] - self._latent_prec[j]
                        + self._realise_slots[j])
                 lr = math.log(max(prev_equity_clamped + d_j, 1e-8)
                               / prev_equity_clamped)
@@ -5299,7 +5407,7 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_loup_duel_exec41"
+    cfg_duel.model_prefix = "saintv2_loup_duel_exec42"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -5323,7 +5431,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward exec41: trois folds sans bootstrap inter-fold.")
+    print("Walk-forward exec42: trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
