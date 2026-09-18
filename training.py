@@ -866,14 +866,22 @@ class PPOConfig:
     # produit des decisions, et un balayage anterieur avait deja montre que le
     # compte meurt sur les deux graines des 10 % en mono-instrument.
     #
-    # DEUX VALEURS DONNENT L'ESSAIM SANS TUER LE RUN : 30 % a 1 000 EUR, au
-    # bord du garde-fou de drawdown ; ou 3 % a 25 000 EUR, qui produit le meme
-    # essaim pour six fois moins de creux. C'est un probleme de CAPITAL, pas
-    # de budget : a 25 000 EUR le lot minimum de l'or ne pese plus que 0.11 %.
-    # RETENU : 30 %. C'est la valeur la plus haute ou les deux instruments
-    # essaiment ET ou l'episode survit — a 100 % il meurt a la barre 538 sur
-    # 4 000. Le creux de 37 % reste au bord du garde-fou a 40 %, ce qui est
-    # assume : c'est le prix d'un essaim d'or a 1 000 EUR de capital.
+    # RETENU : 3 %, ET LE COMMENTAIRE CI-DESSUS DECRIVAIT UN AUTRE CHOIX.
+    # Il concluait "RETENU : 30 %" au-dessus d'une valeur a 0.03 : le 30 %
+    # avait ete retracte — il ne survivait qu'a un test de 4 000 barres et
+    # mourait a 5 000 — sans que le texte soit repris. Deux descriptions du
+    # meme reglage qui divergent en silence : la faute habituelle de ce depot.
+    #
+    # CE QUE COUTE VRAIMENT D'ELARGIR, mesure le 2026-09-17 sur l'OR SEUL, un
+    # episode d'entrainement complet, quatre graines, entrees neutres tentees
+    # a chaque barre possible — le tableau complet est sous
+    # `episodes_per_epoch`. En resume : de 3 % a 30 %, les decisions par
+    # episode passent de 16 a 39 (x2.4) tandis que le creux median passe de
+    # 11 % a 40 % (x3.6) et qu'une graine sur quatre touche le garde-fou.
+    #
+    # L'ESSAIM N'EST DONC PAS CE QUI MANQUE. La rarete des decisions vient de
+    # la DUREE des trades — 28 h a 10xATR — pas de la capacite du compte. On
+    # garde 3 %, et c'est le nombre d'EPISODES qui fournit le gradient.
     budget_risque: float = 0.03
     # ------------------------------------------------------------------
 
@@ -898,7 +906,36 @@ class PPOConfig:
     # et les departs sont tires au hasard : la couverture cumulee augmente.
     # PLAFOND d'episodes, pas une consigne : le nombre reellement joue se
     # deduit de `cible_decisions` a chaque epoch. Voir ci-dessous.
-    episodes_per_epoch: int = 40
+    #
+    # 40 -> 160, PARCE QU'IL MORDAIT. Le chiffre de 40 avait ete calibre sur
+    # le BTC, dont un episode produit ~200 decisions : la cible de 4 000 etait
+    # alors atteinte en 20 episodes et le plafond ne servait que de garde-fou.
+    #
+    # L'OR N'A PAS CETTE DENSITE. Son lot minimum vaut 4 265 $ de notionnel
+    # contre 762 pour le BTC, donc le budget de risque n'autorise qu'une a
+    # deux positions a 1 000 EUR ; le compte est alors en position ~99 % du
+    # temps et un episode de 5 760 barres ne produit que ~25 decisions. Mesure
+    # du 2026-09-17, entrees neutres tentees a CHAQUE barre possible, quatre
+    # graines, episode d'entrainement complet :
+    #
+    #   budget   pos med   pos max   dec/episode   creux med   survie
+    #       3%       2         3          16           11%      4/4
+    #       6%       3         5          19           17%      4/4
+    #       9%       4         6          22           19%      4/4
+    #      12%       5         6          23           16%      4/4
+    #      18%       6        10          29           27%      3/4
+    #      30%       9        19          39           40%      3/4
+    #
+    # ELARGIR LE COMPTE NE REGLE DONC RIEN : dix fois le budget de risque ne
+    # multiplie les decisions que par 2.4, pour quatre fois le creux et une
+    # graine sur quatre qui meurt. La densite de decisions est bornee par la
+    # DUREE des trades (28 h), pas par la capacite du compte.
+    #
+    # Le seul levier propre est donc le nombre d'episodes, et son cout est
+    # lineaire : 40 episodes plafonnes donnaient ~1 000 decisions, soit le
+    # QUART de la cible. L'acteur recevait quatre fois moins de gradient que
+    # prevu — ce qui n'etait pas un choix, juste un plafond herite du BTC.
+    episodes_per_epoch: int = 160
 
     # ------------------------------------------------------------------
     # LE BUDGET D'UNE EPOCH SE COMPTE EN DECISIONS, ET IL S'AJUSTE SEUL.
@@ -6122,7 +6159,12 @@ if __name__ == "__main__":
     # Deux verrous plutot qu'un, verifies par `test_cote.py` : la regle de
     # decision connait le cote, et l'entrainement leve si le cote interdit
     # compte un seul trade.
-    cfg_long.model_prefix = "saintv2_or_exec03"
+    # exec04 — exec03 plus le PLAFOND D'EPISODES releve de 40 a 160.
+    # exec03 confirmait la correction du cote (S(0W/0L) partout) mais tournait
+    # encore a 1 107 decisions par epoch pour 4 000 visees : le plafond
+    # herite du BTC mordait, et l'acteur recevait le quart du gradient prevu.
+    # Seule cette borne change ; le reste est exec03 a l'identique.
+    cfg_long.model_prefix = "saintv2_or_exec04"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -6146,7 +6188,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward or_exec03 LONG-ONLY (XAUUSD seul) : trois folds sans bootstrap inter-fold.")
+    print("Walk-forward or_exec04 LONG-ONLY (XAUUSD seul) : trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
@@ -6190,9 +6232,9 @@ if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("  WALK-FORWARD LONG-ONLY TERMINÉ : 3 folds.")
     print("  Fichiers générés :")
-    print("    best_saintv2_or_exec03_long_wf1_long_wf1.pth")
-    print("    best_saintv2_or_exec03_long_wf2_long_wf2.pth")
-    print("    best_saintv2_or_exec03_long_wf3_long_wf3.pth")
+    print("    best_saintv2_or_exec04_long_wf1_long_wf1.pth")
+    print("    best_saintv2_or_exec04_long_wf2_long_wf2.pth")
+    print("    best_saintv2_or_exec04_long_wf3_long_wf3.pth")
     print("=" * 70)
 
     # ---------------------------------------------------------
