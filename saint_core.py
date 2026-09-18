@@ -535,12 +535,53 @@ def load_calib_thresholds(pth: str, repli: Optional[float] = None):
     return b, sl
 
 
-def decide_avec_barres(p_buy: float, p_sell: float, barres) -> int:
-    """0 = BUY, 1 = SELL, 2 = HOLD. SOURCE UNIQUE de la règle de décision."""
+COTES_PERMISES = {"long": (True, False), "short": (False, True),
+                  "both": (True, True), "duel": (True, True)}
+
+
+def cotes_permises(side: str):
+    """(achat permis, vente permise) — MEME table que le masque d'actions."""
+    if side not in COTES_PERMISES:
+        raise ValueError(f"cote inconnu : {side!r}")
+    return COTES_PERMISES[side]
+
+
+def decide_avec_barres(p_buy: float, p_sell: float, barres,
+                       side: str = "both") -> int:
+    """0 = BUY, 1 = SELL, 2 = HOLD. SOURCE UNIQUE de la règle de décision.
+
+    `side` INTERDIT un cote, exactement comme `build_mask_from_pos_scalar`
+    l'interdit dans les logits. Il fallait les deux, et c'est ce qui manquait.
+
+    CE QUE COUTAIT L'OUBLI, mesure sur or_exec02 (run long-only, trois folds).
+    La validation et le test remplacent les probabilites de la politique par
+    la sortie de la TETE AUXILIAIRE quand `tri_par_tete_aux` est vrai :
+
+        probs_np = sigmoid(policy.rendement(st))
+
+    Cette substitution ECRASE le tableau issu des logits masques, donc le
+    masque de cote avec. La tete auxiliaire predit les deux sens sans rien
+    savoir du cote autorise, et `decide` retenait "le meilleur des deux" —
+    des ventes, dans un run qui n'en avait jamais entraine une seule.
+
+        fold   LONG        SHORT       part des trades vendus
+        wf1    +87.9 $     -286.9 $    68 %
+        wf2    +421.1 $    -108.5 $    31 %
+        wf3    +517.1 $    -435.8 $    64 %
+
+    L'entrainement affichait S(0W/0L) +0.00 $ a chaque epoch — le rollout,
+    lui, respectait le masque. Les ventes ont emporte 81 % du gain des
+    achats, et c'est sur ce net que le "meilleur modele" a ete choisi.
+
+    ON NE CORRIGE PAS DANS LES SCORES mais ici, dans la regle : mettre le
+    cote interdit a -inf obligerait sa barre calibree a valoir +inf pour que
+    rien ne passe, soit deux choses a garder d'accord. Une seule suffit.
+    """
     if isinstance(barres, EntryDecisionPolicy):
         return barres.decide(p_buy, p_sell)
-    ok_b = p_buy >= barres[0]
-    ok_s = p_sell >= barres[1]
+    permis_b, permis_s = cotes_permises(side)
+    ok_b = permis_b and p_buy >= barres[0]
+    ok_s = permis_s and p_sell >= barres[1]
     if ok_b and ok_s:
         return 0 if (p_buy - barres[0]) >= (p_sell - barres[1]) else 1
     if ok_b:
@@ -2093,6 +2134,12 @@ class EntryDecisionPolicy:
         if self.spec.get('version') != 1:
             raise ValueError('Version de politique de décision inconnue')
         self.mode = self.spec['mode']
+        # LE COTE FAIT PARTIE DE LA SPECIFICATION, donc du checkpoint : une
+        # politique long-only rechargee ailleurs doit rester long-only sans
+        # que l'appelant ait a le redire. Les specs anterieures n'ont pas la
+        # cle et gardent leur comportement documente.
+        self.side = str(self.spec.get('side', 'both'))
+        cotes_permises(self.side)          # leve tot si la valeur est fausse
         if self.mode == 'rolling_rank':
             if self.spec.get('ties') != 'conservative':
                 raise ValueError('Convention des égalités inconnue')
@@ -2117,22 +2164,28 @@ class EntryDecisionPolicy:
         if not np.isfinite(values).all():
             raise ValueError('Probabilités non finies')
         thresholds = self.thresholds  # Both read before either history changes.
-        action = decide_avec_barres(*values, thresholds)
+        action = decide_avec_barres(*values, thresholds, self.side)
         if self.mode == 'rolling_rank':
+            # Les DEUX historiques continuent d'observer, meme le cote
+            # interdit : sa barre ne sert alors a rien, mais la fenetre reste
+            # comparable d'un run a l'autre et le jour ou le cote est rouvert
+            # elle n'a pas a etre reamorcee.
             for rank, value in zip(self.ranks, values):
                 rank.observe(value)
         return action
 
 
-def rolling_decision_spec(fraction, window, bootstrap):
+def rolling_decision_spec(fraction, window, bootstrap, side='both'):
     spec = {'version': 1, 'mode': 'rolling_rank', 'ties': 'conservative',
+            'side': str(side),
             'fraction_per_side': float(fraction), 'window': int(window),
-            'bootstrap': [[float(v) for v in side[-window:]] for side in bootstrap]}
+            'bootstrap': [[float(v) for v in side_[-window:]]
+                          for side_ in bootstrap]}
     EntryDecisionPolicy(spec)  # Fail before saving an unusable checkpoint.
     return spec
 
 
-def load_decision_policy(checkpoint, fallback=None):
+def load_decision_policy(checkpoint, fallback=None, side=None):
     """Fresh state on every load; callers retain one instance per stream."""
     import json
     from pathlib import Path
@@ -2141,9 +2194,15 @@ def load_decision_policy(checkpoint, fallback=None):
         with path.open(encoding='utf-8') as f:
             metadata = json.load(f)
         if 'decision_policy' in metadata:
-            return EntryDecisionPolicy(metadata['decision_policy'])
+            spec = dict(metadata['decision_policy'])
+            # `side` explicite l'emporte : un checkpoint d'avant la correction
+            # ne porte pas la cle, et le rechargerait sans restriction.
+            if side is not None:
+                spec['side'] = str(side)
+            return EntryDecisionPolicy(spec)
     # Older checkpoints retain their documented fixed-threshold behavior.
     return EntryDecisionPolicy({'version': 1, 'mode': 'fixed',
+                                'side': str(side) if side is not None else 'both',
                                 'thresholds': list(load_calib_thresholds(checkpoint, fallback))})
 
 

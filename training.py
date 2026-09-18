@@ -111,6 +111,7 @@ from saint_core import (
     SeuilRang,
     N_BLOCS_DEFAUT,
     EntryDecisionPolicy,
+    cotes_permises,
     rolling_decision_spec,
     SAINTPolicySingleHead,
     PatchTSTPolicy,
@@ -3685,6 +3686,24 @@ def compute_gae_semi_mdp(rewards, values, dones, dts, gamma, lam, last_value=0.0
     return adv, returns
 
 
+_VEILLEUR = None
+
+
+def _veilleur():
+    """L'analyste des epochs, construit une fois et garde pour tout le run.
+
+    Son etat est par FOLD — PnL cumule, epoch precedente, epochs a actor gele
+    qui servent de reference au hasard — donc il doit traverser les trois
+    folds. Un objet par epoch afficherait "premiere epoch" quatre-vingt-dix
+    fois de suite.
+    """
+    global _VEILLEUR
+    if _VEILLEUR is None:
+        import veille_epochs
+        _VEILLEUR = veille_epochs.Veilleur()
+    return _VEILLEUR
+
+
 def build_action_mask_from_positions(positions: torch.Tensor, side: str) -> torch.Tensor:
     device = positions.device
     B = positions.shape[0]
@@ -5164,8 +5183,15 @@ def run_training_on_split(
         # la memoire repondrait avec l'encodage d'il y a N pas de gradient.
         policy.rafraichit_banque()
 
+        # LA SELECTIVITE SE DIVISE PAR LE NOMBRE DE COTES OUVERTS, pas par
+        # deux. `val_selectivity / 2.0` supposait un run bilateral : en
+        # long-only il ne reste qu'un cote, et diviser quand meme faisait
+        # trader l'agent a la MOITIE de la frequence demandee — 2.5 % la ou
+        # la configuration en demande 5. Le cote ferme n'a besoin d'aucune
+        # part du budget puisque `EntryDecisionPolicy` le refuse desormais.
+        _n_cotes = max(sum(cotes_permises(cfg.side)), 1)
         decision_spec = rolling_decision_spec(
-            val_selectivity / 2.0, cfg.rang_fenetre, pbs_val)
+            val_selectivity / _n_cotes, cfg.rang_fenetre, pbs_val, cfg.side)
         val_decisions = [EntryDecisionPolicy(decision_spec) for _ in range(n_val)]
 
         # ---------- PASSE 2 : validation réelle, rang glissant ----------
@@ -5364,6 +5390,20 @@ def run_training_on_split(
         val_long_pnl  = val_split["long"]["pnl"]
         val_short_pnl = val_split["short"]["pnl"]
 
+        # LE COTE INTERDIT DOIT AFFICHER ZERO TRADE, et rien ne le verifiait.
+        # or_exec02 a tourne 91 epochs x 3 folds en long-only avec 31 a 68 %
+        # de VENTES en validation : l'entrainement montrait bien S(0W/0L),
+        # mais personne ne comparait les deux lignes. Le controle coute une
+        # comparaison par epoch et aurait economise le run entier.
+        _pb, _ps = cotes_permises(cfg.side)
+        for _nom, _permis, _n in (("achats", _pb, val_long_w + val_long_l),
+                                  ("ventes", _ps, val_short_w + val_short_l)):
+            if not _permis and _n:
+                raise RuntimeError(
+                    f"side={cfg.side!r} interdit les {_nom}, or la validation "
+                    f"en compte {_n}. La regle de decision et le masque "
+                    f"d'actions ne decrivent plus la meme strategie.")
+
         # --------- Couleurs / styles ---------
         tag       = _col(f"[{cfg.side.upper()}{suffix}]", _C.MAGENTA + _C.BOLD)
         epoch_str = _col(f"EPOCH {epoch:03d}", _C.CYAN + _C.BOLD)
@@ -5386,7 +5426,7 @@ def run_training_on_split(
             return _C.RED
 
         # ----- Ligne 1 : TRAIN -----
-        print(
+        _ligne_train = (
             f"{tag} {epoch_str}  "
             f"{_col('TRAIN', _C.WHITE + _C.BOLD)}  "
             f"PNL {_money(profit_epoch, width=10)}  "
@@ -5399,9 +5439,10 @@ def run_training_on_split(
             f"{_col('S', _C.BLUE)}({_col(str(train_short_w), _C.GREEN)}W/"
             f"{_col(str(train_short_l), _C.RED)}L) {_money(train_short_pnl, width=9)}"
         )
+        print(_ligne_train)
 
         # ----- Ligne 2 : VAL -----
-        print(
+        _ligne_val = (
             f"{tag} {epoch_str}  "
             f"{_col('VAL  ', _C.WHITE + _C.BOLD)}  "
             f"PNL {_money(val_profit, width=10)}  "
@@ -5414,6 +5455,7 @@ def run_training_on_split(
             f"{_col('S', _C.BLUE)}({_col(str(val_short_w), _C.GREEN)}W/"
             f"{_col(str(val_short_l), _C.RED)}L) {_money(val_short_pnl, width=9)}"
         )
+        print(_ligne_val)
 
         # ----- Ligne 3 : METRICS PPO -----
         # On rend au generateur son etat d'avant validation : les graines fixes
@@ -5504,7 +5546,7 @@ def run_training_on_split(
             if _sa:
                 _rho_aux = _correlation_rang(np.concatenate(_sa), _rang_reel)
 
-        print(
+        _ligne_meta = (
             f"{tag} {epoch_str}  "
             f"{_col('META ', _C.GREY + _C.BOLD)}  "
             f"rho {_rho_ep:>+6.4f}  rhoAux {_rho_aux:>+6.4f}  "
@@ -5542,6 +5584,34 @@ def run_training_on_split(
             f"{_col(f'H {hold_ratio:>4.1%}', _C.GREY)}]"
             + ("  MOYENNE DES POIDS" if epoch_moyenne else "")
         )
+        print(_ligne_meta)
+
+        # ---- L'ANALYSE DE LA VEILLE, DANS CE TERMINAL-CI ----
+        #
+        # Les trois lignes ci-dessus sont des colonnes : elles disent ce qui
+        # s'est passe, pas ce que cela vaut. Le point mort, l'ecart a la
+        # politique GELEE DU MEME RUN, l'erreur-type de cet ecart et les
+        # diagnostics vivaient dans `veille_epochs.py` — donc dans une
+        # seconde fenetre, qu'il fallait penser a lancer. Quand elle ne
+        # l'etait pas, personne ne lisait ces chiffres.
+        #
+        # C'est le MEME code qui les produit, pas une copie : on lui donne le
+        # texte qu'on vient d'ecrire et il rend les memes blocs qu'au fichier.
+        # Une seconde mise en forme aurait diverge de la premiere sans que
+        # rien ne le signale, comme le reste de ce depot l'a deja montre.
+        try:
+            for _console, _brut in _veilleur().avale(
+                    "\n".join((_ligne_train, _ligne_val, _ligne_meta))):
+                for _l in _console:
+                    print(_l)
+                print()
+        except Exception as _e:
+            # L'analyse ne doit JAMAIS interrompre un entrainement : elle
+            # commente, elle ne produit rien dont la suite depende. Mais elle
+            # se tait bruyamment — trois fois deja un motif casse l'a rendue
+            # muette sans que personne ne s'en apercoive.
+            print(f"  [veille] analyse indisponible ({type(_e).__name__}: "
+                  f"{_e}) — les colonnes ci-dessus restent valides.")
 
         # Écriture CSV
         with open(csv_path, "a", newline="", encoding="utf-8") as _f:
@@ -5967,16 +6037,14 @@ if __name__ == "__main__":
     cfg_base = PPOConfig()
 
     # =======================================================
-    # PIPELINE DUEL : un seul modèle qui décide BUY ou SELL
+    # PIPELINE LONG-ONLY : un modèle spécialisé qui décide BUY ou HOLD.
     # =======================================================
-    # side="both": BUY, SELL ou HOLD à plat, sans actions forcées.
-    # Résultat : un unique fichier .pth qui remplace LONG + SHORT,
-    # exactement comme en live "duel".
+    # side="long": BUY ou HOLD à plat ; les ventes restent interdites.
     print("\n" + "=" * 70)
-    print("  ENTRAÎNEMENT DUEL (long + short combinés)")
+    print("  ENTRAÎNEMENT LONG-ONLY (buy + hold)")
     print("=" * 70)
-    cfg_duel = PPOConfig(**cfg_base.__dict__)
-    cfg_duel.side = "both"
+    cfg_long = PPOConfig(**cfg_base.__dict__)
+    cfg_long.side = "long"
     # Un prefixe par jeu d'observation OU par architecture : les poids ne sont
     # jamais interchangeables d'une lignee a l'autre, et le manifeste refuse de
     # reecrire un run existant.
@@ -6015,7 +6083,34 @@ if __name__ == "__main__":
     # archives Binance spot au lieu de MT5). Donc 5.4 parametres par barre.
     # On ne touche a rien d'autre, sinon exec11 et exec12 ne seraient plus
     # comparables et on ne saurait pas ce qui a agi.
-    cfg_duel.model_prefix = "saintv2_or_exec01"
+    # exec03 — MEME reglage qu'exec02, UNE SEULE chose change : la validation
+    # et le test cessent de vendre dans un run long-only.
+    #
+    # exec02 a tourne 91 epochs x 3 folds. L'entrainement etait correct — la
+    # ligne TRAIN affichait S(0W/0L) +0.00$ a chaque epoch — mais la
+    # validation ouvrait des ventes, parce que la substitution par la tete
+    # auxiliaire ecrasait le tableau de probabilites ET le masque de cote
+    # avec. Ce que cela a coute, par fold et par epoch :
+    #
+    #     fold   LONG        SHORT       part des trades vendus
+    #     wf1    +87.9 $     -286.9 $    68 %
+    #     wf2    +421.1 $    -108.5 $    31 %
+    #     wf3    +517.1 $    -435.8 $    64 %
+    #
+    # Les achats rapportaient +1 026 $ par epoch tous folds confondus, les
+    # ventes en reprenaient 831. Le "meilleur modele" a donc ete choisi sur
+    # un net qui ne mesurait pas la strategie entrainee, et la fenetre de
+    # test a ete consommee avec la meme regle : -190 $, +279 $, +525 $, soit
+    # +614 $ pour 174 trades, 1.4 ecart-type — indistinguable de zero.
+    #
+    # LE TEST D'exec03 SERA UNE SECONDE LECTURE de ces memes fenetres. Il
+    # faut le lire comme tel : la correction est un defaut repare, pas un
+    # reglage choisi sur le test, mais la fenetre n'est plus vierge.
+    #
+    # Deux verrous plutot qu'un, verifies par `test_cote.py` : la regle de
+    # decision connait le cote, et l'entrainement leve si le cote interdit
+    # compte un seul trade.
+    cfg_long.model_prefix = "saintv2_or_exec03"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -6028,7 +6123,7 @@ if __name__ == "__main__":
     # donc pas diverger de ce qui tourne : si elles se contredisent a l'ecran,
     # c'est la configuration qui se contredit.
     import cibles as _CIB
-    _so, _ci = _CIB._regle(cfg_duel), _CIB._regle_cible(cfg_duel)
+    _so, _ci = _CIB._regle(cfg_long), _CIB._regle_cible(cfg_long)
     print(f"SORTIE    stop {_so['sl']:g}xATR = 1 R | objectif "
           f"{(str(_so['tp'] / _so['sl']) + ' R') if _so['tp'] else 'AUCUN'} | "
           f"trailing " + (f"depuis {_so['ts'] / _so['sl']:.2f} R, "
@@ -6039,7 +6134,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward or_exec01 (XAUUSD seul) : trois folds sans bootstrap inter-fold.")
+    print("Walk-forward or_exec03 LONG-ONLY (XAUUSD seul) : trois folds sans bootstrap inter-fold.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
@@ -6075,18 +6170,17 @@ if __name__ == "__main__":
     #
     # Ils partagent maintenant le rollout : l'action executee est celle du
     # melange, et chacun apprend a jouer SA part dans une decision commune.
-    run_walkforward(cfg_duel, train_frac=0.55, val_frac=0.15, test_frac=0.10,
+    run_walkforward(cfg_long, train_frac=0.55, val_frac=0.15, test_frac=0.10,
                     max_folds=3, start_fold=1,
                     bootstrap_from_path=None,
                     auto_chain=False)
 
     print("\n" + "=" * 70)
-    print("  WALK-FORWARD TERMINÉ : 3 folds, tous les reseaux dans le meme "
-          "rollout.")
+    print("  WALK-FORWARD LONG-ONLY TERMINÉ : 3 folds.")
     print("  Fichiers générés :")
-    print("    bestprofit_saintv2_loup_duel_exec2_wf1_both_wf1.pth")
-    print("    bestprofit_saintv2_loup_duel_exec2_wf2_both_wf2.pth")
-    print("    bestprofit_saintv2_loup_duel_exec2_wf3_both_wf3.pth")
+    print("    best_saintv2_or_exec03_long_wf1_long_wf1.pth")
+    print("    best_saintv2_or_exec03_long_wf2_long_wf2.pth")
+    print("    best_saintv2_or_exec03_long_wf3_long_wf3.pth")
     print("=" * 70)
 
     # ---------------------------------------------------------

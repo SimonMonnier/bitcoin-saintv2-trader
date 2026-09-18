@@ -64,19 +64,19 @@ NB = r"[+-]?[\d.]+"
 # Les trois lignes que le training ecrit par epoch. Chaque motif est ancre sur
 # le fold pour que deux folds ne se confondent pas.
 RE_VAL = re.compile(
-    r"\[BOTH_(wf\d+)\]\s+EPOCH (\d+)\s+VAL\s+PNL\s+(" + NB + r")\$\s+"
+    r"\[(?:BOTH|LONG|SHORT)_(wf\d+)\]\s+EPOCH (\d+)\s+VAL\s+PNL\s+(" + NB + r")\$\s+"
     r"trades=\s*(\d+)\s+WR\s+([\d.]+)%\s+PF\s+([\d.]+)\s+DD\s+([\d.]+)%"
     r".*?L\((\d+)W/(\d+)L\)\s+(" + NB + r")\$"
     r"\s+S\((\d+)W/(\d+)L\)\s+(" + NB + r")\$")
 RE_TRAIN = re.compile(
-    r"\[BOTH_(wf\d+)\]\s+EPOCH (\d+)\s+TRAIN\s+PNL\s+(" + NB + r")\$\s+"
+    r"\[(?:BOTH|LONG|SHORT)_(wf\d+)\]\s+EPOCH (\d+)\s+TRAIN\s+PNL\s+(" + NB + r")\$\s+"
     r"trades=\s*(\d+)\s+WR\s+([\d.]+)%\s+PF\s+([\d.]+)\s+DD\s+([\d.]+)%")
 RE_META = re.compile(
     # `rho` s'intercale entre META et Sortino depuis le 2026-09-16. Le groupe
     # est NON CAPTURANT : la suite du fichier lit m[2] a m[22] par position, et
     # un groupe de plus les decalerait tous en silence. Il est OPTIONNEL pour
     # que la veille continue de lire les journaux des runs anterieurs.
-    r"\[BOTH_(wf\d+)\]\s+EPOCH (\d+)\s+META\s+(?:rho\s+" + NB + r"\s+)?"
+    r"\[(?:BOTH|LONG|SHORT)_(wf\d+)\]\s+EPOCH (\d+)\s+META\s+(?:rho\s+" + NB + r"\s+)?"
     r"(?:rhoAux\s+" + NB + r"\s+)?"
     # Marqueur des epochs ou la validation a ete sautee : le PnL affiche est
     # celui de la derniere mesure reelle. Troisieme fois qu'un champ ajoute
@@ -195,7 +195,7 @@ def _point_mort(avg_w, avg_l):
 
 
 def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
-            ent_prec=None, rho=None):
+            ent_prec=None, rho=None, cote="both"):
     """Rend (lignes colorees, lignes brutes, gain par trade, ecart, gele)."""
     ep = int(v[1])
     pnl, trades, wr, pf, dd = (float(v[2]), int(v[3]), float(v[4]),
@@ -311,9 +311,17 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     # resultat de TabM s'est effondre, tout son gain venant d'un bloc haussier.
     def _wr(w, l):
         return 100.0 * w / max(w + l, 1)
-    L.append(f"  sens    LONG  {lw:4d}W/{ll:<4d}L  {_wr(lw, ll):4.1f}%  "
-             f"{lpnl:+9.2f}$   |   SHORT {sw:4d}W/{sl_:<4d}L  "
-             f"{_wr(sw, sl_):4.1f}%  {spnl:+9.2f}$")
+    # DEUX LIGNES, ET LE TOTAL EN CLAIR. L'ancien format ecrivait
+    # `LONG  16W/12  L  57.1%` : le cadrage a gauche du nombre de perdants
+    # detachait son `L`, et la paire se lisait comme une fraction — "16
+    # gagnants sur 12 trades". Elle n'a jamais voulu dire cela : 16 gagnants
+    # ET 12 perdants, soit 28 trades. Le total est desormais affiche, et
+    # verifie contre la ligne du haut.
+    n_l, n_s = lw + ll, sw + sl_
+    L.append(f"  sens    LONG  {n_l:>4d} trades  {lw:>4d} gagnants "
+             f"{ll:>4d} perdants  {_wr(lw, ll):5.1f}%  {lpnl:+10.2f}$")
+    L.append(f"          SHORT {n_s:>4d} trades  {sw:>4d} gagnants "
+             f"{sl_:>4d} perdants  {_wr(sw, sl_):5.1f}%  {spnl:+10.2f}$")
     L.append(f"  actions B {b_pct:.1f}%  S {s_pct:.1f}%  H {h_pct:.1f}%"
              f"   |   selectivite  train {sel_tr:.1f}%  val {sel_val:.1f}%")
     # L'ETAT DE LA POLITIQUE, sur sa propre ligne. L'entropie et l'etendue
@@ -366,7 +374,23 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
         notes.append(f"etendue val {et_val:.4f}, soit "
                      f"{et_val/TREMBLEMENT_SEUIL:.0f}x le tremblement du seuil : "
                      f"la selection est portee par le modele.")
-    if (lpnl > 0) != (spnl > 0):
+    if n_l + n_s != trades:
+        notes.append(f"LES DEUX SENS NE FONT PAS LE TOTAL : {n_l} achats + "
+                     f"{n_s} ventes = {n_l + n_s}, or la ligne VAL en annonce "
+                     f"{trades}. Un trade manque a la ventilation.")
+    # LE COTE INTERDIT DOIT ETRE VIDE. or_exec02 a tourne 273 epochs en
+    # long-only avec 31 a 68 % de ventes en validation, et rien ne l'a dit :
+    # la veille affichait les deux sens sans jamais les confronter au cote
+    # declare dans le tag du journal.
+    if cote == "long" and n_s:
+        notes.append(f"VENTES DANS UN RUN LONG-ONLY : {n_s} ventes pour "
+                     f"{spnl:+.2f}$ alors que le run est declare LONG. La "
+                     f"regle de decision ne respecte pas le masque d'actions "
+                     f"— le resultat net ne mesure pas la strategie entrainee.")
+    if cote == "short" and n_l:
+        notes.append(f"ACHATS DANS UN RUN SHORT-ONLY : {n_l} achats pour "
+                     f"{lpnl:+.2f}$ alors que le run est declare SHORT.")
+    if (sw + sl_ > 0) and ((lpnl > 0) != (spnl > 0)):
         gagnant = "LONG" if lpnl > 0 else "SHORT"
         notes.append(f"GAIN UNILATERAL : seul le {gagnant} rapporte. Un modele "
                      f"qui ne gagne que d'un cote a un biais directionnel, pas "
@@ -400,108 +424,173 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     return console, L, par_trade, ecart, gele
 
 
+RE_COTE = re.compile(r"\[(BOTH|LONG|SHORT)_(wf\d+)\]")
+
+
+class Veilleur:
+    """L'analyse des epochs, alimentee par le TEXTE du journal.
+
+    POURQUOI UN OBJET. Cette analyse n'existait que dans une seconde fenetre :
+    sans `veille_epochs.py` lance a cote, le terminal d'entrainement ne
+    montrait que ses propres colonnes — ni le point mort, ni l'ecart a la
+    politique gelee du run, ni aucun des diagnostics. L'etat necessaire tient
+    en quelques dictionnaires par fold ; les sortir d'une boucle `main` suffit
+    a ce que `training.py` fasse defiler le meme texte au moment ou il l'ecrit.
+
+    IL N'Y A PAS DE SECONDE MISE EN FORME, et c'est la seule raison d'etre de
+    ce decoupage. Recopier la presentation cote entrainement aurait cree deux
+    descriptions du meme resultat, qui doivent s'accorder par convention :
+    la faute que ce depot passe son temps a payer.
+
+    `avale` rend une liste de (lignes colorees, lignes brutes). Les lignes
+    brutes valent None pour les annonces qui ne sont pas des epochs.
+    """
+
+    def __init__(self):
+        self.vus = set()
+        self.vals, self.metas, self.trains, self.rhos = {}, {}, {}, {}
+        self.cotes = {}         # par fold : long / short / both, lu du tag
+        self.precedent = {}     # par fold : gain par trade de l'epoch d'avant
+        self.geles = {}         # par fold : ecarts des epochs a actor gele
+        self.cumul = {}         # par fold : PnL de validation cumule
+        self.entropie = {}      # par fold : entropie de l'epoch precedente
+        self.attend_moyenne = set()
+        self.fold_courant = None
+
+    def oublie_tout(self):
+        """Journal tronque ou run relance : on repart de zero."""
+        self.vus.clear()
+        for d in (self.vals, self.metas, self.trains, self.rhos, self.cotes,
+                  self.precedent, self.geles, self.cumul, self.entropie):
+            d.clear()
+        self.attend_moyenne.clear()
+        self.fold_courant = None
+
+    def avale(self, texte):
+        blocs = []
+        for ligne in ANSI.sub("", texte).split("\n"):
+            mc = RE_COTE.search(ligne)
+            if mc:
+                self.cotes[mc.group(2)] = mc.group(1).lower()
+            if "[MEMOIRE]" in ligne:
+                blocs.append(([f"{C.CYAN}  {ligne.strip()}{C.FIN}"], None))
+            if "MOYENNE DES POIDS sur les" in ligne:
+                # Annonce emise AVANT l'epoch concernee : les poids qui
+                # suivent sont la moyenne des dernieres epochs, donc le
+                # modele qui part au test.
+                blocs.append((
+                    [f"{C.CYAN}{C.GRAS}  {ligne.strip()}{C.FIN}"], None))
+                self.attend_moyenne.add(
+                    ligne.split("]")[0].strip("[").split("_")[-1])
+            if "[TEST]" in ligne:
+                blocs.append(([f"{C.CYAN}{C.GRAS}  {ligne.strip()}{C.FIN}"],
+                              None))
+            mv, mm = RE_VAL.search(ligne), RE_META.search(ligne)
+            mt = RE_TRAIN.search(ligne)
+            if mv:
+                self.vals[(mv.group(1), int(mv.group(2)))] = mv.groups()
+            if mm:
+                self.metas[(mm.group(1), int(mm.group(2)))] = mm.groups()
+                # Lus par des motifs separes : les inclure dans RE_META
+                # decalerait les indices que `analyse` lit par position.
+                mr = RE_RHO.search(ligne)
+                ma = RE_RHO_AUX.search(ligne)
+                self.rhos[(mm.group(1), int(mm.group(2)))] = (
+                    float(mr.group(1)) if mr else None,
+                    float(ma.group(1)) if ma else None)
+            if mt:
+                self.trains[(mt.group(1), int(mt.group(2)))] = mt.groups()
+
+        for cle in sorted(set(self.vals) & set(self.metas) - self.vus):
+            self.vus.add(cle)
+            fold, ep = cle
+            entete = []
+            if fold != self.fold_courant:
+                entete = [f"{C.CYAN}{C.GRAS}  ===  {fold.upper()}  ==={C.FIN}",
+                          ""]
+                self.fold_courant = fold
+            ref = None
+            if len(self.geles.get(fold, [])) >= 2:
+                g = self.geles[fold]
+                ref = (len(g), sum(g) / len(g))
+            self.cumul[fold] = (self.cumul.get(fold, 0.0)
+                                + float(self.vals[cle][2]))
+            est_moyenne = fold in self.attend_moyenne
+            self.attend_moyenne.discard(fold)
+            console, brut, par_trade, ecart, gele = analyse(
+                self.vals[cle], self.metas[cle], self.trains.get(cle),
+                self.precedent.get(fold), ref, self.cumul[fold], est_moyenne,
+                self.entropie.get(fold), self.rhos.get(cle),
+                self.cotes.get(fold, "both"))
+            self.entropie[fold] = float(self.metas[cle][5])
+            self.precedent[fold] = par_trade
+            if gele:
+                self.geles.setdefault(fold, []).append(ecart)
+            horo = dt.datetime.now().strftime("%H:%M:%S")
+            blocs.append((entete + [f"{C.GRIS}[{horo}]{C.FIN}"] + console,
+                          brut))
+        return blocs
+
+
+def ecrit_rapport(brut, fold, chemin=RAPPORT):
+    horo = dt.datetime.now().strftime("%H:%M:%S")
+    with open(chemin, "a", encoding="utf-8") as r:
+        r.write(f"\n## {horo} — {fold} — {brut[0]}\n\n")
+        for l in brut[1:]:
+            r.write(l.strip() + "\n")
+
+
 def main() -> int:
     print(f"\n{C.CYAN}{C.GRAS}  KAIROS — veille d'analyse par epoch{C.FIN}")
     print(f"{C.GRIS}  {'-' * 66}")
     print(f"  journal : {JOURNAL}")
     print(f"  rapport : {RAPPORT}")
     print(f"  reference : les epochs a actor gele DU RUN EN COURS")
-    print(f"  LECTURE SEULE — fermer cette fenetre n'arrete pas l'entrainement")
+    print(f"  LECTURE SEULE — fermer cette fenetre n'arrete pas "
+          f"l'entrainement")
     print(f"  {'-' * 66}{C.FIN}\n")
 
-    vus = set()
-    metas, vals, trains, rhos = {}, {}, {}, {}
-    precedent = {}          # par fold
-    geles = {}              # par fold : ecarts des epochs a actor gele
-    cumul = {}              # par fold : PnL de validation cumule
-    entropie = {}           # par fold : entropie de l'epoch precedente
-    attend_moyenne = set()  # folds dont l'epoch suivante porte la moyenne
+    v = Veilleur()
     position = 0
-    fold_courant = None
+    utf16 = False
 
     while True:
         try:
-            # Le journal est REECRIT a chaque relance de l'entrainement. Si sa
-            # taille a diminue, notre position pointe au-dela de la fin : on
-            # repart du debut et on oublie ce qu'on croyait avoir vu, sinon la
-            # veille resterait muette sur tout un nouveau run.
-            if os.path.getsize(JOURNAL) < position:
-                print(f"{C.JAUNE}  journal reecrit — nouveau run detecte, "
+            taille = os.path.getsize(JOURNAL)
+            if taille < position:
+                print(f"\n{C.JAUNE}  journal tronque ou run relance — "
                       f"relecture depuis le debut{C.FIN}\n")
                 position = 0
-                vus.clear(); vals.clear(); metas.clear(); trains.clear()
-                rhos.clear()
-                precedent.clear(); geles.clear(); cumul.clear()
-                entropie.clear()
-                attend_moyenne.clear()
-                fold_courant = None
-            with open(JOURNAL, encoding="utf-8", errors="replace") as f:
+                utf16 = False
+                v.oublie_tout()
+            # Lecture en BYTES puis decodage selon le BOM : le journal peut
+            # etre relance sous PowerShell (> fichier.log), qui ecrit en
+            # UTF-16LE avec BOM au lieu d'UTF-8. Lu en utf-8, chaque caractere
+            # est suivi d'un \x00, aucun motif ne matche et la veille reste
+            # muette sans rien dire. Les offsets restent des octets, donc la
+            # logique de reprise de position est inchangee.
+            with open(JOURNAL, "rb") as f:
                 f.seek(position)
                 nouveau = f.read()
                 position = f.tell()
+            if (nouveau.startswith(b"\xff\xfe")
+                    or nouveau.startswith(b"\xfe\xff")):
+                nouveau = nouveau.decode("utf-16")
+                utf16 = True
+            elif utf16:
+                nouveau = nouveau.decode("utf-16")
+            else:
+                nouveau = nouveau.decode("utf-8", errors="replace")
         except FileNotFoundError:
             time.sleep(PAS_SONDAGE)
             continue
 
-        for ligne in ANSI.sub("", nouveau).split("\n"):
-            if "[MEMOIRE]" in ligne:
-                print(f"{C.CYAN}  {ligne.strip()}{C.FIN}\n")
-            if "MOYENNE DES POIDS sur les" in ligne:
-                # Annonce emise par l'entrainement AVANT l'epoch concernee :
-                # les poids qui suivent sont la moyenne des dernieres epochs,
-                # donc le modele qui part au test.
-                print(f"{C.CYAN}{C.GRAS}  {ligne.strip()}{C.FIN}")
-                print()
-                attend_moyenne.add(
-                    ligne.split("]")[0].strip("[").split("_")[-1])
-            if "[TEST]" in ligne:
-                print(f"{C.CYAN}{C.GRAS}  {ligne.strip()}{C.FIN}\n")
-            mv, mm = RE_VAL.search(ligne), RE_META.search(ligne)
-            mt = RE_TRAIN.search(ligne)
-            if mv:
-                vals[(mv.group(1), int(mv.group(2)))] = mv.groups()
-            if mm:
-                metas[(mm.group(1), int(mm.group(2)))] = mm.groups()
-                # Lu par un motif separe : l'inclure dans RE_META decalerait
-                # les indices que `analyse` lit par position.
-                mr = RE_RHO.search(ligne)
-                ma = RE_RHO_AUX.search(ligne)
-                rhos[(mm.group(1), int(mm.group(2)))] = (
-                    float(mr.group(1)) if mr else None,
-                    float(ma.group(1)) if ma else None)
-            if mt:
-                trains[(mt.group(1), int(mt.group(2)))] = mt.groups()
-
-        for cle in sorted(set(vals) & set(metas) - vus):
-            vus.add(cle)
-            fold, ep = cle
-            if fold != fold_courant:
-                print(f"{C.CYAN}{C.GRAS}  ===  {fold.upper()}  ==={C.FIN}\n")
-                fold_courant = fold
-            ref = None
-            if len(geles.get(fold, [])) >= 2:
-                g = geles[fold]
-                ref = (len(g), sum(g) / len(g))
-            cumul[fold] = cumul.get(fold, 0.0) + float(vals[cle][2])
-            est_moyenne = fold in attend_moyenne
-            attend_moyenne.discard(fold)
-            console, brut, par_trade, ecart, gele = analyse(
-                vals[cle], metas[cle], trains.get(cle), precedent.get(fold),
-                ref, cumul[fold], est_moyenne, entropie.get(fold),
-                rhos.get(cle))
-            entropie[fold] = float(metas[cle][5])
-            precedent[fold] = par_trade
-            if gele:
-                geles.setdefault(fold, []).append(ecart)
-            horo = dt.datetime.now().strftime("%H:%M:%S")
-            print(f"{C.GRIS}[{horo}]{C.FIN}")
+        for console, brut in v.avale(nouveau):
             for l in console:
                 print(l)
             print()
-            with open(RAPPORT, "a", encoding="utf-8") as r:
-                r.write(f"\n## {horo} — {fold} — {brut[0]}\n\n")
-                for l in brut[1:]:
-                    r.write(l.strip() + "\n")
+            if brut is not None:
+                ecrit_rapport(brut, v.fold_courant or "?")
 
         time.sleep(PAS_SONDAGE)
 
