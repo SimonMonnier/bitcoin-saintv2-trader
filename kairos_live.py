@@ -135,11 +135,38 @@ BEST_MODEL_DUEL_PATH = "bestprofit_saintv2_loup_duel_exec11_wf1_both_wf1.pth"
 # soit le state_dict refuse de se charger, soit — pire — il se charge et
 # l'agent trade en lisant autre chose que ce sur quoi il a appris.
 # wf2/wf3 n'existent pas encore en BTC : leur activation doit echouer bruyamment.
-MULTI_AGENT_PATHS: Dict[str, str] = {
-    "wf1": "bestprofit_saintv2_loup_duel_exec11_wf1_both_wf1.pth",
-    "wf2": "bestprofit_saintv2_loup_duel_exec11_wf2_both_wf2.pth",
-    "wf3": "bestprofit_saintv2_loup_duel_exec11_wf3_both_wf3.pth",
-}
+#
+# ============================================================
+# CES CHEMINS SE RESOLVENT, ILS NE S'ECRIVENT PLUS EN DUR — le 2026-09-18.
+#
+# Ils pointaient sur `exec11`, une lignee BTC BILATERALE, pendant que le
+# pipeline entraine l'OR en LONG-ONLY. Les fichiers existent, donc rien ne
+# levait : le live aurait charge un modele entraine a vendre du Bitcoin pour
+# acheter de l'or. C'est exactement la panne que `checkpoints.py` a ete ecrit
+# pour supprimer, et ce dictionnaire y avait echappe.
+#
+# `checkpoints.resoud` rend le run le plus RECENT dont l'observation ET le
+# cote correspondent au pipeline courant, et refuse tout le reste plutot que
+# de proposer une lignee incompatible. La famille par defaut est `last`, la
+# moyenne des poids : choisir sur la validation coute -3.3 points mesures.
+#
+# La resolution est PARESSEUSE. La faire a l'import ferait echouer tout
+# module qui importe celui-ci — l'interface, les tests — alors qu'un run peut
+# tres bien etre en cours d'ecriture. Elle echoue au moment ou l'on veut
+# trader, ce qui est le seul moment ou l'absence de modele est une faute.
+# ============================================================
+_MULTI_AGENT_PATHS: Optional[Dict[str, str]] = None
+
+
+def chemins_multi_agents(famille: str = "last") -> Dict[str, str]:
+    """{"wf1": chemin du .pth, ...} — un agent par fold du run courant."""
+    global _MULTI_AGENT_PATHS
+    if _MULTI_AGENT_PATHS is None:
+        prefixe, folds = checkpoints.resoud(famille=famille, min_folds=1)
+        _MULTI_AGENT_PATHS = {
+            f"wf{f}": checkpoints.chemins(prefixe, f)[0] for f in folds}
+        print(f"Checkpoints resolus : {prefixe}, folds {folds}")
+    return _MULTI_AGENT_PATHS
 MULTI_AGENT_MAGICS: Dict[str, int] = {
     "wf1": 424241,
     "wf2": 424242,
@@ -220,7 +247,12 @@ class LiveConfig:
     #   "duel"  : 2 modèles séparés long+short, arbitrage par max(prob)
     #   "long"  : uniquement agent LONG (pas de short)
     #   "short" : uniquement agent SHORT (pas de long)
-    side: str = "both"
+    # LE COTE N'EST PAS UN REGLAGE DU LIVE, c'est celui sous lequel le
+    # modele a appris. Le recopier ici en ferait deux valeurs a garder
+    # d'accord, et la divergence serait silencieuse : un live "both" devant
+    # un reseau long-only prendrait des ventes que rien n'a jamais entrainees
+    # ni mesurees. Meme raison que pour le veto de TabM, un peu plus haut.
+    side: str = field(default_factory=lambda: _cote_entrainement())
 
     # ======= STOP SUIVEUR — DESORMAIS LA SEULE SORTIE =======
     # Il etait inactif, et son appel commente dans la boucle, au motif que le
@@ -301,6 +333,16 @@ class LiveConfig:
 # SEUIL CALIBRÉ
 # ============================================================
 
+def _cote_entrainement() -> str:
+    """Le cote sous lequel le reseau deploye a ete entraine.
+
+    Lu dans `training.PPOConfig`, jamais recopie : c'est la meme regle que
+    pour `votant_si_actif`, et pour la meme raison.
+    """
+    import training as _T
+    return str(_T.PPOConfig().side)
+
+
 def seuil_calibre(pth: str):
     """Barres (BUY, SELL) du checkpoint. Source unique : saint_core."""
     return load_calib_thresholds(pth)
@@ -308,7 +350,8 @@ def seuil_calibre(pth: str):
 
 def get_calib_threshold(agent_name: str):
     """Barres du checkpoint associé à un agent du mode multi-agent."""
-    return seuil_calibre(MULTI_AGENT_PATHS.get(agent_name, BEST_MODEL_DUEL_PATH))
+    return seuil_calibre(
+        chemins_multi_agents().get(agent_name, BEST_MODEL_DUEL_PATH))
 
 
 # ============================================================
@@ -884,25 +927,31 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
 
     # Filtre des agents actifs (None = tous)
     active = getattr(cfg, "active_agents", None)
+    dispo = chemins_multi_agents()
     if active is None:
-        agents_to_load = list(MULTI_AGENT_PATHS.keys())
+        agents_to_load = list(dispo.keys())
     else:
-        agents_to_load = [a for a in active if a in MULTI_AGENT_PATHS]
+        agents_to_load = [a for a in active if a in dispo]
         if not agents_to_load:
             raise ValueError(f"active_agents={active} ne contient aucun agent valide. "
-                             f"Choix possibles : {list(MULTI_AGENT_PATHS.keys())}")
+                             f"Choix possibles : {list(dispo.keys())}")
     print(f"Agents actifs : {' / '.join(a.upper() for a in agents_to_load)}")
 
     # Chargement des checkpoints
     policies: Dict[str, nn.Module] = {}
     entry_decisions = {}
     for agent_name in agents_to_load:
-        path = MULTI_AGENT_PATHS[agent_name]
+        path = dispo[agent_name]
         if not os.path.exists(path):
             raise FileNotFoundError(f"Checkpoint {agent_name} introuvable : {path}")
         p = _charge_policy(path)
         policies[agent_name] = p
-        entry_decisions[agent_name] = load_decision_policy(path)
+        # LE COTE EST IMPOSE, il n'est pas seulement lu. Les checkpoints
+        # anterieurs au 2026-09-18 n'ont pas la cle `side` dans leur calib :
+        # `EntryDecisionPolicy` retombe alors sur "both", et un reseau
+        # entraine long-only se remettrait a vendre en production — la panne
+        # exacte qui a coute le run exec02, mais cette fois avec de l'argent.
+        entry_decisions[agent_name] = load_decision_policy(path, side=cfg.side)
         agent_stats[agent_name] = load_model_norm_stats(path)
         magic = MULTI_AGENT_MAGICS[agent_name]
         print(f"Modèle {agent_name.upper():3s} chargé (magic={magic}) : {path}")
@@ -965,7 +1014,15 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
                     s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                     logits_d, _ = policy(s)
                     logits_d = logits_d[0]
-                    mask_d = build_mask_from_pos_scalar(0, device, "both")
+                    # LE COTE, PAS "both" EN DUR. La substitution par la
+                    # tete auxiliaire, quinze lignes plus bas, ECRASE ce
+                    # tableau et le masque avec — c'est ainsi qu'un run
+                    # long-only s'est mis a vendre en validation. Le refus
+                    # definitif vient donc de `decision.decide`, qui porte le
+                    # cote lu dans le checkpoint ; ce masque-ci garde les
+                    # probabilites affichees coherentes avec ce qui peut
+                    # reellement etre joue.
+                    mask_d = build_mask_from_pos_scalar(0, device, cfg.side)
                     logits_d_m = logits_d.masked_fill(~mask_d, MASK_VALUE)
                     probs = torch.softmax(logits_d_m, dim=-1)
                     pb, ps = float(probs[0]), float(probs[1])
@@ -1084,7 +1141,8 @@ def live_loop(cfg: LiveConfig, should_continue):
         if not os.path.exists(BEST_MODEL_DUEL_PATH):
             raise FileNotFoundError(f"Modèle DUEL introuvable : {BEST_MODEL_DUEL_PATH}")
         policy_duel = _charge_policy(BEST_MODEL_DUEL_PATH)
-        duel_decision = load_decision_policy(BEST_MODEL_DUEL_PATH)
+        duel_decision = load_decision_policy(BEST_MODEL_DUEL_PATH,
+                                             side=cfg.side)
         print(f"Modèle DUEL chargé : {BEST_MODEL_DUEL_PATH}")
     else:
         if cfg.side in ("duel", "long"):

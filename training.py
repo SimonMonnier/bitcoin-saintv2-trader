@@ -1882,7 +1882,19 @@ class PPOConfig:
     # "both"  → BUY + SELL + HOLD
     # "long"  → seulement BUY1 / HOLD
     # "short" → seulement SELL1 / HOLD
-    side: str = "both"
+    #
+    # C'EST ICI QUE LE COTE SE DECLARE, et nulle part ailleurs. Il valait
+    # "both" pendant que le bloc __main__ posait `cfg_long.side = "long"` :
+    # tout ce qui lisait `PPOConfig()` sans passer par ce bloc — le resolveur
+    # de checkpoints, le live, l'interface — croyait donc le pipeline
+    # bilateral. Le resolveur ne cherchait que des fichiers `*_both_*` et
+    # proposait le dernier run BTC bilateral a un live long-only sur l'or.
+    #
+    # Un reglage duplique finit toujours par diverger ; celui-ci l'avait
+    # deja fait sans lever d'erreur. Le bloc __main__ le repete desormais a
+    # l'identique, ce qui est une redondance visible et non un second
+    # reglage.
+    side: str = "long"
 
     # Préfixe pour nommer les fichiers de modèle
     model_prefix: str = "saintv2_singlehead_scalping_ohlc_indics_h1_loup"
