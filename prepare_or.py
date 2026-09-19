@@ -49,6 +49,26 @@ import prepare_m5 as P
 
 SYMBOLE = "XAUUSD"
 SORTIE = "data_cache_XAUUSD_M5.pkl"
+# 500 000 N'EST PAS UNE LIMITE TECHNIQUE, C'EST LA FIN DES DONNEES DENSES.
+#
+# Avec le plafond de barres du terminal porte a « illimite », MetaTrader rend
+# 573 465 bougies M5 remontant a 2007 — douze annees de plus. Mesure du
+# 2026-09-19 avant d'en faire quoi que ce soit :
+#
+#     periode              barres   ans   barres/sem   ATR relatif
+#     2007-10 -> 2019-09   79 095  12.0          127      4.68 bps
+#     2019-09 -> 2026-09  494 232   7.0        1 358      6.63 bps
+#
+# Une semaine d'or en M5 en compte ~2 016. La partie ancienne en a CENT
+# VINGT-SEPT : ce ne sont pas des seances, ce sont des fragments epars. Les
+# indicateurs glissants se calculent sur la suite des BARRES, donc une
+# moyenne de vingt barres y enjamberait des semaines entieres et ne
+# decrirait rien. Et l'ATR relatif y vaut 4.68 contre 6.63 : le meme
+# multiplicateur de stop n'y designe pas le meme trade.
+#
+# Douze ans de calendrier pour 16 % de barres en plus, dont la geometrie
+# differe de 40 % : l'historique ancien est ecarte. 500 000 barres s'arretent
+# juste avant lui.
 N_BARRES = 500_000
 
 

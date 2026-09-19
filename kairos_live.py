@@ -25,6 +25,7 @@ from saint_core import (
     load_calib_thresholds,
     load_decision_policy,
     decide_avec_barres,
+    places_ouvrables_compte,
     charge_source_externe,
     SOURCE_EXT_NOM,
     safe_normalize,
@@ -333,6 +334,68 @@ class LiveConfig:
 # SEUIL CALIBRÉ
 # ============================================================
 
+def etat_compte(cfg, magic=None):
+    """L'etat du compte tel que l'ENVIRONNEMENT le verrait.
+
+    L'environnement d'entrainement porte plusieurs positions et resume leur
+    etat en quatre nombres, que l'observation transporte : le sens NET, le
+    latent en unites d'ATR, la duree de detention de la PLUS ANCIENNE, et la
+    part de capacite encore libre. Le live n'en calculait aucun de la meme
+    facon — il regardait UNE position et posait la capacite a 1.0.
+
+    Rend (sens_net, prix_entree_pondere, n_positions, plus_ancienne_sec,
+    marge_utilisee, equity).
+    """
+    positions = mt5.positions_get(symbol=cfg.symbol) or ()
+    if magic is not None:
+        positions = tuple(p for p in positions if p.magic == magic)
+    ai = mt5.account_info()
+    equity = float(ai.equity) if ai else 0.0
+    marge = float(ai.margin) if ai else 0.0
+    if not positions:
+        return 0, 0.0, 0, 0, marge, equity
+    # Sens NET pondere par le volume, comme `BTCTradingEnvDiscrete.position`.
+    net = sum((1 if p.type == mt5.ORDER_TYPE_BUY else -1) * p.volume
+              for p in positions)
+    sens = 0 if net == 0 else (1 if net > 0 else -1)
+    vol = sum(p.volume for p in positions)
+    entree = (sum(p.price_open * p.volume for p in positions) / vol
+              if vol > 0 else 0.0)
+    # La PLUS ANCIENNE, comme `bars_in_position`.
+    plus_vieille = min(int(p.time) for p in positions)
+    age = max(int(datetime.now().timestamp()) - plus_vieille, 0)
+    return sens, float(entree), len(positions), age, marge, equity
+
+
+def capacite_ouvrable(cfg, prix: float, marge_utilisee: float,
+                      equity: float) -> int:
+    """Combien de positions de plus le compte permet — MEME regle qu'a
+    l'entrainement.
+
+    Elle appelle `saint_core.places_ouvrables_compte`, la fonction que
+    l'environnement appelle aussi. C'est la seule facon qu'ils aient de
+    rester d'accord : jusqu'ici le live n'avait aucune regle de capacite, il
+    ouvrait UNE position par agent et passait son tour — pendant que
+    l'entrainement en ouvrait autant que la marge permettait.
+
+    Les constantes viennent de `instruments.py`, la meme source que
+    l'entrainement, et non de valeurs recopiees ici.
+    """
+    import instruments as _I
+    import training as _T
+    p = _I.INSTRUMENTS[cfg.symbol]
+    c = _T.PPOConfig()
+    return places_ouvrables_compte(
+        equity=equity,
+        marge_utilisee=marge_utilisee,
+        prix=prix,
+        lot_min=float(p["lot_min"]),
+        contrat=float(p["contrat"]),
+        marge_frac=float(p["marge_frac"]),
+        niveau_marge=float(getattr(c, "niveau_marge_ouverture", 3.0)),
+        budget_risque=float(getattr(c, "budget_risque", 0.0)))
+
+
 def _cote_entrainement() -> str:
     """Le cote sous lequel le reseau deploye a ete entraine.
 
@@ -423,6 +486,13 @@ def build_live_obs(
     bars_held_norm = float(min(bars_in_position / max(SCALPING_MAX_HOLDING, 1), 3.0))
 
     pos_feature  = float(pos)
+    # LA QUATRIEME COLONNE PORTE LA CAPACITE RESTANTE, comme a
+    # l'entrainement — `_libres / (_libres + _tenues)`. Elle valait ici
+    # `last_risk_scale`, c'est-a-dire 1.0 en permanence : le reseau lisait
+    # donc une CONSTANTE la ou il avait appris une grandeur qui varie avec
+    # le solde et le nombre de positions. C'est precisement la colonne qui
+    # porte le cercle vertueux — gagner augmente la capacite — et elle etait
+    # muette en production.
     risk_feature = float(last_risk_scale)
 
     extra_vec = np.array(
@@ -992,19 +1062,49 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
             # ========================================================
             for agent_name, policy in policies.items():
                 magic = MULTI_AGENT_MAGICS[agent_name]
-                pos, entry_price, ticket = get_current_position_by_magic(cfg.symbol, magic)
 
-                if pos != 0:
-                    print(f"  [{agent_name.upper()}] déjà en position (ticket={ticket}, side={pos}) → SKIP")
+                # ====================================================
+                # PLUSIEURS POSITIONS, BORNEES PAR LE COMPTE — comme a
+                # l'entrainement.
+                #
+                # CE QUI ETAIT FAIT AVANT : « deja en position -> SKIP ».
+                # Une position a la fois, quoi qu'il arrive. L'environnement
+                # d'entrainement, lui, en ouvre autant que la marge permet —
+                # jusqu'a soixante depuis que le budget de risque est
+                # retire. Deux strategies differentes sous le meme nom, et
+                # le modele deploye n'aurait jamais joue celle qu'il a
+                # apprise.
+                #
+                # CE QUI EST FAIT MAINTENANT : on demande au COMPTE combien
+                # de positions il permet encore, par la meme fonction que
+                # l'environnement appelle, et on s'arrete quand elle rend
+                # zero. C'est le courtier qui borne, plus une regle ecrite
+                # ici.
+                # ====================================================
+                sens, entree, n_pos, age_sec, marge, equity = etat_compte(
+                    cfg, magic)
+                prix_courant = float(df_closed["close"].iloc[-1])
+                libres = capacite_ouvrable(cfg, prix_courant, marge, equity)
+                if libres <= 0:
+                    print(f"  [{agent_name.upper()}] {n_pos} position(s), le "
+                          f"compte n'en permet pas d'autre "
+                          f"(equite {equity:.2f}, marge {marge:.2f}) → HOLD")
                     continue
 
-                # Construction de l'obs (cet agent est flat)
+                # L'ETAT TRANSMIS AU RESEAU EST CELUI DE TOUTES LES
+                # POSITIONS, pas d'une seule : sens net, prix d'entree
+                # pondere par le volume, age de la PLUS ANCIENNE. C'est ce
+                # que `BTCTradingEnvDiscrete` resume dans ses quatre
+                # colonnes d'etat, et le reseau a appris a les lire ainsi.
+                barres_detenues = (age_sec // (5 * 60)) if n_pos else 0
                 obs = build_live_obs(
                     df_closed, agent_stats[agent_name], cfg,
-                    pos=0,
-                    entry_price=0.0,
-                    last_risk_scale=1.0,
-                    bars_in_position=0,
+                    pos=sens,
+                    entry_price=entree,
+                    # La part de capacite encore libre, exactement comme
+                    # `_get_obs` la calcule : libres / (libres + tenues).
+                    last_risk_scale=libres / max(libres + n_pos, 1),
+                    bars_in_position=int(barres_detenues),
                 )
                 if obs is None:
                     print(f"  [{agent_name.upper()}] obs None → SKIP")
