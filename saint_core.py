@@ -459,9 +459,101 @@ FEATURE_COLS = (FEATURE_COLS_TF + FEATURE_COLS_SUP
 
 N_BASE_FEATURES = len(FEATURE_COLS)
 
-# Embedding de position, dans cet ordre exact :
-#   position (-1/0/+1), unrealized_atr, bars_held_norm, last_risk_scale
-N_POS_FEATURES = 4
+# Embedding de position, DANS CET ORDRE EXACT — l'entrainement et le live
+# remplissent ces colonnes chacun de leur cote, et une inversion ne leverait
+# aucune erreur :
+#   0  position         -1 / 0 / +1, sens net
+#   1  unrealized_atr   latent des positions ouvertes, en unites d'ATR
+#   2  bars_held_norm   age de la PLUS ANCIENNE position
+#   3  capacite         places ouvrables / (ouvrables + tenues)
+#   4  distance_creux   creux courant du compte, 1.0 = il ne reste rien
+#
+# LA CINQUIEME A ETE AJOUTEE LE 2026-09-19, et voici pourquoi. La penalite de
+# creux est portee par chaque position — on demandait donc au modele de gerer
+# une grandeur qu'il ne voyait pas.
+#
+# IL N'ETAIT PAS AVEUGLE POUR AUTANT : la capacite restante correle a -0.60
+# avec le creux, puisqu'elle est proportionnelle a l'equite, et une
+# regression sur les quatre colonnes en expliquait 67.5 % de la variance.
+# MAIS LE PIC MANQUAIT. Le creux vaut (pic - equite) / pic, et le pic n'etait
+# nulle part : l'erreur residuelle valait 4.3 points de creux, et deux
+# observations IDENTIQUES pouvaient correspondre a 12 points d'ecart. Avec un
+# c'est exactement l'incertitude qui compte — le modele ne pouvait pas
+# distinguer « je vais bien » de « je suis au bord ».
+#
+# LA FORME A CHANGE D'ECHELLE LE MEME JOUR, en fin de journee. Elle valait
+# `creux / max_drawdown`, donc 1.0 la ou le garde-fou coupait a 40 %. Ce
+# garde-fou a ete retire : il tuait l'episode au quart de sa tranche, laissait
+# les trois quarts non mesures, et un tiers des episodes ainsi tues auraient
+# fini AU-DESSUS du capital de depart. Seule la ruine termine desormais un
+# episode — appel de marge, lot minimum infinancable, equite a zero — comme
+# chez un courtier.
+#
+# La colonne porte donc le CREUX LUI-MEME : 0 au sommet, 1.0 quand il ne
+# reste plus rien. Bornee a 40 % elle saturait, et un compte a -40 % etait
+# indiscernable d'un compte a -90 % — elle cessait d'informer exactement
+# quand la situation empirait.
+#
+# L'EQUITE QU'ELLE MESURE INCLUT TOUTES LES POSITIONS OUVERTES : le compte
+# est juge sur ce qu'il vaudrait s'il fermait tout maintenant, ce que le
+# courtier regarde. `kairos_live.distance_garde_fou` applique la MEME
+# formule ; les deux doivent bouger ensemble.
+#
+# COUT : l'observation passe de 260 a 261 entrees, donc AUCUN checkpoint
+# anterieur n'est chargeable. `checkpoints.py` filtre sur `n_features` et les
+# refusera au lieu de les charger de travers.
+# LE MODELE CHOISIT SON BUDGET DE RISQUE, donc le NOMBRE de positions.
+#
+# PREMIERE TENTATIVE, ET SON ECHEC. J'avais d'abord donne au modele une tete
+# de TAILLE, qui multipliait la taille de chaque position. Mesure du
+# 2026-09-19 : les quatre paliers rendaient EXACTEMENT le meme lot.
+#
+#     taille demandee a l'echelle 1.00 : 0.0205 once
+#     lot minimum du courtier          : 1.0000 once
+#
+# Le plancher du courtier ecrase la demande d'un facteur 49. A 1 000 $ de
+# capital, UN lot minimum sur l'or vaut 1 550 $ de notionnel — 155 % du compte
+# — et risque 2.81 % du capital au stop. `risk_per_trade` n'a donc jamais ete
+# operant a ce capital, et aucune tete de taille ne peut l'etre : il faudrait
+# ~50 000 $ pour que le dimensionnement par le risque reprenne la main.
+#
+# LE SEUL LEVIER QUI EXISTE REELLEMENT A CE CAPITAL EST LE NOMBRE DE
+# POSITIONS. Il est gouverne par `peut_entrer()` -> `places_ouvrables`, donc
+# par le BUDGET DE RISQUE du portefeuille — celui qui valait 3 % jusqu'au
+# 2026-09-19 et qu'on a mis a zero pour laisser le modele apprendre. Le mettre
+# a zero ne lui a pas donne le controle : cela le lui a RETIRE, puisque rien
+# dans son espace d'action ne le remplacait.
+#
+# La tete choisit donc un budget, et le budget commande la capacite. C'est
+# exactement « qu'il ouvre autant de trades qu'il peut, afin de gerer le
+# risque » — mais avec la main sur le curseur.
+#
+# LES PALIERS SE DEDUISENT DU RISQUE D'UN LOT MINIMUM (2.81 % a 1 000 $ sur
+# l'or) : ils valent approximativement 1, 2, 5 et 14 positions tenables. Le
+# plus bas vaut 3 %, exactement le reglage d'exec04 — le seul run de ce depot
+# dont le creux de validation soit reste a 14 %.
+#
+# AUCUN PALIER NE PEUT ETRE NUL. Un budget sous le risque d'un seul lot
+# rendrait `peut_entrer()` faux en permanence ; l'environnement ne figurerait
+# plus dans `deciding`, et le modele ne serait PLUS JAMAIS consulte pour
+# relever son budget. Le plus bas doit donc laisser passer une position.
+#
+# LA POLITIQUE EST FACTORISEE : la direction garde ses trois actions, donc les
+# seuils calibres, le masque de cote, `decide_avec_barres` et la tete de rang
+# sont INCHANGES. Le budget est tire a CHAQUE decision, y compris quand elle
+# vaut « attendre » — choisir de rester serre en attendant est une decision de
+# portefeuille a part entiere, contrairement a une taille qui ne sert qu'a
+# l'ouverture.
+#
+#     log pi(a) = log pi_dir(d) + log pi_budget(b)
+N_BUDGETS = 4
+BUDGETS_RISQUE = (0.03, 0.06, 0.15, 0.40)
+
+# LA SIXIEME COLONNE PORTE LE BUDGET COURANT. La quatrieme porte deja la
+# capacite restante, mais deux budgets differents peuvent donner la meme
+# capacite : le modele ne saurait pas lequel il a choisi. C'est la meme lecon
+# que pour le creux — on ne peut pas gerer ce qu'on ne voit pas.
+N_POS_FEATURES = 6
 OBS_N_FEATURES = N_BASE_FEATURES + N_POS_FEATURES
 
 
@@ -1467,6 +1559,7 @@ class SAINTPolicySingleHead(nn.Module):
         # auxiliaire porte tout, la comparaison entre ses scores et ceux de la
         # politique le dira.
         self.tete_aux = nn.Linear(mlp_dim, 2)
+        self.tete_budget = nn.Linear(mlp_dim, N_BUDGETS)
 
         self._init_poids()
 
@@ -1551,12 +1644,47 @@ class SAINTPolicySingleHead(nn.Module):
         value = self.critic(h).squeeze(-1)
         return logits, value
 
+    def sorties(self, x: torch.Tensor):
+        """Les QUATRE tetes en UN SEUL passage dans le tronc.
+
+        POURQUOI. Le rollout appelait `policy(x)` puis `policy.budget(x)`, et
+        la validation y ajoutait `policy.rendement(x)` : deux et trois
+        traversees completes du tronc pour des tetes qui ne sont que des
+        couches lineaires sur la MEME representation. Avec un ensemble de deux
+        reseaux, cela faisait quatre et six encodages par lot de decision.
+
+        Profil du 2026-09-19 : le passage avant pese 95 % de la collecte, soit
+        87 ms par lot pour un reseau de 46 000 parametres — un cout de
+        LANCEMENT, pas de calcul. Le tronc est traverse une fois ici.
+
+        Les sorties sont identiques, terme pour terme, a celles des methodes
+        separees : meme `h`, memes couches, meme ordre.
+        """
+        h = self.encode(x)
+        if self.memoire is not None:
+            h = self.memoire(h)
+        z = self.mlp(self.norm(h))
+        return (self.actor(z), self.critic(z).squeeze(-1),
+                self.tete_budget(z), self.tete_aux(z))
+
     def rendement(self, x: torch.Tensor) -> torch.Tensor:
         """Rendement net attendu (achat, vente), en unites de risque. (B, 2)."""
         h = self.encode(x)
         if self.memoire is not None:
             h = self.memoire(h)
         return self.tete_aux(self.mlp(self.norm(h)))
+
+    def budget(self, x: torch.Tensor) -> torch.Tensor:
+        """Logits sur les paliers de budget de risque. (B, N_BUDGETS).
+
+        Meme chemin que `rendement` : un second passage dans le tronc. Il ne
+        coute que sur les etats de DECISION, qui sont rares — la politique
+        n'est sollicitee que sur les environnements plats.
+        """
+        h = self.encode(x)
+        if self.memoire is not None:
+            h = self.memoire(h)
+        return self.tete_budget(self.mlp(self.norm(h)))
 
     def definit_banque(self, obs: torch.Tensor):
         """Fixe les references. UNIQUEMENT des observations de la fenetre train."""
@@ -1657,6 +1785,7 @@ class PatchTSTPolicy(nn.Module):
         # deux membres doivent predire la MEME quantite pour que leur
         # moyenne ait un sens.
         self.tete_aux = nn.Linear(mlp_dim, 2)
+        self.tete_budget = nn.Linear(mlp_dim, N_BUDGETS)
 
         # MEME INTERFACE QUE SAINT. L'entrainement interroge `policy.memoire`
         # et appelle `rafraichit_banque()` a chaque epoch : sans ces deux
@@ -1717,9 +1846,33 @@ class PatchTSTPolicy(nn.Module):
         h = self.mlp(self.encode(x))
         return self.actor(h), self.critic(h).squeeze(-1)
 
+    def sorties(self, x: torch.Tensor):
+        """Les QUATRE tetes en UN SEUL passage dans le tronc.
+
+        POURQUOI. Le rollout appelait `policy(x)` puis `policy.budget(x)`, et
+        la validation y ajoutait `policy.rendement(x)` : deux et trois
+        traversees completes du tronc pour des tetes qui ne sont que des
+        couches lineaires sur la MEME representation. Avec un ensemble de deux
+        reseaux, cela faisait quatre et six encodages par lot de decision.
+
+        Profil du 2026-09-19 : le passage avant pese 95 % de la collecte, soit
+        87 ms par lot pour un reseau de 46 000 parametres — un cout de
+        LANCEMENT, pas de calcul. Le tronc est traverse une fois ici.
+
+        Les sorties sont identiques, terme pour terme, a celles des methodes
+        separees : meme `h`, memes couches, meme ordre.
+        """
+        z = self.mlp(self.encode(x))
+        return (self.actor(z), self.critic(z).squeeze(-1),
+                self.tete_budget(z), self.tete_aux(z))
+
     def rendement(self, x: torch.Tensor) -> torch.Tensor:
         """Rendement net attendu (achat, vente), en unites de risque. (B, 2)."""
         return self.tete_aux(self.mlp(self.encode(x)))
+
+    def budget(self, x: torch.Tensor) -> torch.Tensor:
+        """Logits sur les paliers de budget de risque. (B, N_BUDGETS)."""
+        return self.tete_budget(self.mlp(self.encode(x)))
 
 
 N_REF_DEFAUT = 256
@@ -1805,6 +1958,38 @@ class PolitiqueEnsemble(nn.Module):
         quantite, leur moyenne l'estime en moins bruite.
         """
         return torch.stack([m.rendement(x) for m in self.membres], 0).mean(0)
+
+    def budget(self, x):
+        """Logits de budget de l'ensemble. (B, N_BUDGETS).
+
+        On moyenne les PROBABILITES puis on rend leur log, exactement comme
+        `forward` le fait pour la direction : moyenner des logits n'aurait pas
+        de sens, ils ne vivent pas sur la meme echelle d'un membre a l'autre.
+        """
+        p = torch.stack([torch.softmax(m.budget(x), dim=-1)
+                         for m in self.membres], 0).mean(0).clamp_min(1e-9)
+        return torch.log(p)
+
+    def sorties(self, x):
+        """Les quatre tetes de l'ensemble, un seul passage par membre.
+
+        CHAQUE TETE EST COMBINEE COMME ELLE L'ETAIT SEPAREMENT : moyenne des
+        PROBABILITES pour la direction et le budget — moyenner des logits
+        n'aurait pas de sens, ils ne vivent pas sur la meme echelle d'un
+        membre a l'autre — et moyenne directe pour la valeur et le rendement,
+        qui estiment la meme quantite.
+        """
+        pd_, vs, pb_, rs = [], [], [], []
+        for m in self.membres:
+            lo, v, bu, re = m.sorties(x)
+            pd_.append(torch.softmax(lo, dim=-1))
+            pb_.append(torch.softmax(bu, dim=-1))
+            vs.append(v)
+            rs.append(re)
+        p = torch.stack(pd_, 0).mean(0).clamp_min(1e-9)
+        pb = torch.stack(pb_, 0).mean(0).clamp_min(1e-9)
+        return (torch.log(p), torch.stack(vs, 0).mean(0),
+                torch.log(pb), torch.stack(rs, 0).mean(0))
 
     def forward(self, x):
         probs, valeurs = [], []

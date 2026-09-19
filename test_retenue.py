@@ -23,15 +23,17 @@ import math
 import training as T
 
 MIN_TRADES = 20
-MAX_DD = 0.40
+# Le critere n'est plus un pourcentage de creux mais la DESTRUCTION du
+# compte : appel de marge, lot minimum infinancable, equite a zero. Le seuil
+# de 40 % a ete retire le 2026-09-19 — il tuait l'episode au quart de sa
+# tranche, et un tiers des episodes ainsi tues auraient fini gagnants.
 
 echecs = []
 
 
 def cas(nom, attendu_retenu, attendu_motif=None, **kw):
     params = dict(gain_top=0.50, score_rang=0.08, val_num_trades=60,
-                  val_max_dd=0.15, best_metric=0.20,
-                  min_trades=MIN_TRADES, max_dd=MAX_DD)
+                  val_ruine=0, best_metric=0.20, min_trades=MIN_TRADES)
     params.update(kw)
     retenu, motif = T.retient_checkpoint(**params)
     ok = (retenu == attendu_retenu) and (
@@ -45,15 +47,13 @@ def cas(nom, attendu_retenu, attendu_motif=None, **kw):
 def main() -> int:
     print("CE QUI DOIT ETRE RETENU")
     cas("meilleur sommet, classement positif, compte sain", True)
-    cas("creux juste sous le garde-fou", True, val_max_dd=0.3999)
+    cas("creux profond mais compte vivant", True, val_ruine=0)
 
-    print("\nCE QUI DOIT ETRE REFUSE — et le creux est le cas qui compte")
-    cas("creux AU garde-fou, sommet pourtant meilleur", False, "creux",
-        val_max_dd=0.40, gain_top=9.99)
-    cas("creux au-dela, sommet pourtant meilleur", False, "creux",
-        val_max_dd=0.63, gain_top=9.99)
-    cas("compte ruine (creux 100 %), sommet excellent", False, "creux",
-        val_max_dd=1.00, gain_top=99.0)
+    print("\nCE QUI DOIT ETRE REFUSE — le compte detruit est le cas qui compte")
+    cas("un compte detruit, sommet pourtant meilleur", False, "compte detruit",
+        val_ruine=1, gain_top=9.99)
+    cas("plusieurs comptes detruits, sommet excellent", False, "compte detruit",
+        val_ruine=4, gain_top=99.0)
     cas("pas assez de trades", False, "seulement",
         val_num_trades=MIN_TRADES - 1)
     cas("classement nul", False, "classement", score_rang=0.0)
@@ -64,19 +64,19 @@ def main() -> int:
     cas("classement non mesurable", False, "classement",
         score_rang=float("nan"))
 
-    print("\nL'ORDRE DES REFUS : le creux prime sur tout le reste")
-    cas("creux ET trop peu de trades -> le compte d'abord", False, "seulement",
-        val_max_dd=0.9, val_num_trades=3)
+    print("\nL'ORDRE DES REFUS : le compte prime sur tout le reste")
+    cas("detruit ET trop peu de trades -> le compte d'abord", False, "seulement",
+        val_ruine=1, val_num_trades=3)
 
     print("\nUN REFUS POUR CREUX EST RECONNAISSABLE, c'est lui qui est compte")
     _, motif = T.retient_checkpoint(
-        gain_top=9.9, score_rang=0.08, val_num_trades=60, val_max_dd=0.55,
-        best_metric=0.2, min_trades=MIN_TRADES, max_dd=MAX_DD)
-    ok = motif.startswith("creux")
+        gain_top=9.9, score_rang=0.08, val_num_trades=60, val_ruine=1,
+        best_metric=0.2, min_trades=MIN_TRADES)
+    ok = motif.startswith("compte detruit")
     print(("  ok   " if ok else "  RATE ")
-          + f"{'le motif commence par creux':<52}{motif}")
+          + f"{'le motif commence par compte detruit':<52}{motif}")
     if not ok:
-        echecs.append("motif creux")
+        echecs.append("motif compte detruit")
 
     print()
     if echecs:

@@ -17,6 +17,7 @@ import checkpoints
 import flux_live
 import prepare_m5
 from saint_core import (
+    BUDGETS_RISQUE,
     MASK_VALUE,
     NORM_STATS_PATH,
     FEATURE_COLS,
@@ -393,7 +394,73 @@ def capacite_ouvrable(cfg, prix: float, marge_utilisee: float,
         contrat=float(p["contrat"]),
         marge_frac=float(p["marge_frac"]),
         niveau_marge=float(getattr(c, "niveau_marge_ouverture", 3.0)),
-        budget_risque=float(getattr(c, "budget_risque", 0.0)))
+        # LE BUDGET COURANT, celui que la tete de budget a choisi, et non
+        # le reglage de la config : celui-ci n'est plus que le point de
+        # depart. Lire la config ici ferait borner le live par une valeur que
+        # le modele a deja remplacee.
+        budget_risque=budget_courant_live())
+
+
+# LE PIC D'EQUITE, QUE METATRADER NE DONNE PAS.
+#
+# L'environnement d'entrainement remet `peak_capital` a zero au debut de
+# chaque episode de 5 760 barres — vingt jours. En live il n'y a pas
+# d'episode, donc pas de remise a zero naturelle : suivre le pic depuis le
+# demarrage du processus donnerait une distance au garde-fou qui ne
+# ressemble a rien de ce que le modele a vu, et qui derive sans fin.
+#
+# On tient donc un MAXIMUM GLISSANT sur la meme duree qu'un episode. C'est
+# l'analogue stationnaire le plus proche.
+#
+# CE QUI RESTE DIFFERENT, ET QU'IL FAUT SAVOIR : a l'entrainement le pic
+# court depuis le DEBUT de l'episode, donc sur une fenetre qui s'allonge de
+# zero a vingt jours ; ici elle vaut toujours vingt jours. Au milieu d'un
+# episode l'entrainement regarde en moyenne dix jours en arriere, le live
+# vingt. La distance au garde-fou sera donc legerement plus grande en live
+# qu'a l'entrainement pour une meme trajectoire.
+_EQUITE_RECENTE: List[Tuple[float, float]] = []      # (horodatage, equite)
+
+
+# LE BUDGET DE RISQUE COURANT DU LIVE.
+#
+# Choisi par la tete de budget du reseau, exactement comme a l'entrainement,
+# il PERSISTE entre deux decisions : c'est un etat de portefeuille, pas un
+# parametre d'ouverture. Tant qu'aucune decision n'a ete prise, il vaut le
+# reglage par defaut de `PPOConfig` — le palier le plus prudent.
+_BUDGET_LIVE = [None]
+
+
+def budget_courant_live() -> float:
+    if _BUDGET_LIVE[0] is None:
+        import training as _T
+        _BUDGET_LIVE[0] = float(_T.PPOConfig().budget_risque)
+    return float(_BUDGET_LIVE[0])
+
+
+def pose_budget_live(b: float) -> None:
+    """Enregistre le budget choisi par le reseau pour les entrees a venir."""
+    _BUDGET_LIVE[0] = float(max(b, 0.0))
+
+
+def distance_garde_fou(equity: float, fenetre_s: float = 20 * 24 * 3600.0,
+                       seuil: Optional[float] = None) -> float:
+    """Creux courant du compte. 0 au sommet, 1.0 quand il ne reste rien.
+
+    MEME FORMULE QUE L'ENVIRONNEMENT, sinon le modele lirait ici une grandeur
+    qui n'est pas celle sous laquelle il a appris. Elle etait divisee par
+    `max_drawdown` (40 %) et saturait donc des ce seuil ; ce garde-fou a ete
+    retire le 2026-09-19 et le creux se mesure desormais jusqu'a la ruine.
+
+    `seuil` n'est conserve que pour les appels existants : il ne sert plus.
+    """
+    maintenant = datetime.now().timestamp()
+    _EQUITE_RECENTE.append((maintenant, float(equity)))
+    while _EQUITE_RECENTE and _EQUITE_RECENTE[0][0] < maintenant - fenetre_s:
+        _EQUITE_RECENTE.pop(0)
+    pic = max(e for _, e in _EQUITE_RECENTE)
+    pic = max(pic, float(equity))
+    creux = (pic - float(equity)) / (pic + 1e-8)
+    return float(min(max(creux, 0.0), 1.0))
 
 
 def _cote_entrainement() -> str:
@@ -495,8 +562,21 @@ def build_live_obs(
     # muette en production.
     risk_feature = float(last_risk_scale)
 
+    # CINQUIEME COLONNE : la distance au garde-fou de creux. MEME ORDRE
+    # qu'a l'entrainement — une inversion ne leverait aucune erreur, elle
+    # ferait simplement lire au reseau deux grandeurs pour deux autres.
+    ai = mt5.account_info()
+    distance_creux = (distance_garde_fou(float(ai.equity)) if ai else 0.0)
+
+    # SIXIEME COLONNE : le budget de risque courant, rapporte au plus large
+    # des paliers. Le modele le CHOISIT en entrainement via sa tete de budget,
+    # et il doit lire ici la MEME grandeur — sinon il deciderait en live sur
+    # une entree dont le sens a change.
+    budget_norm = float(budget_courant_live() / max(BUDGETS_RISQUE[-1], 1e-9))
+
     extra_vec = np.array(
-        [pos_feature, unrealized_atr, bars_held_norm, risk_feature],
+        [pos_feature, unrealized_atr, bars_held_norm, risk_feature,
+         distance_creux, budget_norm],
         dtype=np.float32
     )
     extra_block = np.repeat(extra_vec[None, :], cfg.lookback, axis=0)
@@ -1114,6 +1194,17 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
                     s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                     logits_d, _ = policy(s)
                     logits_d = logits_d[0]
+                    # LE BUDGET DE RISQUE, choisi par le reseau comme en
+                    # validation : par ARGMAX, donc de facon deterministe. Le
+                    # rollout le TIRE, la mesure et le live le prennent au
+                    # maximum — meme regle que pour la direction, qui est
+                    # echantillonnee a l'entrainement et passe une barre
+                    # calibree ici.
+                    _ib = int(policy.budget(s).argmax(-1).item())
+                    pose_budget_live(BUDGETS_RISQUE[_ib])
+                    print(f"  [{agent_name.upper()}] budget de risque "
+                          f"{100*BUDGETS_RISQUE[_ib]:.0f} % "
+                          f"(palier {_ib + 1}/{len(BUDGETS_RISQUE)})")
                     # LE COTE, PAS "both" EN DUR. La substitution par la
                     # tete auxiliaire, quinze lignes plus bas, ECRASE ce
                     # tableau et le masque avec — c'est ainsi qu'un run

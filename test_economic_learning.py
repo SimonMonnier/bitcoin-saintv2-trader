@@ -32,7 +32,7 @@ class NetLearningTests(unittest.TestCase):
         for c in t.FEATURE_COLS:
             if c not in f:f[c]=0.
         cfg=t.PPOConfig(episode_length=300,max_holding_bars=20,use_vol_curriculum=False,
-                        tick_noise_bps=0,use_be_trail=False,max_drawdown=.99,min_capital_frac=0.)
+                        tick_noise_bps=0,use_be_trail=False)
         indices=np.array([100,160,200,250,350])
         targets,exits=net_trade_targets(f,indices,cfg)
         data=t.MarketData(f,t.FEATURE_COLS)

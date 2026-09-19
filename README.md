@@ -80,8 +80,57 @@ Le budget de risque à zéro signifie que **le courtier seul borne**. À
 capital modeste cela autorise des dizaines de positions, dont l'exposition
 cumulée dépasse largement l'équité. C'est assumé : le modèle doit apprendre à
 ne pas y aller. Ce qui l'en empêche entre-temps est l'appel de marge, le
-garde-fou de creux, le plancher de capital, et une pénalité de creux **portée
-par chaque position** — donc croissante avec l'exposition.
+appel de marge, l'impossibilité de financer le lot minimum, et une pénalité
+de creux **portée par chaque position** — donc croissante avec l'exposition.
+
+### La pénalité de creux facture le creusement, pas le creux
+
+Elle valait `−0.2 si creux > 40 %` : une marche sans gradient, qui ne disait
+rien au modèle tant qu'il n'était pas déjà mort. Pire, elle rendait la mort
+désirable — la politique perdait −0.0417 par barre juste avant d'être coupée,
+donc être tué lui épargnait un futur négatif.
+
+La remplacer par une rampe sur le niveau (`−λ·d²`) était pire encore : un
+compte **plat**, sans aucune position, se voyait prélever à chaque barre pour
+un creux hérité d'un trade déjà clos. Une taxe sur un état est une intégrale
+sur le temps — à mi-chemin du garde-fou elle pèse −43 500 sur une epoch — et
+elle ne s'interrompt qu'en refaisant un sommet, ou en mourant.
+
+La forme retenue est celle du **potentiel** : `Φ(s) = −λ·d²`, et la récompense
+reçoit `Φ(s′) − Φ(s)`, la seule variation. Creusement : coût. Résorption :
+crédit égal. Compte plat : rien. Le terme télescope, donc un épisode paie au
+total `λ·d_final²` quel que soit le chemin, jamais selon le temps passé sous
+l'eau. C'est la seule classe de shaping connue pour ne pas déplacer la
+politique optimale : elle ne crée aucune valeur, elle redistribue dans le
+temps une magnitude déjà présente.
+
+`d` est le **creux du compte** — 0 au sommet, 1 quand il ne reste rien — et
+c'est **la 5ᵉ colonne d'observation** : le modèle voit au bit près la grandeur
+sur laquelle il est facturé. L'équité qui la calcule inclut toutes les
+positions ouvertes.
+
+`λ = 6.5` est **ancré sur un rapport, pas sur un chiffre** — et il a fallu
+deux essais ratés pour l'admettre. Ancré d'abord sur l'ancienne falaise
+(0.2, puis 1.25 après extension de `d` jusqu'à la ruine), il héritait d'une
+magnitude réglée quand `|R|` valait 1,36. Le levier illimité a porté `|R|` à
+6,77 : la pénalité ne pesait plus que **4 %** du signal qu'elle devait
+contrebalancer, et sur sept epochs le creux de validation n'a pas bougé d'un
+point (104,9 → 112,0 %) pendant que le PnL médian par épisode restait à
+−950 $ sur 1 000 $. Recalé par le rapport `1.25 × (6.77 / 1.36) ≈ 6.5`, il
+pèse ~21 % du signal d'une décision.
+
+| creux | pénalité |
+|---|---|
+| 25 % | 0,41 |
+| 40 % | 1,04 |
+| 70 % | 3,19 |
+| 100 % (ruine) | 6,50 |
+
+**Le symptôme à surveiller** : λ trop grand n'est pas visible comme une
+erreur, il écrase le gradient monétaire dans le bruit. Si le nombre de trades
+s'effondre pendant que le creux descend, c'est ce terme qu'il faut
+soupçonner — pas s'en réjouir. Vérifié par `test_potentiel_creux.py`, qui
+contrôle que la part du signal reste dans une plage de 5 à 40 %.
 
 ### Un seul modèle, du plus ancien au plus récent
 
@@ -107,8 +156,9 @@ Le critère n'est ni le PnL ni le Sortino — tous deux calculés sur quelques
 dizaines de trades, donc dominés par le bruit. C'est le **rendement moyen des
 occasions que le checkpoint mettrait effectivement en position**, mesuré sur
 les quelques milliers de points de décision de la fenêtre de validation,
-sous deux gardes : le classement doit être positif, et le portefeuille doit
-avoir survécu au garde-fou de creux.
+sous deux gardes : le classement doit être positif, et **aucun épisode de
+validation ne doit avoir détruit le compte** — appel de marge, lot minimum
+infinançable, équité à zéro.
 
 Cette dernière garde existe parce que le critère mesure les occasions **une à
 une** et ne sait rien du nombre tenu simultanément : un modèle au classement
@@ -637,14 +687,14 @@ jours de trous en 2022). Coût : 2.28 M → 1.97 M bougies.
 
 1. **Reward normalization Welford online** — élimine les explosions de CriticL au début du training (de l'ordre de 1e+10 sans, ~1-10 avec)
 2. **Cosine LR + KL early stop combinés** — empêche les mises à jour destructives en fin de training
-3. **Curriculum learning avec biais SHORT** — sur marché bullish 2022-2026, force le modèle à explorer la direction perdante au début pour ne pas converger en long-only
+3. ~~**Curriculum learning avec biais SHORT**~~ — **retiré**. Il forçait l'exploration du côté vendeur pour éviter une convergence long-only ; la stratégie est désormais long-only par construction (`side = "long"`), donc ce biais n'a plus d'objet
 4. **Critic warmup 5 epochs** — laisse le baseline V(s) se stabiliser avant d'optimiser l'actor (sinon l'actor "court après" un critic non calibré)
 5. **Gradient clipping serré (norm=0.3) + unscale AMP fix** — empêche les gradient explosions ; clip appliqué AVANT scaler.unscale_ pour AMP fp16 correct
-6. **Reward shaping multi-composant** — combine PnL réalisé + bonus trade gagnant + pénalité bad entry + slippage micro
+6. ~~**Reward shaping multi-composant**~~ — **retiré**. Bonus de trade gagnant, pénalité d'entrée, micro-termes : il récompensait le fait d'*être* en position et a enseigné une stratégie perdante pendant 75 epochs. Principe adopté depuis : on ne garde que ce qui correspond à de l'argent réel, symétriquement. Le seul terme non monétaire restant est la pénalité de creux, et c'est un **potentiel** — il ne crée aucune valeur, il redistribue dans le temps une magnitude déjà présente (voir plus haut)
 7. **Garde-fous anti-NaN** — clamp logits ±30, clamp log_ratio ±10, skip-batch si NaN/Inf détecté, entropy floor ×5 si H<0.1
 8. **Clip normalisation Z-score ±5σ** — aligne training / backtest / live → robustesse aux outliers de marché
-9. **max_drawdown=0.4** — terminaison anticipée si DD > 40% → force le modèle à apprendre la prudence
-10. **Validation 7 épisodes** (au lieu de 2) — stabilise le Sortino30 utilisé pour la sélection du best
+9. ~~**max_drawdown=0.4**~~ et ~~**min_capital_frac=0.20**~~ — **retirés le 19/09/2026**. Aucun courtier ne coupe à 40 % de creux ni sous 20 % du capital : c'étaient des conventions de laboratoire, et elles coûtaient cher. En mesure, 26 % seulement des barres de chaque tranche étaient jouées, et **un tiers des épisodes ainsi tués auraient fini au-dessus du capital de départ** — on refusait un checkpoint sans savoir ce qu'il valait. En apprentissage, le modèle ne voyait jamais l'au-delà du garde-fou, donc ne pouvait pas apprendre à se remettre d'un creux profond. Ce qui termine un épisode est désormais ce qui termine un compte réel : appel de marge, lot minimum infinançable, équité à zéro. La prudence est enseignée par la pénalité de creux, qui est graduée et que le modèle voit venir
+10. **Validation à chaque epoch**, 8 épisodes couvrant 96 % de la fenêtre — la sélection du checkpoint se fait dessus, sur le sommet retenu par occasion et non sur le PnL
 
 ### Hyperparamètres clés
 
@@ -681,7 +731,7 @@ qui a fait choisir chaque valeur, sont dans les commentaires de `training.py`.
 | `saint_mlp_dim` | 4 | la tête pèse 92–98 % du réseau ; ramène la capacité à 10.2 param./occasion |
 | `mlp_dim` | 8 | idem côté PatchTST, sous peine qu'il devienne dominant par accident |
 | `saint_lecture` | `colonnes` | lit chaque colonne, au lieu d'un CLS agrégé |
-| `max_drawdown` | 0.4 | force l'apprentissage prudent |
+| `penalite_creux` | 6.5 | λ du potentiel de creux ; calé sur `|R|` mesuré, ~21 % du signal d'une décision |
 | `tick_noise_bps` | 3.0 | extension des wicks. **Doit rester ≪ `atr_sl_mult` × ATR**, sinon le bruit déclenche le SL avant le marché |
 
 #### Pourquoi gamma est passé de 0.995 à 0.9999

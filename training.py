@@ -122,7 +122,10 @@ torch.manual_seed(SEED)
 
 from saint_core import (
     PolitiqueEnsemble,
+    N_POS_FEATURES,
     N_ACTIONS,
+    N_BUDGETS,
+    BUDGETS_RISQUE,
     MASK_VALUE,
     NORM_STATS_PATH,
     FEATURE_COLS,
@@ -271,8 +274,8 @@ def rollout_action_probabilities(model_probs, force_prob, threshold, side):
     return (1.0-force_prob) * effective + force_prob * forced
 
 
-def retient_checkpoint(gain_top, score_rang, val_num_trades, val_max_dd,
-                       best_metric, min_trades, max_dd):
+def retient_checkpoint(gain_top, score_rang, val_num_trades, val_ruine,
+                       best_metric, min_trades):
     """Ce checkpoint remplace-t-il le meilleur ? Rend (oui, raison).
 
     UNE FONCTION PLUTOT QU'UN `if` DANS LA BOUCLE, parce que c'est la regle
@@ -293,12 +296,22 @@ def retient_checkpoint(gain_top, score_rang, val_num_trades, val_max_dd,
       proprement dit : le rendement moyen, en unites de risque, des
       occasions que ce checkpoint mettrait en position.
 
-      LE PORTEFEUILLE A SURVECU. Le creux de la derniere mesure reelle doit
-      rester sous `max_drawdown`, le seuil qui termine deja un episode. Sans
-      cette condition, un modele au classement excellent qui vide le compte
-      en ouvrant soixante positions correlees serait retenu — et transmis au
+      LE COMPTE N'A PAS ETE DETRUIT. Aucun episode de validation ne doit
+      s'etre termine par une fin que le courtier aurait imposee — appel de
+      marge, lot minimum infinancable, equite sous zero. Sans cette
+      condition, un modele au classement excellent qui vide le compte en
+      ouvrant soixante positions correlees serait retenu, et transmis au
       fold suivant. `gain_top` ne peut pas le voir : il mesure les occasions
       UNE A UNE et ne sait rien du nombre tenu simultanement.
+
+      CE CRITERE ETAIT UN POURCENTAGE, et il ne pouvait plus l'etre. Il
+      refusait tout checkpoint dont un episode depassait 40 % de creux —
+      ce qui etait le seuil qui TUAIT l'episode, donc la condition se
+      confondait avec « un episode est mort ». Depuis que l'episode va au
+      bout de sa tranche, un creux de 60 % peut etre suivi d'une remontee :
+      garder 40 % refuserait presque tout, et refuserait sur un chiffre
+      qu'aucun courtier n'applique. Mesure du 2026-09-19 : un tiers des
+      episodes tues a 40 % auraient fini AU-DESSUS du capital de depart.
 
     La raison rendue n'est pas decorative : elle est affichee quand un
     candidat est ecarte, sans quoi on regarde quatre-vingt-dix epochs en
@@ -312,9 +325,9 @@ def retient_checkpoint(gain_top, score_rang, val_num_trades, val_max_dd,
         return False, "sommet non mesurable"
     if gain_top <= best_metric:
         return False, f"sommet {gain_top:+.3f} R sous le record {best_metric:+.3f}"
-    if not (val_max_dd < max_dd):
-        return False, (f"creux {100*val_max_dd:.0f} % au-dela du garde-fou "
-                       f"{100*max_dd:.0f} %")
+    if val_ruine:
+        return False, (f"compte detruit sur {val_ruine} episode(s) de "
+                       f"validation")
     return True, ""
 
 
@@ -1005,7 +1018,35 @@ class PPOConfig:
     # Les episodes mourront plus souvent. Un episode qui meurt enseigne sa
     # mort ; c'est le prix a payer pour que le modele decouvre la limite au
     # lieu de la recevoir.
-    budget_risque: float = 0.0
+    # LE BUDGET DE RISQUE EST DESORMAIS CHOISI PAR LE MODELE, a chaque
+    # decision, parmi `BUDGETS_RISQUE`. Cette valeur n'est plus que le point
+    # de DEPART d'un episode, avant la premiere decision.
+    #
+    # Elle vaut le palier le PLUS BAS, et c'est deliberement un a priori
+    # prudent : le modele doit choisir activement de s'exposer davantage. La
+    # mettre a zero — le reglage du 2026-09-19 — ne donnait pas le controle au
+    # modele, cela le lui retirait : plus rien ne bornait, et rien dans son
+    # espace d'action ne le remplacait.
+    # TOUS LES COMBIEN LE BUDGET PEUT-IL ETRE REVISE, en barres.
+    #
+    # Le budget est choisi a chaque decision, mais une decision n'existait que
+    # si le budget COURANT laissait de la place : un modele qui choisit 3 % et
+    # ouvre une position se verrouillait pour la vie de cette position, soit
+    # ~1 140 barres avec un stop a 10xATR. Mesure : l'ancien gating bloquait
+    # 99 % des barres, et le modele n'etait consulte que 44 fois par episode.
+    #
+    # Rouvrir la revision a CHAQUE barre leve le verrou mais coute cher :
+    # 33 307 decisions au lieu de 530, et l'epoch passe de 3 a 12 minutes —
+    # collecte 26 s -> 181 s, validation 96 s -> 293 s. Sur 160 epochs et
+    # trois folds, 96 heures au lieu de 24.
+    #
+    # 12 barres de M5 = UNE HEURE. Le modele garde le moyen de sortir d'un
+    # budget serre sans attendre la fermeture d'une position, et la lecture
+    # est simple : c'est la frequence a laquelle un gerant revisite son budget
+    # de risque. A zero, la revision est rouverte a chaque barre.
+    revision_budget_barres: int = 12
+
+    budget_risque: float = 0.03
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
 
@@ -1468,9 +1509,94 @@ class PPOConfig:
     # A REVERIFIER si le compte change : un historique de deals MT5 donne la
     # commission reelle par lot (le champ `commission` de history_deals_get).
     fee_rate: float = 0.0
-    min_capital_frac: float = 0.20  # garde-fou capital : épisode terminé si capital < 20%
                                      # config validée +135 EUR MT5 tester
-    max_drawdown: float = 0.40  # garde-fou DD : épisode terminé si drawdown > 40%
+    # `max_drawdown` et `min_capital_frac` ONT ETE RETIRES le 2026-09-19.
+    #
+    # Ils terminaient l'episode a 40 % de creux et sous 20 % du capital de
+    # depart. Aucun courtier n'applique l'un ni l'autre : ce qui termine un
+    # compte reel est l'appel de marge, l'impossibilite de financer le lot
+    # minimum, et l'equite a zero — les trois sont modelises dans `step`.
+    #
+    # Ce qu'ils coutaient, mesure sur 29 episodes a la selectivite de
+    # validation : 26 % seulement des barres etaient jouees, et UN TIERS des
+    # episodes tues auraient fini AU-DESSUS du capital de depart. On refusait
+    # donc un checkpoint sur une observation tronquee, sans savoir ce qu'il
+    # valait — et le modele, ne voyant jamais l'au-dela, ne pouvait pas
+    # apprendre a se remettre d'un creux profond.
+    #
+    # La prudence n'est plus enseignee par une coupure mais par la PENALITE
+    # DE CREUX, qui est graduee et que le modele voit venir.
+    # ------------------------------------------------------------------
+    # LA PENALITE DE CREUX EST UNE RAMPE, PLUS UNE FALAISE.
+    #
+    # Elle valait `-0.2 si creux > max_drawdown, sinon 0` : rien entre 0 et
+    # 40 %, puis une marche a l'instant meme ou l'episode est tue. Aucun
+    # gradient n'indiquait au modele qu'il approchait.
+    #
+    # CE QUE CELA PRODUISAIT, mesure le 2026-09-19 sur six episodes a
+    # entrees neutres : CINQ SUR SIX meurent du garde-fou, au quart de leur
+    # longueur. Et surtout —
+    #
+    #     recompense moyenne par barre sur les 200 dernieres : -0.0417
+    #     recompense moyenne sur tout l'episode              : -0.0144
+    #
+    # — la politique PERDAIT au moment de mourir, et de plus en plus vite.
+    # Couper l'episode lui evitait donc des milliers de barres negatives :
+    # dans le mecanisme RL standard la terminaison coute le futur, mais ici
+    # le futur etait negatif. LA MORT ETAIT UN SOULAGEMENT, et la marche de
+    # -0.2 le seul contrepoids.
+    #
+    # LA FORME : `penalite_creux x d^2`, ou d est la distance au garde-fou
+    # bornee a 1. Le carre la garde hors du chemin tant que le compte va
+    # bien et la fait mordre pres de la coupure.
+    #
+    # LAMBDA SE RECALE SUR L'ECHELLE REELLE DE LA RECOMPENSE, et c'est le
+    # deuxieme recalibrage de la journee. Le premier etait errone.
+    #
+    # HISTORIQUE, parce que l'erreur est instructive. La penalite valait
+    # `-0.2 si creux > 40 %`. En la transformant en potentiel j'ai voulu
+    # garder cette magnitude et j'ai ancre lambda dessus : d'abord 0.2 quand
+    # `d` saturait a 40 % de creux, puis 1.25 quand `d` a ete etendu jusqu'a
+    # la ruine (`lambda x 0.40^2 = 0.2`). Les deux fois j'ai ancre sur un
+    # CHIFFRE, sans verifier a quelle echelle de recompense ce chiffre avait
+    # ete regle.
+    #
+    # CE QUE LA MESURE A MONTRE, exec09 epochs 1 a 7 :
+    #
+    #     exec04 (budget de risque 3 %)          |R| ~ 2.8
+    #     exec07 (budget 0, garde-fou a 40 %)    |R|   1.36   <- l'ancrage
+    #     exec09 (budget 0, sans garde-fou)      |R|   6.77   (mediane)
+    #
+    # Le levier illimite a multiplie le signal monetaire par CINQ pendant que
+    # la penalite restait callee sur l'ancienne echelle. Une position
+    # traversant un creux de 0.5 a 0.7 payait 1.25 x 0.24 = 0.30 contre un
+    # |R| de 7.6 : quatre pour cent du signal qu'elle devait contrebalancer.
+    # Sur sept epochs le creux de validation n'a pas bouge d'un point —
+    # 104.9, 100.3, 102.8, 100.4, 108.3, 103.8, 112.0 % — et le PnL MEDIAN
+    # par episode est reste a -950 $ sur 1 000 $, epoch apres epoch.
+    #
+    # LE NOUVEL ANCRAGE EST UN RAPPORT, PLUS UN CHIFFRE : lambda suit |R|.
+    # 1.25 x (6.77 / 1.36) = 6.2, arrondi a 6.5.
+    #
+    #     creux  25 % -> 0.41
+    #     creux  40 % -> 1.04
+    #     creux  70 % -> 3.19
+    #     creux 100 % -> 6.50   (ruine)
+    #
+    # Une position traversant un creux de 0.5 a 0.7 paie desormais 1.56
+    # contre |R| 7.6, soit ~21 % du signal. Senti, sans dominer.
+    #
+    # RESERVE, ET ELLE EST SERIEUSE. C'est du shaping, et ce depot l'a deja
+    # paye : l'ancien shaping — quatre termes qui recompensaient le fait
+    # d'ETRE en position — a enseigne une strategie perdante pendant
+    # soixante-quinze epochs, et il a ete retire au profit d'un principe :
+    # on ne garde que ce qui correspond a de l'argent reel, symetriquement.
+    # Ce qui justifie l'exception ici est que le creux EST de l'argent reel,
+    # et que la falaise creait une incitation manifestement perverse.
+    # A surveiller : si le modele cesse d'ouvrir plutot que d'ouvrir mieux,
+    # c'est ce terme qu'il faut soupconner en premier.
+    penalite_creux: float = 6.5
+    # ------------------------------------------------------------------
                                  # config validée +135 EUR MT5 tester
 
     # Risk management / position sizing
@@ -2666,6 +2792,56 @@ class Portefeuille:
         return sum(e.n_positions for e in envs)
 
 
+BORNE_LOG = 0.05
+
+
+def comprime_log(x, borne: float = BORNE_LOG):
+    """Borne un log-rendement SANS en detruire l'ordre.
+
+    CE QU'ELLE REMPLACE, et pourquoi la troncature etait un piege.
+
+    La recompense valait `10 x clip(log(E'/E), -0.05, +0.05)`. Le logarithme
+    de l'equite est le bon objectif pour un compte qui compose : maximiser
+    E[log W] est exactement le critere qui evite la ruine, parce que log(0)
+    diverge. C'est ce qui donne a une politique une raison de ne pas tout
+    miser, sans qu'on ait a le lui dire.
+
+    LA TRONCATURE COUPAIT PRECISEMENT CETTE PARTIE. Mesure du 2026-09-19 sur
+    13 491 barres : la pire barre emportait 91.3 % de l'equite d'un coup, et
+    rapportait -0.50 — exactement comme une barre a -4.9 %. Cent quatre-vingts
+    barres perdaient plus de 10 %, cinq plus de 50 %, toutes indiscernables.
+    Le clip effacait jusqu'a 23.87 de signal sur UNE barre, quand la penalite
+    de creux calibree le meme jour vaut au plus 6.5 sur TOUT un episode : on
+    soignait le symptome en amont du mal.
+
+    MAIS BORNER RESTE NECESSAIRE, et ce n'est pas negociable. Sans borne,
+    l'equite ecretee a 1e-8 donne log(1e-8/950) = -25.3, donc -253 de
+    recompense. Mesure a l'epoch 1 : |R| 338, advStd 28168, quasi0 100 % —
+    les avantages etant normalises par leur ecart-type, une poignee de
+    valeurs geantes ecrase tout le reste sous 0.05 et l'acteur ne recoit
+    PLUS AUCUN GRADIENT. Cela a ete essaye et cela detruit l'apprentissage.
+
+    LE DEFAUT N'ETAIT DONC PAS DE BORNER, C'ETAIT DE TRONQUER. Cette forme
+    borne en croissance logarithmique tout en restant strictement monotone :
+
+        x = -0.05  (-4.9 %)   ->  -0.035
+        x = -0.11  ( -10 %)   ->  -0.055
+        x = -0.29  ( -25 %)   ->  -0.089
+        x = -2.44  ( -91 %)   ->  -0.195
+        x = -25.3  (ruine)    ->  -0.311
+
+    Un ecart de 5.6x entre une perte de 5 % et une perte de 91 %, la ou la
+    troncature en donnait 1.0x. Et le cas pathologique rend -0.31 au lieu de
+    -25.3 : le probleme d'echelle qui avait impose le clip ne revient pas.
+
+    Elle vaut x au premier ordre (f'(0) = 1), donc les barres ordinaires —
+    l'immense majorite — sont inchangees.
+    """
+    if isinstance(x, np.ndarray):
+        return borne * np.sign(x) * np.log1p(np.abs(x) / borne)
+    return borne * math.copysign(math.log1p(abs(x) / borne), x)
+
+
 class BTCTradingEnvDiscrete(gym.Env):
     metadata = {"render_modes": []}
 
@@ -2724,6 +2900,25 @@ class BTCTradingEnvDiscrete(gym.Env):
 
         self.low_vol_starts = low if len(low) > 0 else None
         self.high_vol_starts = high if len(high) > 0 else None
+
+    def set_budget_risque(self, budget: float) -> None:
+        """Fixe le budget de risque du PORTEFEUILLE, choisi par le modele.
+
+        LE CACHE DE CAPACITE DOIT TOMBER AVEC. `places_ouvrables` memorise son
+        resultat sur (idx, capital, versions des emplacements) — le budget n'y
+        figure pas, puisqu'il etait constant. Le changer sans invalider
+        rendrait l'ancienne capacite jusqu'a la prochaine barre, et le modele
+        verrait son choix ignore sans que rien ne le signale.
+        """
+        _b = float(max(budget, 0.0))
+        # INERTE SI RIEN NE CHANGE. Les boucles de mesure reappliquent le
+        # budget a chaque barre pour chaque environnement actif ; invalider
+        # le cache a chaque fois le detruirait sur le chemin chaud, alors que
+        # la valeur est identique neuf fois sur dix.
+        if _b == self._k_budget:
+            return
+        self._k_budget = _b
+        self._cap_cle, self._cap_val = None, {}
 
     def set_risk_scale(self, scale: float):
         self.risk_scale = float(max(scale, 0.0))
@@ -2833,6 +3028,11 @@ class BTCTradingEnvDiscrete(gym.Env):
         self.last_risk_scale = 1.0
 
         self.max_dd = 0.0
+        # Le potentiel de creux de la barre precedente. A zero au depart :
+        # l'episode commence a son sommet, donc rien n'est du. C'est ce qui
+        # fait que le total facture sur l'episode vaut exactement le creux
+        # FINAL, et non la somme des creux traverses.
+        self._d_prec = 0.0
 
         obs = self._get_obs()
         return obs, {
@@ -2959,7 +3159,7 @@ class BTCTradingEnvDiscrete(gym.Env):
             return mini
         return math.floor(taille / pas + 1e-9) * pas
 
-    def places_ouvrables(self, prix: float) -> int:
+    def places_ouvrables(self, prix: float, budget=None) -> int:
         # Memorisee pour la barre : la boucle de collecte la demande via
         # `peut_entrer()` puis via `_get_obs()`, et rien entre les deux ne
         # peut la changer. La cle porte l'etat dont elle depend, donc une
@@ -2985,17 +3185,24 @@ class BTCTradingEnvDiscrete(gym.Env):
         # fois. L'etat du COMPTE est resume par les versions de ses
         # environnements — une ouverture ou une fermeture, ici ou sur l'autre
         # instrument, les fait bouger.
+        # LE BUDGET ENTRE DANS LA CLE. Il etait constant quand ce cache a
+        # ete ecrit ; il est desormais choisi par le modele a chaque decision,
+        # et `peut_entrer(au_plafond=True)` interroge la capacite sous un
+        # budget qui n'est PAS celui en vigueur. Sans le budget dans la cle,
+        # les deux reponses se chasseraient l'une l'autre et le gating
+        # lirait la capacite calculee pour l'autre budget.
+        _b = self._k_budget if budget is None else float(budget)
         cle = (self.idx, self.capital,
                tuple(e._ver for e in self.portefeuille.envs))
         if self._cap_cle != cle:
             self._cap_cle, self._cap_val = cle, {}
-        val = self._cap_val.get(prix)
+        val = self._cap_val.get((prix, _b))
         if val is None:
-            val = self._places_ouvrables(prix)
-            self._cap_val[prix] = val
+            val = self._places_ouvrables(prix, _b)
+            self._cap_val[(prix, _b)] = val
         return val
 
-    def _places_ouvrables(self, prix: float) -> int:
+    def _places_ouvrables(self, prix: float, budget=None) -> int:
         """Combien de positions le SOLDE permet encore, ici et maintenant.
 
         C'est le K reel. Il ne se configure pas, il se calcule : il tombe
@@ -3019,8 +3226,9 @@ class BTCTradingEnvDiscrete(gym.Env):
         # Le risque d'une position de plus, a la taille que le courtier
         # imposerait reellement — lot minimum compris. Calcule seulement si
         # le budget de risque est actif : a zero il n'est pas lu.
+        _b = self._k_budget if budget is None else float(budget)
         r_une = 0.0
-        if self._k_budget > 0.0:
+        if _b > 0.0:
             atr_raw = (float(self.data.atr14[self.idx - 1])
                        if self.idx - 1 >= 0 else 0.0)
             atr = max(atr_raw, ATR_PLANCHER_FRAC * prix, 1e-8)
@@ -3035,7 +3243,7 @@ class BTCTradingEnvDiscrete(gym.Env):
             contrat=self._k_contrat,
             marge_frac=self._k_marge_frac,
             niveau_marge=self._k_seuil_marge,
-            budget_risque=self._k_budget,
+            budget_risque=_b,
             risque_engage=self.portefeuille.risque_engage(),
             risque_une=r_une)
 
@@ -3094,10 +3302,52 @@ class BTCTradingEnvDiscrete(gym.Env):
         return (eq / max(seuil, 1e-9)
                 - self.portefeuille.marge_utilisee()) >= m_une
 
-    def peut_entrer(self) -> bool:
-        """Une DECISION existe quand le solde permet encore une position."""
+    def peut_decider(self) -> bool:
+        """Le reseau doit-il etre consulte a cette barre ?
+
+        DEUX RAISONS, ET UNE SEULE SOURCE pour les trois boucles — rollout,
+        validation, test. Les avoir ecrites separement, c'est exactement
+        comment ce depot s'est retrouve avec une validation qui jouait une
+        autre strategie que l'entrainement.
+
+          IL PEUT ENTRER MAINTENANT, sous le budget qu'il s'est donne. C'est
+          le cas normal, celui d'avant.
+
+          C'EST UNE BARRE DE REVISION. Toutes les `revision_budget_barres`
+          barres, on lui redonne la parole s'il aurait de la place a un budget
+          PLUS LARGE — c'est ce qui lui permet de desserrer sans attendre
+          qu'une position se ferme. Inutile de le consulter si meme le plafond
+          ne laisse rien : il n'y aurait rien a desserrer.
+        """
+        if self.peut_entrer():
+            return True
+        _n = int(getattr(self.cfg, "revision_budget_barres", 0))
+        if _n <= 0 or (self.idx % _n) == 0:
+            return self.peut_entrer(au_plafond=True)
+        return False
+
+    def peut_entrer(self, au_plafond: bool = False) -> bool:
+        """Une DECISION existe quand le solde permet encore une position.
+
+        `au_plafond` REND LE BUDGET REVISABLE, et c'est tout l'objet du
+        parametre.
+
+        Le budget etait choisi a chaque decision, mais une decision n'existait
+        que si le budget COURANT laissait de la place. Un modele qui choisit
+        3 % et ouvre une position remplit son budget, sort de `deciding`, et
+        n'est plus consulte jusqu'a ce que la position se ferme — environ
+        1 140 barres avec un stop a 10xATR. Il pouvait donc se verrouiller
+        dans un budget serre sans pouvoir le relever. Mesure du 2026-09-19 :
+        44 decisions par episode de 5 760 barres, soit une tous les 130 barres.
+
+        En interrogeant la capacite au budget le PLUS LARGE, l'environnement
+        est consulte des qu'une position serait possible A UN BUDGET
+        QUELCONQUE. Le modele choisit alors son budget, et c'est ce choix qui
+        ouvre ou refuse l'entree — au lieu qu'un choix passe la lui interdise.
+        """
         prix = float(self.data.close[min(self.idx, self.data.length - 1)])
-        return self.places_ouvrables(prix) > 0
+        _b = BUDGETS_RISQUE[-1] if au_plafond else None
+        return self.places_ouvrables(prix, _b) > 0
 
     # CINQ AGREGATS, UNE SEULE PASSE, ET ILS NE CHANGENT QU'AVEC LES
     # EMPLACEMENTS. `_get_obs` lit `position` deux fois, `entry_price` et
@@ -3261,13 +3511,48 @@ class BTCTradingEnvDiscrete(gym.Env):
         # collecte garde l'observation dans `en_attente[k]["state"]` jusqu'a
         # la mise a jour PPO. Un tampon reutilise ferait apprendre le reseau
         # sur l'etat de la DERNIERE barre pour toutes les decisions.
+        # LA DISTANCE AU GARDE-FOU DE CREUX. Elle vaut 0 au sommet et 1.0
+        # quand l'episode est coupe. Sans elle le modele ne voyait pas la
+        # limite qu'on lui demande de respecter : le creux se deduisait a
+        # 67 % de la capacite restante, mais le PIC manquait, et deux
+        # observations identiques pouvaient correspondre a douze points de
+        # creux d'ecart.
+        #
+        # ELLE SE MESURE PAR RAPPORT A LA RUINE, PLUS PAR RAPPORT A 40 %.
+        #
+        # Elle valait `creux / 0.40`, bornee a 1 : elle saturait donc des
+        # 40 % de creux, et au-dela le modele voyait la meme valeur pour un
+        # compte a -40 % et un compte a -90 %. Elle decrivait une convention
+        # de laboratoire, pas la realite du compte.
+        #
+        # Elle vaut maintenant le creux lui-meme : 0 au sommet, 1 quand il ne
+        # reste plus rien. C'est « combien de creux il reste avant de ne plus
+        # pouvoir trader », et c'est la meme grandeur que celle qui tue
+        # desormais l'episode.
+        #
+        # L'EQUITE INCLUT TOUTES LES POSITIONS OUVERTES — `_latent_at_bid`
+        # les somme. Le compte est juge sur ce qu'il vaudrait s'il fermait
+        # tout maintenant, ce qui est exactement ce que le courtier regarde.
+        _eq = self.capital + self._latent_at_bid(current_price)
+        _pic = max(self.peak_capital, _eq)
+        _creux = (_pic - _eq) / (_pic + 1e-8)
+        distance_creux = float(min(max(_creux, 0.0), 1.0))
+
+        # LE BUDGET COURANT, rapporte au plus large des paliers. La
+        # quatrieme colonne porte deja la capacite restante, mais deux budgets
+        # differents peuvent donner la meme capacite : sans cette colonne le
+        # modele ne saurait pas lequel il a choisi, ni donc quoi corriger.
+        budget_courant = float(self._k_budget / max(BUDGETS_RISQUE[-1], 1e-9))
+
         n_base = base.shape[1]
-        obs = np.empty((self.lookback, n_base + 4), dtype=np.float32)
+        obs = np.empty((self.lookback, n_base + 6), dtype=np.float32)
         obs[:, :n_base] = base
         obs[:, n_base] = pos_feature
         obs[:, n_base + 1] = unrealized_atr
         obs[:, n_base + 2] = bars_held_norm
         obs[:, n_base + 3] = risk_feature
+        obs[:, n_base + 4] = distance_creux
+        obs[:, n_base + 5] = budget_courant
         return obs
 
     def _apply_micro(self, price: float, side: int, is_entry: bool = True) -> float:
@@ -3778,10 +4063,32 @@ class BTCTradingEnvDiscrete(gym.Env):
             # qui est faux — un compte qui ne peut plus prendre le lot
             # minimum est termine.
             done_reason = "solde_insuffisant"
-        elif marked_dd > self.cfg.max_drawdown:
-            done_reason = "max_drawdown"
-        elif marked_equity < self.cfg.initial_capital * self.cfg.min_capital_frac:
-            done_reason = "min_capital"
+        elif marked_equity <= 0.0:
+            # LA SEULE FIN QUI EXISTE VRAIMENT : le compte n'a plus rien.
+            #
+            # Les deux fins qui etaient ici — creux > 40 %, capital sous 20 %
+            # du depart — n'existent pas chez un courtier. C'etaient des
+            # conventions de laboratoire, et elles coutaient cher :
+            #
+            #   - EN MESURE. Un episode tue au quart de sa tranche laisse les
+            #     trois quarts non joues. Mesure du 2026-09-19, 29 episodes a
+            #     la selectivite de validation : 26 % des barres seulement
+            #     etaient jouees, et UN TIERS des episodes tues auraient fini
+            #     AU-DESSUS du capital de depart. On refusait un checkpoint
+            #     sur une observation tronquee, sans savoir ce qu'il valait.
+            #
+            #   - EN APPRENTISSAGE. Le modele ne voyait jamais l'au-dela du
+            #     garde-fou, donc il ne pouvait pas apprendre a se remettre
+            #     d'un creux profond : ces trajectoires n'existaient pas dans
+            #     son vecu.
+            #
+            # CE QUI RESTE EST CE QUE LE COURTIER FAIT REELLEMENT, et qui
+            # etait deja modelise juste au-dessus : l'appel de marge quand le
+            # niveau passe sous 50 %, et l'impossibilite de financer le lot
+            # minimum. Cette branche-ci est le filet : une bougie qui saute
+            # peut emporter l'equite sous zero avant que le niveau de marge
+            # ne soit relu.
+            done_reason = "ruine"
         if done_reason is not None and self._p_sens.any():
             restants = np.flatnonzero(self._p_sens != 0)
             restants = restants[np.argsort(self._p_idx[restants], kind="stable")]
@@ -3813,7 +4120,7 @@ class BTCTradingEnvDiscrete(gym.Env):
         # surtout quasi0 100 % — les avantages etant normalises par leur
         # ecart-type, une poignee de valeurs geantes ecrase TOUS les autres sous
         # 0.05 et l'acteur ne recoit plus aucun gradient (g[actor 1.5e-04]).
-        log_ret = max(min(log_ret, 0.05), -0.05)
+        log_ret = comprime_log(log_ret)
 
         # ==================================================================
         # REWARD ALIGNÉ SUR LA RENTABILITÉ RÉELLE
@@ -3892,9 +4199,51 @@ class BTCTradingEnvDiscrete(gym.Env):
         dd = (self.peak_capital - equity) / (self.peak_capital + 1e-8)
         self.max_dd = max(self.max_dd, dd)
 
-        # Pénalité DD réactivée (max_drawdown=0.40) — punit les trajectoires catastrophiques
-        if dd > self.cfg.max_drawdown:
-            reward -= 0.2
+        # ON FACTURE LE CREUSEMENT, PAS LE CREUX.
+        #
+        # J'ai d'abord ecrit `-lambda x d^2`, la rampe sur le NIVEAU. Le pas
+        # 18 du scenario `avec objectif` l'a condamnee : compte plat, aucune
+        # position, rien d'ouvert ni de ferme — et -4.19e-05 preleve quand
+        # meme, a chaque barre, pour un creux hérité d'un trade deja clos.
+        # Une taxe sur un etat est une INTEGRALE SUR LE TEMPS : a d = 0.5 elle
+        # coute 0.05 par barre, soit -43 500 sur une epoch de 870 000 barres,
+        # ce qui noie tout le signal de trading. Et surtout elle ne s'arrete
+        # qu'en refaisant un sommet — ou en MOURANT. Je rendais la mort plus
+        # attirante en croyant l'en dissuader.
+        #
+        # LA FORME JUSTE EST CELLE DU POTENTIEL. Avec Phi(s) = -lambda x d^2,
+        # le terme `Phi(s') - Phi(s)` ne facture que la VARIATION du creux :
+        #
+        #   - creux qui se creuse   -> cout
+        #   - creux qui se resorbe  -> credit, exactement egal
+        #   - compte plat, d constant -> RIEN
+        #
+        # Il telescope : sur tout un episode le total vaut Phi(fin) - Phi(0),
+        # soit -lambda x d_fin^2. Un episode tue au garde-fou paie donc
+        # EXACTEMENT -0.2 au total — l'ancienne falaise, au centime — mais
+        # etalee le long du chemin, ce qui donne enfin un gradient. Un episode
+        # qui stationne a 20 % de creux pendant cent mille barres paie 0.05
+        # UNE FOIS, et non cent mille fois.
+        #
+        # C'est aussi la seule classe de shaping dont on sache qu'elle ne
+        # change pas la politique optimale (Ng, Harada & Russell, 1999) :
+        # elle redistribue le meme total dans le temps. C'est ce qui leve ma
+        # reserve — le shaping a enseigne une strategie perdante ici pendant
+        # soixante-quinze epochs, mais c'etait un shaping qui ajoutait de la
+        # valeur la ou il n'y avait pas d'argent. Celui-ci n'en ajoute aucune.
+        #
+        # gamma vaut 1 dans le terme, et non gamma^dt : l'exactitude du
+        # telescopage compte ici plus que l'escompte d'une penalite qui, sur
+        # une barre, vaut deja presque son actualisation.
+        # MEME `d` QUE CELUI QUE LE MODELE OBSERVE : le creux lui-meme, 0 au
+        # sommet et 1 a la ruine. Plus de division par 40 % — la penalite
+        # saturait alors des 40 % de creux, donc elle cessait de mordre
+        # exactement quand la situation empirait.
+        _dist_creux = min(max(dd, 0.0), 1.0)
+        _pen = (float(getattr(self.cfg, "penalite_creux", 0.2))
+                * (_dist_creux * _dist_creux - self._d_prec * self._d_prec))
+        self._d_prec = _dist_creux
+        reward -= _pen
 
         # CHAQUE POSITION CALCULE SA PROPRE RECOMPENSE. Elle n'est pas une
         # part d'un total.
@@ -3943,7 +4292,11 @@ class BTCTradingEnvDiscrete(gym.Env):
             # le gradient qui manquait pour distinguer la 1re position de la
             # 40e. Chaque position ouverte a contribue au creux ; chaque
             # decision doit le sentir.
-            _pen = 0.2 if dd > self.cfg.max_drawdown else 0.0
+            # `_pen` EST CELUI DE LA PENALITE GLOBALE, calcule UNE SEULE FOIS
+            # plus haut — le recalculer ici le doublerait, puisque le terme
+            # de potentiel avance `_d_prec` au passage. Chaque emplacement
+            # porte la meme variation de creux, non divisee par leur nombre,
+            # pour la raison exposee ci-dessus.
             _clip = (hasattr(self.cfg, "current_epoch")
                      and self.cfg.current_epoch >= 10)
             # ON NE PARCOURT QUE LES EMPLACEMENTS CONCERNES. La boucle
@@ -3985,7 +4338,7 @@ class BTCTradingEnvDiscrete(gym.Env):
             # resultat different de 4.4e-16 des que la penalite est active :
             # l'addition flottante n'est pas associative. Le test bit a bit
             # l'a montre — identique a penalite nulle, different sinon.
-            _v = self._r_slots[_idx] + (10.0 * np.clip(_lr, -0.05, 0.05)
+            _v = self._r_slots[_idx] + (10.0 * comprime_log(_lr)
                                         - _pen)
             self._r_slots[_idx] = np.clip(_v, -3.5, 3.5) if _clip else _v
         else:
@@ -4176,7 +4529,7 @@ class ScoresAPlat:
     construction, et le compteur `secours` dit combien de fois c'est arrive.
     """
 
-    ETAT_A_PLAT = (0.0, 0.0, 0.0, 1.0)
+    ETAT_A_PLAT = (0.0, 0.0, 0.0, 1.0, 0.0)
 
     def __init__(self, policy, data, cfg, device, masque, lot=8192,
                  aux=True):
@@ -4220,11 +4573,12 @@ class ScoresAPlat:
             with torch.no_grad():
                 for d0 in range(0, len(idx), self.lot):
                     b = idx[d0:d0 + self.lot]
-                    obs = np.empty((len(b), lb, n_f + 4), np.float32)
+                    obs = np.empty((len(b), lb, n_f + 5), np.float32)
                     # `fen[i - lb]` porte les barres [i-lb, i), axes (n_f, lb)
                     obs[:, :, :n_f] = np.swapaxes(fen[b - lb], 1, 2)
                     obs[:, :, n_f:n_f + 3] = 0.0
                     obs[:, :, n_f + 3] = 1.0
+                    obs[:, :, n_f + 4] = 0.0
                     st = torch.from_numpy(obs).to(self.device)
                     lg, _ = self.policy(st)
                     pr = torch.softmax(
@@ -4747,7 +5101,7 @@ def run_training_on_split(
     best_metric = -1e9
     best_state = None
     _best_epoch = -1        # l'epoch dont les poids partent au fold suivant
-    _refus_creux = 0        # candidats ecartes parce que le compte a plonge
+    _refus_creux = 0        # candidats ecartes parce que le compte a ete DETRUIT
     best_thresholds = None
     best_decision_spec = None
     epochs_no_improve = 0
@@ -4821,6 +5175,7 @@ def run_training_on_split(
         batch_masques = []
         batch_barres = []
         batch_actions = []
+        batch_budgets = []
         batch_oldlog = []
         batch_adv = []
         batch_returns = []
@@ -4879,6 +5234,7 @@ def run_training_on_split(
             {"states": [], "masques": [], "barres": [], "actions": [],
              "logprobs": [],
              "rewards": [], "values": [], "dones": [], "positions": [],
+             "budgets": [],
              "dts": []}
             for _ in range(n_envs)
         ]
@@ -4935,6 +5291,10 @@ def run_training_on_split(
         # son emplacement qu'APRES le pas, puisque c'est l'environnement qui
         # l'attribue.
         en_attente: Dict[int, Dict] = {}
+        # Repartition des paliers de budget retenus sur l'epoch, et combien
+        # de fois le palier choisi a lui-meme refuse l'entree.
+        budgets_epoch = [0] * N_BUDGETS
+        budgets_refus = [0] * N_BUDGETS
         sampling_audit = {"decisions": 0, "forced_actions": 0,
                           "remapped_actions": 0, "max_logprob_error": 0.0,
                           "episodes_joues": len(envs)}
@@ -4947,6 +5307,7 @@ def run_training_on_split(
             buf["masques"].append(p["masque"])
             buf["barres"].append(p["barre"])
             buf["actions"].append(p["action"])
+            buf["budgets"].append(p["budget"])
             buf["logprobs"].append(p["logprob"])
             buf["rewards"].append(p["R"])
             buf["values"].append(p["value"])
@@ -4962,7 +5323,7 @@ def run_training_on_split(
             # 1) Un environnement decide des qu'il lui reste un emplacement
             #    libre — c'est la definition d'une decision. A K=1 cela revient
             #    exactement a "etre plat".
-            deciding = [k for k in active if envs[k].peut_entrer()]
+            deciding = [k for k in active if envs[k].peut_decider()]
             actions_env = {k: 2 for k in active}
 
             if deciding:
@@ -4995,16 +5356,32 @@ def run_training_on_split(
                 masks_b = torch.from_numpy(masks_np).to(device)
 
                 with torch.no_grad():
-                    logits_b, values_b = policy(s_tensor)
+                    # UN SEUL PASSAGE DANS LE TRONC pour toutes les tetes.
+                    # Profil du 2026-09-19 : le passage avant pese 95 % de la
+                    # collecte. La cause n'etait pas le calcul — 46 000
+                    # parametres — mais le NOMBRE de traversees : direction,
+                    # budget et rendement etaient demandes separement, soit
+                    # deux a trois encodages par lot, doubles par l'ensemble.
+                    # `sorties` les rend en un passage, terme pour terme
+                    # identiques aux appels separes.
+                    logits_b, values_b, _bud_b, _ = policy.sorties(s_tensor)
                     logits_mb = logits_b.masked_fill(~masks_b, MASK_VALUE)
                     logp_b = torch.log_softmax(logits_mb, dim=-1)
+                    # LA TETE DE TAILLE, sur le meme lot. Elle n'est
+                    # sollicitee que sur les etats de DECISION, qui sont rares
+                    # — la politique ne tourne que sur les environnements
+                    # plats — donc ce second passage dans le tronc ne pese pas
+                    # sur le debit de l'epoch.
+                    logt_b = torch.log_softmax(_bud_b, dim=-1)
                     packed = torch.cat(
-                        [logp_b, values_b.reshape(-1, 1)], dim=1
+                        [logp_b, values_b.reshape(-1, 1), logt_b], dim=1
                     ).cpu().numpy()
 
                 logp_np = packed[:, :N_ACTIONS]
                 vals_np = packed[:, N_ACTIONS]
+                logt_np = packed[:, N_ACTIONS + 1:]
                 probs_np = np.exp(logp_np)
+                probt_np = np.exp(logt_np)
 
                 for bi, k in enumerate(deciding):
                     # ---- CURRICULUM D'OUVERTURE FORCÉE ----
@@ -5027,12 +5404,44 @@ def run_training_on_split(
                     # les états flat, y compris ceux ouverts de force.
                     pbs_epoch.append(float(max(probs_np[bi, 0], probs_np[bi, 1])))
 
+                    # LE BUDGET SE CHOISIT AVANT LA DIRECTION, et cet ordre
+                    # est le coeur du mecanisme.
+                    #
+                    # `deciding` interroge desormais la capacite AU PLAFOND :
+                    # l'environnement est consulte des qu'une position serait
+                    # possible a un budget quelconque. C'est le budget choisi
+                    # ici qui ouvre ou refuse l'entree — au lieu qu'un choix
+                    # passe la lui interdise pendant les ~1 140 barres de vie
+                    # d'une position.
+                    #
+                    # Le budget est tire a CHAQUE decision, y compris quand
+                    # elle finit en « attendre » : c'est un etat de
+                    # PORTEFEUILLE, pas un parametre d'ouverture, et rester
+                    # serre en attendant commande les entrees futures.
+                    _pt = probt_np[bi]
+                    _s = int(np.random.choice(N_BUDGETS, p=_pt / _pt.sum()))
+                    envs[k].set_budget_risque(BUDGETS_RISQUE[_s])
+                    budgets_epoch[_s] += 1
+                    # La capacite SOUS LE BUDGET QU'IL VIENT DE CHOISIR.
+                    _place = envs[k].places_ouvrables(
+                        float(envs[k].data.close[
+                            min(envs[k].idx, envs[k].data.length - 1)]))
+
                     if a is None:
                         p = probs_np[bi]
                         a = int(np.random.choice(N_ACTIONS, p=p / p.sum()))
                         if a != 2 and p[a] < conf_thr:
                             sampling_audit["remapped_actions"] += 1
                             a = 2  # conviction insuffisante → attendre
+                    # SON PROPRE BUDGET PEUT LUI REFUSER L'ENTREE. On remappe
+                    # alors sur « attendre », exactement comme pour une
+                    # conviction insuffisante : l'action ENREGISTREE doit etre
+                    # celle qui a ete JOUEE, sinon PPO apprendrait qu'acheter
+                    # a produit ce qu'attendre a produit.
+                    if a != 2 and _place <= 0:
+                        sampling_audit["remapped_actions"] += 1
+                        budgets_refus[_s] += 1
+                        a = 2
 
                     sampling_audit["decisions"] += 1
                     normalized_p = rollout_action_probabilities(
@@ -5041,15 +5450,20 @@ def run_training_on_split(
                         sampling_audit["max_logprob_error"],
                         abs(float(np.log(normalized_p[a])) - float(logp_np[bi, a])))
 
+                    # La log-vraisemblance est TOUJOURS la somme des deux
+                    # tetes : le budget a ete tire dans tous les cas.
+                    _logp_tot = float(logp_np[bi, a]) + float(logt_np[bi, _s])
+
                     en_attente[k] = {
                         "state": states[k],
+                        "budget": _s,
                         "masque": masks_np[bi].copy(),
                         # L'indice de barre : la tete auxiliaire a besoin de
                         # l'etiquette de CETTE occasion, et elle se calcule sur
                         # le dataframe, pas sur l'observation normalisee.
                         "barre": envs[k].idx - 1,
                         "action": a,
-                        "logprob": float(logp_np[bi, a]),
+                        "logprob": _logp_tot,
                         "value": float(vals_np[bi]),
                         "R": 0.0,
                         "dt": 0,
@@ -5061,7 +5475,12 @@ def run_training_on_split(
             for k in active:
                 env_k = envs[k]
                 env_action = actions_env[k]
-                env_k.set_risk_scale(1.0)
+                # L'ECHELLE N'EST PLUS REMISE A 1.0 ICI. Elle etait imposee
+                # a chaque pas, ce qui rendait la tete de taille sans effet :
+                # la decision la posait juste avant, cette ligne l'effacait
+                # juste apres. Elle est desormais fixee au moment de la
+                # decision et ne sert qu'a l'ouverture, donc la conserver
+                # entre deux decisions est sans consequence.
                 action_counts_env[env_action] += 1
 
                 ns, reward, done, _, info = env_k.step(env_action)
@@ -5180,6 +5599,7 @@ def run_training_on_split(
             batch_masques.extend(buf["masques"])
             batch_barres.extend(buf["barres"])
             batch_actions.extend(buf["actions"])
+            batch_budgets.extend(buf["budgets"])
             batch_oldlog.extend(buf["logprobs"])
             batch_adv.extend(adv)
             batch_returns.extend(ret)
@@ -5219,6 +5639,11 @@ def run_training_on_split(
             _keep[:] = True
         if _keep.sum() < cfg.batch_size:      # garde-fou : jamais moins d'un batch
             _keep[:] = True
+        # Le nombre de transitions REELLEMENT PRODUITES par la collecte,
+        # fige avant le sous-echantillonnage : c'est lui qui dimensionne
+        # le budget d'episodes de l'epoch suivante, pas la taille du lot
+        # PPO qui suit, ni le nombre de consultations du reseau.
+        _n_transitions = len(batch_actions)
         _sel = np.flatnonzero(_keep)
 
         # Diagnostic : la normalisation des avantages mélange-t-elle des
@@ -5236,6 +5661,7 @@ def run_training_on_split(
         batch_masques = [batch_masques[i] for i in _sel]
         batch_barres = [batch_barres[i] for i in _sel]
         batch_actions = [batch_actions[i] for i in _sel]
+        batch_budgets = [batch_budgets[i] for i in _sel]
         batch_oldlog = [batch_oldlog[i] for i in _sel]
         batch_adv = [batch_adv[i] for i in _sel]
         batch_returns = [batch_returns[i] for i in _sel]
@@ -5292,7 +5718,31 @@ def run_training_on_split(
                 ra, rv = _CIB.rendements(train_data.df, idx, cfg,
                                          indicateur=True)
                 y = np.stack([ra, rv], axis=1).astype(np.float32)
-                ok = np.isfinite(y).all(axis=1)
+                # LE MASQUE DE COTE, pour la tete auxiliaire.
+                #
+                # Elle sort DEUX rendements — achat et vente — et n'est PAS
+                # masquee, contrairement a l'acteur. En long-only le neurone
+                # VENDRE de l'acteur recoit exactement zero gradient
+                # (`masked_fill` remplace son logit par une constante), mais
+                # celui de la tete auxiliaire, lui, apprend a plein regime une
+                # sortie que rien ne lira jamais. Et cette tete n'est pas
+                # decorative : elle porte `rhoAux` et `tri_par_tete_aux`,
+                # donc c'est ELLE qui selectionne le checkpoint.
+                #
+                # Mesure du 2026-09-19 sur 8 116 occasions : la correlation
+                # entre les deux colonnes vaut -0.51. Ni l'image miroir — le
+                # tronc n'apprend donc pas une seule tache dont la vente
+                # serait la negation gratuite — ni deux taches independantes.
+                # Partiellement redondantes : masquer libere quelque chose de
+                # reel, sans que ce soit la moitie.
+                _m_cotes_np = np.array(cotes_permises(cfg.side), dtype=bool)
+                _m_cotes = torch.tensor(_m_cotes_np.astype(np.float32),
+                                        device=device)
+                # `ok` n'exige la finitude que des colonnes LUES. Il exigeait
+                # les deux : une occasion dont l'achat se resolvait mais pas
+                # la vente etait jetee. Le gain est petit — 43 etiquettes sur
+                # 17 000, +0.3 % — mais c'est la semantique juste.
+                ok = np.isfinite(y)[:, _m_cotes_np].all(axis=1)
                 cibles_aux = (
                     torch.tensor(np.nan_to_num(y), device=device),
                     torch.tensor(ok, device=device))
@@ -5318,6 +5768,7 @@ def run_training_on_split(
                   f"(fenetre train, epoch {epoch})")
 
         actions = torch.tensor(batch_actions, dtype=torch.long, device=device)
+        budgets = torch.tensor(batch_budgets, dtype=torch.long, device=device)
         oldlog = torch.tensor(batch_oldlog, dtype=torch.float32, device=device).view(-1)
         advantages = torch.tensor(batch_adv, dtype=torch.float32, device=device)
         returns = torch.tensor(batch_returns, dtype=torch.float32, device=device)
@@ -5349,6 +5800,12 @@ def run_training_on_split(
         epoch_aux_loss = []
         epoch_entropy = []
         epoch_entropy_flat = []
+        # Entropie de la TETE DE TAILLE, tenue a part et hors des tuples
+        # de stats reportees : elle n'a pas a decaler des indices lus par
+        # position ailleurs. Son plafond est ln(4) = 1.386. Si elle tombe
+        # vers 0, le modele a fige sa taille — c'est le symptome a
+        # surveiller en premier.
+        epoch_entropy_budget = []
         epoch_grad_norm = []
         epoch_flat_frac = []
         g_actor_hist = []
@@ -5372,6 +5829,7 @@ def run_training_on_split(
 
                 sb = states[ids]
                 ab = actions[ids]
+                tb = budgets[ids]
                 lb_old = oldlog[ids]
                 adv_b = advantages[ids]
                 ret_b = returns[ids]
@@ -5379,7 +5837,12 @@ def run_training_on_split(
                 pos_b = positions[ids]
 
                 with torch.amp.autocast(device_type=device.type, enabled=cfg.use_amp):
-                    logits, value = policy(sb)
+                    # UN SEUL PASSAGE, ET AVEC GRADIENT. La mise a jour
+                    # demandait la direction, le budget et le rendement
+                    # separement : trois traversees du tronc par mini-lot,
+                    # doublees par l'ensemble, et trois graphes d'autograd la
+                    # ou un seul suffit.
+                    logits, value, _bud_u, _rend_u = policy.sorties(sb)
                     # LE MASQUE QUI A AGI, PAS UN MASQUE RECONSTRUIT.
                     #
                     # Il etait refabrique ici depuis la seule position. Tant
@@ -5408,7 +5871,29 @@ def run_training_on_split(
                         continue
 
                     dist = Categorical(logits=logits_masked)
-                    new_log = dist.log_prob(ab)
+                    # LA POLITIQUE EST FACTORISEE ET CONDITIONNELLE.
+                    #
+                    # `log pi(a) = log pi_dir(d) + log pi_budget(b)`, et la
+                    # somme vaut pour TOUTES les decisions, y compris
+                    # « attendre » : le budget est un etat de portefeuille qui
+                    # commande les entrees futures, pas un parametre
+                    # d'ouverture. Le rollout le tire de la meme facon, sans
+                    # condition — si les deux divergeaient, le ratio PPO
+                    # comparerait deux politiques differentes et corrigerait
+                    # un ecart qui n'existe pas.
+                    dist_t = Categorical(logits=torch.log_softmax(
+                        _bud_u, dim=-1))
+                    new_log = dist.log_prob(ab) + dist_t.log_prob(tb)
+                    _ent_t = dist_t.entropy()
+                    # `entropy` RESTE CELLE DE LA DIRECTION SEULE.
+                    #
+                    # Elle est AFFICHEE sous le nom `H` et la veille la compare
+                    # a ln(2) en long-only. Y sommer la tete de budget donnait
+                    # `H 1.841/0.693` — un nombre au-dessus de son propre
+                    # plafond, parce que 0.693 (direction, saturee) + 1.148
+                    # (budget) etait rapporte au plafond de la direction. La
+                    # somme reste lisible : `Hflat` et `Hbudget` sont tous deux
+                    # au journal, avec chacun son plafond.
                     entropy_per_state = dist.entropy()
                     entropy = entropy_per_state.mean()
 
@@ -5419,10 +5904,19 @@ def run_training_on_split(
                     # « beaucoup d'états en position ». H_flat le dit sans
                     # ambiguïté — max = ln(3) = 1.0986.
                     _flat_b = (pos_b == 0)
+                    # `entropy` (la perte) est la SOMME des deux tetes, c'est
+                    # ce qu'il faut maximiser. Mais `entropy_flat` est AFFICHE
+                    # et compare a un plafond de ln(2) : y melanger la tete de
+                    # taille rendrait le chiffre incomparable a tout
+                    # l'historique du depot, et incomparable a lui-meme selon
+                    # la proportion d'entrees dans le lot. On affiche donc la
+                    # DIRECTION seule, et la taille a part.
+                    _ent_dir = dist.entropy()
                     entropy_flat = (
-                        entropy_per_state[_flat_b].mean()
-                        if bool(_flat_b.any()) else entropy
+                        _ent_dir[_flat_b].mean()
+                        if bool(_flat_b.any()) else _ent_dir.mean()
                     )
+                    entropy_budget = _ent_t.mean()
 
                     # GARDE-FOU 3 : ratio PPO clampé pour éviter exp() explosif
                     log_ratio = new_log - lb_old
@@ -5476,10 +5970,23 @@ def run_training_on_split(
                     # l'ordre de 1e-4. La policy restait clouée à l'uniforme,
                     # donc plafonnée à p = 1/3 = 0.333 — condamnée à repasser
                     # sous le seuil de conviction dès que la rampe atteint 0.40.
-                    entropy_bonus = entropy_coef_epoch * entropy_flat
+                    # LE BONUS PORTE SUR LES DEUX TETES, et l'oublier a ete
+                    # un vrai bug, pas un detail d'affichage.
+                    #
+                    # En separant `entropy_flat` pour que le journal reste
+                    # lisible, je l'avais rendue « direction seule » — or c'est
+                    # ELLE qui entre dans la perte. La tete de budget se
+                    # retrouvait sans aucune regularisation d'exploration et
+                    # pouvait s'effondrer sur un palier sans que rien ne l'en
+                    # empeche.
+                    entropy_bonus = entropy_coef_epoch * (entropy_flat
+                                                          + entropy_budget)
 
-                    # Sur un maximum de ln(3) = 1.0986, passer sous 0.1 est un
-                    # vrai effondrement de la policy.
+                    # Sur un maximum de ln(2) = 0.693 en long-only, passer sous
+                    # 0.1 est un vrai effondrement de la policy. Le controle
+                    # reste sur la DIRECTION : c'est elle qui decide de trader,
+                    # et son effondrement est d'une autre nature que celui du
+                    # budget, que `Hbudget` signale a part.
                     if entropy_flat.item() < 0.1:
                         entropy_bonus = entropy_bonus * 5.0
 
@@ -5511,9 +6018,26 @@ def run_training_on_split(
                     if cibles_aux is not None:
                         y_b, ok_b = cibles_aux[0][ids], cibles_aux[1][ids]
                         if ok_b.any():
-                            pred = policy.rendement(sb)
-                            aux_loss = ((pred - y_b).pow(2).mean(dim=1)
-                                        * ok_b).sum() / ok_b.sum()
+                            pred = _rend_u
+                            # MOYENNE SUR LES COLONNES PERMISES SEULEMENT.
+                            #
+                            # C'etait `.mean(dim=1)` sur les deux : en
+                            # long-only, la moitie du gradient auxiliaire
+                            # entrainait la colonne vendeuse.
+                            #
+                            # CONSEQUENCE A CONNAITRE : diviser par le nombre
+                            # de colonnes LUES au lieu de 2 rend a la colonne
+                            # acheteuse tout le poids de `aux_coef`, au lieu
+                            # de la moitie. C'est l'effet voulu — concentrer
+                            # le gradient, pas affaiblir la tete — mais cela
+                            # DOUBLE de fait le coefficient auxiliaire en
+                            # long-only. Si `AuxL` s'emballe ou si la tete de
+                            # rang se met a dominer le tronc, c'est ici qu'il
+                            # faut regarder.
+                            _err = (pred - y_b).pow(2) * _m_cotes
+                            aux_loss = (
+                                (_err.sum(dim=1) / _m_cotes.sum()) * ok_b
+                            ).sum() / ok_b.sum()
                             loss = loss + cfg.aux_coef * aux_loss
 
                 # GARDE-FOU 5 : check la loss finale
@@ -5583,6 +6107,7 @@ def run_training_on_split(
                 epoch_aux_loss.append(aux_loss.item())
                 epoch_entropy.append(entropy.item())
                 epoch_entropy_flat.append(entropy_flat.item())
+                epoch_entropy_budget.append(float(entropy_budget.item()))
                 epoch_kl.append(approx_kl)
                 # Norme du gradient AVANT clipping (clip_grad_norm_ la retourne).
                 # Le rapport gnorm / max_grad_norm donne le facteur exact par
@@ -5607,7 +6132,21 @@ def run_training_on_split(
         # pour atteindre la cible. Borne entre 1 et le plafond, et lissee de
         # moitie pour qu'une epoch atypique ne fasse pas osciller le budget.
         _joues = max(sampling_audit.get("episodes_joues", 1), 1)
-        _par_ep = max(sampling_audit["decisions"] / _joues, 1e-9)
+        # ON COMPTE LES TRANSITIONS VERSEES, PLUS LES DECISIONS.
+        #
+        # Les deux se confondaient tant qu'une decision n'existait que si une
+        # entree etait possible : presque chacune ouvrait une position, donc
+        # produisait une transition. Depuis que `deciding` interroge la
+        # capacite AU PLAFOND, l'environnement est consulte sur presque toutes
+        # les barres et la plupart des decisions finissent en « attendre » —
+        # or une decision qui n'ouvre rien N'EST PAS versee au tampon.
+        #
+        # Mesure de l'epoch 1 d'exec14 : 33 307 decisions pour 12 episodes,
+        # soit 2 776 par episode. Viser `cible_decisions / 2776` aurait ramene
+        # le budget a UN episode par epoch — une seule fenetre de marche par
+        # gradient. Le compteur mesurait la consultation, pas l'apprentissage.
+        _transitions = max(_n_transitions, 1)
+        _par_ep = max(_transitions / _joues, 1e-9)
         _vise = int(round(cfg.cible_decisions / _par_ep))
         _vise = max(1, min(_vise, cfg.episodes_per_epoch))
         n_episodes_courant[0] = max(1, (n_episodes_courant[0] + _vise) // 2)
@@ -5677,6 +6216,11 @@ def run_training_on_split(
         pbs_val: List[List[float]] = [[], []]   # convictions BUY / SELL sur le val
         val_pnl = []
         val_dd = []
+        # COMMENT CHAQUE EPISODE DE VALIDATION S'EST TERMINE. Le creux ne
+        # suffit plus a juger : depuis que l'episode va au bout de sa tranche,
+        # un creux de 60 % peut etre suivi d'une remontee. Ce qui disqualifie
+        # un checkpoint n'est plus un pourcentage, c'est un compte DETRUIT.
+        val_fins: List[str] = []
         val_trades = []
         val_trades_side: List[int] = []
 
@@ -5796,7 +6340,7 @@ def run_training_on_split(
                     masks_b = torch.from_numpy(
                         np.repeat(MASK_FLAT[None, :], len(cal_active), axis=0)
                     ).to(device)
-                    logits_b, _ = policy(st)
+                    logits_b, _, _, _rend_c = policy.sorties(st)
                     probs_np = torch.softmax(
                         logits_b.masked_fill(~masks_b, MASK_VALUE), dim=-1
                     ).cpu().numpy()
@@ -5808,7 +6352,7 @@ def run_training_on_split(
                     # cotes, toujours.
                     if getattr(cfg, "tri_par_tete_aux", False):
                         try:
-                            _a = policy.rendement(st).float().cpu().numpy()
+                            _a = _rend_c.float().cpu().numpy()
                             probs_np = 1.0 / (1.0 + np.exp(-np.clip(_a, -30, 30)))
                         except Exception:
                             pass
@@ -5818,7 +6362,8 @@ def run_training_on_split(
                 pas_courant += 1
                 suite = []
                 for bi, k in enumerate(cal_active):
-                    calib_envs[k].set_risk_scale(1.0)
+                    # La calibration force HOLD a chaque pas : aucune
+                    # position n'y est ouverte, donc l'echelle n'y sert a rien.
                     ns, _r, done, _, info = calib_envs[k].step(2)   # HOLD forcé
                     v_states[k] = ns
                     v_infos[k] = info
@@ -5841,8 +6386,8 @@ def run_training_on_split(
         # resultats de la passe de TRADING, elle toujours sautee, sont repris.
         if not _valide and _val_prec is not None:
             (val_pnl, val_dd, val_trades, val_trades_side,
-             _, _val_epoch) = _val_prec
-            val_pnl, val_dd = list(val_pnl), list(val_dd)
+             _, _val_epoch, val_fins) = _val_prec
+            val_pnl, val_dd, val_fins = list(val_pnl), list(val_dd), list(val_fins)
             val_trades, val_trades_side = list(val_trades), list(val_trades_side)
 
         # Barres issues de CETTE distribution, une par côté, budget partagé.
@@ -5929,8 +6474,11 @@ def run_training_on_split(
                 #
                 # `peut_entrer()` demande au SOLDE, pas au tableau : c'est la
                 # meme regle partagee que `kairos_live` appelle desormais.
-                deciding = [k for k in v_active if val_envs[k].peut_entrer()]
+                deciding = [k for k in v_active if val_envs[k].peut_decider()]
                 v_actions = {k: 2 for k in v_active}
+                # Budget choisi par la tete de budget. Le reglage par
+                # defaut sert aux envs qui n'ont pas encore decide.
+                v_budgets = {}
 
                 if deciding:
                     vb = np.stack([v_states[k] for k in deciding], axis=0)
@@ -5939,7 +6487,16 @@ def run_training_on_split(
                         np.repeat(MASK_FLAT[None, :], len(deciding), axis=0)
                     ).to(device)
 
-                    logits_b, _ = policy(st)
+                    # UN SEUL PASSAGE DANS LE TRONC pour toutes les tetes.
+                    # Profil du 2026-09-19 : le passage avant pese 95 % de la
+                    # collecte. La cause n'etait pas le calcul — 46 000
+                    # parametres — mais le NOMBRE de traversees : direction,
+                    # budget et rendement etaient demandes separement, soit
+                    # deux a trois encodages par lot, doubles par l'ensemble.
+                    # `sorties` les rend en un passage, terme pour terme
+                    # identiques aux appels separes.
+                    logits_b, _, _bud_v, _rend_v = policy.sorties(st)
+                    _tl_np = _bud_v.argmax(-1).cpu().numpy()
                     logits_mb = logits_b.masked_fill(~masks_b, MASK_VALUE)
                     probs_np = torch.softmax(logits_mb, dim=-1).cpu().numpy()
 
@@ -5952,7 +6509,7 @@ def run_training_on_split(
                     # de l'echelle.
                     if getattr(cfg, "tri_par_tete_aux", False):
                         try:
-                            _aux = policy.rendement(st).float().cpu().numpy()
+                            _aux = _rend_v.float().cpu().numpy()
                             probs_np = 1.0 / (1.0 + np.exp(-np.clip(_aux, -30, 30)))
                         except Exception:
                             pass
@@ -5979,11 +6536,34 @@ def run_training_on_split(
                         # une occasion ne doit pas participer au quantile qui
                         # la juge.
                         a = val_decisions[k].decide(pb, ps)
+                        # MEME REGLE QU'EN ROLLOUT : le budget est pose d'abord, et
+                        # c'est LUI qui ouvre ou refuse l'entree. `deciding`
+                        # interroge la capacite au plafond, donc sans ce
+                        # controle on entrerait sur une capacite qu'un budget
+                        # serre n'autorise pas — et la mesure jouerait une
+                        # autre strategie que celle qu'on entraine.
+                        _ve = val_envs[k]
+                        _ve.set_budget_risque(
+                            float(BUDGETS_RISQUE[int(_tl_np[bi])]))
+                        if a != 2 and _ve.places_ouvrables(
+                                float(_ve.data.close[
+                                    min(_ve.idx, _ve.data.length - 1)])) <= 0:
+                            a = 2
                         v_actions[k] = a
+                        # LE BUDGET SUIT LA MEME REGLE QUE LA DIRECTION :
+                        # deterministe a la mesure. En rollout il est TIRE de
+                        # la tete de budget ; ici on prend son argmax,
+                        # exactement comme la direction passe par une barre
+                        # calibree au lieu d'un tirage. Garder un budget fixe
+                        # ferait mesurer une AUTRE strategie que celle qu'on
+                        # entraine — le defaut qui a deja coute a ce depot.
+                        v_budgets[k] = float(
+                            BUDGETS_RISQUE[int(_tl_np[bi])])
 
                 still = []
                 for k in v_active:
-                    val_envs[k].set_risk_scale(1.0)
+                    val_envs[k].set_budget_risque(
+                        v_budgets.get(k, cfg.budget_risque))
                     ns, _r, done, _, info = val_envs[k].step(v_actions[k])
                     v_states[k] = ns
                     v_infos[k] = info
@@ -6018,6 +6598,7 @@ def run_training_on_split(
             final_equity = ve.capital + latent
             val_pnl.append(final_equity - cfg.initial_capital)
             val_dd.append(v_infos[k]["drawdown"])
+            val_fins.append(str(v_infos[k].get("done_reason") or "episode_end"))
             val_trades.extend(ve.trades_pnl)
             val_trades_side.extend(ve.trades_side)
 
@@ -6047,12 +6628,18 @@ def run_training_on_split(
             _val_epoch = epoch
             _val_prec = (list(val_pnl), list(val_dd), list(val_trades),
                          list(val_trades_side), [list(pbs_val[0]),
-                                                 list(pbs_val[1])], epoch)
+                                                 list(pbs_val[1])], epoch,
+                         list(val_fins))
 
         # Recalibration pour l'epoch SUIVANTE, sur la fenêtre de validation.
         # Même garde-fou : filtrer une distribution plate revient à tirer au sort.
         val_profit = float(sum(val_pnl))
         val_max_dd = float(max(val_dd) if val_dd else 0.0)
+        # UN COMPTE DETRUIT, c'est-a-dire une fin que le COURTIER aurait
+        # imposee : appel de marge, impossibilite de financer le lot minimum,
+        # ou equite sous zero. Une fin de tranche n'en est pas une.
+        _FINS_RUINE = ("ruine", "appel_de_marge", "solde_insuffisant")
+        val_ruine = int(sum(1 for f in val_fins if f in _FINS_RUINE))
         val_num_trades = len(val_trades)
         val_winrate = (
             float(np.mean([t > 0 for t in val_trades]))
@@ -6220,8 +6807,22 @@ def run_training_on_split(
         _sa = []
         if _rang_idx is not None:
             policy.eval()
-            _extra = np.zeros((cfg.lookback, 4), np.float32)
-            _extra[:, 3] = 1.0
+            # Etat A PLAT : aucune position, capacite pleine, aucun creux.
+            #
+            # LA LARGEUR VIENT DE `N_POS_FEATURES`, ET NON D'UN 5 EN DUR.
+            # Elle etait ecrite en dur, et ajouter une sixieme colonne d'etat
+            # a fait tomber le run sur un `RuntimeError` de dimension — la
+            # seule chance dans l'affaire, car un bloc trop COURT leve, la ou
+            # un bloc mal REMPLI se serait tu. Toute colonne future doit donc
+            # etre initialisee ici explicitement.
+            _extra = np.zeros((cfg.lookback, N_POS_FEATURES), np.float32)
+            _extra[:, 3] = 1.0          # capacite pleine
+            # Le budget de reference est celui de depart : cette passe mesure
+            # le CLASSEMENT des occasions, pas une politique de portefeuille,
+            # et il lui faut une valeur definie plutot qu'un zero qui ne
+            # correspond a aucun palier atteignable.
+            _extra[:, 5] = float(cfg.budget_risque
+                                 / max(BUDGETS_RISQUE[-1], 1e-9))
             _s = []
             with torch.no_grad():
                 for _d in range(0, len(_rang_idx), 8192):
@@ -6230,9 +6831,10 @@ def run_training_on_split(
                         np.concatenate([val_data.features[i - cfg.lookback:i],
                                         _extra], axis=-1) for i in _b])
                     _t = torch.from_numpy(_o).to(device)
-                    _lg = policy(_t)
-                    if isinstance(_lg, tuple):
-                        _lg = _lg[0]
+                    # UN SEUL PASSAGE : cette boucle traversait le tronc
+                    # deux fois par lot de 8 192, pour la direction puis pour
+                    # le rendement.
+                    _lg, _, _, _rend_r = policy.sorties(_t)
                     _pr = torch.softmax(_lg, dim=-1).float().cpu().numpy()
                     _s.append(_pr[:, 0] - _pr[:, 1])
                     # LA TETE AUXILIAIRE CLASSE-T-ELLE MIEUX QUE LA POLITIQUE ?
@@ -6251,7 +6853,7 @@ def run_training_on_split(
                     # celui de la politique reste plat, c'est elle qui doit
                     # trier en production.
                     try:
-                        _a = policy.rendement(_t).float().cpu().numpy()
+                        _a = _rend_r.float().cpu().numpy()
                         _sa.append(_a[:, 0] - _a[:, 1])
                     except Exception:
                         _sa = None
@@ -6315,6 +6917,16 @@ def run_training_on_split(
             # politique differenciee a 63 %.
             f"Hflat {np.mean(epoch_entropy_flat):>5.3f}/"
             f"{math.log(sum(cotes_permises(cfg.side)) + 1):>5.3f}  "
+            f"Hbudget {np.mean(epoch_entropy_budget) if epoch_entropy_budget else float(chr(110)+chr(97)+chr(110)):>5.3f}/{np.log(N_BUDGETS):>5.3f}  "
+            # LA REPARTITION DES PALIERS RETENUS, et entre parentheses la part
+            # de fois ou le palier choisi a lui-meme refuse l'entree.
+            # `Hbudget` dit s'il hesite ; ceci dit VERS QUOI il penche.
+            + f"budgets[" + " ".join(
+                f"{100*BUDGETS_RISQUE[_i]:.0f}%:"
+                f"{100*budgets_epoch[_i]/max(sum(budgets_epoch),1):.0f}"
+                + (f"({100*budgets_refus[_i]/max(budgets_epoch[_i],1):.0f})"
+                   if budgets_refus[_i] else "")
+                for _i in range(N_BUDGETS)) + "]  "
             f"sel[train {100*selectivite:>4.1f}% val {100*val_selectivity:>4.1f}%] "
             f"thr[tr {conf_thr:.3f} "
             f"valB {val_decisions[0].thresholds[0]:.3f} valS {val_decisions[0].thresholds[1]:.3f}] "
@@ -6597,7 +7209,8 @@ def run_training_on_split(
         #
         # On refuse donc de retenir un checkpoint dont la DERNIERE mesure de
         # portefeuille a creve le garde-fou de creux. Le seuil n'est pas
-        # invente : c'est `max_drawdown`, celui qui termine deja un episode.
+        # invente : c'est la destruction du compte, celle qui termine deja
+        # un episode.
         #
         # LE CREUX EST CELUI DE L'EPOCH JUGEE. `validation_tous_les` vaut 1
         # depuis le 2026-09-19 : le portefeuille est mesure a chaque epoch,
@@ -6611,14 +7224,14 @@ def run_training_on_split(
         _score_rang = _rho_aux if np.isfinite(_rho_aux) else _rho_ep
         _retenu, _pourquoi = retient_checkpoint(
             gain_top=_gain_top, score_rang=_score_rang,
-            val_num_trades=val_num_trades, val_max_dd=val_max_dd,
+            val_num_trades=val_num_trades, val_ruine=val_ruine,
             best_metric=best_metric,
-            min_trades=cfg.min_val_trades_save, max_dd=cfg.max_drawdown)
+            min_trades=cfg.min_val_trades_save)
         # UN REFUS POUR CAUSE DE CREUX SE DIT. Les autres refus sont la
         # normale — un sommet sous le record, c'est quatre-vingts epochs sur
         # quatre-vingt-dix. Celui-la est different : le modele etait
         # MEILLEUR au classement et c'est le portefeuille qui l'a disqualifie.
-        if not _retenu and _pourquoi.startswith("creux"):
+        if not _retenu and _pourquoi.startswith("compte detruit"):
             _refus_creux += 1
             print(f"  {_col('REFUSE', _C.RED + _C.BOLD)}  sommet "
                   f"{_gain_top:+.3f} R meilleur que {best_metric:+.3f}, "
@@ -6666,8 +7279,9 @@ def run_training_on_split(
         print(f"[{cfg.side.upper()}{suffix}] AUCUN checkpoint 'best' ecrit sur "
               f"ce fold. Le fold suivant reprendra 'last'.")
         if _refus_creux:
-            print(f"    {_refus_creux} candidat(s) ont ete ECARTES pour un "
-                  f"creux au-dela de {100*cfg.max_drawdown:.0f} %. Le "
+            print(f"    {_refus_creux} candidat(s) ont ete ECARTES parce que "
+                  f"le compte a ete DETRUIT en validation — appel de marge, "
+                  f"lot minimum infinancable, ou equite a zero. Le "
                   f"classement progressait, le portefeuille mourait : c'est "
                   f"le cas ou il faut valider a CHAQUE epoch "
                   f"(validation_tous_les = 1) pour que le critere voie ce "
@@ -6681,8 +7295,7 @@ def run_training_on_split(
               f"occasion. C'est lui qui ouvre le fold suivant.")
         if _refus_creux:
             print(f"    ({_refus_creux} candidat(s) mieux classes ont ete "
-                  f"ecartes pour un creux au-dela de "
-                  f"{100*cfg.max_drawdown:.0f} %.)")
+                  f"ecartes pour un compte detruit en validation.)")
 
     if not cfg.evaluate_test:
         print(f"[{cfg.side.upper()}{suffix}] Entrainement termine. TEST reserve, non consulte.")
@@ -6733,8 +7346,9 @@ def run_training_on_split(
             # MEME REGLE QU'EN VALIDATION ET QU'A L'ENTRAINEMENT. Mesurer
             # le test sur une strategie a une position quand on en deploie
             # une a plusieurs mesurerait ce que personne ne joue.
-            deciding = [k for k in t_active if test_envs[k].peut_entrer()]
+            deciding = [k for k in t_active if test_envs[k].peut_decider()]
             t_actions = {k: 2 for k in t_active}
+            t_budgets = {}
 
             if deciding:
                 tb = np.stack([t_states[k] for k in deciding], axis=0)
@@ -6743,7 +7357,9 @@ def run_training_on_split(
                     np.repeat(MASK_FLAT[None, :], len(deciding), axis=0)
                 ).to(device)
 
-                logits_b, _ = policy(st)
+                # UN SEUL PASSAGE DANS LE TRONC, comme en validation.
+                logits_b, _, _bud_t, _rend_t = policy.sorties(st)
+                _tl_np = _bud_t.argmax(-1).cpu().numpy()
                 logits_mb = logits_b.masked_fill(~masks_b, MASK_VALUE)
                 probs_np = torch.softmax(logits_mb, dim=-1).cpu().numpy()
                 # MEME SCORE DE TRI QU'EN VALIDATION. Mesurer le test avec un
@@ -6751,7 +7367,7 @@ def run_training_on_split(
                 # mesurerait une strategie que personne ne deploierait.
                 if getattr(cfg, "tri_par_tete_aux", False):
                     try:
-                        _a = policy.rendement(st).float().cpu().numpy()
+                        _a = _rend_t.float().cpu().numpy()
                         probs_np = 1.0 / (1.0 + np.exp(-np.clip(_a, -30, 30)))
                     except Exception:
                         pass
@@ -6766,11 +7382,24 @@ def run_training_on_split(
                     # les données censées mesurer la généralisation.
                     pb, ps = float(probs_np[bi, 0]), float(probs_np[bi, 1])
                     a = test_decisions[k].decide(pb, ps)
+                    # MEME REGLE QU'EN ROLLOUT ET QU'EN VALIDATION.
+                    _te = test_envs[k]
+                    _te.set_budget_risque(
+                        float(BUDGETS_RISQUE[int(_tl_np[bi])]))
+                    if a != 2 and _te.places_ouvrables(
+                            float(_te.data.close[
+                                min(_te.idx, _te.data.length - 1)])) <= 0:
+                        a = 2
                     t_actions[k] = a
+                    # LE BUDGET SUIT LA MEME REGLE QUE LA DIRECTION :
+                    # deterministe a la mesure, par argmax de la tete.
+                    t_budgets[k] = float(
+                        BUDGETS_RISQUE[int(_tl_np[bi])])
 
             still = []
             for k in t_active:
-                test_envs[k].set_risk_scale(1.0)
+                test_envs[k].set_budget_risque(
+                    t_budgets.get(k, cfg.budget_risque))
                 ns, _r, done, _, info = test_envs[k].step(t_actions[k])
                 t_states[k] = ns
                 t_infos[k] = info
@@ -7226,7 +7855,62 @@ if __name__ == "__main__":
     # relatif de 4.68 points de base contre 6.63 — des fragments epars, pas
     # des seances, et une geometrie qui n'est pas la meme. Le detail est dans
     # `prepare_or.py`.
-    cfg_long.model_prefix = "saintv2_or_exec06"
+    # exec07 — NOUVELLE LIGNEE D'OBSERVATION : 261 entrees au lieu de 260.
+    #
+    # La cinquieme colonne d'etat porte la DISTANCE AU GARDE-FOU DE CREUX.
+    # Le modele ne la voyait pas, alors qu'on lui demande de ne pas franchir
+    # cette limite : la capacite restante lui en donnait 67 % de la variance,
+    # mais le PIC manquait, et deux observations identiques pouvaient
+    # correspondre a douze points de creux d'ecart.
+    #
+    # AUCUN CHECKPOINT ANTERIEUR N'EST CHARGEABLE. `checkpoints.py` filtre
+    # sur `n_features` et les refuse au lieu de les charger de travers —
+    # verifie.
+    # exec08 — LA PENALITE DE CREUX EST UNE RAMPE, PLUS UNE FALAISE.
+    #
+    # ET C'EST PRECISEMENT POURQUOI LE PREFIXE DOIT CHANGER. L'observation
+    # est identique a exec07 — 261 entrees — donc le filtre sur `n_features`
+    # de `checkpoints.py` ACCEPTERAIT ces poids sans rien signaler. Ils ont
+    # ete entraines contre une recompense differente : le critic a appris a
+    # evaluer un monde ou approcher le garde-fou ne coutait rien jusqu'a la
+    # marche. Le reprendre ici reviendrait a demarrer avec une fonction de
+    # valeur fausse, en silence. La seule barriere est le prefixe.
+    # exec09 — L'EPISODE MEURT DE RUINE, PLUS D'UN POURCENTAGE DE CREUX.
+    #
+    # ET C'EST POURQUOI LE PREFIXE DOIT CHANGER, alors meme que
+    # l'observation garde ses 261 entrees : la CINQUIEME A CHANGE
+    # D'ECHELLE. Elle valait `creux / 0.40` et saturait a 1 des 40 % de
+    # creux ; elle vaut maintenant le creux lui-meme, donc 1 seulement a la
+    # ruine. Le filtre sur `n_features` de `checkpoints.py` ne peut pas voir
+    # cela — il compte les colonnes, pas ce qu'elles signifient — et
+    # accepterait les poids d'exec08 en silence, avec une entree dont le
+    # sens a ete divise par 2.5. Le prefixe est la seule barriere.
+    # exec10 — lambda passe de 1.25 a 6.5. La recompense change, donc les
+    # poids d'exec09 ne sont pas reprenables : leur critic a appris a evaluer
+    # un monde ou approcher la ruine coutait cinq fois moins.
+    # exec17 — UN SEUL PASSAGE DANS LE TRONC. Changement de COUT, pas de
+    # comportement : les sorties sont identiques au bit.
+    #
+    # Profil de la collecte d'exec16 : le passage avant pese 95 % du temps,
+    # le gating 0.3 %, `env.step` 4.6 %. Soit 87 ms par lot pour un reseau de
+    # 46 000 parametres — un cout de LANCEMENT, pas de calcul, parce que le
+    # tronc etait traverse plusieurs fois par lot :
+    #
+    #     rollout                4 traversees (direction + budget, x2 membres)
+    #     validation / test      6 (+ rendement)
+    #     mise a jour PPO        6, et trois graphes d'autograd
+    #     passe de classement    4 par lot de 8 192
+    #
+    # Les tetes ne sont que des couches lineaires sur la MEME representation.
+    # `PolitiqueEnsemble.sorties` les rend en un passage, et chaque tete est
+    # combinee comme elle l'etait separement — moyenne des probabilites pour
+    # la direction et le budget, moyenne directe pour la valeur et le
+    # rendement. Ecart maximal verifie : 0.000e+00 sur les quatre.
+    #
+    # Reprend exec16 : revision horaire du budget, bonus d'entropie sur les
+    # deux tetes, `H` ramenee a la direction seule, budget d'episodes compte
+    # sur les transitions versees.
+    cfg_long.model_prefix = "saintv2_or_exec17"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -7250,7 +7934,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward or_exec06 LONG-ONLY (XAUUSD seul) : trois folds CHAINES, le meilleur checkpoint de chacun ouvre le suivant.")
+    print("Walk-forward or_exec17 LONG-ONLY (XAUUSD seul) : trois folds CHAINES, le meilleur checkpoint de chacun ouvre le suivant.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
@@ -7294,9 +7978,9 @@ if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("  WALK-FORWARD LONG-ONLY TERMINÉ : 3 folds.")
     print("  Fichiers générés :")
-    print("    best_saintv2_or_exec06_long_wf1_long_wf1.pth")
-    print("    best_saintv2_or_exec06_long_wf2_long_wf2.pth")
-    print("    best_saintv2_or_exec06_long_wf3_long_wf3.pth")
+    print("    best_saintv2_or_exec17_long_wf1_long_wf1.pth")
+    print("    best_saintv2_or_exec17_long_wf2_long_wf2.pth")
+    print("    best_saintv2_or_exec17_long_wf3_long_wf3.pth")
     print("=" * 70)
 
     # ---------------------------------------------------------

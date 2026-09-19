@@ -31,6 +31,285 @@ Ordre antichronologique.
 
 ---
 
+## 19 septembre 2026 (nuit) — λ était ancré sur un chiffre, il fallait l'ancrer sur un rapport
+
+### Ce que sept epochs ont montré
+
+exec09 a tourné avec `penalite_creux = 1.25`. L'acteur s'est dégelé à l'epoch 6
+(`g_actor` 1.3e-05 → 0.43, `clipfrac` 29 %, entropie 0.693 → 0.683).
+
+| ep | sommet | \|R\| | DD val | détruits | PnL total | **PnL médian/épisode** |
+|---|---|---|---|---|---|---|
+| 1 | +0.748 | 6.77 | 104,9 % | 1/8 | +14 144 | **−974** |
+| 2 | −0.259 | 8.71 | 100,3 % | 1/8 | +2 187 | **−931** |
+| 3 | +0.004 | 7.27 | 102,8 % | 3/8 | −4 872 | **−978** |
+| 4 | +0.348 | 5.10 | 100,4 % | 1/8 | −4 958 | **−967** |
+| 5 | +0.400 | 5.21 | 108,3 % | 1/8 | −8 018 | **−990** |
+| 6 | +0.565 | 3.09 | 103,8 % | 2/8 | −7 925 | **−969** |
+| 7 | +1.073 | 7.56 | 112,0 % | 3/8 | +25 698 | **−904** |
+
+**Le PnL médian par épisode est resté à −950 $ sur 1 000 $, sans exception.**
+L'épisode typique perd 90 à 99 % du capital, epoch après epoch, y compris
+après le dégel de l'acteur.
+
+Les totaux, eux, sautent partout — uniquement selon qu'un épisode a explosé à
+la hausse. L'epoch 7 : l'épisode 2 fait **+26 985 $** à lui seul ; sans lui,
+l'epoch vaut −1 287 $. Le `sommet +1.073 R` et le `PF 3.02` décrivent ce seul
+billet gagnant.
+
+### L'erreur de calibrage, et elle est instructive
+
+En transformant la falaise en potentiel, j'ai voulu conserver sa magnitude et
+j'ai ancré λ dessus : d'abord 0.2, puis 1.25 quand `d` a été étendu jusqu'à la
+ruine (`λ·0.40² = 0.2`). **Les deux fois j'ai ancré sur un CHIFFRE sans
+vérifier à quelle échelle de récompense ce chiffre avait été réglé.**
+
+| run | `\|R\|` par décision |
+|---|---|
+| exec04 (budget de risque 3 %) | ~2,8 |
+| exec07 (budget 0, garde-fou 40 %) | **1,36** ← l'ancrage |
+| exec09 (budget 0, sans garde-fou) | **6,77** (médiane) |
+
+Le levier illimité a multiplié le signal monétaire par cinq pendant que la
+pénalité restait calée sur l'ancienne échelle. Une position traversant un
+creux de 0,5 à 0,7 payait `1,25 × 0,24 = 0,30` contre un `|R|` de 7,6 : **4 %
+du signal qu'elle devait contrebalancer.**
+
+### La correction
+
+L'ancrage devient un **rapport** : `1.25 × (6.77 / 1.36) ≈ 6.2`, arrondi à
+**6.5**. Une position traversant le même creux paie désormais 1,56, soit
+~21 % du signal d'une décision.
+
+`test_potentiel_creux.py` contrôle maintenant cette proportion et échoue si
+elle sort de la plage 5–40 %. `test_concurrence` ne montre qu'un écart par
+scénario, sur les récompenses seules — capital final et trades identiques au
+bit près (644,2185 $ sur `break-even actif@3000`), donc la référence a été
+refigée.
+
+### Ce que cette mesure ne dit pas
+
+Sept epochs dont deux seulement avec un acteur qui apprend. Il n'est **pas**
+établi que λ = 1.25 aurait échoué à plus long terme : ce qui est établi est
+que sa magnitude relative était cinq fois plus faible que ce que je croyais
+régler. C'est un défaut de calibrage démontré, pas un échec d'apprentissage
+démontré.
+
+### Le risque propre à ce réglage
+
+Le terme reste un potentiel, donc il ne déplace pas la politique optimale quel
+que soit λ. Mais un λ trop grand écrase le gradient monétaire dans le bruit, et
+**le symptôme ne ressemble pas à une erreur** : le modèle cesserait d'ouvrir au
+lieu d'ouvrir mieux, et le creux descendrait. Si le nombre de trades s'effondre
+pendant que le creux s'améliore, c'est ce terme qu'il faut soupçonner en
+premier.
+
+Run `or_exec10` lancé sur cette base. Nouveau préfixe : la récompense change,
+donc le critic d'exec09 a appris à évaluer un monde où approcher la ruine
+coûtait cinq fois moins.
+
+---
+
+## 19 septembre 2026 (soir) — les deux garde-fous de laboratoire sont retirés
+
+### La question posée
+
+« Si l'épisode est coupé à 40 % de creux, on ne sait pas ce que le modèle fait
+sur le reste de la tranche — donc on ne sait pas s'il est réellement bon. »
+
+Elle est juste, et elle vise plus loin que ce que j'avais mesuré le matin.
+J'avais montré que la coupure était **flatteuse** ; la question porte sur
+l'**ignorance** qu'elle crée.
+
+### Ce que la coupure coûtait, mesuré
+
+29 épisodes, garde-fou désactivé, chacun comparé **à lui-même** :
+
+| | sélectivité 5 % | sélectivité 32 % |
+|---|---|---|
+| épisodes tués par le garde-fou | 29/29 | 29/29 |
+| barres réellement jouées | 26 % | 17 % |
+| **auraient fini gagnants (> 1 000 $)** | **10/29 — 34 %** | 2/29 — 7 % |
+| auraient fini pires qu'à la coupure | 21/29 — 72 % | 27/29 — 93 % |
+| équité finale, médiane / max | 194 $ / 10 998 $ | 146 $ / 48 540 $ |
+
+**Un tiers des épisodes tués auraient fini au-dessus du capital de départ.**
+La coupure ne disait pas « ce modèle est mauvais », elle disait « ce modèle a
+touché 40 % au moins une fois » — et jetait avec ça un tiers de ce qu'elle
+touchait, sans qu'on puisse le savoir.
+
+Deux mécanismes s'y ajoutaient, du côté apprentissage :
+
+- le modèle n'expérimentait **jamais** l'au-delà du garde-fou, donc ne pouvait
+  pas apprendre à se remettre d'un creux profond ;
+- `last_value = 0.0` à toute fin d'épisode : sur une trajectoire perdante à
+  −0.0417 par barre, continuer vaut du négatif et mourir vaut zéro. **Mourir
+  était l'option de plus haute valeur.**
+
+### Ce qui a été retiré, et ce qui reste
+
+`max_drawdown = 0.40` et `min_capital_frac = 0.20` sont supprimés — les
+réglages eux-mêmes, pas seulement leur usage : un réglage mort qui a l'air
+vivant est exactement la façon dont ce dépôt s'est déjà fait avoir.
+
+Ce qui termine un épisode est désormais ce qui termine un compte réel, et les
+trois étaient **déjà modélisés** : appel de marge sous 50 % de niveau, lot
+minimum infinançable, équité à zéro.
+
+Effet mesuré sur le régime de fin, à la sélectivité de validation :
+
+| | avant | après |
+|---|---|---|
+| barres jouées par tranche | 26 % | **98 %** |
+| fins | 100 % garde-fou | 12 appel de marge, 12 fin de tranche |
+
+Ce qui tronque encore est l'appel de marge — la contrainte réelle du courtier,
+pas une convention.
+
+### Trois conséquences qu'il a fallu traiter
+
+**La 5ᵉ colonne d'observation change d'échelle.** Elle valait `creux / 0.40` et
+saturait dès 40 % : au-delà, un compte à −40 % et un compte à −90 % donnaient
+la même valeur. Elle porte maintenant le creux lui-même, 1 à la ruine.
+`kairos_live.distance_garde_fou` a été aligné dans le même mouvement — sans
+quoi le live aurait présenté au modèle une entrée d'un autre sens.
+
+**λ est recalibré, par le même ancrage déplacé au même point.** `λ·0.40² = 0.2`
+donne **λ = 1.25** : la pénalité vaut exactement l'ancienne falaise à 40 % de
+creux, et continue de croître au-delà. Conséquence vérifiable : en dessous de
+40 % le terme est *numériquement identique* à celui d'avant, et
+`test_concurrence` rend `IDENTIQUE` sur ses six scénarios.
+
+**La règle de sélection ne peut plus être un pourcentage.** Elle refusait tout
+checkpoint dont un épisode dépassait 40 % de creux — ce qui se confondait avec
+« un épisode est mort ». Les épisodes allant maintenant au bout, un creux de
+60 % peut être suivi d'une remontée : garder 40 % refuserait presque tout, et
+sur un chiffre qu'aucun courtier n'applique. Le critère est désormais **le
+compte détruit**.
+
+### Ce que ces mesures ne disent pas
+
+Les entrées sont tirées **au hasard**. Elles décrivent ce que le marché fait
+après un creux profond sous exposition aveugle, pas ce qu'un modèle entraîné
+ferait — 29/29 épisodes crèvent 40 %, ce qui dit surtout que la politique
+aléatoire est mauvaise. Et le dimensionnement étant illimité, la queue haute
+(48 540 $) est amplifiée par le levier.
+
+Deux échecs de `test_training_economics` subsistent (coût d'entrée sur la
+première barre, spread dans le prix de sortie). Vérifié en mettant λ à zéro :
+ils sont **antérieurs** à ce changement et sans rapport avec lui.
+
+Run `or_exec09` lancé sur cette base. Nouveau préfixe bien que l'observation
+garde ses 261 entrées : `checkpoints.py` compte les colonnes, pas leur sens,
+et aurait accepté les poids d'exec08 en silence.
+
+---
+
+## 19 septembre 2026 — la pénalité de creux, et une rampe qu'il a fallu jeter
+
+### Ce que la falaise produisait
+
+La pénalité de creux valait `−0.2 si creux > 40 %, sinon 0` : rien entre 0 et
+le garde-fou, puis une marche à l'instant où l'épisode est tué. Mesure sur six
+épisodes à entrées neutres (3 % des barres) :
+
+| | |
+|---|---|
+| épisodes tués par le garde-fou | **5 / 6** |
+| durée médiane atteinte | 25 % de l'épisode |
+| récompense/barre sur les 200 dernières | **−0.0417** |
+| récompense/barre sur tout l'épisode | −0.0144 |
+
+La politique **perdait de plus en plus vite** au moment de mourir. Couper
+l'épisode lui évitait donc des milliers de barres négatives : dans le mécanisme
+RL standard la terminaison coûte le futur, mais ici le futur était négatif. La
+mort était un soulagement, et la marche de −0.2 son seul contrepoids.
+
+### La première correction était fausse, et le test l'a dit en une ligne
+
+J'ai remplacé la marche par une rampe sur le **niveau** : `−λ·d²`, avec `d` la
+distance au garde-fou bornée à 1, et `λ = 0.2` choisi pour que la rampe
+rejoigne exactement la falaise à `d = 1` — aucune magnitude nouvelle.
+
+Trois contrôles passaient : continuité, monotonie, et accord au bit près avec
+la 5ᵉ colonne d'observation. `test_concurrence` l'a quand même condamnée, au
+pas 18 du scénario `avec objectif` :
+
+```
+pas  18  act 2  r -0.0000419151  slots [-4.19151e-05]
+         p_sens [0]  fermes []  ouvert -1
+         creux 0.579 %   capital 994.2093  pic 1000.0000
+```
+
+Compte **plat** — aucune position, rien d'ouvert, rien de fermé — et prélevé
+quand même, à chaque barre, pour un creux hérité d'un trade déjà clos.
+
+Une taxe sur un **état** est une intégrale sur le temps. À `d = 0.5` elle coûte
+0.05 par barre, soit **−43 500** sur une epoch de 870 000 barres : elle noie
+tout le signal de trading. Et elle ne s'interrompt qu'en refaisant un sommet —
+ou **en mourant**. Je rendais la mort plus attirante en croyant l'en dissuader.
+
+Le défaut préexistait sous forme invisible : sous la falaise le montant valait
+zéro, et zéro ne se voit pas. La rampe n'a rien cassé, elle a révélé.
+
+### La forme retenue : le potentiel
+
+`Φ(s) = −λ·d²`, et la récompense reçoit `Φ(s′) − Φ(s)` — la seule **variation**
+du creux. Creusement : coût. Résorption : crédit égal. Compte plat : rien.
+
+Le terme télescope. Sur un épisode le total vaut `Φ(fin) − Φ(0) = −λ·d_fin²`,
+donc il ne dépend **pas** du temps passé sous l'eau. Vérifié sur trois épisodes,
+tous tués au garde-fou :
+
+| graine | barres | cumul facturé | attendu | écart |
+|---|---|---|---|---|
+| 7 | 131 | +0.200000000 | +0.200000000 | 0 |
+| 19 | 188 | +0.200000000 | +0.200000000 | 2.8e-17 |
+| 23 | 235 | +0.200000000 | +0.200000000 | 5.6e-17 |
+
+Un épisode tué au garde-fou paie donc **exactement l'ancienne falaise**, mais
+étalée le long du chemin — c'est le gradient qui manquait. Un épisode qui
+stationne à 20 % de creux cent mille barres paie 0.05 **une fois**.
+
+C'est aussi la seule classe de shaping dont on sache qu'elle ne change pas la
+politique optimale (Ng, Harada & Russell, 1999). C'est ce qui lève la réserve
+de fond : le shaping a enseigné une stratégie perdante ici pendant 75 epochs,
+mais c'était un shaping qui **ajoutait** de la valeur là où il n'y avait pas
+d'argent. Celui-ci n'en ajoute aucune, il redistribue dans le temps une
+magnitude déjà présente.
+
+Test permanent : `test_potentiel_creux.py`, quatre propriétés.
+
+**Ce que la mesure ne dit pas** : rien sur la rentabilité, ni même sur le fait
+que le modèle apprendra effectivement à éviter le garde-fou. Elle établit
+seulement que le terme a la forme annoncée. Si le modèle se met à ne plus
+ouvrir plutôt qu'à ouvrir mieux, c'est ce terme qu'il faut soupçonner d'abord.
+
+### Pourquoi un PnL d'epoch dépasse le solde de départ
+
+Question posée, deux mécanismes mesurés séparément — à l'exposition réelle du
+run (32 % de sélectivité), douze épisodes, tous tués par le garde-fou :
+
+| | |
+|---|---|
+| creux au moment de la coupure | médiane **43.8 %**, max **53.6 %** |
+| dépassement du seuil de 40 % | médiane +3.8 pt, max +13.6 pt |
+| capital le plus bas atteint | **514 $** sur 1 000 $ |
+| équité passée sous zéro | **0 / 12** |
+| perte médiane par épisode | −218 $ |
+
+1. **Le PnL d'une epoch est une somme sur les épisodes**, chacun repartant d'un
+   solde neuf de 1 000 $. Vingt épisodes à −218 $ font −4 359 $ sans qu'aucun
+   compte n'ait été vidé. Les −3 677 $ observés à l'epoch 4 tombent dedans.
+2. **Le `DD 66.5 %` affiché dépasse le garde-fou de 40 %** parce que celui-ci
+   est une *vérification* à la clôture de la barre, pas un ordre stop : plusieurs
+   stops tombent sur la même bougie et le creux constaté dépasse le seuil qui
+   l'a déclenché.
+
+Aucun compte n'est jamais passé sous zéro dans ces mesures.
+
+---
+
 ## 19 septembre 2026 — le chaînage des folds, et deux fois le débit de l'environnement
 
 Trois mesures, et deux découvertes qui n'étaient pas cherchées.

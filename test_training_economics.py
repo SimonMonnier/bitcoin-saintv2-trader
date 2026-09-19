@@ -88,10 +88,21 @@ class EconomicsTests(unittest.TestCase):
                 self.assertLess(reward,0)
                 self.assertEqual(e.trades_meta[0]['terminal_reason'],'episode_end')
 
-    def test_drawdown_guard_liquidates(self):
-        e=environment(max_drawdown=.00001,spread_bps=10.)
+    def test_ruine_liquide(self):
+        """Une fin de compte liquide les positions et la dit.
+
+        Ce test exigeait `done_reason == 'max_drawdown'`. Ce garde-fou a ete
+        retire le 2026-09-19 : aucun courtier ne coupe a 40 % de creux, et la
+        coupure laissait les trois quarts de chaque tranche non mesures. Ce
+        qui termine un compte est desormais ce qui le termine reellement —
+        appel de marge, lot minimum infinancable, equite a zero. On verifie
+        donc la LIQUIDATION, propriete commune a ces fins, plutot qu'un motif
+        qui n'existe plus.
+        """
+        e=environment(niveau_marge_liquidation=9e9,spread_bps=10.)
         _,_,done,_,info=e.step(0)
-        self.assertTrue(done);self.assertEqual(info['done_reason'],'max_drawdown')
+        self.assertTrue(done)
+        self.assertEqual(info['done_reason'],'appel_de_marge')
         self.assertEqual(e.position,0);self.assertEqual(len(e.trades_pnl),1)
 
     def test_time_exit_short_pays_ask(self):
