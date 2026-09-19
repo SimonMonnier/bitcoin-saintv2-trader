@@ -84,3 +84,6 @@ conviction.err
 *_norm.npz
 *_calib.json
 run_saintv2_*.json
+
+# Reglages locaux de la session Claude Code — propres a la machine.
+.claude/

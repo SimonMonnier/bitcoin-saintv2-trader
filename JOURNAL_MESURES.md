@@ -8,6 +8,163 @@ Ordre antichronologique.
 
 ---
 
+## 19 septembre 2026 — le chaînage des folds, et deux fois le débit de l'environnement
+
+Trois mesures, et deux découvertes qui n'étaient pas cherchées.
+
+### Ce qui interdisait le chaînage valait 0,013 écart-type
+
+`run_walkforward` levait une exception explicite : « le bootstrap inter-fold
+exige une adaptation explicite de normalisation ». L'argument est correct —
+chaque fold calculait ses statistiques sur **son** train, donc un réseau qui
+hériterait des poids du fold précédent verrait ses entrées à une autre échelle
+que celle sous laquelle il a appris. Il n'avait jamais été chiffré.
+
+Mesure : écart entre les statistiques de normalisation du fold 1 et celles des
+suivants, **exprimé en écarts-types du fold 1** — c'est exactement le décalage
+que verrait le réseau à l'entrée.
+
+```
+                       derive de moyenne          sigma_k / sigma_1
+   fold      med       p95       max        med      p95      max
+      2     0.008     0.063     0.125      1.007    1.074    1.253
+      3     0.013     0.092     0.162      1.011    1.084    1.281
+```
+
+Les huit colonnes qui dérivent le plus entre le fold 1 et le fold 3 sont
+toutes des mesures de volatilité ou de largeur de range : `vol_20_h1` 0,162 ;
+`vol_20` 0,155 ; `vol_20_h4` 0,150 ; `rng_dist_ze_atr_h4` 0,149.
+
+**La raison tient à la géométrie du walk-forward.** Le pas vaut la longueur de
+la fenêtre de test, soit 49 349 barres, alors que le train en compte 271 423 :
+les trains des folds 1 et 3 partagent donc 172 725 barres, soit **64 %**. Ce
+ne sont pas trois échantillons indépendants, ce sont trois fenêtres glissantes
+qui se recouvrent largement.
+
+**Ce que la mesure permet de conclure** : à ce recouvrement, recalculer la
+normalisation par fold ne protège de presque rien, et l'objection qui
+interdisait le chaînage ne tient pas quantitativement.
+
+**Ce qu'elle ne permet pas de conclure** : que la normalisation par fold soit
+inutile en général. À pas plus grand, ou sur un instrument dont l'échelle
+dérive vraiment, le même calcul rendrait autre chose — il faudrait le refaire.
+
+**Décision** : la normalisation est désormais calculée **une fois**, sur le
+train du premier fold, et sert à tous. La dérive ci-dessus devient le prix
+payé — l'échelle vue par le réseau ne bouge plus du tout — et le transfert des
+poids est exact. Le fold 2 reprend `best_..._wf1`, le fold 3 reprend
+`best_..._wf2` : un seul modèle traverse l'histoire du plus ancien au plus
+récent.
+
+**Le checkpoint transmis est le MEILLEUR, sur demande explicite, et ce choix
+a un coût connu.** Sélectionner sur la validation vaut −3,3 points mesurés
+ici, parce que la validation sélectionne à l'envers de façon reproductible —
+le fold 2 d'`exec18` affichait +8,14 en validation pour −0,9 en test. C'est
+pourquoi `checkpoints.py` déploie `last_`, la moyenne des poids, qui ne
+dépend d'aucun tirage. Mais transmettre n'est pas déployer : ce qui part au
+fold suivant sera réentraîné sur une nouvelle fenêtre, pas mis en production.
+Le repli sur `last_` est annoncé à l'écran si un fold n'a jamais amélioré son
+Sortino, et l'absence des deux rompt la chaîne bruyamment.
+
+Vérifié plutôt que supposé : les checkpoints de deux folds du même run portent
+les mêmes 107 tenseurs, aux mêmes formes, avec des poids différents — donc
+`load_state_dict(strict=True)` passe d'un fold à l'autre.
+
+**Ce que le chaînage ne casse pas.** La fenêtre d'entraînement d'un fold
+s'arrête avant sa validation, qui précède son test : un modèle entre au test
+de son fold sans avoir vu une seule de ses barres. Que le fold 3 s'entraîne
+plus tard sur ce qui fut le test du fold 1 ne change rien au chiffre du fold 1,
+relevé avant.
+
+**Ce qu'il change à la lecture.** Les epochs à actor gelé d'un fold chaîné ne
+mesurent plus le hasard mais la politique héritée. La veille le dit désormais
+au lieu d'annoncer une « référence au hasard » — sans quoi un transfert réussi
+se lirait comme un coup de chance.
+
+### L'environnement passait 41 réductions numpy par barre sur des tableaux de 64
+
+Profilé avec `cProfile` sur 20 000 barres, géométrie de l'or, entrées neutres
+tentées à chaque barre possible — donc le cas que la collecte joue vraiment,
+pas un micro-banc sur une fonction extraite.
+
+```
+   20 000 pas en 7.74 s  =  2 584 barres/s
+
+   819 548  reductions numpy          41 par barre
+   479 595  .sum()
+   319 961  .any()
+    80 022  _latent_at_bid    1.44 s   4 par barre, 19 % du pas
+   199 911  _actifs                   10 par barre
+    99 988  position                   5 par barre
+```
+
+À 64 éléments, une réduction numpy ne calcule rien : elle paie son coût
+d'appel. Et rien de tout cela ne change entre deux mutations des emplacements.
+
+Deuxième poste, une boucle Python : la répartition de la récompense parcourait
+`range(self._K)` — **soixante-quatre tours par barre** pour en traiter un ou
+deux, soit 56 millions d'itérations par epoch, dont 55 millions n'écrivaient
+qu'un zéro sur un zéro déjà en place.
+
+```
+                                 avant      apres
+   barres/s                      2 584     ~4 950     x1.92
+   reductions numpy / barre         41          7
+   _get_obs (cumule)             3.66 s     0.96 s
+   _latent_at_bid (cumule)       1.81 s     0.50 s
+```
+
+**Aucun calcul n'a changé.** Une version d'état `_ver` s'incrémente aux quatre
+endroits où `_p_sens` bouge — reset, agrandissement, ouverture, fermeture — et
+tout ce qui s'en déduit est gardé tant qu'elle ne bouge pas : mêmes tableaux,
+mêmes ordres de sommation. `_get_obs` écrit dans un seul tampon neuf au lieu
+d'enchaîner `np.repeat`, `np.concatenate` et `.astype`.
+
+**Comment c'est vérifié.** La référence figée `reference_env_k1.json` ne
+pouvait pas arbitrer : elle avait été enregistrée sur un autre jeu de barres —
+elle ouvre à 1 494 $ l'once quand le cache courant ouvre à 4 257 $. On a donc
+vérifié la **propriété** plutôt qu'une trajectoire : `verifie_caches()`
+recalcule à froid tout ce qui est mémorisé et le compare, **après chaque
+barre**. 40 000 barres passent sans un écart, à 3 % comme à 30 % de budget,
+jusqu'à 17 positions simultanées. `test_concurrence.py concurrence 4` confirme
+séparément que la somme des parts vaut la récompense sur 1 887 trades. La
+référence a ensuite été réenregistrée sur les barres du jour (642 trades).
+
+**Une optimisation rejetée par la mesure.** Restreindre `_latents_par_slot`
+aux emplacements ouverts paraissait évident : 4 400 barres/s contre 4 950,
+mesuré trois fois. À cette taille, l'indexation booléenne et l'allocation du
+tampon coûtent plus que la passe complète sur 64 éléments contigus. Le code
+garde la forme simple, et le commentaire dit pourquoi.
+
+**Un défaut corrigé au passage, dont l'effet mesuré est nul.** La mémo de
+`places_ouvrables` ne portait pas le PRIX dans sa clé : `peut_entrer()`
+interroge au close, `step()` à l'ouverture de la même barre, et la seconde
+recevait la réponse calculée pour la première. Le prix entre dans la marge par
+lot, dans le plancher d'ATR et dans la taille quantifiée, donc la capacité
+annoncée n'était pas celle du prix demandé. Compté sur 40 000 barres : **0
+barre** où les deux prix donnent une capacité différente. La clé était fausse,
+la correction est juste, et son effet sur ce jeu est nul — les trois à la fois.
+
+### Deux découvertes non cherchées
+
+**PyTorch était le build CPU.** `torch 2.3.0+cpu` dans l'environnement, alors
+que la machine porte une RTX 3070 avec un pilote à jour. Le run lancé le matin
+affichait « Pas de CUDA — utilisation CPU » et personne ne l'aurait vu passer
+autrement que par un ralentissement. Réinstallé en `2.3.0+cu121`, même version
+pour ne rien casser d'autre.
+
+**Le terminal MetaTrader plafonnait son historique.** Fraîchement installé, il
+rendait 20 000 barres M5 sur XAUUSD et **rien** au-delà de 100 000, contre
+493 497 dans le cache. Le garde-fou de fraîcheur du cache, en jetant celui-ci
+pour redemander les barres, aurait remplacé sept ans d'historique par trois
+semaines — sans autre signe qu'un run plus rapide. Après passage du plafond à
+illimité : **573 465 barres remontant à 2007-06-22**, soit 19 ans contre 7.
+
+C'est le genre de panne que ce dépôt collectionne : rien ne lève, tout rend
+des nombres plausibles, et le chiffre qu'on lit ne décrit pas ce qu'on croit.
+
+---
+
 ## 16 septembre 2026, quatrième partie — trois chiffres annoncés, trois chiffres retirés
 
 Cette entrée corrige une mesure publiée quelques heures plus tôt dans ce même

@@ -1,204 +1,262 @@
-# KAIROS — Agent RL Multi-Stratégie pour BTCUSD M5
+# KAIROS — Agent RL long-only sur XAUUSD M5
 
 > *Le modèle ne prédit pas le marché. Il attend le moment.*
 
-> **PPO + SAINTv2** : agent d'apprentissage par renforcement entraîné en walk-forward sur neuf ans d'historique BTCUSD en barres de cinq minutes, lu simultanément à trois échelles (M5, H1, H4), déployable en live sur MetaTrader 5 via une interface graphique dédiée.
+> **PPO + SAINTv2 + PatchTST** : deux réseaux qui votent dans le même rollout,
+> entraînés en walk-forward **chaîné** sur 7,1 ans d'or en barres de cinq
+> minutes, lus à trois échelles (M5, H1, H4), avec un compte partagé qui ouvre
+> **plusieurs positions simultanées** selon ce que le solde permet. Déployable
+> sur MetaTrader 5 via une interface graphique dédiée.
 
 ---
 
 ## ⚠️ État actuel — aucun modèle n'est déployable
 
-**Le run en cours (`exec25`) n'a pas encore d'epoch entraînée concluante.** Le
-meilleur résultat hors échantillon jamais obtenu reste **TabM à +3.8 ± 2.3
-points** au-dessus du point mort, PF 1.18, 3 folds sur 3 — non significatif. La
-meilleure politique PPO, `exec18`, donne **+2.2 ± 2.2 points**, 2 folds sur 3.
+Le run courant est **`or_exec05`** : or seul, long seul, walk-forward chaîné.
+Il n'a pas encore produit de résultat hors échantillon.
 
-Aucun `.pth` ne doit être mis en production. `kairos_live.py` refuse d'ailleurs
-de trader sans fichier `_calib.json` correspondant (`min_confidence = None`),
-et il tourne **encore sur l'ancien pipeline M1** : il n'a pas été porté au M5
-ni aux 260 colonnes. Le porter est un chantier ouvert, pas un détail.
+**La fenêtre de test de cette lignée a déjà été consommée**, et par un
+harnais défectueux. `or_exec02` a tourné 91 epochs × 3 folds et donné en test
+−190,30 $, +279,30 $ et +525,22 $ — soit +614 $ pour 174 trades, **+3,5 $ par
+trade avec une erreur-type de 2,5 $, 1,4 écart-type**. Indistinguable de zéro,
+et mesuré avec une règle de décision qui prenait des ventes dans un run
+long-only. Ce que lira `or_exec05` sur ces mêmes fenêtres sera une **seconde
+lecture**, à traiter comme telle.
+
+### Le défaut le plus cher de la session : un run long-only qui vendait
+
+L'entraînement respectait le masque d'actions — `S(0W/0L) +0.00$` à chaque
+epoch. La validation, la calibration et le test, eux, ouvraient des ventes :
+quand `tri_par_tete_aux` est vrai, la sortie de la tête auxiliaire **écrase**
+le tableau de probabilités issu des logits masqués, et le masque de côté
+disparaît avec lui.
+
+| fold | LONG | SHORT | part des trades vendus |
+|---|---|---|---|
+| wf1 | +87,9 $ | −286,9 $ | 68 % |
+| wf2 | +421,1 $ | −108,5 $ | 31 % |
+| wf3 | +517,1 $ | −435,8 $ | 64 % |
+
+Les achats rapportaient +1 026 $ par epoch, les ventes en reprenaient 831. Le
+« meilleur modèle » a été choisi 273 fois de suite sur ce net. **Le modèle
+avait un avantage à l'achat sur les trois folds ; le harnais l'a jeté.**
+
+La correction vit dans la **règle** de décision et non dans les scores :
+`EntryDecisionPolicy` et `decide_avec_barres` connaissent le côté et refusent
+l'autre. Le côté voyage dans la spécification, donc dans le checkpoint, donc
+jusqu'au live — et `load_decision_policy(chemin, side=...)` l'impose aux
+checkpoints antérieurs, qui n'ont pas la clé. Deux verrous plutôt qu'un :
+`training.py` lève si le côté interdit compte un seul trade, et
+`test_cote.py` falsifie les deux.
+
+Au passage, la sélectivité se divisait par deux même avec un seul côté
+ouvert : en long-only l'agent tradait à **2,5 % au lieu des 5 %** demandés.
+
+### Un seul modèle, du plus ancien au plus récent
+
+Le walk-forward est **chaîné** : le fold 2 reprend les poids du fold 1, le
+fold 3 ceux du fold 2. Au lieu de trois modèles ayant vu chacun un tiers de
+l'histoire, un seul la traverse dans l'ordre du temps.
+
+Le chaînage était refusé par une garde explicite — « le bootstrap inter-fold
+exige une adaptation explicite de normalisation ». L'objection est juste :
+chaque fold calculait ses statistiques sur **son** train, donc un réseau
+hérité aurait vu ses entrées à une autre échelle. Mais elle n'avait jamais été
+chiffrée. Mesure du 2026-09-19, écart aux statistiques du fold 1, **en
+écarts-types du fold 1** :
+
+| fold | dérive de moyenne (méd / p95 / max) | σ_k / σ_1 (méd) |
+|---|---|---|
+| 2 | 0,008 / 0,063 / 0,125 | 1,007 |
+| 3 | 0,013 / 0,092 / 0,162 | 1,011 |
+
+Treize millièmes d'écart-type en médiane sur des entrées qui vivent dans
+[−3, 3] : la raison tient à la géométrie du walk-forward, dont le pas vaut la
+longueur du test, si bien que les trains des folds 1 et 3 **partagent 64 % de
+leurs barres**. On ne corrige donc rien, on supprime le problème : la
+normalisation est calculée **une fois**, sur le train du premier fold, et sert
+à tous. Le transfert devient exact et le checkpoint ne porte qu'une échelle.
+
+**Rien ne fuit.** La fenêtre d'entraînement d'un fold s'arrête avant sa
+validation, qui précède son test : un modèle entre au test de son fold sans
+avoir vu une seule de ses barres. Que le fold 3 s'entraîne plus tard sur ce
+qui fut le test du fold 1 ne change rien au chiffre du fold 1 — il a été
+relevé avant.
+
+Conséquence de lecture : les epochs à actor gelé d'un fold chaîné ne mesurent
+plus le hasard mais **la politique héritée**. La veille le dit désormais au
+lieu d'annoncer une référence au tirage.
+
+### Plusieurs positions à la fois, et c'est le solde qui décide
+
+Il n'y a pas de K fixe. `places_ouvrables()` calcule, à chaque barre, combien
+de positions le compte supporte encore — marge du courtier d'un côté, budget
+de risque de l'autre — et le modèle **voit** cette capacité dans la quatrième
+colonne de son bloc d'état. Gagner l'augmente, perdre la réduit : le cercle
+est dans l'environnement, pas dans une consigne.
+
+`Portefeuille` porte un seul solde, une seule équité, une seule marge pour
+tous les instruments inscrits. À un instrument il se réduit exactement au
+comportement d'avant, ce que `test_concurrence.py` vérifie.
+
+Ce que le budget de risque achète réellement, mesuré sur un épisode
+d'entraînement complet, quatre graines, entrées neutres tentées à chaque barre
+possible :
+
+| budget | positions (méd) | décisions / épisode | creux médian | survie |
+|---|---|---|---|---|
+| **3 %** | **2** | **16** | **11 %** | **4/4** |
+| 9 % | 4 | 22 | 19 % | 4/4 |
+| 18 % | 6 | 29 | 27 % | 3/4 |
+| 30 % | 9 | 39 | 40 % | 3/4 |
+
+Dix fois le budget ne multiplie les décisions que par 2,4, pour quatre fois le
+creux et une graine sur quatre qui meurt. **La rareté des décisions vient de
+la durée des trades — 28 h à 10×ATR — pas de la capacité du compte.** Le seul
+levier propre est le nombre d'épisodes, dont le coût est linéaire : le plafond
+est passé de 40 à 160, et la cible de 4 000 décisions par epoch est enfin
+atteinte (4 141 à 151 épisodes).
+
+### L'environnement deux fois plus rapide, à résultat identique
+
+Profilé sur 20 000 barres à la géométrie de l'or : **819 548 réductions numpy
+pour 20 000 pas**, soit quarante et une par barre, toutes sur des tableaux de
+64 emplacements où une réduction ne calcule rien — elle paie son coût d'appel.
+`_latent_at_bid` était appelé quatre fois par barre pour un état qui ne change
+qu'à l'ouverture et à la fermeture. Et la répartition de la récompense
+parcourait `range(self._K)` — soixante-quatre tours de boucle Python par
+barre pour en traiter deux, soit 56 millions d'itérations par epoch dont 55
+n'écrivaient qu'un zéro sur un zéro.
+
+| | avant | après |
+|---|---|---|
+| barres/s | 2 584 | **~4 950** |
+| réductions numpy / barre | 41 | 7 |
+| `_get_obs` (cumulé) | 3,66 s | 0,96 s |
+
+**Aucun calcul n'a changé** : une version d'état `_ver` s'incrémente à chaque
+mutation des emplacements et tout ce qui s'en déduit est gardé tant qu'elle ne
+bouge pas — mêmes tableaux, mêmes ordres de sommation. `verifie_caches()`
+recalcule tout à froid après **chaque** barre et compare ; 40 000 barres
+passent sans un écart, jusqu'à 17 positions simultanées.
+
+Un essai a été **rejeté par la mesure** : restreindre `_latents_par_slot` aux
+emplacements ouverts tombe à 4 400 barres/s, l'indexation booléenne coûtant
+plus que la passe complète sur 64 éléments contigus.
 
 ### Ce que le projet a compris de lui-même
 
-Le mur n'a jamais été l'architecture ni l'algorithme. Six expériences
-d'architecture ont rendu nul ou négatif (SAINT contre PatchTST, attention entre
-groupes −2.3, méta-étiquetage −2.9, lookback nul, taille par conviction +0.3).
-Ce qui a déplacé des chiffres : l'**échelle de temps**, l'**historique**, les
-**features**, et la **taille du modèle** — réduire le réseau de 493 796 à
-15 680 paramètres a fait passer PPO de −1.4 à +2.2 en test.
+Le mur n'a jamais été l'architecture ni l'algorithme. Ce qui a déplacé des
+chiffres : l'**échelle de temps**, l'**historique**, les **features**, la
+**taille du modèle** — et, plus souvent que tout le reste, la **correction
+d'un défaut de mesure**.
 
 La grandeur qui commande tout est le nombre d'**occasions indépendantes** :
 la durée d'historique divisée par la durée d'un trade, **jamais** le nombre de
-barres. Il en faut ~4 900 pour qu'un avantage de 0.02 R soit lisible.
+barres.
 
-| configuration | friction / R | horizon | occasions | avantage requis |
-|---|---|---|---|---|
-| H1, SL 2×ATR | 0.047 R | 13.0 h | 2 314 | +0.0233 R |
-| M5, SL 4×ATR | 0.099 R | 3.7 h | 15 089 | +0.0892 R |
-| M5, SL 8×ATR | 0.049 R | 12.2 h | 4 516 | +0.0425 R |
-| **M5, SL 12×ATR** | **0.021 R** | **34.1 h** | **1 709** | **+0.0210 R** |
+**Le classement est là, mais ce n'est pas la politique qui le produit.** Une
+régression linéaire ordonne les occasions à 2 σ pendant que le ρ de la
+politique oscille dans le bruit : PPO optimise le rendement de ses **actions**,
+jamais l'**ordre** de ses probabilités — et c'est pourtant tout ce dont la
+sélectivité se sert. D'où `tri_par_tete_aux` : c'est la tête auxiliaire, celle
+qui prédit le rendement net, qui trie en validation, en test et en production.
 
-Le `SL 8×ATR` en M5 domine le H1 sur tous les axes : même friction, même
-horizon — donc le même problème de prédiction, celui sur lequel l'avantage de
-+0.09 à +0.13 R a effectivement été mesuré — pour deux fois plus d'occasions.
+**Le trailing est le seul mécanisme qui gagne.** Sans lui, la part symétrique
+(achat + vente)/2 vaut exactement zéro à toutes les largeurs de stop, et
+chaque trade perd 1 R de friction. Ce n'est pas un réglage d'appoint.
+
+**Le chemin de l'équité, pas la somme des R.** Un balayage conjoint stop ×
+trailing donnait 4×ATR / 6 R comme optimum à +42,5 R/an contre +16,2 pour
+10×/2 R. Rejoué en équité continue — un seul compte, qui compose et qui peut
+mourir — l'optimum s'effondre. Additionner des R suppose des trades
+indépendants pris à 1 R chacun ; sous concurrence et budget de risque partagé,
+l'ordre des rendements décide. Retour à **10×ATR / 2 R**.
+
+### Pourquoi l'or, et pourquoi seul
+
+Un second instrument n'ajoute des occasions que s'il est **décorrélé**. La
+corrélation entre les rendements de la stratégie sur BTC et sur or vaut
+**0,088** — pratiquement zéro — quand les cryptos corrèlent de 0,62 (BCH) à
+0,81 (ETH) et n'ajouteraient que 10 % d'occasions contre 84 % pour l'or. Son
+avantage mesuré est en outre supérieur : +16,5 à +20,1 R/an contre +12,5 pour
+le meilleur réglage du BTC.
+
+Ce qui ne se copie **jamais** d'un instrument à l'autre : la largeur du stop
+(ATR relatif 6,6 points de base sur l'or contre 15,9 sur le BTC), la friction
+(0,68 bp contre 2,23), et surtout **la taille du contrat** — un lot d'or vaut
+cent onces, donc son lot minimum représente 4 265 $ de notionnel contre 762
+pour le BTC. À 1 000 EUR de capital, une position minimale d'or risque 2,81 %
+du compte contre 0,73 %. La marge, elle, est la même des deux côtés (0,174 %)
+et ne borne jamais.
+
+L'infrastructure multi-instruments existe et est testée — `Portefeuille`,
+`instruments.py`, `alignement.py` qui intersecte les horodatages (492 565
+barres communes, le BTC y perd ses week-ends) — mais la boucle
+d'entraînement ne joue qu'un instrument à la fois. **Le BTC est sorti du run**
+sur décision explicite.
 
 ### Lignées de checkpoints — elles ne sont PAS interchangeables
 
-Un préfixe par jeu d'observation. Charger le mauvais fichier ne produit aucune
-erreur visible : le modèle trade, simplement il lit autre chose que ce sur quoi
-il a appris. Depuis `exec23`, `build_policy` déduit l'architecture complète des
-poids et le reste du fichier `_calib.json` ; un fichier ambigu est refusé.
+Un préfixe par jeu d'observation, par architecture **et par côté**. Charger le
+mauvais fichier ne produit aucune erreur visible : le modèle trade, simplement
+il lit autre chose que ce sur quoi il a appris.
 
-| Préfixe | Échelle | Observation |
-|---------|---------|-------------|
-| `..._exec10` à `..._exec20` | H1 | 103 colonnes, contexte H4 |
-| `..._exec22` | M5 | 103 colonnes, contexte H1 |
-| `..._exec23`, `..._exec24` | M5 | 260 colonnes, M5 + H1 + H4, SL 4×ATR |
-| `..._exec25` | M5 | idem, SL 8×ATR / TP 16×ATR |
-| `..._exec38` | M5 | **SL 12×ATR, stop suiveur 1,5 R, AUCUN objectif** ; objectif 2 R conservé comme cible d'apprentissage de la tête auxiliaire ← courant |
-
-### Les modèles votent PENDANT l'entraînement
-
-Le vote n'existait qu'à l'évaluation, sur des réseaux entraînés chacun à agir
-**seul**. Un modèle qui apprend à décider tout seul, puis qu'on met dans un
-comité, n'a jamais appris à jouer sa part dans une décision commune.
-
-| votant | nature | ce qu'il apporte | état |
+| Préfixe | Instrument | Côté | Observation |
 |---|---|---|---|
-| **SAINT** | PPO, attention sur les features | ne fait que **croiser** les colonnes | actif |
-| **PatchTST** | PPO, canaux indépendants | ne les croise **jamais** | actif |
-| **TabM** | supervisé, MLP ensemble | un veto, pas une proposition | **coupé — mesure nulle** |
-
-Les deux réseaux PPO sont opposés par construction sur la question qui sépare
-le mieux les modèles de ce dépôt. Des erreurs corrélées ne s'annulent pas :
-c'est la condition pour qu'un vote réduise la variance.
-
-**Pourquoi un mélange et pas trois entraînements séparés.** Si on entraîne
-séparément puis qu'on fait voter, l'action exécutée ne vient d'**aucune** des
-politiques mises à jour : le rapport de PPO perd son sens et réclame un poids
-d'importance non borné. En présentant le mélange comme une seule politique,
-l'action est tirée de ce qui est mis à jour — PPO reste exact, et le gradient
-atteint chaque membre par sa part dans la probabilité de l'action choisie.
-`PolitiqueEnsemble` moyenne les **probabilités**, une voix par membre, et non
-les logits qui laisseraient un membre très confiant écraser les autres.
-
-**TabM entre par une autre porte.** Il n'a pas de gradient dans cette boucle,
-et ses scores dépendent de la **barre** et non de la seule observation. Il
-passe donc par le **masque d'actions** : il ne propose rien, il interdit. C'est
-la fonction du Chikou-Span dans le système Ichimoku — un signal n'est pas pris
-si autre chose le contredit.
-
-Son ajustement est **croisé** : le rollout se joue sur la fenêtre même qui
-servirait à l'ajuster, où il serait un **oracle**. Les deux réseaux
-apprendraient à lui déférer, et en production le partenaire deviendrait
-ordinaire. Chaque barre reçoit donc le score d'un TabM qui ne l'a pas vue —
-trois blocs **contigus**, parce que des lignes voisines partagent leurs barres
-de résultat. Coût mesuré : 12 s par fold, 100 % des barres notées.
-
-**Le veto a été mesuré, puis coupé.** Comparaison appariée de chaque phase à
-elle-même sans veto, 12 phases, sur la validation :
-
-| part | trades/phase | écart au témoin | err-type | t |
-|---|---|---|---|---|
-| 0.30 | 50 | −0.0317 | 0.0343 | −0.92 |
-| 0.50 | 117 | −0.0097 | 0.0281 | −0.35 |
-| 0.80 | 169 | −0.0069 | 0.0126 | −0.55 |
-
-`|t| < 1` partout. Six mécanismes ont déjà été écartés ici sur ce critère ;
-celui-ci les rejoint. `votant_tabm = False`, et le code reste en place —
-`tabm_votant.py`, l'ajustement croisé, le veto dans le masque — pour qu'une
-mesure ultérieure puisse le rallumer sans tout réécrire.
-
-> **Ce que la mesure ne dit pas** : elle juge le veto comme filtre **autonome**
-> sur des barrières, pas son interaction avec les réseaux PPO. L'absence de
-> valeur autonome n'est pas une preuve d'inutilité — c'est la seule preuve
-> disponible, et ici la charge revient au mécanisme.
-
-> **Quand le veto est actif, il change le plafond d'entropie.** La politique
-> choisit alors entre deux actions et non trois : le maximum vaut `p²·ln3 +
-> 2p(1-p)·ln2`, soit **0.621** à p = 0.50 au lieu de 1.099. Lire une entropie
-> de 0.573 contre ln 3 ferait croire à une politique fortement différenciée
-> alors qu'elle décide au hasard. La veille calcule ce plafond depuis la
-> configuration au lieu de le coder en dur.
-
-### La capacité se règle sur le seul régime qui ait marché
-
-La tête pèse 92 à 98 % du réseau et lit `n_features × d_model` : passer de 103 à
-260 colonnes l'a multipliée par 2.5, et ajouter un second réseau encore par 1.6.
-
-| mlp SAINT / patch | SAINT | PatchTST | total | par occasion (4 516) |
-|---|---|---|---|---|
-| 16 / 32 | 62 548 | 35 776 | 98 324 | 21.8 |
-| 8 / 16 | 45 412 | 18 016 | 63 428 | 14.0 |
-| **4 / 8** | 36 892 | 9 328 | **46 220** | **10.2** |
-
-Le seul ancrage empirique est le régime H1 qui avait rendu **+2.2 en test** :
-11.6 paramètres par occasion. À 21.8 on était au double, alors que la seule
-chose qui ait jamais déplacé un résultat côté modèle ici est la **réduction**
-de taille. C'est un ancrage hérité, **pas une mesure** : la capacité ne se
-tranche pas sur une sonde supervisée, il faut un run.
-
-> **PatchTST à lookback 4 est un MLP par colonne**, et il faut l'assumer.
-> `mesure_lookback_utile` n'a rien trouvé au-delà de 4 barres de passé, et à
-> cette profondeur `patch 2 / pas 1` est la seule géométrie qui donne trois
-> patchs — tout le reste dégénère à un ou deux. Son rôle dans le vote reste
-> intact, mais le nom promet plus que la profondeur ne permet.
+| `..._exec10` à `..._exec20` | BTCUSD | both | H1, 103 colonnes |
+| `..._exec23` à `..._exec59` | BTCUSD | both | M5, 260 colonnes |
+| `or_exec01` | XAUUSD | both | M5, 260 colonnes |
+| `or_exec02` | XAUUSD | long | **validation contaminée par des ventes** |
+| `or_exec03`, `or_exec04` | XAUUSD | long | fuite corrigée ; morts tôt |
+| `or_exec05` | XAUUSD | long | **walk-forward chaîné** ← courant |
 
 ### Le checkpoint se résout, il ne s'écrit pas en dur
 
 `checkpoints.py` rend le run le plus récent — au **numéro d'exec**, pas à la
-date du fichier qu'un `touch` fausserait — dont l'observation correspond au
-pipeline courant. `kairos_live` pointait sur `exec11`, dix-sept runs en
-arrière, et rien ne l'aurait signalé : un chemin périmé ne lève pas d'erreur
-tant que le fichier existe.
+date du fichier qu'un `touch` fausserait — dont l'observation **et le côté**
+correspondent au pipeline courant.
 
-Deux garde-fous qui ont servi immédiatement : sans le filtre de compatibilité,
-« le plus récent complet » rendait `exec20` et ses 107 colonnes contre 264 au
-pipeline ; et un champ `n_features` absent ne vaut **pas** autorisation, sans
-quoi `exec13` passait aussi.
+Le côté a été ajouté le 2026-09-19, et son absence était grave : le résolveur
+ne cherchait que des fichiers `*_both_*`, donc aucun checkpoint d'un run
+long-only n'existait pour lui et il proposait le dernier run **bilatéral**.
+Dans le même temps `MULTI_AGENT_PATHS` pointait en dur sur `exec11`, une
+lignée **BTC bilatérale** : le live aurait chargé un modèle entraîné à vendre
+du Bitcoin pour acheter de l'or, sans qu'aucune erreur ne soit levée.
 
 La famille par défaut est **`last`**, la moyenne des poids. Demander « le
 meilleur » rend quand même la moyenne, en disant pourquoi : choisir un
-checkpoint sur son résultat de validation coûte −3.3 points mesurés ici. Le
-« meilleur » checkpoint est le plus mauvais déployable.
+checkpoint sur son résultat de validation coûte −3,3 points mesurés ici. Le
+« meilleur » checkpoint est le plus mauvais déployable — et c'est aussi ce qui
+rend `or_exec02` encore lisible, ses poids moyennés n'ayant jamais dépendu du
+net contaminé par les ventes.
 
 ### Le vrai sujet ouvert
 
-Une régression logistique atteint **0.6271 d'AUC** sur ces colonnes. Aucune
-politique entraînée n'a dépassé **0.5707**. Cet écart est le fait le plus
-reproductible et le moins expliqué du projet : le signal est dans les features,
-PPO n'arrive pas à le prendre.
+Une régression logistique atteint **0,6271 d'AUC** sur ces colonnes. Aucune
+politique entraînée n'a dépassé **0,5707**. Cet écart est le fait le plus
+reproductible et le moins expliqué du projet : le signal est dans les
+features, PPO n'arrive pas à le prendre. `tri_par_tete_aux` contourne le
+problème sans le résoudre.
 
-Et la validation **sélectionne à l'envers**, de façon reproductible : −3.3
+Et la validation **sélectionne à l'envers**, de façon reproductible : −3,3
 points pour le choix du checkpoint, −4 points pour la sélectivité TabM, et le
-fold 2 d'exec18 affichait +8.14 en validation pour −0.9 en test. C'est pourquoi
-le choix du meilleur checkpoint a été remplacé par la **moyenne des dix
-derniers jeux de poids**, qui ne dépend d'aucun tirage particulier.
+fold 2 d'`exec18` affichait +8,14 en validation pour −0,9 en test.
 
 ### Le live et l'entraînement calculent les mêmes colonnes — et c'est vérifié
 
-Jusqu'au 2026-09-16 ils passaient par **deux chemins différents** : `merge_m1_h1`
-d'un côté, `prepare_m5.construit` de l'autre. Deux implémentations de la même
-chose, qui devaient s'accorder par convention et que rien ne vérifiait. Elles
-avaient cessé de s'accorder : le live était resté en M1, lookback 96, stop
-2×ATR, checkpoints `exec11`, pendant que l'entraînement passait au M5, 260
-colonnes, lookback 4 et 8×ATR. Chargé tel quel, le modèle n'aurait levé aucune
-erreur — il aurait tradé, en lisant autre chose que ce sur quoi il a appris.
+Il n'y a qu'un chemin : `kairos_live` passe ses bougies au **même**
+`prepare_m5.construit` que le jeu d'entraînement. `test_alignement.py` le
+vérifie plutôt que de le supposer — il récupère des bougies **par le chemin du
+live**, sur une fenêtre finissant dans le jeu, et compare les colonnes valeur
+par valeur, en unités de R pour les réglages recopiés. Il a été falsifié avec
+six défauts délibérés.
 
-Il n'y a plus qu'un chemin. `flux_live.py` récupère les bougies M5 au format
-exact de `klines_5m_spot_BTCUSDT.pkl`, et `kairos_live` les passe au **même**
-`prepare_m5.construit` que le jeu d'entraînement.
-
-`test_alignement.py` le vérifie plutôt que de le supposer : il récupère des
-bougies **par le chemin du live**, sur une fenêtre finissant dans le jeu, et
-compare les 260 colonnes valeur par valeur. Il contrôle aussi les réglages —
-stop, objectif, lookback, risque par trade — de tout fichier qui les **recopie**.
-
-> Les bougies viennent de **Binance, pas de MT5**. Quatre des 260 colonnes —
-> part acheteuse agressive, taille moyenne de trade, intensité — n'existent pas
-> dans un flux CFD : MT5 ne publie ni `taker_buy_base`, ni `quote_vol`, ni
-> `nb_trades`. MT5 ne sert plus qu'à **exécuter**, et l'écart de prix entre les
-> deux est exactement ce que la friction représente.
+Les quatre colonnes de carnet — part acheteuse agressive, taille moyenne de
+trade, intensité — ont été **retirées** : elles n'existent que sur Binance,
+et leur retrait a été mesuré gratuit (ρ +0,0432 → +0,0426). Les 256 colonnes
+restantes se calculent depuis un OHLCV pur, donc depuis n'importe quel
+instrument. L'or vient de MetaTrader, qui en porte 7,1 ans en M5.
 
 > La **dernière bougie est toujours jetée** : l'API rend celle en formation en
 > dernière ligne, et la garder injecterait cinq minutes de futur à chaque
@@ -208,42 +266,26 @@ stop, objectif, lookback, risque par trade — de tout fichier qui les **recopie
 
 `evalue_test_exhaustif.py`, `evalue_ensemble.py` et `stress_test.py`
 construisent tous leur environnement depuis `training.PPOConfig` et
-`BTCTradingEnvDiscrete`. Ils suivent donc l'entraînement **par construction** :
-il n'y a rien à maintenir en double.
+`BTCTradingEnvDiscrete`. Ils suivent donc l'entraînement **par construction**.
+`stress_test.py` ne réimplémente rien : il prend le vrai moteur et dégrade ce
+qu'il consomme — spread doublé, glissement triplé, mèches étendues, ATR faussé
+de 10 %, micro-gaps, pics de news, puis tout ensemble. Il tourne sur la
+**validation** par défaut ; `--test` le dit en clair avant de partir.
 
-`stress_test.py` remplace `backtest_saintv2_stress_test.py`, qui
-réimplémentait l'environnement au-dessus de MT5 — sa propre lecture des
-bougies, son propre moteur d'ordres, ses propres réglages recopiés à la main.
-Ils avaient dérivé jusqu'à l'absurde : instrument **XAUUSD**, stop de 5×ATR
-annoté « optimum mesuré sur l'or », lookback 25. Le nouveau ne réimplémente
-rien : il prend le vrai moteur et dégrade ce qu'il consomme — spread doublé,
-glissement triplé, mèches étendues, ATR faussé de 10 %, micro-gaps, pics de
-news, puis tout ensemble. Il tourne sur la **validation** par défaut ; la
-fenêtre de test ne sert qu'une fois, et `--test` le dit en clair avant de
-partir.
+`cibles.py` reste la source unique de la règle de trade, et `cibles_gpu.py` en
+est une seconde implémentation sur GPU, onze fois plus rapide — dont
+`verifie()` exige l'égalité au 1e-9 sur les rendements **et** les durées avant
+qu'aucun chiffre n'en soit lu.
 
-### Divergence restante entre l'entraînement et le live
+### Divergences restantes entre l'entraînement et le live
 
 `kairos_live.py` n'a **aucun chemin de fermeture au marché** — les positions ne
-sortent que par SL/TP chez le courtier. Tant que ce n'est pas écrit, toute règle
-de sortie temporelle côté entraînement simulerait une stratégie inexécutable ;
-c'est pourquoi `max_holding_bars` vaut 0, et pourquoi toutes les mesures de
-géométrie se font **sans plafond de durée**.
+sortent que par SL/TP chez le courtier. C'est pourquoi `max_holding_bars` vaut
+0 et pourquoi toutes les mesures de géométrie se font sans plafond de durée.
 
-### Ce qui a été retiré, et où le retrouver
-
-Le 2026-09-16, 31 scripts et 5 rapports datés ont été supprimés, ainsi que
-865 Mo de données. Tout ce qui portait sur l'**échelle de décision M1** — le
-cache de 627 Mo et les seize scripts qui le lisaient — est parti avec elle :
-même à un stop de 8×ATR le M1 exige +0.114 R d'avantage, davantage que tout ce
-que ce dépôt a mesuré. Sont partis aussi le *basis* (aucun écart au-dessus du
-bruit de phase), le flux à la minute (`taker_1m_ma5` n'est plus dans
-`FEATURE_COLS`), la taille par conviction (+0.3), et le doublon exact
-`data_cache_BTCUSD_H1_complet.pkl`.
-
-Les fichiers de code et de documentation étaient suivis par git : `git log --
-<fichier>` puis `git show <commit>^:<fichier>` les rend intacts. Les `.pkl` ne
-l'étaient pas, mais chacun se régénère depuis son script de téléchargement.
+Ses branches `duel` et `short` construisent encore leurs masques avec `"both"`
+en dur. Elles sont mortes en long-only, et n'ont pas été touchées faute de
+pouvoir les exécuter.
 
 ### Où est écrit ce qu'on a appris
 

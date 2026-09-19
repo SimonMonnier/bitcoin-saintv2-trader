@@ -355,15 +355,23 @@ aucun spread payé sur les autres.
 ## 7. Configuration au moment du transfert
 
 ```
-jeu        data_cache_BTCUSD_M5.pkl — 948 532 barres, 2017-08-31 -> 2026-09-14
-           260 colonnes, trois echelles (M5 / H1 / H4), float32
-geometrie  SL 8xATR, TP 16xATR, R:R 2.0, aucune sortie au temps
-modele     ensemble SAINT + PatchTST dans le MEME rollout, 46 220 parametres
-           gamma 0.9999, lr 1e-3, 336 episodes x 1 440 barres, 8 passes
-           rampe de selectivite 50 % -> 5 % en 10 epochs
-           tete auxiliaire supervisee, aux_coef 1.0
+instrument XAUUSD SEUL — le BTC est sorti de l'entrainement
+cote       LONG SEUL (PPOConfig.side = "long", declare LA et nulle part ailleurs)
+jeu        data_cache_XAUUSD_M5.pkl — 256 colonnes + 4 d'etat = 260 en entree
+           trois echelles (M5 / H1 / H4), float32, source MetaTrader
+geometrie  SL 10xATR, AUCUN objectif, trailing 2.0 R (declenchement ET distance)
+           cible d'apprentissage de la tete auxiliaire : 2 R
+compte     1 000 EUR, budget de risque 3 %, marge 0.174 %, lot min 0.01
+           contrat 100 ONCES — a 1 000 EUR un lot minimum risque 2.81 %
+           PLUSIEURS POSITIONS SIMULTANEES, K calcule par le solde a chaque barre
+modele     ensemble SAINT + PatchTST dans le MEME rollout, 45 592 parametres
+           episodes de 5 760 barres, plafond 160 par epoch, cible 4 000 decisions
+           90 epochs, validation une sur trois
+           tete auxiliaire supervisee, et c'est ELLE qui trie (tri_par_tete_aux)
+foldage    WALK-FORWARD CHAINE : wf2 herite de wf1, wf3 de wf2
+           normalisation figee sur le train du fold 1, la meme pour tous
 veto TabM  COUPE (votant_tabm = False) — mesure nulle, code conserve
-run        exec32, 3 folds, ~4 h 20
+run        or_exec05
 ```
 
 **Les périodes Ichimoku sont des nombres de BOUGIES**, pas des durées : Tenkan 9
@@ -391,16 +399,28 @@ vaut 45 min en M5, 9 h en H1, 36 h en H4. On ne les convertit jamais.
 
 ## 9. Ce qui est ouvert
 
-1. **exec32 tourne** — la tête auxiliaire transfère-t-elle ? Si elle apprend
-   mais que la politique continue de perdre, le tronc n'est pas le goulot et
-   c'est PPO qu'il faut retirer du chemin de décision.
-2. **Le stress-test n'a jamais produit un seul chiffre** — tué en mémoire deux
-   fois en partageant la carte avec l'entraînement. `stress_test.py` est écrit
-   et vérifié syntaxiquement, à relancer GPU libre.
-3. **`evalue_ensemble.py` est en partie redondant** depuis que le vote vit dans
-   la politique. À transformer en comparateur ensemble/membres, ou à retirer.
-4. **Les spreads altcoins** sont mesurés marchés fermés, à revérifier en séance.
-5. **La statistique de rang** — la piste gratuite non explorée.
+1. **La fenêtre de test de la lignée `or_` est déjà consommée**, et par un
+   harnais défectueux : `or_exec02` a lu les trois folds avec une règle de
+   décision qui prenait des ventes dans un run long-only. Tout test ultérieur
+   sur ces mêmes fenêtres est une **seconde lecture**, et doit être annoncé
+   comme telle.
+2. **Le chaînage n'a jamais franchi le fold 2 en conditions réelles.** Le
+   mécanisme est vérifié — mêmes 107 tenseurs, mêmes formes entre folds, donc
+   `strict=True` passe — mais aucun run n'est encore allé jusque-là.
+3. **Le stress-test n'a toujours produit aucun chiffre.** `stress_test.py` est
+   écrit et vérifié syntaxiquement, à relancer GPU libre.
+4. **`kairos_live` garde deux branches mortes** — `duel` et `short` — dont les
+   masques sont encore écrits `"both"` en dur. Inoffensives en long-only, non
+   corrigées faute de pouvoir les exécuter.
+5. **La boucle multi-instruments n'existe pas.** `Portefeuille`,
+   `instruments.py` et `alignement.py` sont écrits et testés, mais
+   `run_training_on_split` ne joue qu'un instrument.
+6. **L'écart AUC reste inexpliqué** : 0.6271 pour une régression logistique,
+   0.5707 pour la meilleure politique. `tri_par_tete_aux` contourne le
+   problème sans le résoudre.
+7. **Le GPU est bridé thermiquement** — jusqu'à 210 MHz sur 2 100 observés.
+   Les durées d'epoch ne sont pas comparables entre elles tant que la
+   température dérive.
 
 ---
 
