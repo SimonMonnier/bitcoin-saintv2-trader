@@ -5,8 +5,32 @@
 
 import os
 import re
+import warnings
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# `expandable_segments` N'EXISTE PAS SOUS WINDOWS. L'allocateur CUDA le
+# refuse et emet un avertissement a chaque transfert de tenseur — du rouge
+# plein la fenetre, pour une option qui n'a jamais rien fait ici. On ne la
+# pose donc que la ou elle est supportee.
+if os.name != "nt":
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# DEUX AVERTISSEMENTS PYTORCH, CONNUS ET SANS CONSEQUENCE, TUS NOMMEMENT.
+#
+# Ils sortaient en rouge a chaque lancement et a chaque construction de
+# reseau, au milieu des chiffres qu'on vient lire — au point de faire croire
+# a une panne. Ils sont filtres UN PAR UN, sur leur texte : un
+# `filterwarnings("ignore")` global cacherait aussi ceux qu'on veut voir, et
+# c'est precisement le genre de silence que ce depot paie cher.
+#
+#   enable_nested_tensor : `nn.TransformerEncoder` renonce a son chemin
+#   optimise parce que nos blocs sont en pre-norm. C'est notre choix
+#   d'architecture, pas un defaut, et le resultat est identique.
+#
+#   flash attention : la roue installee n'embarque pas le noyau flash, donc
+#   `scaled_dot_product_attention` retombe sur le noyau mathematique. Plus
+#   lent, exact au meme resultat, et rien ici ne peut le changer.
+warnings.filterwarnings("ignore", message=".*enable_nested_tensor is True.*")
+warnings.filterwarnings("ignore", message=".*not compiled with flash attention.*")
 
 import math
 from economic_learning import downside_score
@@ -112,6 +136,7 @@ from saint_core import (
     N_BLOCS_DEFAUT,
     EntryDecisionPolicy,
     cotes_permises,
+    places_ouvrables_compte,
     rolling_decision_spec,
     SAINTPolicySingleHead,
     PatchTSTPolicy,
@@ -149,6 +174,41 @@ CONF_THRESHOLD = 0.40  # Ancien seuil ABSOLU de production. Conservé pour les
 # automatiquement l'échelle du modèle, et il est stocké avec le checkpoint pour
 # que live / backtests / MQL5 appliquent exactement la même barre.
 SELECTIVITE_START = 0.50   # epoch 1 : on trade la moitié des occasions (feedback)
+# CE QUE COUTE D'ELARGIR, mesure le 2026-09-19 sur le checkpoint d'exec06 a
+# l'epoch 7, fenetre de validation du fold 1 (3 273 occasions, 8.2 mois).
+#
+# ESSAYE A 16.18 %, PUIS REVENU A 5 % le meme jour, sur demande — le
+# tableau reste parce qu'il repond a la question « et si on elargissait »,
+# et qu'elle reviendra.
+#
+#     select.  occasions  trades/mois  gain/occ  avantage  total
+#         5%        164         20.1    +1.798    +1.192   +196
+#        10%        327         40.1    +1.611    +1.005   +329
+#     16.18%        530         65.0    ~+1.35    ~+0.74   ~+392
+#        20%        655         80.3    +1.181    +0.575   +376
+#        50%      1,636        200.6    +0.897    +0.291   +475
+#       100%      3,273        401.3    +0.606    +0.000      +0
+#
+# TROIS FOIS PLUS DE TRADES POUR 38 % D'AVANTAGE EN MOINS par occasion, donc
+# environ le DOUBLE d'avantage total sur la fenetre. La ligne a 100 % dit
+# pourquoi la question a une reponse : prendre toutes les occasions, c'est
+# gagner la moyenne de toutes les occasions, donc zero avantage. Elargir
+# n'est gratuit nulle part.
+#
+# DEUX RESERVES, ET ELLES NE SONT PAS LEVEES.
+#
+#   La colonne « total » additionne des R en supposant les occasions
+#   INDEPENDANTES. Ce depot a deja vu cette somme mentir : l'optimum
+#   4xATR/6R qu'elle designait s'est effondre des qu'on l'a rejoue en equite
+#   continue. A 65 trades par mois les positions se chevauchent bien plus
+#   qu'a 20, donc la correlation mord davantage. A verifier en equite.
+#
+#   La courbe depend de la QUALITE du classement. Rejouee le meme jour sur
+#   un checkpoint non entraine, elle devient PLATE et non monotone —
+#   +0.336 a 5 %, -0.001 a 10 %, +0.096 a 16 % — c'est-a-dire qu'elle ne
+#   dit plus rien. Celle du tableau vient d'un modele a rhoAux +0.16. Toute
+#   decision de selectivite prise sur un modele qui ne classe pas encore est
+#   prise sur du bruit.
 SELECTIVITE_FIN = 0.05     # régime : les 5 % les plus favorables
 # 40 -> 10, LE 2026-09-16 : la rampe passait tout le run dans la zone perdante.
 #
@@ -209,6 +269,53 @@ def rollout_action_probabilities(model_probs, force_prob, threshold, side):
     forced = np.array([1., 0., 0.] if side == 'long' else
                       [0., 1., 0.] if side == 'short' else [.5, .5, 0.])
     return (1.0-force_prob) * effective + force_prob * forced
+
+
+def retient_checkpoint(gain_top, score_rang, val_num_trades, val_max_dd,
+                       best_metric, min_trades, max_dd):
+    """Ce checkpoint remplace-t-il le meilleur ? Rend (oui, raison).
+
+    UNE FONCTION PLUTOT QU'UN `if` DANS LA BOUCLE, parce que c'est la regle
+    qui decide ce qui part au fold suivant et donc ce qui sera deploye. Elle
+    etait ecrite en ligne et n'avait jamais ete exercee : aucune epoch
+    n'avait encore rempli la condition de refus, donc personne ne savait si
+    elle tirait.
+
+    QUATRE CONDITIONS, toutes necessaires.
+
+      ASSEZ DE TRADES. Un resultat sur trois trades ne dit rien.
+
+      UN CLASSEMENT POSITIF. Le rho sert de garde : un sommet rentable avec
+      un classement nul est un tirage, pas un tri, et il ne se reproduira
+      pas sur une autre fenetre.
+
+      LE SOMMET RAPPORTE PLUS QUE LE MEILLEUR CONNU. C'est le critere
+      proprement dit : le rendement moyen, en unites de risque, des
+      occasions que ce checkpoint mettrait en position.
+
+      LE PORTEFEUILLE A SURVECU. Le creux de la derniere mesure reelle doit
+      rester sous `max_drawdown`, le seuil qui termine deja un episode. Sans
+      cette condition, un modele au classement excellent qui vide le compte
+      en ouvrant soixante positions correlees serait retenu — et transmis au
+      fold suivant. `gain_top` ne peut pas le voir : il mesure les occasions
+      UNE A UNE et ne sait rien du nombre tenu simultanement.
+
+    La raison rendue n'est pas decorative : elle est affichee quand un
+    candidat est ecarte, sans quoi on regarde quatre-vingt-dix epochs en
+    croyant qu'un meilleur modele est garde alors que rien ne l'est.
+    """
+    if val_num_trades < min_trades:
+        return False, f"seulement {val_num_trades} trades de validation"
+    if not np.isfinite(score_rang) or score_rang <= 0.0:
+        return False, f"classement {score_rang:+.4f}, non positif"
+    if not np.isfinite(gain_top):
+        return False, "sommet non mesurable"
+    if gain_top <= best_metric:
+        return False, f"sommet {gain_top:+.3f} R sous le record {best_metric:+.3f}"
+    if not (val_max_dd < max_dd):
+        return False, (f"creux {100*val_max_dd:.0f} % au-dela du garde-fou "
+                       f"{100*max_dd:.0f} %")
+    return True, ""
 
 
 def selectivite_for_epoch(epoch: int) -> float:
@@ -552,7 +659,31 @@ class PPOConfig:
     #
     # La DERNIERE epoch valide toujours, pour que le run se termine sur une
     # mesure complete.
-    validation_tous_les: int = 3
+    #
+    # ------------------------------------------------------------------
+    # 3 -> 1 LE 2026-09-19 : LA VALIDATION TOURNE A CHAQUE EPOCH.
+    #
+    # Le raisonnement ci-dessus tenait tant que la validation ne servait
+    # qu'a produire un PnL qu'on ne lisait pas. Deux choses l'ont perime.
+    #
+    # LE CRITERE DE SELECTION A CHANGE. Ce n'est plus le Sortino mais le
+    # rendement du SOMMET, sous garde que le PORTEFEUILLE ait survecu. Cette
+    # garde lit le creux de la derniere mesure reelle : une epoch sur trois,
+    # elle jugeait donc un modele sur un portefeuille vieux de deux epochs.
+    #
+    # LE PLAFOND DE RISQUE A ETE RETIRE. Le compte peut desormais porter des
+    # dizaines de positions correlees, et c'est precisement ce que le
+    # critere ne voit pas : `gain_top` mesure les occasions UNE A UNE. Un
+    # modele au classement excellent qui vide le compte serait retenu — et
+    # transmis au fold suivant — si le creux qui le disqualifie date de deux
+    # epochs.
+    #
+    # CE QUE CELA COUTE, et ce n'est pas negligeable : ~145 s par epoch,
+    # soit environ SEPT HEURES sur un run de trois folds a quatre-vingt-dix
+    # epochs. C'est le prix pour que le garde-fou de survie regarde le
+    # portefeuille de l'epoch qu'il juge, et non celui d'avant.
+    # ------------------------------------------------------------------
+    validation_tous_les: int = 1
 
     diag_rang: bool = True
     diag_rang_pas: int = 12    # une decision suivie toutes les heures
@@ -841,48 +972,41 @@ class PPOConfig:
     # La valeur 0.10 n'est pas mesuree — c'est une limite de prudence, pas un
     # optimum. Ce qui est mesure, c'est qu'elle mord la ou la marge ne mord
     # pas. Le modele apprend a l'interieur ; il ne la choisit pas.
-    # BUDGET DE RISQUE PARTAGE, en part de l'equite du COMPTE.
+    # ------------------------------------------------------------------
+    # PLUS AUCUN PLAFOND DE RISQUE : SEUL LE COURTIER BORNE, sur demande
+    # explicite. Le modele doit apprendre a ouvrir autant de positions que le
+    # compte en permet, et a gerer ce risque lui-meme.
     #
-    # Porte a 1.00 sur demande explicite, pour que LES DEUX instruments
-    # tiennent un essaim. Ce qui suit dit ce que cette valeur coute, mesure et
-    # non suppose.
+    # CE QUE CETTE VALEUR FAISAIT. `places_ouvrables` prenait le minimum de
+    # deux bornes : ce que la MARGE du courtier autorise, et ce que NOTRE
+    # budget de risque tolere. La seconde est une politique, pas une
+    # contrainte de marche — et a 3 % elle etait de loin la plus serree :
+    # elle n'autorisait qu'UNE position d'or a 1 000 EUR, ce qui rendait
+    # toute la machinerie de concurrence inerte.
     #
-    # POURQUOI IL FAUT MONTER SI HAUT POUR L'OR. Son contrat vaut cent onces :
-    # a 1 000 EUR son lot MINIMUM risque 2.81 % du compte contre 0.73 % pour
-    # le BTC. Un essaim d'or exige donc mecaniquement de risquer la moitie du
-    # capital — ce n'est pas un reglage, c'est la taille du contrat.
+    # A ZERO, la borne de risque disparait (`par_risque` vaut l'infini) et il
+    # ne reste que la marge.
     #
-    # MESURE SUR EQUITE CONTINUE, deux instruments alignes, entrees neutres :
+    # CE QUE CELA OUVRE, ET CE QU'IL FAUT SAVOIR. La marge autorise environ
+    # QUARANTE-QUATRE lots minimums d'or a 1 000 EUR — niveau de marge 3,
+    # 7.44 $ immobilises par lot. Chacun risque 2.81 % de l'equite au stop,
+    # donc quarante-quatre positions de meme sens exposent ~124 % du compte.
+    # Un mouvement adverse coordonne le vide. Ce n'est pas un effet de bord :
+    # c'est la situation que le modele doit apprendre a ne pas provoquer.
     #
-    #   budget   capital   pos BTC   pos OR     gain    creux   barres     fin
-    #       3%    1,000$    9/25     0/1         -5%       9%    4,000      ok
-    #      10%    1,000$   36/51     0/3         -0%      17%    4,000      ok
-    #      30%    1,000$   57/107    7/16       +51%      37%    4,000      ok
-    #     100%    1,000$   22/33    36/44       -23%      43%      538  XAUUSD
-    #       3%   25,000$   42/93    14/22        -0%       6%    4,000      ok
+    # CE QUI RESTE POUR L'EN EMPECHER, et ce sont les seules barrieres :
+    #   - l'appel de marge, quand l'equite tombe sous la moitie de la marge ;
+    #   - le garde-fou de creux a 40 %, qui termine l'episode ;
+    #   - le plancher de capital a 20 % ;
+    #   - la penalite de creux, PORTEE PAR CHAQUE POSITION et non partagee,
+    #     donc croissante avec l'exposition — c'est le gradient qui distingue
+    #     la premiere position de la quarantieme.
     #
-    # A 100 % L'EPISODE MEURT A LA BARRE 538 sur 4 000. L'entrainement ne peut
-    # rien apprendre a cette valeur : les episodes s'arretent avant d'avoir
-    # produit des decisions, et un balayage anterieur avait deja montre que le
-    # compte meurt sur les deux graines des 10 % en mono-instrument.
-    #
-    # RETENU : 3 %, ET LE COMMENTAIRE CI-DESSUS DECRIVAIT UN AUTRE CHOIX.
-    # Il concluait "RETENU : 30 %" au-dessus d'une valeur a 0.03 : le 30 %
-    # avait ete retracte — il ne survivait qu'a un test de 4 000 barres et
-    # mourait a 5 000 — sans que le texte soit repris. Deux descriptions du
-    # meme reglage qui divergent en silence : la faute habituelle de ce depot.
-    #
-    # CE QUE COUTE VRAIMENT D'ELARGIR, mesure le 2026-09-17 sur l'OR SEUL, un
-    # episode d'entrainement complet, quatre graines, entrees neutres tentees
-    # a chaque barre possible — le tableau complet est sous
-    # `episodes_per_epoch`. En resume : de 3 % a 30 %, les decisions par
-    # episode passent de 16 a 39 (x2.4) tandis que le creux median passe de
-    # 11 % a 40 % (x3.6) et qu'une graine sur quatre touche le garde-fou.
-    #
-    # L'ESSAIM N'EST DONC PAS CE QUI MANQUE. La rarete des decisions vient de
-    # la DUREE des trades — 28 h a 10xATR — pas de la capacite du compte. On
-    # garde 3 %, et c'est le nombre d'EPISODES qui fournit le gradient.
-    budget_risque: float = 0.03
+    # Les episodes mourront plus souvent. Un episode qui meurt enseigne sa
+    # mort ; c'est le prix a payer pour que le modele decouvre la limite au
+    # lieu de la recevoir.
+    budget_risque: float = 0.0
+    # ------------------------------------------------------------------
     # ------------------------------------------------------------------
 
     # 84 -> 20, ET C'EST UN GAIN, pas une reduction.
@@ -1846,11 +1970,14 @@ class PPOConfig:
     # Figer les fenetres ne suffisait pas : c'est la REGLE de decision qui
     # devait l'etre aussi pour que deux checkpoints soient comparables.
     #
-    # Valeur 5 % : la cible finale du calendrier d'entrainement, donc le regime
-    # qu'on cherche reellement a atteindre. Assez selectif pour approcher la
-    # zone ou la sonde mesurait un avantage, assez large pour garder une
-    # centaine de trades par epoch — au-dela, l'estimation du winrate devient
-    # trop bruitee pour suivre une progression.
+    # Valeur : la cible finale du calendrier d'entrainement, donc le regime
+    # qu'on cherche reellement a atteindre. Elle doit suivre
+    # `SELECTIVITE_FIN` — si les deux divergent, on entraine vers un regime
+    # et on mesure dans un autre, et la comparaison entre checkpoints ne
+    # veut plus rien dire.
+    #
+    # Repassee a 5 % apres un essai a 16.18 % : voir le tableau sous
+    # `SELECTIVITE_FIN`. Elle doit rester egale a `SELECTIVITE_FIN`.
     validation_selectivity: Optional[float] = 0.05
     # Part de la fenetre de validation reservee a la CALIBRATION des seuils.
     #
@@ -1903,6 +2030,28 @@ class PPOConfig:
     # Cache disque du dataframe fusionné (évite ~15 min de recalcul d'indicateurs
     # à chaque lancement). Invalidé si le cache accuse plus de N heures de retard.
     use_data_cache: bool = True
+    # 48 HEURES, la valeur d'origine, retablie le 2026-09-19.
+    #
+    # Elle avait ete relevee le temps que le terminal MetaTrader — fraichement
+    # installe — rapatrie son historique. Il etait alors plafonne en nombre de
+    # barres et ne rendait rien au-dela de 20 000 en M5, contre 493 497 dans
+    # `data_cache_XAUUSD_M5.pkl` : jeter le cache a ce moment-la aurait
+    # remplace sept ans d'historique par trois semaines, sans autre signe
+    # qu'un run plus rapide. Le plafond du terminal est passe a ILLIMITE, donc
+    # le garde-fou peut reprendre son role.
+    #
+    # Ce qu'il protege : un ENTRAINEMENT lance en croyant porter les barres du
+    # jour alors que le cache en a des anciennes. Ce qu'il ne protege pas : le
+    # LIVE, qui ne passe pas par ce cache — `kairos_live` lit `flux_live` et a
+    # sa propre exigence de fraicheur.
+    #
+    # LE RAFRAICHISSEMENT DE L'OR PASSE PAR `prepare_or.py`, qui lit du M5.
+    # Le chemin MT5 de `load_mt5_data` demande du M1 : c'est l'heritage du
+    # BTC, et il ne sait pas reconstruire le jeu de l'or.
+    #
+    # Pour travailler hors ligne sans toucher a cette valeur, relever
+    # `cfg.data_cache_max_lag_hours` sur l'INSTANCE au lancement du script
+    # concerne : le garde-fou reste entier pour tous les autres.
     data_cache_max_lag_hours: float = 48.0
 
     # Device
@@ -1935,6 +2084,44 @@ class PPOConfig:
 
     # Préfixe pour nommer les fichiers de modèle
     model_prefix: str = "saintv2_singlehead_scalping_ohlc_indics_h1_loup"
+    def __post_init__(self):
+        """Les constantes de l'instrument viennent de `instruments.py`.
+
+        POURQUOI ICI ET PAS CHEZ L'APPELANT. Elles etaient recopiees dans ce
+        dataclass ET dans le registre, et il fallait que chaque consommateur
+        pense a appeler `config_instrument`. Personne ne le faisait :
+        l'entrainement, les trois backtests et le live lisaient tous les
+        valeurs du dataclass, et le registre ne servait a rien.
+
+        ELLES AVAIENT DEJA DIVERGE : la marge valait 0.001734 ici contre
+        0.001744 dans le registre, ou elle est mesuree par
+        `order_calc_margin`. Assez pour que l'entrainement compte 129 places
+        ouvrables la ou le live en comptait 128 — trouve par le test
+        d'alignement de capacite, pas par une relecture.
+
+        En le faisant a la construction, tout objet `PPOConfig` porte les
+        memes constantes, quel que soit le fichier qui le cree. Les valeurs
+        ecrites plus haut dans ce dataclass ne sont plus que des defauts
+        pour un symbole inconnu du registre.
+        """
+        try:
+            import instruments as _I
+        except Exception:
+            return
+        p = _I.INSTRUMENTS.get(getattr(self, "symbol", None))
+        if p is None:
+            return
+        self.atr_sl_mult = float(p["atr_sl_mult"])
+        self.atr_trail_mult = float(p["trail_R"]) * self.atr_sl_mult
+        self.atr_trail_dist = float(p["trail_R"]) * self.atr_sl_mult
+        self.atr_tp_mult = 6.0 * self.atr_sl_mult      # inutilise, use_tp False
+        self.aux_tp_mult = 2.0 * self.atr_sl_mult      # cible du classement
+        self.spread_bps = float(p["spread_bps"])
+        self.lot_min = float(p["lot_min"])
+        self.lot_pas = float(p["lot_pas"])
+        self.marge_frac = float(p["marge_frac"])
+        self.contrat = float(p["contrat"])
+
 
 
 
@@ -2436,22 +2623,47 @@ class Portefeuille:
         if env not in self.envs:
             self.envs.append(env)
 
+    # A UN SEUL INSTRUMENT, LA SOMME EST SON TERME UNIQUE. Ces quatre
+    # fonctions sont appelees plusieurs fois par barre et par environnement ;
+    # a un instrument, la boucle et le generateur coutent plus que le calcul
+    # qu'ils portent. Le raccourci rend exactement la meme valeur — `0.0 + x`
+    # vaut `x` — et le chemin general reste la, inchange, pour le jour ou le
+    # Bitcoin revient dans le compte.
+
     def equity(self) -> float:
         """Capital plus le latent de TOUS les instruments."""
+        envs = self.envs
+        if len(envs) == 1:
+            e = envs[0]
+            bid = e.data.close[min(max(e.idx - 1, 0), e.data.length - 1)]
+            return self.capital + e._latent_at_bid(bid)
         lat = 0.0
-        for e in self.envs:
+        for e in envs:
             bid = e.data.close[min(max(e.idx - 1, 0), e.data.length - 1)]
             lat += e._latent_at_bid(bid)
         return self.capital + lat
 
     def marge_utilisee(self) -> float:
-        return sum(e.marge_utilisee for e in self.envs)
+        envs = self.envs
+        if len(envs) == 1:
+            return envs[0].marge_utilisee
+        return sum(e.marge_utilisee for e in envs)
 
     def risque_engage(self) -> float:
-        return sum(float(e._p_risque[e._p_sens != 0].sum()) for e in self.envs)
+        # `risque_engage_local` est la MEME somme qu'avant, gardee tant que
+        # les emplacements ne bougent pas. Elle etait recalculee deux fois par
+        # barre — masque booleen, indexation avancee, reduction — pour un
+        # tableau qui ne change qu'a l'ouverture et a la fermeture.
+        envs = self.envs
+        if len(envs) == 1:
+            return envs[0].risque_engage_local
+        return sum(e.risque_engage_local for e in envs)
 
     def n_positions(self) -> int:
-        return sum(e.n_positions for e in self.envs)
+        envs = self.envs
+        if len(envs) == 1:
+            return envs[0].n_positions
+        return sum(e.n_positions for e in envs)
 
 
 class BTCTradingEnvDiscrete(gym.Env):
@@ -2576,7 +2788,33 @@ class BTCTradingEnvDiscrete(gym.Env):
         self._slots_fermes: List[int] = []
         self._slot_ouvert = -1
         self._notionnel = 0.0
-        self._cap_cle, self._cap_val = None, 0
+        self._cap_cle, self._cap_val = None, {}
+        self._ver = 0
+        self._c_actifs = None
+        self._c_latent = None
+        self._c_risque = None
+        self._c_agr = None
+        self._c_n = -1
+        self._touche()
+
+        # LES CONSTANTES DU COURTIER, LUES UNE FOIS. `_places_ouvrables` et
+        # `_taille_quantifiee` les relisaient par `getattr(self.cfg, ...,
+        # defaut)` a chaque appel : releve au profileur, 696 764 `getattr` et
+        # 618 471 `max` pour 20 000 barres, soit trente-cinq de chaque par
+        # barre. Elles ne changent pas pendant un episode — l'environnement
+        # est reconstruit ou remis a zero entre deux — donc les relire est du
+        # pur cout d'appel.
+        #
+        # LES NOMS ET LES DEFAUTS SONT CEUX D'AVANT, terme pour terme : c'est
+        # la meme lecture, faite une fois.
+        c = self.cfg
+        self._k_marge_frac = float(getattr(c, "marge_frac", 0.001734))
+        self._k_seuil_marge = float(getattr(c, "niveau_marge_ouverture", 3.0))
+        self._k_lot_min = float(getattr(c, "lot_min", 0.01))
+        self._k_lot_pas = float(getattr(c, "lot_pas", 0.01))
+        self._k_contrat = float(getattr(c, "contrat", 1.0))
+        self._k_budget = float(getattr(c, "budget_risque", 0.0))
+        self._k_realiste = bool(getattr(c, "marge_realiste", False))
 
         self.risk_amount = 0.0
         # Spread du trade en cours — réé-échantillonné à chaque ouverture
@@ -2612,13 +2850,74 @@ class BTCTradingEnvDiscrete(gym.Env):
     # depot paie en boucle des qu'une valeur est recopiee au lieu d'etre lue.
     #
     # A K=1 chacune rend exactement ce que l'attribut rendait avant.
+    # ------------------------------------------------------------------
+    # UNE VERSION D'ETAT, ET TOUT CE QUI EN DEPEND CESSE D'ETRE REFAIT.
+    #
+    # Releve au profileur sur 20 000 barres, geometrie de l'or, entrees
+    # neutres : 819 548 reductions numpy pour 20 000 pas — QUARANTE ET UNE
+    # par barre — dont 479 595 `.sum()` et 319 961 `.any()`, toutes sur des
+    # tableaux de 64 emplacements. A cette taille une reduction numpy ne
+    # calcule presque rien : elle paie son cout d'appel. Le poste suivant,
+    # `_latent_at_bid`, etait appele QUATRE fois par barre — 1.44 s sur 7.74,
+    # soit 19 % du pas — pour un etat qui ne change qu'a l'ouverture et a la
+    # fermeture.
+    #
+    # ON NE CHANGE AUCUN CALCUL. `_ver` s'incremente a chaque mutation des
+    # emplacements, et ce qui s'en deduit est garde tant qu'elle ne bouge
+    # pas : memes tableaux, memes ordres de sommation, mêmes valeurs au bit
+    # pres. `test_concurrence.py` le verifie sur 613 trades et six scenarios
+    # a geometrie figee, et `verifie_caches()` ci-dessous recalcule tout a
+    # froid pour le confronter au cache.
+    #
+    # LE PIEGE A EVITER EST CONNU : un compteur qui derive silencieusement de
+    # ce qu'il resume. D'ou une seule porte — `_touche()` — appelee aux
+    # quatre endroits ou `_p_sens` change : reset, agrandissement, ouverture,
+    # fermeture.
+    # ------------------------------------------------------------------
+    def _touche(self) -> None:
+        """Les emplacements ont change : ce qui en derive est perime."""
+        self._ver += 1
+        self._c_actifs = None
+        self._c_latent = None
+        self._c_risque = None
+        self._c_agr = None
+        self._c_n = -1
+
+    def verifie_caches(self) -> None:
+        """Le cache dit-il la meme chose qu'un calcul a froid ? Leve sinon."""
+        a = self._p_sens != 0
+        assert np.array_equal(self._actifs, a), "cache _actifs perime"
+        assert self.n_positions == int(np.count_nonzero(self._p_sens)), \
+            "cache n_positions perime"
+        assert self.risque_engage_local == float(self._p_risque[a].sum()), \
+            "cache risque_engage perime"
+        agr, self._c_agr = self._agregats(), None
+        assert agr == self._agregats(), "cache des agregats perime"
+
     @property
     def _actifs(self):
-        return self._p_sens != 0
+        c = self._c_actifs
+        if c is None:
+            c = self._p_sens != 0
+            self._c_actifs = c
+        return c
 
     @property
     def n_positions(self) -> int:
-        return int(np.count_nonzero(self._p_sens))
+        n = self._c_n
+        if n < 0:
+            n = int(np.count_nonzero(self._p_sens))
+            self._c_n = n
+        return n
+
+    @property
+    def risque_engage_local(self) -> float:
+        """Somme des montants a perdre si tous les stops etaient touches."""
+        r = self._c_risque
+        if r is None:
+            r = float(self._p_risque[self._actifs].sum())
+            self._c_risque = r
+        return r
 
     @property
     def notionnel(self) -> float:
@@ -2629,7 +2928,7 @@ class BTCTradingEnvDiscrete(gym.Env):
 
     @property
     def marge_utilisee(self) -> float:
-        return self.notionnel * float(getattr(self.cfg, "marge_frac", 0.001734))
+        return self.notionnel * self._k_marge_frac
 
     def _equity_courante(self) -> float:
         """L'equite du COMPTE, tous instruments confondus."""
@@ -2643,7 +2942,7 @@ class BTCTradingEnvDiscrete(gym.Env):
         impose 2.2 fois la position voulue. L'ignorer, c'est s'entrainer sur
         un courtier qui n'existe pas.
         """
-        if not getattr(self.cfg, "marge_realiste", False):
+        if not self._k_realiste:
             return taille
         # LE LOT N'EST PAS L'UNITE. `taille` est en unites de l'instrument —
         # bitcoins ou onces — alors que le courtier quantifie en LOTS, et un
@@ -2651,9 +2950,9 @@ class BTCTradingEnvDiscrete(gym.Env):
         # taille du contrat ferait trader un centieme d'once la ou le minimum
         # reel est une once : cent fois trop petit, et le risque annonce
         # n'aurait aucun rapport avec le risque joue.
-        contrat = float(getattr(self.cfg, "contrat", 1.0))
-        pas = float(getattr(self.cfg, "lot_pas", 0.01)) * contrat
-        mini = float(getattr(self.cfg, "lot_min", 0.01)) * contrat
+        contrat = self._k_contrat
+        pas = self._k_lot_pas * contrat
+        mini = self._k_lot_min * contrat
         if taille < mini:
             # Le courtier ne sait pas faire plus petit. On prend le minimum,
             # comme le fait `kairos_live`, et le risque reel depasse la cible.
@@ -2669,13 +2968,31 @@ class BTCTradingEnvDiscrete(gym.Env):
         # instrument change la capacite de celui-ci, et la memo doit s'en
         # apercevoir. Sans cela, l'or continuerait d'ouvrir sur une capacite
         # calculee avant que le Bitcoin ne consomme le budget.
-        cle = (self.idx, self.portefeuille.n_positions(),
-               round(self.portefeuille.marge_utilisee(), 9),
-               round(self.portefeuille.risque_engage(), 9), self.capital)
-        if getattr(self, "_cap_cle", None) == cle:
-            return self._cap_val
-        val = self._places_ouvrables(prix)
-        self._cap_cle, self._cap_val = cle, val
+        # LE PRIX MANQUAIT A LA CLE, et ce n'etait pas un detail de cache.
+        # `peut_entrer()` interroge au CLOSE de la barre, `step()` a son
+        # OUVERTURE : deux prix differents dans la meme barre, qui
+        # renvoyaient pourtant la valeur memorisee du premier. Le prix entre
+        # dans `m_une`, dans le plancher d'ATR et dans la taille quantifiee,
+        # donc la capacite annoncee n'etait pas celle du prix demande.
+        #
+        # L'etat du COMPTE est desormais resume par les versions de ses
+        # environnements : une ouverture ou une fermeture, ici ou sur l'autre
+        # instrument, les fait bouger. C'est exact et cela ne coute aucune
+        # reduction — la cle precedente en demandait quatre.
+        # DEUX PRIX PAR BARRE, DEUX ENTREES. La cloture et l'ouverture sont
+        # interrogees en alternance dans la meme barre : une memo a une seule
+        # case les chasserait l'une l'autre et recalculerait tout a chaque
+        # fois. L'etat du COMPTE est resume par les versions de ses
+        # environnements — une ouverture ou une fermeture, ici ou sur l'autre
+        # instrument, les fait bouger.
+        cle = (self.idx, self.capital,
+               tuple(e._ver for e in self.portefeuille.envs))
+        if self._cap_cle != cle:
+            self._cap_cle, self._cap_val = cle, {}
+        val = self._cap_val.get(prix)
+        if val is None:
+            val = self._places_ouvrables(prix)
+            self._cap_val[prix] = val
         return val
 
     def _places_ouvrables(self, prix: float) -> int:
@@ -2692,45 +3009,35 @@ class BTCTradingEnvDiscrete(gym.Env):
         # l'allocation courante contient. La borner par la taille du tableau
         # la ferait mentir des que l'equity depasse ce qui a ete alloue, et
         # c'est exactement ce que le modele doit voir changer quand il gagne.
-        if not getattr(self.cfg, "marge_realiste", False):
+        # LE CALCUL VIT DANS `saint_core`, pas ici. L'environnement et
+        # `kairos_live` appellent la MEME fonction : c'est la seule facon
+        # qu'ils aient de rester d'accord sur le nombre de positions
+        # ouvrables. Ici on ne fait que lui fournir l'etat du compte.
+        if not self._k_realiste:
             return max(self._K - self.n_positions, 0)
-        eq = self._equity_courante()
-        if eq <= 0:
-            return 0
-        frac = float(getattr(self.cfg, "marge_frac", 0.001734))
-        seuil = float(getattr(self.cfg, "niveau_marge_ouverture", 3.0))
-        # Marge qu'une position minimale consommerait.
-        m_une = max(prix * float(getattr(self.cfg, "lot_min", 0.01))
-                    * float(getattr(self.cfg, "contrat", 1.0)) * frac, 1e-12)
-        # On s'arrete avant que le niveau de marge ne descende sous le seuil.
-        marge_max = eq / max(seuil, 1e-9)
-        par_marge = math.floor(
-            (marge_max - self.portefeuille.marge_utilisee()) / m_une)
 
-        # LE RISQUE ENGAGE, et c'est lui qui porte le cercle vertueux. La
-        # somme des montants a perdre si tous les stops etaient touches reste
-        # sous une part de l'EQUITY COURANTE : gagner l'augmente donc la
-        # capacite, perdre la reduit. La marge, elle, est trop large pour
-        # border quoi que ce soit a ce levier.
-        budget = float(getattr(self.cfg, "budget_risque", 0.0))
-        par_risque = float("inf")
-        if budget > 0.0:
+        # Le risque d'une position de plus, a la taille que le courtier
+        # imposerait reellement — lot minimum compris. Calcule seulement si
+        # le budget de risque est actif : a zero il n'est pas lu.
+        r_une = 0.0
+        if self._k_budget > 0.0:
             atr_raw = (float(self.data.atr14[self.idx - 1])
                        if self.idx - 1 >= 0 else 0.0)
             atr = max(atr_raw, ATR_PLANCHER_FRAC * prix, 1e-8)
-            # Le risque d'une position de plus, a la taille que le courtier
-            # imposerait reellement — lot minimum compris.
             taille = self._taille_quantifiee(self._compute_dynamic_size(prix))
             r_une = max(self.cfg.atr_sl_mult * atr * taille, 1e-12)
-            # LE RISQUE ENGAGE EST CELUI DU COMPTE. C'est tout l'interet
-            # du partage : quinze positions ouvertes sur le Bitcoin
-            # consomment le budget, donc l'or en voit moins de disponibles.
-            # Compter instrument par instrument autoriserait deux fois le
-            # risque voulu sans que rien ne le signale.
-            engage = self.portefeuille.risque_engage()
-            par_risque = math.floor((budget * eq - engage) / r_une)
 
-        return int(max(0, min(par_marge, par_risque)))
+        return places_ouvrables_compte(
+            equity=self._equity_courante(),
+            marge_utilisee=self.portefeuille.marge_utilisee(),
+            prix=prix,
+            lot_min=self._k_lot_min,
+            contrat=self._k_contrat,
+            marge_frac=self._k_marge_frac,
+            niveau_marge=self._k_seuil_marge,
+            budget_risque=self._k_budget,
+            risque_engage=self.portefeuille.risque_engage(),
+            risque_une=r_une)
 
     def _agrandir(self) -> None:
         """Double le nombre d'emplacements. Il n'y a pas de plafond.
@@ -2757,6 +3064,7 @@ class BTCTradingEnvDiscrete(gym.Env):
         self._p_trail = _e(self._p_trail, False)
         self._r_slots = _e(self._r_slots)
         self._realise_slots = _e(self._realise_slots)
+        self._touche()
         self._latent_prec = _e(self._latent_prec)
 
     def peut_financer_un_lot(self, prix: float) -> bool:
@@ -2773,15 +3081,14 @@ class BTCTradingEnvDiscrete(gym.Env):
         quand la marge ne suffit plus au plus petit ordre possible. Ne pas
         vouloir trader n'est pas mourir.
         """
-        if not getattr(self.cfg, "marge_realiste", False):
+        if not self._k_realiste:
             return True
         eq = self._equity_courante()
         if eq <= 0:
             return False
-        frac = float(getattr(self.cfg, "marge_frac", 0.001734))
-        seuil = float(getattr(self.cfg, "niveau_marge_ouverture", 3.0))
-        m_une = max(prix * float(getattr(self.cfg, "lot_min", 0.01))
-                    * float(getattr(self.cfg, "contrat", 1.0)) * frac, 1e-12)
+        frac = self._k_marge_frac
+        seuil = self._k_seuil_marge
+        m_une = max(prix * self._k_lot_min * self._k_contrat * frac, 1e-12)
         # La marge deja immobilisee est celle du COMPTE : les positions de
         # l'autre instrument la consomment aussi.
         return (eq / max(seuil, 1e-9)
@@ -2792,43 +3099,62 @@ class BTCTradingEnvDiscrete(gym.Env):
         prix = float(self.data.close[min(self.idx, self.data.length - 1)])
         return self.places_ouvrables(prix) > 0
 
+    # CINQ AGREGATS, UNE SEULE PASSE, ET ILS NE CHANGENT QU'AVEC LES
+    # EMPLACEMENTS. `_get_obs` lit `position` deux fois, `entry_price` et
+    # `entry_atr` chacun deux fois, `bars_in_position` une : releve au
+    # profileur, cinq lectures de `position` par barre, chacune refaisant un
+    # masque booleen, deux indexations avancees et une reduction. Les
+    # expressions sont recopiees terme pour terme — meme ordre de sommation,
+    # meme division — seule leur frequence change.
+    def _agregats(self):
+        c = self._c_agr
+        if c is not None:
+            return c
+        a = self._actifs
+        if not a.any():
+            c = (0, 0.0, 0.0, 0.0, -1)
+        else:
+            t = self._p_taille[a]
+            st = t.sum()
+            net = float((self._p_sens[a] * t).sum())
+            pos = 0 if net == 0.0 else (1 if net > 0 else -1)
+            taille = float(np.abs(t).sum())
+            if st > 0:
+                entree = float((self._p_entree[a] * t).sum() / st)
+                atr = float((self._p_atr[a] * t).sum() / st)
+            else:
+                entree = atr = 0.0
+            c = (pos, taille, entree, atr, int(self._p_idx[a].min()))
+        self._c_agr = c
+        return c
+
     @property
     def position(self) -> int:
         """Sens NET. A K=1, le sens de l'unique position."""
-        a = self._actifs
-        if not a.any():
-            return 0
-        net = float((self._p_sens[a] * self._p_taille[a]).sum())
-        return 0 if net == 0.0 else (1 if net > 0 else -1)
+        return self._agregats()[0]
 
     @property
     def current_size(self) -> float:
-        a = self._actifs
-        return float(np.abs(self._p_taille[a]).sum()) if a.any() else 0.0
+        return self._agregats()[1]
 
     @property
     def entry_price(self) -> float:
         """Prix d'entree moyen PONDERE PAR LA TAILLE. A K=1, le prix exact."""
-        a = self._actifs
-        t = self._p_taille[a]
-        return float((self._p_entree[a] * t).sum() / t.sum()) if t.sum() > 0 else 0.0
+        return self._agregats()[2]
 
     @property
     def entry_atr(self) -> float:
-        a = self._actifs
-        t = self._p_taille[a]
-        return float((self._p_atr[a] * t).sum() / t.sum()) if t.sum() > 0 else 0.0
+        return self._agregats()[3]
 
     @property
     def entry_idx(self) -> int:
-        a = self._actifs
-        return int(self._p_idx[a].min()) if a.any() else -1
+        return self._agregats()[4]
 
     @property
     def bars_in_position(self) -> int:
         """Detention de la position la PLUS ANCIENNE encore ouverte."""
-        a = self._actifs
-        return int(self.idx - self._p_idx[a].min()) if a.any() else 0
+        e = self._agregats()[4]
+        return int(self.idx - e) if e >= 0 else 0
 
     @property
     def sl_price(self) -> float:
@@ -2856,6 +3182,12 @@ class BTCTradingEnvDiscrete(gym.Env):
         `execution_quote` n'est qu'une multiplication — un long sort au BID,
         un short paie l'ASK — donc elle se met en tableau sans rien changer au
         resultat. Les emplacements libres rendent zero, leur sens valant 0.
+
+        RESTREINDRE LE CALCUL AUX EMPLACEMENTS OUVERTS A ETE ESSAYE, ET C'EST
+        PLUS LENT : 4 400 barres/s contre 5 076, mesure trois fois. A cette
+        taille l'indexation booleenne et l'allocation du tampon coutent plus
+        que la passe complete sur soixante-quatre elements contigus. On garde
+        donc la forme la plus simple — c'est aussi la plus rapide ici.
         """
         sens = self._p_sens.astype(np.float64)
         q = float(bid) * np.where(self._p_sens == -1,
@@ -2919,13 +3251,23 @@ class BTCTradingEnvDiscrete(gym.Env):
         else:
             risk_feature = float(self.last_risk_scale)
 
-        extra_vec = np.array(
-            [pos_feature, unrealized_atr, bars_held_norm, risk_feature],
-            dtype=np.float32
-        )
-        extra_block = np.repeat(extra_vec[None, :], self.lookback, axis=0)
-
-        obs = np.concatenate([base, extra_block], axis=-1).astype(np.float32)
+        # UNE ALLOCATION AU LIEU DE TROIS. `np.repeat` construisait un bloc
+        # (lookback, 4), `np.concatenate` un (lookback, 260), puis `.astype`
+        # en recopiait un troisieme. Les features sont deja en float32, donc
+        # l'affectation dans un tampon neuf ecrit exactement les memes
+        # octets. `_get_obs` pesait 35 % du pas au profileur.
+        #
+        # LE TAMPON EST NEUF A CHAQUE APPEL, et ce n'est pas negociable : la
+        # collecte garde l'observation dans `en_attente[k]["state"]` jusqu'a
+        # la mise a jour PPO. Un tampon reutilise ferait apprendre le reseau
+        # sur l'etat de la DERNIERE barre pour toutes les decisions.
+        n_base = base.shape[1]
+        obs = np.empty((self.lookback, n_base + 4), dtype=np.float32)
+        obs[:, :n_base] = base
+        obs[:, n_base] = pos_feature
+        obs[:, n_base + 1] = unrealized_atr
+        obs[:, n_base + 2] = bars_held_norm
+        obs[:, n_base + 3] = risk_feature
         return obs
 
     def _apply_micro(self, price: float, side: int, is_entry: bool = True) -> float:
@@ -3051,16 +3393,26 @@ class BTCTradingEnvDiscrete(gym.Env):
 
         A K=1 c'est le calcul d'avant, terme pour terme.
         """
-        a = self._p_sens != 0
-        if not a.any():
+        # MEMORISE SUR (bid, version). Le meme prix revient plusieurs fois
+        # par barre — `peut_entrer`, `_get_obs`, le marquage d'entree et celui
+        # de sortie lisent tous `close[idx-1]` ou `close[idx]` — et entre deux
+        # de ces appels rien ne peut avoir change si les emplacements n'ont
+        # pas bouge. Le calcul rendu est celui d'avant, terme pour terme.
+        if self.n_positions == 0:
             return 0.0
+        c = self._c_latent
+        if c is not None and c[0] == bid:
+            return c[1]
+        a = self._actifs
         sens = self._p_sens[a]
         # execution_quote(bid, -sens, spread) : le cote vendu paie le spread.
         q = float(bid) * np.where(sens == -1,
                                   1.0 + np.maximum(self._p_spread[a], 0.0) / 1e4,
                                   1.0)
-        return float(((sens * (q - self._p_entree[a])
-                       - self.cfg.fee_rate * q) * self._p_taille[a]).sum())
+        v = float(((sens * (q - self._p_entree[a])
+                    - self.cfg.fee_rate * q) * self._p_taille[a]).sum())
+        self._c_latent = (bid, v)
+        return v
 
     def _close_position(self, exit_price, hit_sl=False, hit_tp=False,
                         hit_temps=False, terminal_reason=None, slot=None):
@@ -3124,6 +3476,7 @@ class BTCTradingEnvDiscrete(gym.Env):
         self._p_risque[slot] = 0.0
         self._p_be[slot] = False
         self._p_trail[slot] = False
+        self._touche()
         if self.n_positions == 0:
             self.risk_scale = 1.0
             self.last_risk_scale = 1.0
@@ -3193,8 +3546,21 @@ class BTCTradingEnvDiscrete(gym.Env):
                 and self.n_positions >= self._K
                 and self.places_ouvrables(prix_execution) > 0):
             self._agrandir()
-        _libres = np.flatnonzero(self._p_sens == 0)
-        if not manual_close and action in (0, 1) and len(_libres):
+        # LA RECHERCHE D'UN EMPLACEMENT LIBRE NE SE FAIT QUE SI ON OUVRE.
+        #
+        # Elle etait faite a CHAQUE barre : une comparaison sur tout le
+        # tableau d'emplacements, puis `flatnonzero` qui alloue la liste
+        # complete des libres — pour n'en lire que le premier, et seulement
+        # dans les 0.5 % de barres ou l'action est un achat. A 256
+        # emplacements et 870 000 barres par epoch, c'est 223 millions de
+        # comparaisons dont 99.5 % sont jetees.
+        #
+        # `argmax` sur le masque booleen rend le PREMIER vrai, donc
+        # exactement ce que `flatnonzero(...)[0]` rendait. La branche est
+        # gardee par `.any()`, qui s'arrete au premier libre trouve.
+        _ouvre = (not manual_close) and action in (0, 1)
+        _masque_libre = (self._p_sens == 0) if _ouvre else None
+        if _ouvre and _masque_libre.any():
             side = 1 if action == 0 else -1
             size = self._taille_quantifiee(self._compute_dynamic_size(prix_execution))
             # LE SOLDE PEUT REFUSER L'ORDRE. C'est un refus, pas une erreur :
@@ -3202,7 +3568,7 @@ class BTCTradingEnvDiscrete(gym.Env):
             if size > 0.0 and self.places_ouvrables(prix_execution) <= 0:
                 size = 0.0
             if size > 0.0:
-                j = int(_libres[0])
+                j = int(np.argmax(_masque_libre))
                 self._p_taille[j] = size
                 self._p_sens[j] = side
                 # Échantillonne le spread pour ce trade (variabilité réaliste)
@@ -3248,6 +3614,7 @@ class BTCTradingEnvDiscrete(gym.Env):
                 self._p_trail[j] = False
                 self._notionnel += exec_price * size
                 self._slot_ouvert = j
+                self._touche()
 
         # --------- BREAK-EVEN + TRAILING STOP ---------
         # Désactivé par défaut (cfg.use_be_trail=False) pour aligner sur le
@@ -3549,7 +3916,7 @@ class BTCTradingEnvDiscrete(gym.Env):
         # recompense globale, et c'est voulu : celle-ci est une grandeur de
         # PORTEFEUILLE, avec ses propres plafonnements. Les deux ne decrivent
         # pas la meme chose et n'ont aucune raison de coincider a plusieurs.
-        _concernes = set(int(j) for j in np.flatnonzero(self._p_sens != 0))
+        _concernes = set(np.flatnonzero(self._actifs).tolist())
         _concernes.update(self._slots_fermes)
         if self._slot_ouvert >= 0:
             _concernes.add(int(self._slot_ouvert))
@@ -3579,19 +3946,48 @@ class BTCTradingEnvDiscrete(gym.Env):
             _pen = 0.2 if dd > self.cfg.max_drawdown else 0.0
             _clip = (hasattr(self.cfg, "current_epoch")
                      and self.cfg.current_epoch >= 10)
+            # ON NE PARCOURT QUE LES EMPLACEMENTS CONCERNES. La boucle
+            # portait sur `range(self._K)` — SOIXANTE-QUATRE tours de boucle
+            # Python par barre, qui doublent avec le tableau, pour n'en
+            # traiter qu'un ou deux. A 870 000 barres par epoch cela faisait
+            # 56 millions d'iterations dont 55 ne servaient qu'a ecrire un
+            # zero sur un zero.
+            #
+            # CAR C'ETAIT BIEN UN ZERO SUR UN ZERO : `_r_slots` est remis a
+            # zero en tete de pas, et les seuls emplacements qu'on y ajoute
+            # ensuite — ceux que `_close_position` crediteur, celui qui
+            # vient d'ouvrir, ceux encore ouverts — sont exactement
+            # `_concernes`. La branche supprimee n'ecrivait donc jamais rien
+            # d'autre que la valeur deja en place.
+            #
+            # EN TABLEAU, ET C'EST MAINTENANT QUE CA COMPTE. La boucle
+            # Python tournait une fois par emplacement CONCERNE et par
+            # barre : deux tours quand le budget de risque n'autorisait
+            # qu'une position, mais soixante depuis qu'il est retire. A
+            # 870 000 barres par epoch, c'est 52 millions d'iterations.
+            #
+            # `math.log` ETAIT LE VERROU, et il a saute a la mesure. Le
+            # remplacer par `np.log` avait ete refuse faute de garantie sur
+            # l'egalite des bits. Mesure du 2026-09-19, trois millions de
+            # valeurs tirees sur toute la plage utile — rapports proches de
+            # 1, rapports larges, rapports a 1e-9 pres — : IDENTIQUES AU BIT
+            # dans les trois cas. Le reste suit terme pour terme,
+            # `np.clip(x, -a, a)` etant exactement `max(min(x, a), -a)`.
             _lat = self._latents_par_slot(price)
-            for j in range(self._K):
-                if j not in _concernes:
-                    self._r_slots[j] = 0.0
-                    continue
-                d_j = (_lat[j] - self._latent_prec[j]
-                       + self._realise_slots[j])
-                lr = math.log(max(prev_equity_clamped + d_j, 1e-8)
-                              / prev_equity_clamped)
-                self._r_slots[j] += 10.0 * max(min(lr, 0.05), -0.05) - _pen
-                if _clip:
-                    self._r_slots[j] = float(
-                        np.clip(self._r_slots[j], -3.5, 3.5))
+            _prec, _real = self._latent_prec, self._realise_slots
+            _idx = np.fromiter(_concernes, np.int64, len(_concernes))
+            _d = _lat[_idx] - _prec[_idx] + _real[_idx]
+            _lr = np.log(np.maximum(prev_equity_clamped + _d, 1e-8)
+                         / prev_equity_clamped)
+            # LE PARENTHESAGE EST CELUI DE LA BOUCLE, et ce n'est pas une
+            # coquetterie. Elle ecrivait `out[j] += 10*c - pen`, donc
+            # `out + (10*c - pen)`. Ecrire `(out + 10*c) - pen` donne un
+            # resultat different de 4.4e-16 des que la penalite est active :
+            # l'addition flottante n'est pas associative. Le test bit a bit
+            # l'a montre — identique a penalite nulle, different sinon.
+            _v = self._r_slots[_idx] + (10.0 * np.clip(_lr, -0.05, 0.05)
+                                        - _pen)
+            self._r_slots[_idx] = np.clip(_v, -3.5, 3.5) if _clip else _v
         else:
             self._r_slots[:] = 0.0
 
@@ -3753,6 +4149,147 @@ def _veilleur():
     return _VEILLEUR
 
 
+class ScoresAPlat:
+    """Les scores de decision de CHAQUE barre, calcules en une seule passe.
+
+    POURQUOI. Profilage de la validation, 2026-09-19 : 131 s au total, dont
+    **124.6 s dans le forward du reseau** — 5 760 appels de lot 10, a 21.6 ms
+    chacun. `env.step` n'en represente que 6.7. Un reseau de 45 000
+    parametres coute la meme chose a lot 1 qu'a lot 64 : ce n'est pas le
+    calcul qui coute, c'est l'appel. Vectoriser du numpy n'y changerait rien.
+
+    CE QUI REND LE GROUPAGE POSSIBLE. L'observation vaut 256 colonnes de
+    marche plus QUATRE colonnes d'etat : sens, latent en ATR, duree de
+    detention, capacite restante. A une barre ou l'environnement est PLAT —
+    et la validation ne decide que la — les trois premieres valent exactement
+    zero par construction, et la quatrieme vaut `libres / (libres + tenues)`
+    avec `tenues = 0`, donc 1.0 des qu'une place est ouvrable.
+
+    L'observation d'un instant de decision ne depend donc que du MARCHE. Elle
+    se calcule pour toutes les barres a l'avance, par lots de 8 192, ce que
+    le diagnostic de rang fait deja depuis toujours.
+
+    CE QUI N'EST PAS SUPPOSE. Le cas `libres = 0` donne 0.0 et non 1.0. On ne
+    parie pas dessus : `pour()` COMPARE les quatre colonnes d'etat reelles a
+    celles du cache et ne sert la valeur memorisee que si elles coincident,
+    au bit pres. Les autres repassent par un forward. C'est exact par
+    construction, et le compteur `secours` dit combien de fois c'est arrive.
+    """
+
+    ETAT_A_PLAT = (0.0, 0.0, 0.0, 1.0)
+
+    def __init__(self, policy, data, cfg, device, masque, lot=8192,
+                 aux=True):
+        self.policy = policy
+        self.data = data
+        self.cfg = cfg
+        self.device = device
+        self.masque = masque
+        self.aux = aux
+        self.lot = lot
+        self.secours = 0
+        self.servis = 0
+        self._table = None
+
+    def _construit(self):
+        lb = self.cfg.lookback
+        n = self.data.length
+        idx = np.arange(lb, n, dtype=np.int64)
+        n_f = self.data.features.shape[1]
+        table = np.full((n, N_ACTIONS), np.nan, np.float32)
+        masque_t = torch.from_numpy(
+            np.repeat(self.masque[None, :], self.lot, axis=0)).to(self.device)
+
+        # LE MODE DU RESEAU EST RESTAURE, PAS FORCE. Une premiere version
+        # finissait par `policy.train()` : appelee depuis la calibration,
+        # elle rallumait le DROPOUT au milieu de la validation, qui tourne en
+        # `eval()` depuis toujours. Le test de non-regression l'a prise en
+        # defaut — ecart maximal 0.23 la ou on attendait 1e-6 — et sans lui
+        # la validation aurait mesure une politique bruitee sans que rien ne
+        # leve.
+        etait_en_train = self.policy.training
+        self.policy.eval()
+
+        # LES FENETRES SE PRENNENT EN VUE GLISSANTE, sans boucle Python. La
+        # premiere version recopiait `features[i-lb:i]` ligne a ligne : 63 000
+        # tours de boucle, 34 s pour une fenetre de validation. La vue ne
+        # copie rien, c'est le passage au tenseur qui materialise le lot.
+        fen = np.lib.stride_tricks.sliding_window_view(
+            self.data.features, lb, axis=0)          # (n-lb+1, n_f, lb)
+        try:
+            with torch.no_grad():
+                for d0 in range(0, len(idx), self.lot):
+                    b = idx[d0:d0 + self.lot]
+                    obs = np.empty((len(b), lb, n_f + 4), np.float32)
+                    # `fen[i - lb]` porte les barres [i-lb, i), axes (n_f, lb)
+                    obs[:, :, :n_f] = np.swapaxes(fen[b - lb], 1, 2)
+                    obs[:, :, n_f:n_f + 3] = 0.0
+                    obs[:, :, n_f + 3] = 1.0
+                    st = torch.from_numpy(obs).to(self.device)
+                    lg, _ = self.policy(st)
+                    pr = torch.softmax(
+                        lg.masked_fill(~masque_t[:len(b)], MASK_VALUE),
+                        dim=-1).cpu().numpy()
+                    if self.aux:
+                        try:
+                            a = self.policy.rendement(st).float().cpu().numpy()
+                            pr = pr.copy()
+                            pr[:, :2] = 1.0 / (1.0 + np.exp(-np.clip(a, -30, 30)))
+                        except Exception:
+                            self.aux = False
+                    table[b] = pr
+        finally:
+            if etait_en_train:
+                self.policy.train()
+        self._table = table
+
+    def pour(self, etats, indices):
+        """Rend le tableau de scores pour ces observations, dans cet ordre.
+
+        `etats[i]` est l'observation deja construite, `indices[i]` la barre
+        qu'elle decrit. Une observation dont les colonnes d'etat ne sont pas
+        celles du cache repasse par le reseau.
+        """
+        if self._table is None:
+            self._construit()
+        n_f = self.data.features.shape[1]
+        attendu = np.asarray(self.ETAT_A_PLAT, np.float32)
+        out = np.empty((len(etats), N_ACTIONS), np.float32)
+        manquants = []
+        for i, (o, bar) in enumerate(zip(etats, indices)):
+            if (0 <= bar < self._table.shape[0]
+                    and np.isfinite(self._table[bar, 0])
+                    and np.array_equal(o[-1, n_f:], attendu)):
+                out[i] = self._table[bar]
+                self.servis += 1
+            else:
+                manquants.append(i)
+        if manquants:
+            self.secours += len(manquants)
+            vb = np.stack([etats[i] for i in manquants], axis=0)
+            st = torch.as_tensor(vb, dtype=torch.float32, device=self.device)
+            mk = torch.from_numpy(
+                np.repeat(self.masque[None, :], len(manquants), axis=0)
+            ).to(self.device)
+            etait = self.policy.training
+            self.policy.eval()
+            with torch.no_grad():
+                lg, _ = self.policy(st)
+                pr = torch.softmax(lg.masked_fill(~mk, MASK_VALUE),
+                                   dim=-1).cpu().numpy()
+                if self.aux:
+                    try:
+                        a = self.policy.rendement(st).float().cpu().numpy()
+                        pr[:, :2] = 1.0 / (1.0 + np.exp(-np.clip(a, -30, 30)))
+                    except Exception:
+                        pass
+            if etait:
+                self.policy.train()
+            for j, i in enumerate(manquants):
+                out[i] = pr[j]
+        return out
+
+
 def build_action_mask_from_positions(positions: torch.Tensor, side: str) -> torch.Tensor:
     device = positions.device
     B = positions.shape[0]
@@ -3868,7 +4405,8 @@ def run_training_on_split(
     test_data: MarketData,
     stats: Dict[str, np.ndarray],
     cfg: PPOConfig,
-    suffix: str = ""
+    suffix: str = "",
+    poids_initiaux: Optional[str] = None,
 ):
     import csv as _csv
 
@@ -4021,7 +4559,7 @@ def run_training_on_split(
     # il se calcule une fois ici, et chaque epoch n'ajoute qu'une passe avant
     # sur 11 000 observations. Ce qui suit est du diagnostic : rien ne s'en
     # sert pour selectionner, decider ou arreter.
-    _rang_idx = _rang_reel = None
+    _rang_idx = _rang_reel = _rang_gain = None
     if getattr(cfg, "diag_rang", True):
         import cibles as _CIB
         _pas = max(int(getattr(cfg, "diag_rang_pas", 12)), 1)
@@ -4036,8 +4574,30 @@ def run_training_on_split(
                 # sous-jacent s'annule, donc un rho positif dit que le modele
                 # distingue les moments, pas qu'il a profite d'une hausse.
                 _rang_reel = ((_ra - _rv) / 2.0)[_ok]
+                # LE GAIN DU COTE REELLEMENT JOUE, en unites de risque.
+                #
+                # `_rang_reel` est la part SYMETRIQUE, (achat - vente) / 2 :
+                # elle annule la derive du sous-jacent, donc un rho positif
+                # dit que le modele distingue les MOMENTS et non qu'il a
+                # profite d'une hausse. C'est la bonne cible pour juger un
+                # CLASSEMENT.
+                #
+                # Ce n'est pas ce que la strategie ENCAISSE. Un run long-only
+                # prend des achats : ce qu'il gagne, c'est `_ra`, derive
+                # comprise. Pour juger la RENTABILITE du tri il faut donc le
+                # rendement du cote qu'on joue vraiment, et les deux
+                # grandeurs doivent coexister — l'une dit si l'ordre est bon,
+                # l'autre si le sommet paie.
+                if cfg.side == "long":
+                    _rang_gain = _ra[_ok]
+                elif cfg.side == "short":
+                    _rang_gain = _rv[_ok]
+                else:
+                    _rang_gain = np.maximum(_ra[_ok], _rv[_ok])
                 print(f"  • Classement : {len(_rang_idx):,} decisions de "
-                      f"validation suivies (une toutes les {_pas*5} min)")
+                      f"validation suivies (une toutes les {_pas*5} min), "
+                      f"gain median du cote joue "
+                      f"{float(np.median(_rang_gain)):+.3f} R")
 
     def _un_membre(archi, taille_patch, pas):
         """Un reseau seul, a l'architecture demandee."""
@@ -4088,6 +4648,34 @@ def run_training_on_split(
         n_actions=N_ACTIONS,
         n_ref=cfg.n_ref,
     ).to(device)
+
+    # ------------------------------------------------------------------
+    # LES POIDS DU FOLD PRECEDENT, quand le walk-forward est CHAINE.
+    #
+    # Sans cela chaque fold repart de zero et le run produit trois modeles
+    # qui n'ont vu qu'un tiers de l'histoire chacun. Chaine, c'est UN modele
+    # qui traverse les fenetres dans l'ordre du temps : le fold 1 apprend sur
+    # les barres les plus anciennes, le 2 reprend ses poids et continue sur
+    # une fenetre decalee, le 3 fait de meme.
+    #
+    # CE QUI NE FUIT PAS. La fenetre d'entrainement du fold k s'arrete avant
+    # sa fenetre de validation, qui precede son test : un modele entre au
+    # test de son fold sans avoir vu une seule de ses barres. Que le fold 3
+    # s'entraine plus tard sur ce qui fut le test du fold 1 ne change rien au
+    # chiffre deja mesure du fold 1 — il a ete releve avant.
+    #
+    # L'OPTIMISEUR, LUI, REPART A NEUF, et c'est voulu : ses moments sont
+    # ceux d'une distribution de gradients qui vient de changer de fenetre.
+    # Le warmup du critic recommence pour la meme raison.
+    # ------------------------------------------------------------------
+    if poids_initiaux is not None:
+        etat = torch.load(poids_initiaux, map_location=device)
+        policy.load_state_dict(etat, strict=True)
+        print(f"[{cfg.side.upper()}{suffix}]  • POIDS HERITES de "
+              f"{poids_initiaux} — ce fold CONTINUE le precedent, il ne "
+              f"repart pas de zero.")
+        print(f"    Les epochs a actor gele ne mesurent donc plus le hasard "
+              f"mais la politique heritee.")
 
     optimizer = optim.Adam(policy.parameters(), lr=cfg.lr, eps=1e-8)
 
@@ -4154,8 +4742,12 @@ def run_training_on_split(
     policy_short = None
 
     best_val_profit = -1e9
+    # Le meilleur CLASSEMENT vu jusqu'ici — un rho, donc dans [-1, 1].
+    # Voir plus bas pourquoi ce n'est plus le Sortino qui selectionne.
     best_metric = -1e9
     best_state = None
+    _best_epoch = -1        # l'epoch dont les poids partent au fold suivant
+    _refus_creux = 0        # candidats ecartes parce que le compte a plonge
     best_thresholds = None
     best_decision_spec = None
     epochs_no_improve = 0
@@ -4376,7 +4968,15 @@ def run_training_on_split(
             if deciding:
                 batch_np = np.stack([states[k] for k in deciding], axis=0)
                 s_tensor = torch.as_tensor(batch_np, dtype=torch.float32, device=device)
-                # Tous ces envs sont flat : un seul masque suffit.
+                # UN SEUL MASQUE, ET CE N'EST PLUS PARCE QU'ILS SONT PLATS.
+                # Le commentaire disait « tous ces envs sont flat » : c'etait
+                # vrai a une position, faux sous concurrence — un
+                # environnement qui garde une place libre peut en tenir
+                # vingt. Le masque reste celui de l'etat PLAT parce que c'est
+                # `peut_entrer()` qui autorise l'ouverture, pas la position
+                # nette. Prendre `build_mask_from_pos_scalar(position)`
+                # interdirait d'ouvrir des qu'une position est ouverte, et
+                # supprimerait l'essaim sans que rien ne le signale.
                 # LE TROISIEME VOTANT ENTRE ICI. TabM n'a pas de gradient et
                 # ses scores dependent de la BARRE, pas seulement de
                 # l'observation : il ne peut donc pas etre un membre du
@@ -5117,6 +5717,35 @@ def run_training_on_split(
         etat_rng = np.random.get_state()
         np.random.seed(cfg.val_seed)
 
+        # LA BANQUE SE RAFRAICHIT ICI, AVANT LA CALIBRATION — elle ne l'etait
+        # qu'apres. Les poids du tronc ont bouge pendant l'epoch, donc les
+        # representations mises en cache sont perimees. La calibration
+        # tournait avec l'ancienne banque et la validation avec la nouvelle :
+        # les barres etaient donc calibrees sur un modele legerement
+        # different de celui qui les applique. Personne ne l'aurait vu.
+        policy.rafraichit_banque()
+
+        # UNE TABLE DE SCORES PRECALCULES A ETE ESSAYEE ICI, ET RETIREE.
+        #
+        # L'idee : la validation ne decide qu'a plat, ou les quatre colonnes
+        # d'etat sont constantes, donc l'observation ne depend que du marche
+        # et tous les scores se calculent d'avance par gros lots. Le calcul
+        # etait juste — verifie, zero decision basculee a la selectivite
+        # jouee — mais il est PLUS LENT : `validation 153 s` contre 142.
+        #
+        # L'ERREUR DE RAISONNEMENT. « Un reseau de 45 000 parametres coute
+        # autant a lot 1 qu'a lot 8 192 » est vrai jusqu'a quelques dizaines
+        # d'echantillons, faux a 8 192 : a cette taille le calcul redevient
+        # reel. Et la table couvre TOUTE la fenetre — 74 107 barres — la ou
+        # la boucle n'en visite que celles ou un environnement est a plat.
+        # On payait donc plus de travail pour eviter des appels moins chers
+        # qu'on ne le croyait.
+        #
+        # CE QUI RESTE A ESSAYER, si quelqu'un y revient : un lot
+        # intermediaire — 256 ou 1 024 — et la table restreinte aux seules
+        # barres que les episodes visitent. Le balayage n'a pas ete mene.
+        # `ScoresAPlat` est conservee, inutilisee, avec son test.
+
         # PASSE 1 sur les environnements de CALIBRATION : la fenetre qui
         # PRECEDE celle de mesure. Les seuils en sortent, puis sont figes.
         v_states = []
@@ -5125,11 +5754,25 @@ def run_training_on_split(
             s0, i0 = reset_au_depart(e, d)
             v_states.append(s0)
             v_infos.append(i0)
-        # LA CALIBRATION NE SERT QU'A LA VALIDATION — elle produit les barres
-        # que la passe suivante applique. La faire tourner une epoch ou la
-        # validation est sautee coutait 38 secondes pour un resultat que
-        # personne ne lit.
-        cal_active = list(range(len(calib_envs))) if _valide else []
+        # LA CALIBRATION TOURNE A CHAQUE EPOCH, et ce n'est plus du gaspillage.
+        #
+        # Elle etait sautee quand la validation l'etait — 38 secondes pour un
+        # resultat que personne ne lisait. C'etait vrai tant que le meilleur
+        # checkpoint se choisissait sur le Sortino, qui n'existe que les
+        # epochs validees.
+        #
+        # CE N'EST PLUS LE CAS. Le critere est desormais le CLASSEMENT, et il
+        # est calcule a CHAQUE epoch sur les memes 3 273 decisions. Une epoch
+        # non validee peut donc porter le meilleur modele du run — et sans
+        # calibration fraiche on ne pourrait pas l'enregistrer, parce que le
+        # `_calib.json` ecrit a cote porte les barres de decision : les
+        # apparier a des poids d'une autre epoch ferait trader le checkpoint
+        # sous une calibration qui n'est pas la sienne.
+        #
+        # Le cout est borne et connu : ~25 s sur les deux tiers des epochs,
+        # soit environ +12 % de duree de run, contre la certitude de pouvoir
+        # enregistrer le meilleur modele QUELLE QUE SOIT l'epoch ou il tombe.
+        cal_active = list(range(len(calib_envs)))
         # PAS DE CALIBRATION — un quantile n'a pas besoin de chaque bougie.
         #
         # Cette passe ne sert qu'a estimer deux quantiles de la distribution de
@@ -5191,12 +5834,16 @@ def run_training_on_split(
         # arrete a l'epoch 2 pour cette raison exacte : un patch qui saute une
         # passe doit fournir ce que cette passe produisait, au moment ou c'est
         # lu, pas plus tard.
+        # `pbs_val` N'EST PLUS REPRIS : il vient de la calibration, qui tourne
+        # maintenant a chaque epoch. Le reprendre ecraserait une distribution
+        # FRAICHE, mesuree sous les poids courants, par celle d'il y a deux
+        # epochs — exactement l'inverse de ce qu'on cherche. Seuls les
+        # resultats de la passe de TRADING, elle toujours sautee, sont repris.
         if not _valide and _val_prec is not None:
             (val_pnl, val_dd, val_trades, val_trades_side,
-             pbs_val, _val_epoch) = _val_prec
+             _, _val_epoch) = _val_prec
             val_pnl, val_dd = list(val_pnl), list(val_dd)
             val_trades, val_trades_side = list(val_trades), list(val_trades_side)
-            pbs_val = [list(pbs_val[0]), list(pbs_val[1])]
 
         # Barres issues de CETTE distribution, une par côté, budget partagé.
         #
@@ -5227,10 +5874,7 @@ def run_training_on_split(
         # dans les 5 % les plus convaincues des 500 dernieres vues ». La fenetre
         # est amorcee avec les convictions de la passe de calibration, qui la
         # precede chronologiquement — donc aucune information future.
-        # Les poids du tronc ont bouge pendant l'epoch : les representations
-        # de la banque mises en cache sont perimees. Sans ce rafraichissement,
-        # la memoire repondrait avec l'encodage d'il y a N pas de gradient.
-        policy.rafraichit_banque()
+        # (La banque a ete rafraichie plus haut, AVANT la calibration.)
 
         # LA SELECTIVITE SE DIVISE PAR LE NOMBRE DE COTES OUVERTS, pas par
         # deux. `val_selectivity / 2.0` supposait un run bilateral : en
@@ -5265,7 +5909,27 @@ def run_training_on_split(
         # envs flat. En position l'action est forcée, le forward serait jeté.
         with torch.no_grad():
             while v_active:
-                deciding = [k for k in v_active if v_infos[k].get("position", 0) == 0]
+                # DES QU'UNE PLACE EST LIBRE, comme l'entrainement et le
+                # live. La condition etait `position == 0` : le compte ne
+                # decidait que s'il etait ENTIEREMENT plat, donc il restait
+                # assis pendant toute la vie d'une position — vingt-cinq
+                # heures en mediane.
+                #
+                # CE QUE CELA FAUSSAIT. L'entrainement joue un essaim
+                # (`peut_entrer()`, ligne ~4927) pendant que la validation
+                # jouait UNE position a la fois. On entrainait donc une
+                # strategie et on en mesurait une autre. Le creux le disait
+                # sans qu'on l'ecoute : 57 a 76 % a l'entrainement contre 12
+                # a 20 % en validation.
+                #
+                # CE QUE CELA COUTAIT EN TRADES. A 5 % de selectivite la
+                # fenetre offre 164 occasions, soit 20 trades par mois ; le
+                # run n'en produisait que 4.4. Le facteur 4.5 manquant etait
+                # ce temps d'inactivite, et non un choix de geometrie.
+                #
+                # `peut_entrer()` demande au SOLDE, pas au tableau : c'est la
+                # meme regle partagee que `kairos_live` appelle desormais.
+                deciding = [k for k in v_active if val_envs[k].peut_entrer()]
                 v_actions = {k: 2 for k in v_active}
 
                 if deciding:
@@ -5552,6 +6216,7 @@ def run_training_on_split(
         # d'entrer : position 0, latent 0, detention 0, echelle de risque 1.
         _rho_ep = float(chr(110) + chr(97) + chr(110))
         _rho_aux = float(chr(110) + chr(97) + chr(110))
+        _gain_top = _gain_tous = float(chr(110) + chr(97) + chr(110))
         _sa = []
         if _rang_idx is not None:
             policy.eval()
@@ -5595,11 +6260,47 @@ def run_training_on_split(
             if _sa:
                 _rho_aux = _correlation_rang(np.concatenate(_sa), _rang_reel)
 
+            # ============================================================
+            # CE QUE LE SOMMET RAPPORTE, et c'est le critere de selection.
+            #
+            # POURQUOI PAS LE RHO SEUL. Un rho eleve dit que l'ORDRE est bon
+            # sur toute la fenetre. Il ne dit pas que les 5 % retenus
+            # gagnent : on peut bien ordonner l'ensemble et avoir un sommet
+            # qui ne paie pas. Or c'est le sommet, et lui seul, qui est
+            # trade.
+            #
+            # POURQUOI PAS LE PNL DE VALIDATION. Il porte sur ~55 trades,
+            # soit +-2.81 $ d'erreur-type pour un gain mesure de +5.30 $ —
+            # 1.9 ecart-type. Selectionner la-dessus quatre-vingt-dix fois,
+            # c'est attraper un pic de chance, et ce depot l'a chiffre :
+            # -3.3 points au test.
+            #
+            # CE QU'ON PREND. Le rendement MOYEN, en unites de risque, des
+            # occasions que ce checkpoint mettrait effectivement en position
+            # — les `selectivite` % les mieux notees. C'est de la
+            # rentabilite, sur l'ensemble reellement joue, mesuree sur ~164
+            # observations au lieu de 55, et sans la variance que le
+            # simulateur ajoute par les emplacements et le budget.
+            #
+            # Mesure anterieure du depot, meme grandeur : le sommet a 5 %
+            # rapporte +0.41 R par occasion contre +0.079 au hasard.
+            # ============================================================
+            _scores_sel = (np.concatenate(_sa) if _sa
+                           else np.concatenate(_s))
+            # LA MEME SELECTIVITE QUE LA VALIDATION APPLIQUE, sans quoi on
+            # jugerait un sommet que personne ne trade.
+            _q = float(np.clip(val_selectivity, 0.01, 1.0))
+            _n_top = max(int(round(_q * len(_scores_sel))), 20)
+            _top = np.argsort(_scores_sel)[-_n_top:]
+            _gain_top = float(np.mean(_rang_gain[_top]))
+            _gain_tous = float(np.mean(_rang_gain))
+
         _ligne_meta = (
             f"{tag} {epoch_str}  "
             f"{_col('META ', _C.GREY + _C.BOLD)}  "
             f"rho {_rho_ep:>+6.4f}  rhoAux {_rho_aux:>+6.4f}  "
             + ("" if _valide else f"[val ep{_val_epoch}] ") +
+            f"sommet {_gain_top:>+6.3f}R/{_gain_tous:>+6.3f}R  "
             f"Sortino {metric:>+6.3f}  "
             f"{_col(f'Sortino30 {s30:>+6.3f}', s30_col)}  "
             f"AvgW {_money(avg_win_train, width=8)}  AvgL {_money(avg_loss_train, width=8)}  "
@@ -5607,7 +6308,13 @@ def run_training_on_split(
             f"AuxL {np.mean(epoch_aux_loss) if epoch_aux_loss else float(chr(110)+chr(97)+chr(110)):>7.4f}  "
             f"CriticL {np.mean(epoch_critic_loss):>7.4f}  "
             f"H {np.mean(epoch_entropy):>5.3f}  "
-            f"Hflat {np.mean(epoch_entropy_flat):>5.3f}/1.099  "
+            # LE PLAFOND EST CELUI DU COTE, pas 1.099 en dur. En
+            # long-only la politique choisit entre ACHETER et ATTENDRE :
+            # son maximum vaut ln 2 = 0.693, pas ln 3. Ecrit en dur, il
+            # faisait passer une politique a PILE OU FACE pour une
+            # politique differenciee a 63 %.
+            f"Hflat {np.mean(epoch_entropy_flat):>5.3f}/"
+            f"{math.log(sum(cotes_permises(cfg.side)) + 1):>5.3f}  "
             f"sel[train {100*selectivite:>4.1f}% val {100*val_selectivity:>4.1f}%] "
             f"thr[tr {conf_thr:.3f} "
             f"valB {val_decisions[0].thresholds[0]:.3f} valS {val_decisions[0].thresholds[1]:.3f}] "
@@ -5814,18 +6521,125 @@ def run_training_on_split(
                 f"ValPNL/trade={_money(best_val_profit, width=10)}  trades={val_num_trades}"
             )
 
-        # Select the CURRENT policy score, not an average of earlier policies.
-        if val_num_trades >= cfg.min_val_trades_save and metric > best_metric:
-            best_metric = metric
+        # ==================================================================
+        # LE MEILLEUR CHECKPOINT SE CHOISIT SUR LE CLASSEMENT, PAS SUR LE
+        # SORTINO NI SUR LE PNL. Trois raisons, toutes mesurees.
+        #
+        # 1. LE NOMBRE D'OBSERVATIONS. Le Sortino et le PnL par trade se
+        #    calculent sur ~55 trades de validation ; le rho porte sur les
+        #    3 273 decisions de la fenetre. La veille annonce elle-meme, a
+        #    presque chaque epoch, que le gain par trade est SOUS son
+        #    erreur-type. Selectionner sur une grandeur non separable de zero
+        #    revient a tirer au sort — et ce tirage coute -3.3 points mesures
+        #    ici, avec un fold d'exec18 a +8.14 en validation pour -0.9 en
+        #    test.
+        #
+        # 2. LE RHO EST LE SEUL A ETRE FRAIS A CHAQUE EPOCH. La validation ne
+        #    tourne qu'une epoch sur `validation_tous_les` ; entre deux, le
+        #    Sortino affiche est CELUI DE LA DERNIERE MESURE. Le comparer a
+        #    `best_metric` ne compare alors rien. Le rho, lui, est recalcule
+        #    a chaque epoch sur les memes 3 273 etats — il suit la politique
+        #    reellement courante.
+        #
+        # 3. C'EST LA GRANDEUR QUI DECIDE EN PRODUCTION. Avec
+        #    `tri_par_tete_aux`, ce sont les scores de la tete auxiliaire qui
+        #    trient les occasions en validation, en test et en live. `rhoAux`
+        #    mesure exactement la qualite de ce tri. Choisir un checkpoint
+        #    sur une autre grandeur, c'est optimiser ce qu'on ne joue pas.
+        #
+        # CE QUE CE CRITERE N'EST PAS : une mesure de rentabilite. Un rho
+        # eleve dit que l'ordre des occasions est bon, pas que la geometrie
+        # gagne. Les deux se lisent ensemble, et `bestprofit_` garde sa
+        # lecture par le PnL pour qu'on puisse les comparer.
+        #
+        # LE CRITERE EST LA RENTABILITE DU SOMMET, sous condition que le
+        # classement tienne. Deux grandeurs, et il faut les deux :
+        #
+        #   `_gain_top`  ce que rapportent, en R, les occasions que ce
+        #                checkpoint mettrait en position — c'est la
+        #                RENTABILITE, mesuree sur l'ensemble reellement joue.
+        #   `rho`        la qualite de l'ORDRE sur toute la fenetre. Il sert
+        #                de garde : un sommet rentable avec un classement nul
+        #                est un tirage, pas un tri, et il ne se reproduira
+        #                pas sur une autre fenetre.
+        #
+        # Prendre le gain SEUL reviendrait a selectionner sur 164
+        # observations sans savoir si le tri les a choisies ou si elles sont
+        # tombees la. Prendre le rho SEUL — ce que faisait la version d'il y
+        # a une heure — mesure un ordre juste sans jamais verifier que le
+        # sommet paie. Les deux ensemble disent : il trie, et ce qu'il trie
+        # rapporte.
+        #
+        # TOUTES LES EPOCHS SONT CANDIDATES, et c'est le point.
+        #
+        # Avant, la selection ne pouvait retenir qu'une epoch sur trois : le
+        # Sortino n'existe que les epochs validees, et sur les autres la
+        # comparaison portait sur une valeur REPRISE de la derniere mesure —
+        # donc jamais superieure au record. Soixante epochs sur quatre-vingt-
+        # dix ne pouvaient structurellement pas etre retenues, quelle que
+        # soit leur qualite. Personne ne l'avait remarque parce que rien ne
+        # le signalait : le code avait l'air de tester chaque epoch.
+        #
+        # Le classement est calcule a chaque epoch, et la calibration aussi
+        # depuis qu'on la fait tourner partout : les poids enregistres et les
+        # barres ecrites a cote viennent donc toujours de la MEME epoch.
+        # ====================================================================
+        # LE GARDE-FOU DE SURVIE, et pourquoi il a fallu l'ajouter.
+        #
+        # `_gain_top` mesure ce que rapportent les occasions du sommet UNE A
+        # UNE. Il ne sait rien du nombre tenu simultanement, de leur
+        # correlation, ni de la survie du compte. Tant que le budget de
+        # risque n'autorisait qu'une ou deux positions, la distinction etait
+        # sans consequence. Depuis qu'il est retire, un modele peut avoir un
+        # excellent classement par occasion ET vider le compte en ouvrant
+        # soixante positions correlees — et `_gain_top` le noterait au
+        # sommet.
+        #
+        # On refuse donc de retenir un checkpoint dont la DERNIERE mesure de
+        # portefeuille a creve le garde-fou de creux. Le seuil n'est pas
+        # invente : c'est `max_drawdown`, celui qui termine deja un episode.
+        #
+        # LE CREUX EST CELUI DE L'EPOCH JUGEE. `validation_tous_les` vaut 1
+        # depuis le 2026-09-19 : le portefeuille est mesure a chaque epoch,
+        # donc la garde lit l'etat du modele qu'elle juge et non celui d'il
+        # y a deux epochs. C'est ce qui a ete paye sept heures de run.
+        #
+        # Si la frequence de validation remonte un jour, cette garde
+        # redevient approximative — elle jugerait sur un portefeuille
+        # perime — et il faudra le savoir avant de lire ses refus.
+        # ====================================================================
+        _score_rang = _rho_aux if np.isfinite(_rho_aux) else _rho_ep
+        _retenu, _pourquoi = retient_checkpoint(
+            gain_top=_gain_top, score_rang=_score_rang,
+            val_num_trades=val_num_trades, val_max_dd=val_max_dd,
+            best_metric=best_metric,
+            min_trades=cfg.min_val_trades_save, max_dd=cfg.max_drawdown)
+        # UN REFUS POUR CAUSE DE CREUX SE DIT. Les autres refus sont la
+        # normale — un sommet sous le record, c'est quatre-vingts epochs sur
+        # quatre-vingt-dix. Celui-la est different : le modele etait
+        # MEILLEUR au classement et c'est le portefeuille qui l'a disqualifie.
+        if not _retenu and _pourquoi.startswith("creux"):
+            _refus_creux += 1
+            print(f"  {_col('REFUSE', _C.RED + _C.BOLD)}  sommet "
+                  f"{_gain_top:+.3f} R meilleur que {best_metric:+.3f}, "
+                  f"mais {_pourquoi} — non retenu, et non transmis au fold "
+                  f"suivant.")
+        if _retenu:
+            best_metric = _gain_top
             best_state = copy.deepcopy(policy.state_dict())
             best_thresholds = list(calib_thr_val)
             best_decision_spec = copy.deepcopy(decision_spec)
             save_checkpoint(best_state, best_path)
             _sauve_seuil(best_path)
             epochs_no_improve = 0
+            _quoi = "rhoAux" if np.isfinite(_rho_aux) else "rho"
+            _best_epoch = epoch
             print(
                 f"  {_col('★', _C.MAGENTA + _C.BOLD)} "
-                f"{_col(f'NEW BEST SORTINO', _C.MAGENTA + _C.BOLD)}  "
+                f"{_col(f'NEW BEST', _C.MAGENTA + _C.BOLD)}  "
+                f"sommet {_gain_top:+.3f} R/occasion "
+                f"(contre {_gain_tous:+.3f} au hasard)  "
+                f"{_quoi}={_score_rang:+.4f}  "
                 f"Sortino={metric:+.3f}  trades={val_num_trades}"
             )
         else:
@@ -5834,12 +6648,41 @@ def run_training_on_split(
             # validation comme une autre — elle choisissait la longueur du run
             # d'apres elle. Le budget est desormais fixe a l'avance.
             if patience > 0 and epochs_no_improve >= patience:
-                print(f"[{cfg.side.upper()}{suffix}] Early stopping après {epoch} epochs (Sortino rolling ne progresse plus).")
+                print(f"[{cfg.side.upper()}{suffix}] Early stopping après "
+                      f"{epoch} epochs (le CLASSEMENT ne progresse plus — "
+                      f"c'est rhoAux qui compte les epochs sans amélioration "
+                      f"depuis qu'il sélectionne le checkpoint).")
                 break
 
     last_path = f"last_{cfg.model_prefix}_{cfg.side}{suffix}.pth"
     save_checkpoint(policy.state_dict(), last_path)
     _sauve_seuil(last_path)
+
+    # CE QUI PART AU FOLD SUIVANT, DIT EN CLAIR. Le chainage transmet
+    # `best_`, et jusqu'ici rien n'affichait DE QUELLE epoch il venait ni
+    # avec quel score : une chaine qui se serait rompue en silence aurait
+    # produit trois modeles independants sous le nom d'un seul.
+    if best_state is None:
+        print(f"[{cfg.side.upper()}{suffix}] AUCUN checkpoint 'best' ecrit sur "
+              f"ce fold. Le fold suivant reprendra 'last'.")
+        if _refus_creux:
+            print(f"    {_refus_creux} candidat(s) ont ete ECARTES pour un "
+                  f"creux au-dela de {100*cfg.max_drawdown:.0f} %. Le "
+                  f"classement progressait, le portefeuille mourait : c'est "
+                  f"le cas ou il faut valider a CHAQUE epoch "
+                  f"(validation_tous_les = 1) pour que le critere voie ce "
+                  f"qui tue le compte.")
+        else:
+            print(f"    Aucune epoch n'a atteint {cfg.min_val_trades_save} "
+                  f"trades de validation avec un classement positif.")
+    else:
+        print(f"[{cfg.side.upper()}{suffix}] MEILLEUR CHECKPOINT : epoch "
+              f"{_best_epoch} sur {epoch}, sommet {best_metric:+.3f} R par "
+              f"occasion. C'est lui qui ouvre le fold suivant.")
+        if _refus_creux:
+            print(f"    ({_refus_creux} candidat(s) mieux classes ont ete "
+                  f"ecartes pour un creux au-dela de "
+                  f"{100*cfg.max_drawdown:.0f} %.)")
 
     if not cfg.evaluate_test:
         print(f"[{cfg.side.upper()}{suffix}] Entrainement termine. TEST reserve, non consulte.")
@@ -5887,7 +6730,10 @@ def run_training_on_split(
 
     with torch.no_grad():
         while t_active:
-            deciding = [k for k in t_active if t_infos[k].get("position", 0) == 0]
+            # MEME REGLE QU'EN VALIDATION ET QU'A L'ENTRAINEMENT. Mesurer
+            # le test sur une strategie a une position quand on en deploie
+            # une a plusieurs mesurerait ce que personne ne joue.
+            deciding = [k for k in t_active if test_envs[k].peut_entrer()]
             t_actions = {k: 2 for k in t_active}
 
             if deciding:
@@ -6012,15 +6858,76 @@ def run_walkforward(
     max_folds: int = 1,
     start_fold: int = 1,
     bootstrap_from_path: Optional[str] = None,
-    auto_chain: bool = False,
+    chaine: bool = True,
 ):
-    """Walk-forward: scaler calculé sur le train de chaque fold, sans transfert implicite.
+    """Walk-forward CHAINE : un seul modele, du plus ancien au plus recent.
 
-    start_fold permet de sélectionner la première fenêtre. Les paramètres de
-    bootstrap historiques restent acceptés pour produire une erreur explicite.
+    `chaine=True` transmet les poids d'un fold au suivant. `start_fold`
+    selectionne la premiere fenetre ; `bootstrap_from_path` donne des poids de
+    depart au tout premier fold.
+
+    POURQUOI LE CHAINAGE ETAIT REFUSE, ET CE QUI A CHANGE. Le code levait :
+    « le bootstrap inter-fold exige une adaptation explicite de
+    normalisation ». L'objection est juste — chaque fold calculait ses
+    statistiques sur SON train, donc un reseau herite aurait vu ses entrees a
+    une autre echelle que celle sous laquelle il a appris — mais elle n'avait
+    jamais ete chiffree.
+
+    MESURE DU 2026-09-19, ecart entre les statistiques du fold 1 et celles
+    des suivants, exprime en ecarts-types du fold 1 :
+
+        fold   derive de moyenne (med / p95 / max)   sigma_k / sigma_1 (med)
+          2         0.008 / 0.063 / 0.125                    1.007
+          3         0.013 / 0.092 / 0.162                    1.011
+
+    Treize millio-iemes d'ecart-type en median, seize centiemes au pire, sur
+    des entrees qui vivent dans [-3, 3]. La raison tient a la geometrie du
+    walk-forward : le pas vaut la longueur du TEST, donc les trains des folds
+    1 et 3 partagent 64 % de leurs barres.
+
+    ON NE CORRIGE DONC RIEN, ON SUPPRIME LE PROBLEME : les statistiques sont
+    calculees UNE FOIS, sur le train du premier fold, et servent a tous. La
+    derive ci-dessus devient le prix a payer — l'echelle vue par le reseau ne
+    bouge plus du tout — et le checkpoint porte une seule normalisation, celle
+    que le live utilisera.
+
+    « MAIS LE MODELE NE CONNAITRA PAS LES PRIX RECENTS. » L'objection est la
+    bonne : l'or vaut 1 494 $ au debut du jeu et 4 463 $ a la fin, et des
+    statistiques de 2019-2023 appliquees a 2026 enverraient toute colonne
+    portant un NIVEAU hors de la plage apprise. Mesure du 2026-09-19, fenetre
+    par fenetre, standardisation par les statistiques du fold 1 :
+
+        fenetre         periode            or            derive med   hors plage
+        fold 1 train    2019-09->2023-08   1494-> 1955$      0.000       0.09 %
+        fold 1 TEST     2024-08->2025-04   2457-> 3319$      0.067       0.13 %
+        fold 2 TEST     2025-04->2026-01   3319-> 4463$      0.060       0.07 %
+        fold 3 TEST     2026-01->2026-09   4463-> 4378$      0.020       0.23 %
+
+    Et la comparaison qui tranche, sur la fenetre LA PLUS RECENTE :
+
+        statistiques du fold 1 (figees)    derive med 0.020   |z| p99 3.74
+        statistiques du fold 3 (par fold)  derive med 0.019   |z| p99 4.09
+
+    Les statistiques figees font AUSSI BIEN, et un peu mieux au 99e centile.
+
+    LA RAISON EST STRUCTURELLE : aucune des 256 colonnes ne suit le prix.
+    Correlation au close sur toute la serie, seuil 0.8 : zero colonne
+    retenue. Ce sont des rendements, des rapports et des rangs. Le prix peut
+    tripler, l'observation ne bouge pas d'echelle — c'est precisement ce qui
+    rend le figeage possible, et ce qui le rendrait impossible si une seule
+    colonne portait un niveau. Le jour ou l'on en ajoute une, cette mesure
+    est a refaire AVANT de figer quoi que ce soit.
+
+    A NOTER, parce que la question revient : AUCUNE normalisation, figee ou
+    par fold, ne peut inclure la fenetre de test. Les statistiques du fold 3
+    s'arretent en 2024-12 pour un test qui court de 2026-01 a 2026-09. Les
+    calculer sur les barres a juger serait une fuite de futur. « Connaitre
+    les prix recents » n'est donc pas ce que la normalisation par fold
+    apporte — elle n'apporte ici rien du tout.
     """
-    if auto_chain or bootstrap_from_path is not None:
-        raise ValueError("Le bootstrap inter-fold exige une adaptation explicite de normalisation; auto_chain doit être False.")
+    if bootstrap_from_path is not None and start_fold != 1:
+        raise ValueError("bootstrap_from_path ne s'applique qu'au premier fold "
+                         "joue ; les suivants heritent du precedent.")
     assert train_frac + val_frac + test_frac <= 1.0 + 1e-6, "Les fractions ne peuvent pas dépasser 1.0"
 
     df_full = load_mt5_data(cfg_base)
@@ -6037,9 +6944,13 @@ def run_walkforward(
 
     step = test_len
 
-    print(f"\n=== WALK-FORWARD {cfg_base.side.upper()} ===")
+    print(f"\n=== WALK-FORWARD {cfg_base.side.upper()}"
+          f"{' CHAINE' if chaine else ' INDEPENDANT'} ===")
     print(f"Total bars={n}, window_len={window_len}, "
           f"train={train_len}, val={val_len}, test={test_len}, step={step}")
+    if chaine:
+        print("Les folds se transmettent le MEILLEUR checkpoint : UN modele "
+              "traverse tout l'historique, du plus ancien au plus recent.")
 
     # Skip les folds avant start_fold
     fold = start_fold - 1
@@ -6047,12 +6958,28 @@ def run_walkforward(
     if start_fold > 1:
         print(f"[SKIP] Folds 1 → {start_fold - 1} sautés (start_fold={start_fold})")
 
+    # UNE SEULE NORMALISATION POUR TOUT LE RUN, celle du train du fold 1.
+    #
+    # Il en faut UNE SEULE parce que les folds se transmettent les poids : si
+    # l'echelle des entrees changeait d'un fold a l'autre, le reseau herite
+    # lirait ses colonnes autrement qu'il ne les a apprises. C'est ce qui
+    # interdisait le chainage avant qu'on le mesure.
+    #
+    # ELLE NE VOIT QUE DU PASSE, et c'est le point. La calculer sur tout
+    # l'historique couvrirait aussi les prix recents, mais ferait entrer les
+    # fenetres de TEST dans la moyenne et l'ecart-type — une fuite de futur.
+    # Elle a ete essayee puis retiree : la mesure ci-dessous montre qu'elle
+    # n'apportait rien qui vaille ce prix.
+    stats = compute_and_save_global_norm_stats(
+        df_full.iloc[start:start + train_len], FEATURE_COLS, path=None)
+    print(f"Normalisation figee sur le train du fold {start_fold} "
+          f"[{start} : {start + train_len}) — la meme pour tous les folds, "
+          f"et elle ne voit que du passe.")
+
+    precedent = bootstrap_from_path
     while start + window_len <= n and fold < max_folds:
         fold += 1
         print(f"\n--- Fold {fold} : indices [{start} : {start + window_len}) ---")
-
-        stats = compute_and_save_global_norm_stats(
-            df_full.iloc[start:start + train_len], FEATURE_COLS, path=None)
         train_data, calib_data, val_data, test_data = create_datasets_from_slices(
             df_full, FEATURE_COLS,
             start=start,
@@ -6068,8 +6995,42 @@ def run_walkforward(
 
         suffix = f"_wf{fold}"
         run_training_on_split(train_data, calib_data, val_data, test_data, stats,
-                              cfg_fold, suffix=suffix)
+                              cfg_fold, suffix=suffix,
+                              poids_initiaux=precedent)
 
+        # LE FOLD SUIVANT REPREND LE MEILLEUR CHECKPOINT, sur demande
+        # explicite. `best_` est celui du meilleur Sortino de validation.
+        #
+        # CE QUE CE CHOIX COUTE, et il est assume : selectionner un
+        # checkpoint sur son resultat de validation vaut -3.3 points mesures
+        # dans ce depot, parce que la validation selectionne a l'envers de
+        # facon reproductible — le fold 2 d'exec18 affichait +8.14 en
+        # validation pour -0.9 en test. La moyenne des derniers jeux de poids
+        # (`last_`) ne depend d'aucun tirage, et c'est pour cela qu'elle reste
+        # la famille deployee par `checkpoints.py`.
+        #
+        # Ici le transfert ne sert pas a deployer mais a CONTINUER : ce qui
+        # part au fold suivant est le jeu de poids qui a le mieux tenu sur la
+        # fenetre precedente, et il sera reentraine sur la suivante.
+        #
+        # Repli sur `last_` si le meilleur n'existe pas — un fold qui n'aurait
+        # jamais ameliore son Sortino n'en ecrit pas. Le repli est annonce,
+        # jamais silencieux : sans cela le fold suivant repartirait de zero
+        # sans que rien ne le dise.
+        if chaine:
+            _best = f"best_{cfg_fold.model_prefix}_{cfg_fold.side}{suffix}.pth"
+            _last = f"last_{cfg_fold.model_prefix}_{cfg_fold.side}{suffix}.pth"
+            if os.path.exists(_best):
+                precedent = _best
+            elif os.path.exists(_last):
+                print(f"  ATTENTION : {_best} absent — le fold {fold} n'a "
+                      f"jamais ameliore son Sortino. Le fold suivant reprend "
+                      f"{_last} a la place.")
+                precedent = _last
+            else:
+                print(f"  ATTENTION : ni {_best} ni {_last} — le fold suivant "
+                      f"REPART DE ZERO, la chaine est rompue.")
+                precedent = None
         start += step
 
     print(f"\n=== FIN WALK-FORWARD {cfg_base.side.upper()} (folds entraînés : {start_fold} → {fold}) ===")
@@ -6079,10 +7040,62 @@ def run_walkforward(
 # MAIN
 # ======================================================================
 
+class _Journal:
+    """Ecrit a l'ecran ET dans un fichier que la veille peut lire.
+
+    POURQUOI PAS `Tee-Object`. La commande PowerShell ouvre le fichier en
+    acces EXCLUSIF : la veille ne peut alors meme pas l'ouvrir en lecture,
+    elle ne lit rien et n'affiche rien — sans erreur visible, puisqu'elle
+    n'attrape que `FileNotFoundError`. Une demi-heure a chercher un motif
+    casse pour un verrou de fichier.
+
+    Python, lui, ouvre en partage par defaut sous Windows : un autre
+    processus peut lire pendant qu'on ecrit. On vide le tampon a chaque
+    ligne, sinon la veille lirait avec plusieurs minutes de retard.
+
+    L'ECRAN RESTE LA SOURCE : si l'ecriture du fichier echoue — disque plein,
+    fichier verrouille par autre chose — on continue d'afficher. Un journal
+    est un confort, l'entrainement n'en depend pas.
+    """
+
+    def __init__(self, flux, chemin):
+        self.flux = flux
+        try:
+            self.f = open(chemin, "w", encoding="utf-8", buffering=1,
+                          newline="\n")
+        except OSError:
+            self.f = None
+
+    def write(self, texte):
+        self.flux.write(texte)
+        if self.f is not None:
+            try:
+                self.f.write(texte)
+            except OSError:
+                self.f = None
+        return len(texte)
+
+    def flush(self):
+        self.flux.flush()
+        if self.f is not None:
+            try:
+                self.f.flush()
+            except OSError:
+                self.f = None
+
+    def isatty(self):
+        return self.flux.isatty()
+
+
 if __name__ == "__main__":
     import sys
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
+    # Le journal que lit `veille_epochs.py`. Ecrit ici plutot que par une
+    # redirection du shell : voir `_Journal`.
+    _jrn = _Journal(sys.stdout, "training_btc.log")
+    sys.stdout = _jrn
+    sys.stderr = _Journal(sys.stderr, "training_err.log")
     cfg_base = PPOConfig()
 
     # =======================================================
@@ -6094,6 +7107,30 @@ if __name__ == "__main__":
     print("=" * 70)
     cfg_long = PPOConfig(**cfg_base.__dict__)
     cfg_long.side = "long"
+
+    # LES CONSTANTES DE L'INSTRUMENT VIENNENT DU REGISTRE, PAS DE LA CONFIG.
+    #
+    # `instruments.py` a ete ecrit pour etre cette source unique — largeur de
+    # stop, trailing, friction, lot minimum, taille du contrat, marge — et il
+    # n'etait appele par personne. Les memes constantes vivaient aussi dans
+    # `PPOConfig`, recopiees a la main.
+    #
+    # ELLES AVAIENT DEJA DIVERGE, d'un seul chiffre et sans bruit : la marge
+    # valait 0.001734 dans la config contre 0.001744 dans le registre, ou
+    # elle est mesuree par `order_calc_margin`. Un ecart de 0.6 % qui ne
+    # casse rien — il decale simplement la capacite d'un cran, 129 places
+    # ouvrables au lieu de 128 — mais qui suffit a ce que l'entrainement et
+    # le live ne comptent pas les memes positions. C'est le test
+    # d'alignement de la capacite qui l'a trouve, pas une relecture.
+    #
+    # Tous les autres champs coincidaient deja. Brancher le registre ne
+    # change donc qu'une valeur, et supprime la source du desaccord.
+    # `PPOConfig.__post_init__` a deja applique le registre : on se contente
+    # de dire ce qui est reellement en vigueur.
+    print(f"Constantes lues dans instruments.py pour {cfg_long.symbol} : "
+          f"stop {cfg_long.atr_sl_mult:g}xATR, spread "
+          f"{cfg_long.spread_bps:g} bps, contrat {cfg_long.contrat:g}, "
+          f"marge {cfg_long.marge_frac:.6f}")
     # Un prefixe par jeu d'observation OU par architecture : les poids ne sont
     # jamais interchangeables d'une lignee a l'autre, et le manifeste refuse de
     # reecrire un run existant.
@@ -6164,7 +7201,32 @@ if __name__ == "__main__":
     # encore a 1 107 decisions par epoch pour 4 000 visees : le plafond
     # herite du BTC mordait, et l'acteur recevait le quart du gradient prevu.
     # Seule cette borne change ; le reste est exec03 a l'identique.
-    cfg_long.model_prefix = "saintv2_or_exec04"
+    # exec05 — TROIS changements, tous structurels, aucun de reglage.
+    #
+    #   1. WALK-FORWARD CHAINE. Le fold 2 reprend les poids du fold 1, le 3
+    #      ceux du 2 : un seul modele traverse l'histoire du plus ancien au
+    #      plus recent, au lieu de trois qui en voient chacun un tiers. La
+    #      normalisation est figee sur le train du fold 1, ce qui rend le
+    #      transfert exact — la derive mesuree entre folds valait 0.013
+    #      ecart-type en median, 0.16 au pire.
+    #
+    #   2. ENVIRONNEMENT DEUX FOIS PLUS RAPIDE, a resultat identique :
+    #      2 584 -> 4 950 barres/s au profileur. Les reductions numpy passent
+    #      de 41 a 7 par barre, la boucle de repartition ne parcourt plus les
+    #      64 emplacements mais les deux concernes.
+    #
+    #   3. exec04 est mort a l'epoch 9 (arret de la machine), donc il n'y a
+    #      rien a comparer plus loin que cela.
+    # exec06 — exec05 sur un cache RAFRAICHI. Le terminal MetaTrader a ete
+    # reinstalle et son plafond de barres porte a illimite ; le jeu de l'or
+    # va desormais jusqu'au 2026-09-18 (494 052 barres contre 493 497).
+    #
+    # Les douze annees supplementaires que le terminal propose ont ete
+    # ECARTEES apres mesure : 127 barres par semaine contre 1 358, et un ATR
+    # relatif de 4.68 points de base contre 6.63 — des fragments epars, pas
+    # des seances, et une geometrie qui n'est pas la meme. Le detail est dans
+    # `prepare_or.py`.
+    cfg_long.model_prefix = "saintv2_or_exec06"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
@@ -6188,7 +7250,7 @@ if __name__ == "__main__":
           f"a CLASSER, pas ce que la position encaisse")
 
     # Chaque fold repart de zéro avec les statistiques de son train.
-    print("Walk-forward or_exec04 LONG-ONLY (XAUUSD seul) : trois folds sans bootstrap inter-fold.")
+    print("Walk-forward or_exec06 LONG-ONLY (XAUUSD seul) : trois folds CHAINES, le meilleur checkpoint de chacun ouvre le suivant.")
     # ==================================================================
     # DEUX ARCHITECTURES DANS LE MEME RUN, pour que le vote existe.
     #
@@ -6227,14 +7289,14 @@ if __name__ == "__main__":
     run_walkforward(cfg_long, train_frac=0.55, val_frac=0.15, test_frac=0.10,
                     max_folds=3, start_fold=1,
                     bootstrap_from_path=None,
-                    auto_chain=False)
+                    chaine=True)
 
     print("\n" + "=" * 70)
     print("  WALK-FORWARD LONG-ONLY TERMINÉ : 3 folds.")
     print("  Fichiers générés :")
-    print("    best_saintv2_or_exec04_long_wf1_long_wf1.pth")
-    print("    best_saintv2_or_exec04_long_wf2_long_wf2.pth")
-    print("    best_saintv2_or_exec04_long_wf3_long_wf3.pth")
+    print("    best_saintv2_or_exec06_long_wf1_long_wf1.pth")
+    print("    best_saintv2_or_exec06_long_wf2_long_wf2.pth")
+    print("    best_saintv2_or_exec06_long_wf3_long_wf3.pth")
     print("=" * 70)
 
     # ---------------------------------------------------------

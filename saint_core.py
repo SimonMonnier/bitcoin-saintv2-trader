@@ -2206,6 +2206,55 @@ def load_decision_policy(checkpoint, fallback=None, side=None):
                                 'thresholds': list(load_calib_thresholds(checkpoint, fallback))})
 
 
+def places_ouvrables_compte(equity: float, marge_utilisee: float,
+                            prix: float, lot_min: float, contrat: float,
+                            marge_frac: float, niveau_marge: float,
+                            budget_risque: float = 0.0,
+                            risque_engage: float = 0.0,
+                            risque_une: float = 0.0) -> int:
+    """Combien de positions de plus le COMPTE permet, ici et maintenant.
+
+    SOURCE UNIQUE. L'environnement d'entrainement et `kairos_live` appellent
+    tous deux cette fonction. C'est la seule facon qu'ils aient de rester
+    d'accord : la version precedente vivait dans
+    `BTCTradingEnvDiscrete._places_ouvrables`, et le live n'en avait aucune
+    — il ouvrait UNE position par agent et passait son tour ensuite, pendant
+    que l'entrainement en ouvrait soixante. Deux strategies differentes sous
+    le meme nom, et rien pour le signaler.
+
+    LA FONCTION EST PURE : elle ne lit ni environnement, ni MetaTrader, ni
+    configuration. L'appelant lui donne l'etat du compte — l'env depuis ses
+    propres tableaux, le live depuis `account_info()` — et elle rend un
+    nombre. C'est ce qui la rend testable des deux cotes avec les memes
+    entrees.
+
+    DEUX BORNES, et la seconde peut etre desactivee.
+
+      LA MARGE, contrainte du COURTIER. On s'arrete avant que le niveau de
+      marge ne descende sous `niveau_marge` : la marge disponible vaut alors
+      `equity / niveau_marge - marge_utilisee`, et chaque position de plus en
+      consomme `prix x lot_min x contrat x marge_frac`.
+
+      LE BUDGET DE RISQUE, qui est NOTRE politique et non une contrainte de
+      marche. A zero — le reglage courant — il disparait : seul le courtier
+      borne, et le modele doit apprendre a ne pas aller au bout. Au-dessus de
+      zero, la somme des montants a perdre si tous les stops etaient touches
+      reste sous `budget_risque` de l'equite.
+    """
+    if equity <= 0:
+        return 0
+    m_une = max(prix * lot_min * contrat * marge_frac, 1e-12)
+    marge_max = equity / max(niveau_marge, 1e-9)
+    par_marge = math.floor((marge_max - marge_utilisee) / m_une)
+
+    par_risque = float("inf")
+    if budget_risque > 0.0:
+        par_risque = math.floor(
+            (budget_risque * equity - risque_engage) / max(risque_une, 1e-12))
+
+    return int(max(0, min(par_marge, par_risque)))
+
+
 def compute_risk_volume(equity: float, risk_frac: float, sl_dist: float,
                         tick_value: float, tick_size: float,
                         vol_min: float = 0.01, vol_step: float = 0.01,
