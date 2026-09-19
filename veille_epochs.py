@@ -76,14 +76,22 @@ RE_META = re.compile(
     # est NON CAPTURANT : la suite du fichier lit m[2] a m[22] par position, et
     # un groupe de plus les decalerait tous en silence. Il est OPTIONNEL pour
     # que la veille continue de lire les journaux des runs anterieurs.
-    r"\[(?:BOTH|LONG|SHORT)_(wf\d+)\]\s+EPOCH (\d+)\s+META\s+(?:rho\s+" + NB + r"\s+)?"
-    r"(?:rhoAux\s+" + NB + r"\s+)?"
-    # Marqueur des epochs ou la validation a ete sautee : le PnL affiche est
-    # celui de la derniere mesure reelle. Troisieme fois qu'un champ ajoute
-    # entre META et Sortino casse ce motif en silence — la veille n'affichait
-    # plus qu'une seule epoch, sans rien signaler.
-    r"(?:\[val ep\d+\]\s*)?"
-    r"Sortino\s+(" + NB + r").*?"
+    r"\[(?:BOTH|LONG|SHORT)_(wf\d+)\]\s+EPOCH (\d+)\s+META\s+"
+    # ON N'ENUMERE PLUS LES CHAMPS QUI PRECEDENT SORTINO. Ils ont ete quatre
+    # a s'inserer la — `rho`, `rhoAux`, `[val epN]`, `sommet` — et un
+    # CINQUIEME, `table`, a casse ce motif le 2026-09-19. A chaque fois le
+    # symptome est le meme : la veille se tait, sans rien signaler, et on
+    # cherche ailleurs.
+    #
+    # `.*?` tolere n'importe quel champ futur. Il ne peut pas deraper : le
+    # motif est ancre sur `[COTE_wfN] EPOCH n META` en tete, il est NON
+    # GOURMAND donc il s'arrete au PREMIER `Sortino` suivi d'une espace, et
+    # `Sortino30` n'en est pas un — le `3` suit immediatement.
+    #
+    # Les champs qu'on veut LIRE se lisent par des motifs separes, comme
+    # `RE_RHO` et `RE_SOMMET` : c'est la seule facon d'en ajouter sans
+    # decaler les indices que `analyse` lit par position.
+    r".*?Sortino\s+(" + NB + r").*?"
     r"AvgW\s+(" + NB + r")\$\s+AvgL\s+(" + NB + r")\$.*?H ([\d.]+).*?"
     r"sel\[train\s+([\d.]+)% val\s+([\d.]+)%\].*?"
     r"etendue\[tr ([\d.-]+) val ([\d.-]+)\].*?"
@@ -92,6 +100,25 @@ RE_META = re.compile(
     r"temps\[collecte (\d+)s maj PPO (\d+)s calibration (\d+)s "
     r"validation (\d+)s\].*?gpu\[(\d+)C (\d+)/"
     r".*?ENV \[B\s+([\d.]+)% S\s+([\d.]+)% H\s+([\d.]+)%\]")
+
+# Le critere de SELECTION depuis le 2026-09-19 : ce que rapportent, en
+# unites de risque, les occasions que le checkpoint mettrait en position, et
+# ce que rapporte une occasion au hasard. Lu par un motif separe pour la
+# meme raison que rho — ne pas decaler les indices de `analyse`.
+RE_SOMMET = re.compile(r"sommet\s+(" + NB + r")R/(" + NB + r")R")
+
+# Combien de scores sont venus de la table groupee, et combien ont du
+# repasser par un forward. Le second doit rester petit : il compte les
+# barres ou l'etat de l'environnement n'etait pas celui que la table
+# suppose, et chacune coute un appel reseau complet.
+RE_TABLE = re.compile(r"table\s+(\d+)/(\d+)")
+
+# LE MARQUEUR DE REPRISE. La validation ne tourne qu'une epoch sur
+# `validation_tous_les` ; les autres, l'entrainement REAFFICHE la derniere
+# mesure et le signale par `[val epN]`. Sans lire ce marqueur, la veille
+# presente trois fois le meme resultat comme trois mesures — et pire, elle
+# l'ADDITIONNE trois fois au cumul du run.
+RE_REPRISE = re.compile(r"\[val ep(\d+)\]")
 
 RE_RHO = re.compile(r"META\s+rho\s+(" + NB + r")")
 RE_RHO_AUX = re.compile(r"rhoAux\s+(" + NB + r")")
@@ -124,17 +151,44 @@ GRADIENT_NUL = 1e-3
 # A p = 0.50 cela fait 0.621. C'est une esperance, pas une borne : une epoch
 # peut la depasser si le veto a moins mordu que prevu. Elle sert de repere,
 # comme 1.099 servait de repere avant.
-def _plafond_entropie() -> float:
+def _plafond_entropie(cote: str = "both") -> float:
+    """L'entropie maximale que la politique PEUT atteindre, a ce cote.
+
+    LE PLAFOND DEPEND DU NOMBRE D'ACTIONS PERMISES, corrige le 2026-09-19 —
+    et l'oubli rendait le diagnostic aveugle.
+
+    A plat, un run BILATERAL choisit entre ACHETER, VENDRE et ATTENDRE :
+    trois actions, plafond ln 3 = 1.099. Un run LONG-ONLY n'en a que deux,
+    ACHETER et ATTENDRE : plafond ln 2 = 0.693.
+
+    CE QUE L'ERREUR COUTAIT. or_exec06 affiche H = 0.693 aux deux premieres
+    epochs. Compare a ln 3, cela fait 63 % du plafond — une politique deja
+    bien differenciee. Compare a ln 2, cela fait 100 % : elle choisit entre
+    ACHETER et ATTENDRE A PILE OU FACE, elle n'a rien differencie du tout.
+    Et le diagnostic « APPREND MAIS RESTE PLAT », declenche au-dessus de
+    0.99 x plafond, ne pouvait structurellement jamais tirer.
+
+    C'est la meme faute que le point mort calcule sur la mauvaise fenetre,
+    et elle est notee dans ce fichier depuis le 2026-09-16 : un chiffre
+    juste, compare au mauvais repere.
+    """
+    n_actions = 3 if cote in ("both", "duel") else 2
     try:
         from training import PPOConfig as _C
         if not getattr(_C(), "votant_tabm", False):
-            return math.log(3)
+            return math.log(n_actions)
         from tabm_votant import PART_LAISSEE as p
     except Exception:
-        return math.log(3)
+        return math.log(n_actions)
+    if n_actions == 2:
+        # Le veto ne peut interdire que le seul cote ouvert ; il ne reste
+        # alors qu'ATTENDRE, d'entropie nulle.
+        return p * math.log(2)
     return (p * p * math.log(3) + 2 * p * (1 - p) * math.log(2))
 
 
+# Valeur par defaut, bilaterale. `analyse` recalcule le plafond avec le
+# COTE lu dans le journal : c'est lui qui decide du nombre d'actions.
 H_MAX = _plafond_entropie()
 
 # LE WARMUP SE LIT SUR LE NUMERO D'EPOCH, PAS SUR UN SEUIL, corrige le
@@ -195,7 +249,8 @@ def _point_mort(avg_w, avg_l):
 
 
 def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
-            ent_prec=None, rho=None, cote="both"):
+            ent_prec=None, rho=None, cote="both", herite=False,
+            sommet=None, reprise=None):
     """Rend (lignes colorees, lignes brutes, gain par trade, ecart, gele)."""
     ep = int(v[1])
     pnl, trades, wr, pf, dd = (float(v[2]), int(v[3]), float(v[4]),
@@ -257,6 +312,8 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     # apprenaient, lentement. Confondre les deux fait passer pour du tirage au
     # sort ce qui est en realite un apprentissage trop lent — deux problemes
     # qui n'appellent pas du tout la meme correction.
+    # LE PLAFOND SE CALCULE POUR CE COTE, pas une fois pour toutes.
+    h_max = _plafond_entropie(cote)
     gele = ep <= WARMUP
     # Contre-verification : le gradient doit s'effondrer pendant le warmup et
     # passer ensuite. Un desaccord signale que la configuration lue ici n'est
@@ -267,8 +324,17 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     L.append((("MODELE DEPLOYE (moyenne des poids)  " if moyenne else "")
               + f"EPOCH {ep:03d}   {par_trade:+.2f}$/trade   {trades} trades   "
                 f"WR {wr:.1f}%   PF {pf:.2f}   {duree:.0f} min"))
-    L.append(f"  PnL      {pnl:+10.2f}$   cumul run {cumul:+11.2f}$   "
-             f"DD {dd:.1f}%   Sortino {sortino:+.3f}")
+    # CE QUI EST MESURE, ET CE QUI EST REPRIS. Une epoch sans validation
+    # reaffiche les chiffres de la derniere mesure reelle. Les presenter
+    # comme neufs laisse croire que le modele a ete evalue alors qu'il ne
+    # l'a pas ete — et c'est la meme ligne qui portait le cumul faux.
+    if reprise is not None:
+        L.append(f"  PnL      {pnl:+10.2f}$   {C.JAUNE}REPRIS de l'epoch "
+                 f"{reprise}, pas mesure ici{C.FIN}   cumul run "
+                 f"{cumul:+11.2f}$   DD {dd:.1f}%")
+    else:
+        L.append(f"  PnL      {pnl:+10.2f}$   cumul run {cumul:+11.2f}$   "
+                 f"DD {dd:.1f}%   Sortino {sortino:+.3f}")
     L.append(f"  point mort {equilibre:.1f}%  ->  ecart {ecart:+.1f} pt "
              f"(+/- {err_pt:.1f} au mieux)")
 
@@ -299,9 +365,25 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
         L.append(f"  classement rho {coul}{rho:+.4f}{C.FIN} "
                  f"(+/- 0.024 env.)  -> {quoi}{sup}")
 
+    # CE QUE RAPPORTE LE SOMMET, et c'est sur lui que le checkpoint est
+    # retenu depuis le 2024-09-19. Le rho dit si l'ORDRE est bon ; celui-ci
+    # dit si les occasions effectivement prises PAIENT. Les lire separement
+    # evite la confusion qui a coute le run precedent : un tri juste dont le
+    # sommet ne rapporte rien n'est pas une strategie.
+    if sommet is not None:
+        g_top, g_hasard = sommet
+        ecart = g_top - g_hasard
+        cs = (C.VERT if ecart > 0.05 else
+              (C.ROUGE if ecart < -0.05 else C.GRIS))
+        L.append(f"  sommet retenu  {cs}{g_top:+.3f} R{C.FIN} par occasion  "
+                 f"contre {g_hasard:+.3f} au hasard  "
+                 f"-> {cs}{ecart:+.3f} R{C.FIN} de mieux"
+                 f"   [c'est ce qui selectionne le checkpoint]")
+
     if reference is not None:
         n_ref, moy_ref = reference
-        L.append(f"  vs politique gelee du meme run : {ecart - moy_ref:+.1f} pt"
+        quoi_ref = "politique heritee" if herite else "politique gelee"
+        L.append(f"  vs {quoi_ref} du meme run : {ecart - moy_ref:+.1f} pt"
                  f"   (reference {moy_ref:+.1f} pt sur {n_ref} epochs)")
     if precedent is not None:
         L.append(f"  vs epoch precedente : {par_trade - precedent:+.2f}$/trade")
@@ -330,7 +412,9 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     # tirage. Les enterrer dans une note conditionnelle les rendait invisibles
     # exactement quand elles importaient le plus.
     d_ent = "" if ent_prec is None else f" ({H - ent_prec:+.3f})"
-    L.append(f"  politique  H {H:.3f}/{H_MAX:.3f}{d_ent}   etendue {et_val:.4f} "
+    L.append(f"  politique  H {H:.3f}/{h_max:.3f}{d_ent}"
+             f" ({100*H/max(h_max,1e-9):.0f} % du plafond a {cote})"
+             f"   etendue {et_val:.4f} "
              f"({et_val/TREMBLEMENT_SEUIL:.0f}x le tremblement)   "
              f"KL {kl:+.4f}   clipfrac {clipfrac:.1f}%   "
              f"g_actor {g_actor:.1e}")
@@ -349,14 +433,24 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
             f"{'dans' if gele else 'hors'} le warmup ({WARMUP} epochs) mais "
             f"son gradient vaut {g_actor:.1e}. La configuration lue par la "
             f"veille n'est peut-etre pas celle du run.")
-    if gele:
+    if gele and herite:
+        # UN FOLD CHAINE NE PART PAS DU HASARD. Ses epochs a actor gele
+        # mesurent la politique HERITEE du fold precedent, appliquee a une
+        # fenetre qu'elle n'a pas encore vue. C'est une reference utile — le
+        # niveau avant tout nouvel apprentissage — mais l'appeler "hasard"
+        # ferait lire un transfert reussi comme un coup de chance.
+        notes.append(f"ACTOR GELE, POIDS HERITES : warmup du critic, gradient "
+                     f"{g_actor:.1e}. Cette epoch mesure la politique du fold "
+                     f"PRECEDENT sur cette fenetre — pas le hasard. C'est le "
+                     f"niveau de depart que la suite doit battre.")
+    elif gele:
         notes.append(f"ACTOR GELE : warmup du critic, gradient {g_actor:.1e}. "
                      f"Cette epoch ne mesure aucun apprentissage — elle sert de "
                      f"reference au hasard pour les suivantes.")
-    elif H > 0.99 * H_MAX:
+    elif H > 0.99 * h_max:
         notes.append(f"APPREND MAIS RESTE PLAT : le gradient passe "
                      f"({g_actor:.1e}) mais l'entropie tient a {H:.3f} sur "
-                     f"{H_MAX:.3f}. La politique se differencie trop lentement pour "
+                     f"{h_max:.3f}. La politique se differencie trop lentement pour "
                      f"que le filtre ait un sens — c'est un probleme de pas "
                      f"d'apprentissage ou d'echelle, pas de tirage.")
     # Mesure du 2026-09-15 sur les 5 epochs gelees d'exec12, qui partagent le
@@ -450,6 +544,9 @@ class Veilleur:
         self.vus = set()
         self.vals, self.metas, self.trains, self.rhos = {}, {}, {}, {}
         self.cotes = {}         # par fold : long / short / both, lu du tag
+        self.herites = set()    # folds dont les poids viennent du precedent
+        self.sommets = {}       # par (fold, epoch) : (gain du sommet, au hasard)
+        self.reprises = {}      # par (fold, epoch) : epoch dont le PnL est repris
         self.precedent = {}     # par fold : gain par trade de l'epoch d'avant
         self.geles = {}         # par fold : ecarts des epochs a actor gele
         self.cumul = {}         # par fold : PnL de validation cumule
@@ -461,8 +558,10 @@ class Veilleur:
         """Journal tronque ou run relance : on repart de zero."""
         self.vus.clear()
         for d in (self.vals, self.metas, self.trains, self.rhos, self.cotes,
-                  self.precedent, self.geles, self.cumul, self.entropie):
+                  self.precedent, self.geles, self.cumul, self.entropie,
+                  self.sommets, self.reprises):
             d.clear()
+        self.herites.clear()
         self.attend_moyenne.clear()
         self.fold_courant = None
 
@@ -472,6 +571,11 @@ class Veilleur:
             mc = RE_COTE.search(ligne)
             if mc:
                 self.cotes[mc.group(2)] = mc.group(1).lower()
+            if "POIDS HERITES" in ligne:
+                if mc:
+                    self.herites.add(mc.group(2))
+                blocs.append(([f"{C.CYAN}{C.GRAS}  {ligne.strip()}{C.FIN}"],
+                              None))
             if "[MEMOIRE]" in ligne:
                 blocs.append(([f"{C.CYAN}  {ligne.strip()}{C.FIN}"], None))
             if "MOYENNE DES POIDS sur les" in ligne:
@@ -484,6 +588,12 @@ class Veilleur:
                     ligne.split("]")[0].strip("[").split("_")[-1])
             if "[TEST]" in ligne:
                 blocs.append(([f"{C.CYAN}{C.GRAS}  {ligne.strip()}{C.FIN}"],
+                              None))
+            if "NEW BEST" in ligne:
+                # Le checkpoint retenu, et sur quoi il l'a ete. Depuis que la
+                # selection se fait sur le CLASSEMENT et non sur le Sortino,
+                # c'est la ligne qui dit quel modele partira au fold suivant.
+                blocs.append(([f"{C.VERT}{C.GRAS}  {ligne.strip()}{C.FIN}"],
                               None))
             mv, mm = RE_VAL.search(ligne), RE_META.search(ligne)
             mt = RE_TRAIN.search(ligne)
@@ -498,6 +608,14 @@ class Veilleur:
                 self.rhos[(mm.group(1), int(mm.group(2)))] = (
                     float(mr.group(1)) if mr else None,
                     float(ma.group(1)) if ma else None)
+                ms = RE_SOMMET.search(ligne)
+                if ms:
+                    self.sommets[(mm.group(1), int(mm.group(2)))] = (
+                        float(ms.group(1)), float(ms.group(2)))
+                mrp = RE_REPRISE.search(ligne)
+                if mrp:
+                    self.reprises[(mm.group(1), int(mm.group(2)))] = int(
+                        mrp.group(1))
             if mt:
                 self.trains[(mt.group(1), int(mt.group(2)))] = mt.groups()
 
@@ -513,15 +631,24 @@ class Veilleur:
             if len(self.geles.get(fold, [])) >= 2:
                 g = self.geles[fold]
                 ref = (len(g), sum(g) / len(g))
-            self.cumul[fold] = (self.cumul.get(fold, 0.0)
-                                + float(self.vals[cle][2]))
+            # ON N'ADDITIONNE QUE LES MESURES REELLES. Le cumul comptait
+            # chaque epoch, reprises comprises : a une validation sur trois,
+            # il annoncait donc environ TROIS FOIS le PnL reellement
+            # realise. Personne ne l'avait vu parce que le chiffre est
+            # plausible — il monte, il a le bon signe, il a juste le mauvais
+            # facteur.
+            _reprise = self.reprises.get(cle)
+            if _reprise is None:
+                self.cumul[fold] = (self.cumul.get(fold, 0.0)
+                                    + float(self.vals[cle][2]))
             est_moyenne = fold in self.attend_moyenne
             self.attend_moyenne.discard(fold)
             console, brut, par_trade, ecart, gele = analyse(
                 self.vals[cle], self.metas[cle], self.trains.get(cle),
                 self.precedent.get(fold), ref, self.cumul[fold], est_moyenne,
                 self.entropie.get(fold), self.rhos.get(cle),
-                self.cotes.get(fold, "both"))
+                self.cotes.get(fold, "both"), fold in self.herites,
+                self.sommets.get(cle), self.reprises.get(cle))
             self.entropie[fold] = float(self.metas[cle][5])
             self.precedent[fold] = par_trade
             if gele:
