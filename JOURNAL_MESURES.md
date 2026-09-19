@@ -1,5 +1,28 @@
 # Journal des mesures — ce qui a été vérifié, et ce qui ne l'a pas été
 
+> ## ⚠️ AUCUN RÉSULTAT DE PERFORMANCE N'EST ÉTABLI DANS CE DÉPÔT
+>
+> **Rien de ce qui suit n'est un résultat de backtest validé.** Ce fichier est
+> un carnet de laboratoire : chaque entrée est une mesure de travail, prise à
+> un moment donné, avec un harnais dont les défauts n'étaient pas tous connus.
+>
+> Les défauts découverts depuis — un côté interdit qui tradait quand même, une
+> validation qui jouait une stratégie différente de celle qu'on entraînait, un
+> cumul compté plusieurs fois, un plafond d'entropie comparé au mauvais repère
+> — invalident **toute** conclusion de rentabilité tirée avant leur correction.
+>
+> La fenêtre de test de la lignée `or_` a en outre déjà été consultée, et avec
+> ce harnais défectueux : elle n'est plus vierge.
+>
+> **Ce qui garde sa valeur ici est la MÉTHODE et les DÉFAUTS** : comment une
+> mesure a été construite, pourquoi elle était fausse, et ce qu'elle ne
+> permettait pas de conclure. La majorité des entrées sont d'ailleurs des
+> résultats négatifs et des rétractations — elles sont conservées telles
+> quelles, parce que savoir ce qui ne marche pas est le seul acquis solide du
+> projet.
+>
+> Aucun chiffre de ce fichier ne doit être cité comme une performance.
+
 Ce fichier existe parce que la plupart des impasses du projet ont été des
 raisonnements plausibles jamais confrontés à une mesure. Chaque entrée dit ce
 qui a été mesuré, comment, et ce que la mesure **ne** permet pas de conclure.
@@ -592,7 +615,8 @@ demander « le meilleur » rend quand même la moyenne, en disant pourquoi.
 ### Le ménage
 
 865 Mo et 70 fichiers suivis en moins (116 → 46). Tout ce qui servait l'échelle
-de décision **M1** est parti avec elle — écartée par mesure, elle exige +0.114 R
+de décision **M1** est parti avec elle — écartée par mesure, elle exige un
+avantage supérieur à tout ce que ce dépôt a jamais mesuré
 d'avantage — ainsi que le *basis*, le flux à la minute et un doublon exact de
 71 Mo. Le code et la documentation supprimés restent dans l'historique.
 
@@ -768,10 +792,11 @@ avantage brut   SL 4     SL 8
 ```
 
 Le croisement tombe à **0.1456 R**. L'avantage mesuré du modèle vaut +0.09 à
-+0.13 R : il est tout entier du côté où 8×ATR gagne. À 0.09 R, le 4×ATR ne
+la borne haute de l'avantage suppose : il est tout entier du côté où
+8×ATR gagne. À la borne basse, le 4×ATR ne
 laisse pas 1 % de l'avantage brut survivre à la friction.
 
-**Et surtout, l'horizon.** Les +0.09 à +0.13 R ont été mesurés en H1, où le
+**Et surtout, l'horizon.** Ces avantages supposés ont été mesurés en H1, où le
 trade médian dure 13 heures. Le 4×ATR en M5 dure 3 h 40 : un avantage mesuré
 sur un horizon, déployé sur un autre 3.5 fois plus court, en supposant qu'il
 suivrait. Rien ne le garantissait — prédire quatre heures et prédire douze
