@@ -33,11 +33,17 @@ echecs = []
 
 def cas(nom, attendu_retenu, attendu_motif=None, **kw):
     params = dict(gain_top=0.50, score_rang=0.08, val_num_trades=60,
-                  val_ruine=0, best_metric=0.20, min_trades=MIN_TRADES)
+                  val_ruine=0, best_metric=0.20, min_trades=MIN_TRADES,
+                  gain_tous=0.10)
     params.update(kw)
     retenu, motif = T.retient_checkpoint(**params)
+    # SOUS-CHAINE, PAS PREFIXE. Le motif du garde contre le hasard nomme
+    # d'abord le sommet ("sommet +1.401 R ne bat pas le hasard +1.499 R"),
+    # parce que c'est le chiffre qu'on veut lire en premier dans le journal.
+    # Le seul endroit qui exige vraiment un PREFIXE est le refus pour compte
+    # detruit — la veille le compte ainsi — et il est verifie a part, plus bas.
     ok = (retenu == attendu_retenu) and (
-        attendu_motif is None or motif.startswith(attendu_motif))
+        attendu_motif is None or attendu_motif in motif)
     print(("  ok   " if ok else "  RATE ") + f"{nom:<52}"
           + ("retenu" if retenu else f"refuse : {motif}"))
     if not ok:
@@ -48,6 +54,18 @@ def main() -> int:
     print("CE QUI DOIT ETRE RETENU")
     cas("meilleur sommet, classement positif, compte sain", True)
     cas("creux profond mais compte vivant", True, val_ruine=0)
+    # LE RHO NE DECIDE PLUS. Il pesait les 21 000 occasions a egalite quand
+    # le deploiement ne regarde que les 5 % du haut ; depuis que la tete est
+    # entrainee sur le critere de deploiement lui-meme, les deux se separent.
+    # Mesure : exec26 ep.1 affiche rho -0.0101 pour un sommet a +2.255 R
+    # contre +1.229 au hasard. L'ancien portillon jetait ce checkpoint.
+    cas("rho nul, mais le sommet bat le hasard", True, score_rang=0.0)
+    cas("rho negatif, mais le sommet bat le hasard", True, score_rang=-0.05)
+    cas("rho non mesurable, mais le sommet bat le hasard", True,
+        score_rang=float("nan"))
+    cas("le cas exec26 ep.1 en entier", True, gain_top=2.255,
+        score_rang=-0.0101, gain_tous=1.229, best_metric=-9e9,
+        val_num_trades=105)
 
     print("\nCE QUI DOIT ETRE REFUSE — le compte detruit est le cas qui compte")
     cas("un compte detruit, sommet pourtant meilleur", False, "compte detruit",
@@ -56,13 +74,18 @@ def main() -> int:
         val_ruine=4, gain_top=99.0)
     cas("pas assez de trades", False, "seulement",
         val_num_trades=MIN_TRADES - 1)
-    cas("classement nul", False, "classement", score_rang=0.0)
-    cas("classement negatif", False, "classement", score_rang=-0.05)
+    cas("sommet egal au hasard", False, "ne bat pas le hasard",
+        gain_tous=0.50)
+    cas("sommet SOUS le hasard", False, "ne bat pas le hasard",
+        gain_tous=0.60)
+    cas("le cas exec23 ep.5 : rho bon, sommet sous le hasard", False,
+        "ne bat pas le hasard", gain_top=1.401, score_rang=0.072,
+        gain_tous=1.499, best_metric=-9e9)
     cas("sommet egal au record", False, "sommet", gain_top=0.20)
     cas("sommet sous le record", False, "sommet", gain_top=0.19)
     cas("sommet non mesurable", False, "sommet", gain_top=float("nan"))
-    cas("classement non mesurable", False, "classement",
-        score_rang=float("nan"))
+    cas("hasard non mesurable : le garde s'efface, il ne refuse pas", True,
+        gain_tous=float("nan"))
 
     print("\nL'ORDRE DES REFUS : le compte prime sur tout le reste")
     cas("detruit ET trop peu de trades -> le compte d'abord", False, "seulement",

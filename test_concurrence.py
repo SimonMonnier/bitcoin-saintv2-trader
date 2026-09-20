@@ -72,6 +72,15 @@ MARGE = False
 
 def _cfg(k=1):
     cfg = T.PPOConfig()
+    # LE VETO DE TENDANCE EST RETIRE ICI, ET C'EST DELIBERE. Ce test verifie
+    # que K=1 reproduit l'environnement d'avant la concurrence, recompense par
+    # recompense et trade par trade ; la politique d'ENTREE lui est orthogonale.
+    # Le laisser actif ferait comparer un jeu de trades filtre a une reference
+    # qui ne l'etait pas, et 78 ecarts apparaissaient — tous legitimes, aucun
+    # informatif. En contrepartie, ce test NE COUVRE PAS le veto : c'est
+    # `mesure_seuil_tendance.py` qui le mesure, et la verification d'accord
+    # avec la colonne brute qui le controle.
+    cfg.veto_tendance = ""
     cfg.positions_max = k
     cfg.marge_realiste = MARGE
     return cfg
@@ -187,14 +196,55 @@ def trajectoire(cfg, depart=3000, graine=GRAINE, n_pas=N_PAS):
     rec["n_pas"] = len(rec["recompenses"])
     rec["viols"] = rec.get("viols", [])
 
-    # SIGNE. Chaque fermeture porte le cumul de l'emplacement sur la vie de la
-    # position. Un trade gagnant doit avoir accumule du positif. La comparaison
-    # se fait dans l'ordre des fermetures, qui est celui de `trades_meta`.
+    # SIGNE. Chaque fermeture porte le cumul de l'emplacement sur la vie de
+    # la position. La comparaison se fait dans l'ordre des fermetures, qui est
+    # celui de `trades_meta`.
+    #
+    # CE CONTROLE EST DEVENU UN TAUX, ET IL FAUT DIRE POURQUOI — affaiblir un
+    # test pour le faire passer est la pire des corrections.
+    #
+    # Il exigeait qu'un trade gagnant accumule du positif, ce qui etait une
+    # TAUTOLOGIE tant que la recompense ne contenait que du resultat. Depuis
+    # le 2026-09-20 elle porte aussi un COUT DE CHEMIN : la penalite de creux
+    # est facturee a chaque barre pendant l'exposition. Un trade qui gagne peu
+    # en traversant un creux profond finit donc legitimement negatif — c'est
+    # exactement ce qu'on a voulu enseigner, et l'exiger nul reviendrait a
+    # annuler le changement.
+    #
+    # CE QUE LE CONTROLE GARDE : la MIS-ATTRIBUTION reste verifiee STRICTEMENT,
+    # par l'autre invariant — un emplacement ni ouvert, ni ferme, ni porteur
+    # doit recevoir exactement zero. Celui-la n'a aucune tolerance et n'en
+    # aura pas.
+    #
+    # LE SEUIL VIENT D'UNE MESURE, pas d'un arrondi commode
+    # (`mesure_lambda_creux.py`, part des trades gagnants a recompense
+    # cumulee negative, entrees neutres) :
+    #
+    #     lambda 0.000 -> 3.7 %     lambda 0.050 -> 5.6 %
+    #     lambda 0.005 -> 5.6 %     lambda 0.150 -> 7.4 %
+    #
+    # 3.7 % EXISTAIT DEJA SANS AUCUNE PENALITE : le seuil ne peut donc pas
+    # etre zero. On tolere 12 %, soit le double de ce que le reglage retenu
+    # produit, et on echoue au-dela — parce qu'a ce niveau le cout de chemin
+    # noierait le resultat du trade et l'acteur apprendrait que gagner est
+    # mauvais.
     ferm = rec.pop("fermetures", [])
     rec.pop("cumul", None)
+    _gagn = _punis = 0
     for (j, c), m in zip(ferm, env.trades_meta):
         r_trade = m["pnl"]
-        if r_trade > 1e-9 and c < -1e-9:
+        if r_trade > 1e-9:
+            _gagn += 1
+            _punis += (c < -1e-9)
+    _part = 100.0 * _punis / max(_gagn, 1)
+    if _gagn >= 20 and _part > 12.0:
+        rec["viols"].append(
+            f"{_part:.1f} % des trades gagnants finissent a recompense "
+            f"NEGATIVE ({_punis}/{_gagn}) : le cout de chemin noie le "
+            f"resultat du trade")
+    for (j, c), m in zip([], []):
+        r_trade = 0.0
+        if False:
             rec["viols"].append(
                 f"emplacement {j} : trade gagnant {r_trade:+.4f}$ mais cumul "
                 f"de recompense {c:+.6f}")
@@ -205,9 +255,48 @@ def trajectoire(cfg, depart=3000, graine=GRAINE, n_pas=N_PAS):
     return rec
 
 
+def empreinte_donnees(cfg) -> dict:
+    """De QUELLES barres la reference a-t-elle ete prise.
+
+    POURQUOI CETTE EMPREINTE EXISTE. La reference fige une trajectoire de
+    6 000 pas partant d'indices FIXES — 3 000, 90 000, 250 000. Ces indices ne
+    designent pas des dates, ils designent des RANGS dans le cache. Le
+    2026-09-20, trois colonnes de tendance ont ete ajoutees ; leur amorcage de
+    8 640 barres a fait tomber autant de lignes en tete du jeu, et l'indice
+    3 000 a cesse de designer la meme bougie.
+
+    Resultat : 78 ecarts, dont "trade 0, exit_idx 3016 contre 3020" et
+    "nombre de trades 243 contre 215". Tous legitimes, aucun informatif — et
+    tous ressemblant a s'y meprendre a une regression du simulateur. Le
+    fichier se le reprochait deja pour les REGLAGES ("un test qui crie au loup
+    a chaque reglage finit ignore") ; il lui manquait la meme prudence pour
+    les DONNEES.
+
+    On enregistre donc de quoi reconnaitre le jeu : son nombre de lignes, ses
+    bornes de dates, et une empreinte des clotures aux indices effectivement
+    parcourus. Un desaccord dit alors "refiger la reference", et non "la
+    concurrence a change K=1".
+    """
+    import hashlib
+    data = _donnees(cfg)
+    c = np.asarray(data.close, np.float64)
+    bornes = []
+    for _, depart, _ in SCENARIOS:
+        f = min(depart + N_PAS + 1, len(c))
+        bornes.append(c[depart:f] if depart < len(c) else np.array([]))
+    h = hashlib.sha256()
+    for b in bornes:
+        h.update(np.ascontiguousarray(b, np.float64).tobytes())
+    t = data.df["time"] if "time" in data.df.columns else None
+    return {"lignes": int(len(c)),
+            "debut": str(t.iloc[0]) if t is not None else "?",
+            "fin": str(t.iloc[-1]) if t is not None else "?",
+            "empreinte": h.hexdigest()[:16]}
+
+
 def tous_scenarios(k=1):
     """La reference complete : un enregistrement par scenario."""
-    out = {}
+    out = {"_donnees": empreinte_donnees(_cfg(k))}
     for nom, depart, maj in SCENARIOS:
         cfg = _cfg(k)
         for cle, val in maj.items():
@@ -251,14 +340,19 @@ def main() -> int:
         with open(REFERENCE, "w", encoding="utf-8") as f:
             json.dump(tout, f)
         total = 0
+        print(f"  donnees : {tout['_donnees']['lignes']:,} lignes, "
+              f"{tout['_donnees']['debut']} -> {tout['_donnees']['fin']}, "
+              f"empreinte {tout['_donnees']['empreinte']}")
         for nom, r in tout.items():
+            if nom == "_donnees":     # l'empreinte n'est pas un scenario
+                continue
             total += len(r["trades"])
             print(f"  {nom:<24} {r['n_pas']:>5} pas  "
                   f"{len(r['trades']):>3} trades  "
                   f"{r['decisions']:>5} decisions  "
                   f"capital {r['capital'][-1]:>10.4f}$")
         print(f"")
-        print(f"reference figee : {len(tout)} scenarios, {total} trades")
+        print(f"reference figee : {len(tout) - 1} scenarios, {total} trades")
         print(f"ecrite dans {REFERENCE}")
         return 0
 
@@ -270,6 +364,33 @@ def main() -> int:
                   f"l'environnement, sinon il n'y a rien a comparer.")
             return 1
         tout = tous_scenarios(1)
+        # LES DONNEES D'ABORD. Sans ce controle, un cache different produit
+        # des dizaines d'ecarts numeriques qui imitent une regression du
+        # simulateur — et on cherche dans le code pendant une heure.
+        e_ref, e_tout = ref.get("_donnees"), tout.get("_donnees")
+        if e_ref is None:
+            print("la reference ne porte pas d'empreinte de donnees (format")
+            print("anterieur au 2026-09-20) : la refiger une fois pour que le")
+            print("prochain desaccord soit lisible.")
+            print("    python test_concurrence.py enregistre")
+            return 1
+        if e_ref != e_tout:
+            print("LE JEU DE DONNEES A CHANGE DEPUIS L'ENREGISTREMENT.")
+            print(f"  reference : {e_ref['lignes']:,} lignes, "
+                  f"{e_ref['debut']} -> {e_ref['fin']}, "
+                  f"empreinte {e_ref['empreinte']}")
+            print(f"  maintenant: {e_tout['lignes']:,} lignes, "
+                  f"{e_tout['debut']} -> {e_tout['fin']}, "
+                  f"empreinte {e_tout['empreinte']}")
+            print("")
+            print("Les scenarios partent d'INDICES fixes (3 000, 90 000,")
+            print("250 000) : ces rangs ne designent plus les memes bougies,")
+            print("donc la comparaison ne veut rien dire. Ce n'est PAS un")
+            print("ecart de code. Refiger la reference :")
+            print("    python test_concurrence.py enregistre")
+            return 1
+        ref = {k: v for k, v in ref.items() if k != "_donnees"}
+        tout = {k: v for k, v in tout.items() if k != "_donnees"}
         if set(tout) != set(ref):
             print("les scenarios ont change depuis l'enregistrement — refiger "
                   "la reference sur la version d'avant, sinon la comparaison "

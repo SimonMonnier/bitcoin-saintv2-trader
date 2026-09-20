@@ -274,8 +274,84 @@ def rollout_action_probabilities(model_probs, force_prob, threshold, side):
     return (1.0-force_prob) * effective + force_prob * forced
 
 
+def perte_top_k(score, y, masque_cote, s_sel, tau_frac=0.25):
+    """Le rendement moyen des `s_sel` % les mieux notes, rendu DERIVABLE.
+
+    C'EST LE CRITERE DE SELECTION LUI-MEME. `gain_top` — le `sommet` du
+    journal — mesure exactement cela : ce que rapportent les occasions que le
+    checkpoint mettrait en position. C'est lui qui decide quel modele part au
+    fold suivant, donc lui qu'il faut optimiser.
+
+    POURQUOI LA MOINDRE CARRE NE SUFFIT PAS, mesure sur exec35. Elle minimise
+    l'erreur sur TOUTES les occasions, donc elle est dominee par le gros de la
+    distribution. Le deploiement, lui, ne garde que les 5 % du haut. Les deux
+    grandeurs ont diverge, et la mesure le montre sur la serie LISSEE sur cinq
+    epochs, dont l'ecart-type vaut 0.120 :
+
+        AuxL (moindres carres)   0.9595 -> 0.9269 -> 0.9074 -> 0.9112  plafonne
+        sommet lisse             1.126  -> ... -> 0.864   = 2.2 ecarts-types
+
+    Le reseau devenait meilleur sur l'occasion moyenne et moins bon sur celles
+    qui decident. RESERVE DE LECTURE : deux baisses precedentes de `sommet`
+    m'avaient trompe parce que je les lisais sur la serie BRUTE, dont
+    l'ecart-type vaut 0.31 — a ce niveau, trois points ne disent rien. C'est
+    la serie lissee qui tranche, et elle seule.
+
+    LE SEUIL EST DETACHE, LA PONDERATION NE L'EST PAS. `topk` donne le k-ieme
+    meilleur score du lot ; la sigmoide autour de ce seuil rend une selection
+    douce dont le gradient remonte aux scores. A temperature nulle on
+    retrouverait exactement la moyenne des k retenus.
+
+    LA TEMPERATURE SUIT L'ECHELLE DES SCORES — une fraction de leur ecart-type
+    — et non une constante : rien ne fixe l'unite d'un score, et un tau absolu
+    deviendrait soit un seuil dur, soit une moyenne uniforme des que le reseau
+    change d'echelle.
+
+    VIVIER UNIQUE ENTRE LES COTES PERMIS. La regle deployee classe
+    max(achat, vente) et retient les 5 % des OCCASIONS ; prendre le sommet de
+    chaque colonne separement garantirait un quota a chaque sens. En
+    long-only la question ne se pose pas, mais elle se reposera.
+    """
+    m = (masque_cote > 0)
+    sc = score[:, m]
+    yy = y[:, m]
+    if sc.numel() == 0:
+        return score.sum() * 0.0
+    sc = sc.reshape(-1)
+    yy = yy.reshape(-1)
+    k = max(int(round(sc.numel() * float(s_sel))), 1)
+    seuil = torch.topk(sc.detach(), k).values[-1]
+    tau = (tau_frac * sc.detach().std()).clamp_min(1e-6)
+    w = torch.sigmoid((sc - seuil) / tau)
+    return -((w * yy).sum() / w.sum().clamp_min(1e-6))
+
+
+def comprime(x: float, borne: float) -> float:
+    """Comprime sans jamais aplatir : `borne * signe(x) * log1p(|x|/borne)`.
+
+    POURQUOI PAS UN ECRETAGE. `clip(r, -3.5, 3.5)` rend IDENTIQUES toutes les
+    barres au-dela de la borne. Une barre qui perd 91 % de l'equite et une qui
+    en perd 35 % recoivent exactement la meme recompense : -3.5. Le modele ne
+    peut donc pas apprendre que la premiere est pire — l'information est
+    detruite avant d'atteindre le gradient, et c'est precisement la queue
+    qu'on veut lui enseigner.
+
+    CETTE FORME EST STRICTEMENT CROISSANTE, donc elle conserve l'ORDRE : plus
+    mauvais reste plus mauvais, indefiniment. Elle borne la magnitude sans
+    borner la distinction. Au voisinage de zero elle vaut x (elle ne deforme
+    pas le regime ordinaire) ; loin, elle croit comme un logarithme.
+
+    L'ECRETAGE RESTE, mais tres au large, comme garde-fou contre une valeur
+    aberrante — un gap, un ATR degenere — et non comme rabot sur le resultat.
+    """
+    if not np.isfinite(x):
+        return 0.0
+    b = max(float(borne), 1e-9)
+    return float(b * math.copysign(math.log1p(abs(x) / b), x))
+
+
 def retient_checkpoint(gain_top, score_rang, val_num_trades, val_ruine,
-                       best_metric, min_trades):
+                       best_metric, min_trades, gain_tous=None):
     """Ce checkpoint remplace-t-il le meilleur ? Rend (oui, raison).
 
     UNE FONCTION PLUTOT QU'UN `if` DANS LA BOUCLE, parce que c'est la regle
@@ -288,9 +364,32 @@ def retient_checkpoint(gain_top, score_rang, val_num_trades, val_ruine,
 
       ASSEZ DE TRADES. Un resultat sur trois trades ne dit rien.
 
-      UN CLASSEMENT POSITIF. Le rho sert de garde : un sommet rentable avec
-      un classement nul est un tirage, pas un tri, et il ne se reproduira
-      pas sur une autre fenetre.
+      LE SOMMET BAT LE HASARD SUR LES MEMES OCCASIONS. C'est le garde
+      contre le tirage : un sommet rentable qui ne fait pas mieux que
+      prendre tout n'a rien trie, il a profite d'une fenetre porteuse.
+
+      CE GARDE ETAIT `rho > 0`, ET IL A COUTE UN RUN ENTIER. Mesure sur
+      exec31 (2026-09-20) : 263 epochs, 263 refus pour "classement", UN SEUL
+      checkpoint retenu. Les folds 1 et 2 n'en ont produit aucun. `rhoAux`
+      etait negatif en permanence — -0.055, -0.145, -0.037 selon le fold —
+      et le portillon lui obeissait, pendant que le fold 3 triait
+      reellement : sommet +0.95 a +1.10 R contre +0.673 au hasard, stable
+      sur dix epochs consecutives.
+
+      POURQUOI rho ET LE SOMMET SE SEPARENT. Le rho pese TOUTES les
+      occasions a egalite ; le deploiement ne regarde que les 5 % du haut.
+      Une tete qui ordonne parfaitement le sommet et au hasard le reste a
+      rho nul, et c'est exactement la tete qu'on veut. Les deux sens de
+      l'erreur ont ete observes :
+
+          exec23 ep.5   rho +0.0720  sommet +1.401 R  contre +1.499 au hasard
+          exec26 ep.1   rho -0.0101  sommet +2.255 R  contre +1.229 au hasard
+
+      La premiere "classe nettement" et perd contre le hasard ; la seconde
+      "n'ordonne rien" et le bat de +1.026 R.
+
+      `score_rang` reste calcule et affiche : il diagnostique, il ne decide
+      plus.
 
       LE SOMMET RAPPORTE PLUS QUE LE MEILLEUR CONNU. C'est le critere
       proprement dit : le rendement moyen, en unites de risque, des
@@ -319,8 +418,10 @@ def retient_checkpoint(gain_top, score_rang, val_num_trades, val_ruine,
     """
     if val_num_trades < min_trades:
         return False, f"seulement {val_num_trades} trades de validation"
-    if not np.isfinite(score_rang) or score_rang <= 0.0:
-        return False, f"classement {score_rang:+.4f}, non positif"
+    if gain_tous is not None and np.isfinite(gain_tous):
+        if not np.isfinite(gain_top) or gain_top <= gain_tous:
+            return False, (f"sommet {gain_top:+.3f} R ne bat pas le hasard "
+                           f"{gain_tous:+.3f} R sur les memes occasions")
     if not np.isfinite(gain_top):
         return False, "sommet non mesurable"
     if gain_top <= best_metric:
@@ -604,6 +705,79 @@ class PPOConfig:
     # epoch. Le mettre a 0.0 retire la tete et redonne exactement le run
     # precedent — c'est le temoin de l'experience.
     aux_coef: float = 1.0
+    # LA GRILLE DENSE SUR LAQUELLE LA TETE DE RANG S'ENTRAINE. Un point toutes
+    # les 12 barres — une occasion par heure en M5 — tire INDEPENDAMMENT de ce
+    # que la politique visite. Voir la construction de `_gr_idx` pour le
+    # diagnostic qui l'impose. 0 desactive et rend le comportement d'avant.
+    pas_grille_rang: int = 12
+    # Pas de gradient supervises par epoch, sur cette grille.
+    # 240, POUR GARDER LE MEME BUDGET DE GRADIENT QU'AVANT. La tete
+    # recevait 264 pas par epoch depuis la boucle PPO (33 lots x 8 mises a
+    # jour) ; ce terme est desormais coupe, et lui donner seulement 40 pas sur
+    # la grille reviendrait a diviser son entrainement par 6.6 EN MEME TEMPS
+    # qu'on change sa distribution. On ne saurait plus lequel des deux agit.
+    # Seule la DONNEE change, pas la quantite.
+    pas_rang_par_epoch: int = 240
+    # LE CRITERE DE SELECTION, AJOUTE A LA PERTE DE LA TETE DE RANG.
+    coef_top_k: float = 1.0
+    # 0.20 ET NON 0.05, ET C'EST UN ECART ASSUME AVEC LE POINT DE COUPE
+    # DEPLOYE. Le raisonnement d'origine etait qu'entrainer sur une autre
+    # selectivite que celle qu'on deploie revient a optimiser une autre regle.
+    # C'est vrai, et ce n'est pas ce qui a casse.
+    #
+    # CE QUE LA MESURE MONTRE (2026-09-20, `rhoAux` par epoch) :
+    #
+    #   exec35 ni top-k ni ancre   +0.074 ... +0.020  |  +0.009 ... +0.031
+    #   exec38 top-k + ancre 0.2   -0.025 ... +0.135  |  -0.011 ... -0.169
+    #                              ^ acteur gele      ^ acteur vivant
+    #
+    # exec38 avait le MEILLEUR rhoAux de tous les runs tant que l'acteur
+    # dormait — jusqu'a +0.135, quand aucun autre ne depasse +0.074. La
+    # rupture tombe a l'epoch 7, soit UNE EPOCH APRES le reveil de l'acteur
+    # (`critic_warmup_epochs = 5`). Et exec35, qui traverse le meme reveil
+    # sans top-k, ne se degrade pas. Ce n'est donc ni l'acteur seul, ni
+    # l'ancre : c'est le top-k qui ne survit pas au reveil.
+    #
+    # LE MECANISME. PPO depose un gradient de 1.47 a 1.81 sur le TRONC
+    # PARTAGE, mesure dans le journal. Le terme top-k, lui, concentre tout son
+    # gradient sur environ SIX occasions par lot de 128 — les 5 % retenus.
+    # Signal faible et a forte variance contre une moindre carre qui utilise
+    # les 128. Tant que l'acteur dort il suffit ; des que PPO remodele le
+    # socle, il ne tient pas.
+    #
+    # A 20 %, le terme porte sur ~26 occasions au lieu de 6 : quatre fois plus
+    # de signal, et une variance divisee par deux. BAISSER `coef_top_k`
+    # ferait l'inverse — affaiblir un signal deja trop faible.
+    #
+    # LE PRIX : on entraine le classement sur le haut des 20 % et on deploie
+    # sur le haut des 5 %. Les deux ensembles sont emboites, donc l'ordre
+    # appris reste le bon ; c'est la ponderation qui differe legerement.
+    selectivite_top_k: float = 0.20
+    # Empeche l'etendue des scores de se resserrer sous celle de la cible.
+    # A SENS UNIQUE : nul quand la moindre carre suffit.
+    #
+    # 0.2 ET NON 1.0. A pleine force l'ancre fait bien son travail — etendue
+    # de validation tenue a 0.55-0.64 contre 0.027-0.093 sans elle — mais elle
+    # coute sur le critere qui SELECTIONNE les checkpoints. Comparaison a
+    # epochs identiques, acteur gele dans les deux cas (2026-09-20) :
+    #
+    #                          exec36 sans ancre   exec37 avec (coef 1.0)
+    #     `sommet` moyen 1-5               1.116                    0.705
+    #     `etendue[val]`            0.027 - 0.093            0.55 - 0.64
+    #     `AuxL` a l'epoch 5              0.3842                   0.1113
+    #
+    # L'ancre gagne sur ce pour quoi elle est faite, et `AuxL` est plus basse
+    # ALORS QU'ELLE PORTE UN TERME DE PLUS — donc moindre carre et top-k
+    # seuls sont strictement mieux ajustes avec elle. Mais 0.705 contre 1.116
+    # sur `sommet` fait nominalement 2 sigma, moins en verite puisque les
+    # epochs d'un meme run sont correlees entre elles.
+    #
+    # CE QUI FAIT PENCHER : sans ancre, l'etendue REMONTAIT toute seule
+    # (0.027 -> 0.078 en cinq epochs). Le probleme qu'elle corrige ne se
+    # produisait donc pas vraiment. On garde une protection contre un
+    # effondrement — le garde-fou `pbs_etendue_min` est a 0.01 — sans en payer
+    # le plein prix sur le classement.
+    coef_ancre: float = 0.2
 
     # ------------------------------------------------------------------
     # DIAGNOSTIC DE CLASSEMENT. Purement informatif : rien ne s'en sert pour
@@ -1595,7 +1769,42 @@ class PPOConfig:
     # et que la falaise creait une incitation manifestement perverse.
     # A surveiller : si le modele cesse d'ouvrir plutot que d'ouvrir mieux,
     # c'est ce terme qu'il faut soupconner en premier.
-    penalite_creux: float = 6.5
+    # 0.05, ET NON 6.5. Le reglage herite valait 6.5 pour la forme A
+    # POTENTIEL, ou le terme est une DIFFERENCE, donc minuscule par barre.
+    # C'est desormais un COUT D'ETAT paye a chaque barre PENDANT L'EXPOSITION.
+    # Un trade dure ~372 barres, donc la penalite effective par trade vaut
+    # 372 x lambda x d^2 : a 6.5 elle depasserait mille, contre un terme en R
+    # borne a +/-3. L'agent n'ouvrirait jamais.
+    #
+    # BALAYAGE DU 2026-09-20 (`mesure_lambda_creux.py`, recompense sommee
+    # telle que l'environnement la rend, 6 episodes de 4 000 barres, entrees
+    # neutres identiques d'un palier a l'autre) :
+    #
+    #   lambda     3 %      6 %     15 %     40 %  choisi  creux  gagnants punis
+    #    0.000    +7.2     +5.6     -0.0     -4.7     3 %   9.7 %          3.7 %
+    #    0.005    +7.2     +5.4     -1.2     -8.0     3 %   9.7 %          5.6 %
+    #    0.015    +7.0     +5.1     -3.5    -14.7     3 %   9.7 %          5.6 %
+    #    0.050    +6.6     +3.8    -11.7    -38.0     3 %   9.7 %          5.6 %
+    #    0.150    +5.5     +0.0    -35.2   -104.6     3 %   9.7 %          7.4 %
+    #
+    # LE RESULTAT INATTENDU : a lambda = 0, SANS aucune penalite, l'objectif
+    # choisit deja 3 % et l'ordre est monotone decroissant en levier. C'est la
+    # correction du TERME EN R — moyenne au lieu de somme — qui a regle le
+    # probleme a elle seule : 40 % passe de +113.9 a -4.7. La penalite de
+    # creux ne decide plus du levier, et AUCUN lambda ne change le budget
+    # choisi ni le creux.
+    #
+    # CE QUI FIXE LA LIMITE HAUTE n'est donc pas le budget mais le SIGNE DES
+    # GAGNANTS : la part des trades gagnants dont la recompense cumulee est
+    # negative. A 0.15 elle double (7.4 % contre 3.7 % sans penalite) — le
+    # cout de chemin noie alors le resultat du trade, et l'acteur apprend que
+    # gagner est mauvais. C'est l'invariant de signe de `test_concurrence`,
+    # et il prime sur tout le reste.
+    #
+    # 0.05 EST LE COMPROMIS : frein six fois plus fort sur le levier maximum
+    # que sans penalite (-38.0 contre -4.7), 8 % de recompense en moins au
+    # palier retenu, et pas un gagnant puni de plus qu'a 0.005.
+    penalite_creux: float = 0.05
     # ------------------------------------------------------------------
                                  # config validée +135 EUR MT5 tester
 
@@ -2031,6 +2240,34 @@ class PPOConfig:
     # symetrique de +0.0638 a +0.0167, et surtout il la rend instable — +0.0280
     # sur la premiere moitie de l'historique, -0.0262 sur la seconde. Un seuil
     # hors d'atteinte le neutralise sans toucher au code.
+    # BREAK-EVEN DESACTIVE, ET CE N'EST PAS UN OUBLI.
+    #
+    # 1e9 est un seuil jamais atteint. Il a ete mesure avant d'etre laisse la
+    # (2026-09-20, 28 099 occasions, train + validation, la fenetre de test
+    # n'est pas lue) :
+    #
+    #   armement   R moyen   perte moy      p10   ecart-type   Sortino
+    #   aucun       +0.228      -1.051    -1.10        2.418    +0.267
+    #   0.25 R      +0.033      -0.283    -1.06        1.360    +0.070
+    #   0.75 R      +0.143      -0.608    -1.09        1.995    +0.208
+    #   1 R         +0.171      -0.726    -1.09        2.134    +0.231
+    #   1.5 R       +0.212      -0.915    -1.10        2.327    +0.262
+    #   2 R         +0.228      -1.051    -1.10        2.418    +0.267
+    #
+    # AUCUN NIVEAU NE RAPPORTE, et le Sortino — l'arbitrage exact qu'un
+    # break-even propose, rendement contre risque de BAISSE — decroit de
+    # facon monotone. A 2 R et au-dela il devient neutre, parce que le
+    # trailing s'arme deja la et remonte le stop au-dessus de l'entree.
+    #
+    # LE CHIFFRE QUI EXPLIQUE TOUT EST LE p10. Le break-even divise la perte
+    # MOYENNE par presque quatre, mais le dixieme percentile ne bouge pas :
+    # -1.10 devient -1.06. Un trade qui part contre soi n'atteint jamais le
+    # seuil d'armement et prend son -1 R entier. Le break-even ne coupe donc
+    # QUE les trades qui sont d'abord alles dans le bon sens — les meilleurs.
+    # A 0.25 R il en coupe 64 % a l'entree et fait tomber le p99 de +11.05 a
+    # +6.47. Il ne protege pas des mauvais trades, il tue les bons.
+    #
+    # `mesure_break_even.py` rejoue la table si quelqu'un veut revenir dessus.
     atr_be_mult: float    = 1e9
     # 1.5 R -> 2.0 R, ET LE TRAILING N'AVAIT JAMAIS ETE CALIBRE.
     #
@@ -2206,6 +2443,39 @@ class PPOConfig:
     # deja fait sans lever d'erreur. Le bloc __main__ le repete desormais a
     # l'identique, ce qui est une redondance visible et non un second
     # reglage.
+    # LE VETO DE TENDANCE : on n'achete que si le marche monte sur un mois.
+    #
+    # MESURE DU 2026-09-20 (`mesure_seuil_tendance.py`, 27 354 occasions,
+    # train + validation, la fenetre de test n'est pas lue) :
+    #
+    #   seuil                gardees   R par trade   R par occasion   sigma
+    #   aucun filtre          100.0%        +0.247           +0.247
+    #   momentum >=  0 %       54.0%        +0.412           +0.223    +1.5
+    #   momentum >= +1 %       46.3%        +0.468           +0.217    +1.8
+    #   momentum >= +3 %       33.6%        +0.483           +0.162    +1.6
+    #   momentum >= +8 %        9.0%        +0.102           +0.009    -0.7
+    #
+    # L'ARBITRAGE, ET POURQUOI IL PENCHE DU COTE DU FILTRE. Le rendement PAR
+    # TRADE passe de +0.247 a +0.412, presque le double. Le rendement PAR
+    # OCCASION baisse, parce qu'on laisse passer la moitie des occasions et
+    # qu'une occasion refusee ne rapporte rien. C'est le premier qui compte
+    # ici : le budget borne le nombre de positions SIMULTANEES et la regle
+    # deployee ne retient deja que 5 % des occasions. On ne manque pas
+    # d'occasions, on manque de places — et remplir une place avec un trade a
+    # +0.41 R plutot qu'a +0.25 R est un gain net.
+    #
+    # ZERO PLUTOT QUE +1 %, bien que +1 % mesure un peu mieux (+0.468 a 1.8
+    # sigma contre +0.412 a 1.5). Zero ne se regle pas : c'est "le marche
+    # monte-t-il sur un mois, oui ou non". +1 % serait un parametre de plus a
+    # sur-ajuster pour 0.3 sigma.
+    #
+    # CE QUE CE VETO N'EST PAS. Il ne designe pas un cote. Meme en tendance
+    # baissiere, l'achat reste meilleur que la vente sur cette fenetre
+    # (+0.049 contre -0.244 R) : le regime gradue la FORCE de l'avantage a
+    # l'achat, il ne le renverse jamais. C'est pourquoi il s'applique ici en
+    # ABSTENTION, pas en bascule vers la vente.
+    veto_tendance: str = "tend_mom_mois"   # "" pour desactiver
+    veto_tendance_seuil: float = 0.0
     side: str = "long"
 
     # Préfixe pour nommer les fichiers de modèle
@@ -2859,6 +3129,17 @@ class BTCTradingEnvDiscrete(gym.Env):
             dtype=np.float32
         )
 
+        # LE VETO DE TENDANCE, lu une fois. Voir `PPOConfig.veto_tendance`
+        # pour la mesure. Une colonne absente du cache desactive le veto
+        # bruyamment plutot qu'en silence.
+        _vt = getattr(cfg, "veto_tendance", "")
+        if _vt and _vt not in data.df.columns:
+            raise ValueError(
+                f"veto_tendance='{_vt}' absent du cache. Colonnes de tendance "
+                f"disponibles : {[c for c in data.df.columns if c.startswith('tend_')]}")
+        self._tendance = (data.df[_vt].to_numpy(np.float64) if _vt else None)
+        self._seuil_tendance = float(getattr(cfg, "veto_tendance_seuil", 0.0))
+
         if self.cfg.use_vol_curriculum:
             self._init_vol_curriculum()
         else:
@@ -3345,9 +3626,36 @@ class BTCTradingEnvDiscrete(gym.Env):
         QUELCONQUE. Le modele choisit alors son budget, et c'est ce choix qui
         ouvre ou refuse l'entree — au lieu qu'un choix passe la lui interdise.
         """
+        if not self.tendance_favorable():
+            return False
         prix = float(self.data.close[min(self.idx, self.data.length - 1)])
         _b = BUDGETS_RISQUE[-1] if au_plafond else None
         return self.places_ouvrables(prix, _b) > 0
+
+    def tendance_favorable(self) -> bool:
+        """Le regime autorise-t-il une entree a cette barre ?
+
+        POSE ICI ET NULLE PART AILLEURS. `peut_entrer` est la source unique
+        de la decision d'entree — rollout, validation et test y passent tous.
+        Un veto ecrit en trois endroits finirait par differer entre eux, et
+        c'est la faute que ce depot a deja payee plusieurs fois.
+
+        Le seuil et la colonne viennent de la configuration : voir
+        `PPOConfig.veto_tendance` pour la mesure qui les justifie. Une colonne
+        vide desactive le veto et l'environnement retrouve exactement son
+        comportement d'avant.
+        """
+        if self._tendance is None:
+            return True
+        # LA COLONNE BRUTE, PAS CELLE DE `features`. Cette derniere est
+        # NORMALISEE : comparer un seuil de 0 a une valeur centree-reduite
+        # reviendrait a couper a la MOYENNE du momentum, pas a zero — soit un
+        # tout autre filtre, et sans que rien ne le signale. `MarketData`
+        # garde le dataframe source, on y lit donc la valeur telle que la
+        # mesure l'a vue.
+        i = min(max(self.idx - 1, 0), len(self._tendance) - 1)
+        v = float(self._tendance[i])
+        return bool(np.isfinite(v) and v >= self._seuil_tendance)
 
     # CINQ AGREGATS, UNE SEULE PASSE, ET ILS NE CHANGENT QU'AVEC LES
     # EMPLACEMENTS. `_get_obs` lit `position` deux fois, `entry_price` et
@@ -3815,6 +4123,10 @@ class BTCTradingEnvDiscrete(gym.Env):
         self._slot_ouvert = -1
 
         realized_trade = 0.0
+        # COMBIEN DE POSITIONS SE FERMENT SUR CETTE BARRE. Le terme en R de la
+        # recompense en avait besoin : voir plus bas, il en prend la MOYENNE
+        # et non la somme.
+        n_fermes = 0
         hit_sl = hit_tp = hit_temps = False
 
         # Plus de mode "close" : fermeture uniquement par SL/TP/break-even/trailing
@@ -4033,6 +4345,7 @@ class BTCTradingEnvDiscrete(gym.Env):
 
                     realized_trade += self._close_position(
                         exit_price, h_sl, h_tp, h_temps, slot=j)
+                    n_fermes += 1
                     hit_sl = hit_sl or h_sl
                     hit_tp = hit_tp or h_tp
                     hit_temps = hit_temps or h_temps
@@ -4101,6 +4414,7 @@ class BTCTradingEnvDiscrete(gym.Env):
                 exit_price *= 1.0 - sens * slip
                 realized_trade += self._close_position(
                     exit_price, terminal_reason=done_reason, slot=j)
+                n_fermes += 1
 
         # ==================================================================
         # REWARD SHAPING Ω — LONG + SHORT AVEC BONUS MOMENTUM CONFIRMÉ
@@ -4143,6 +4457,38 @@ class BTCTradingEnvDiscrete(gym.Env):
         # Shaping sur trade réalisé : proportionnel au PnL et SYMÉTRIQUE, pour
         # densifier le signal sans réintroduire de biais directionnel.
         # Échelle : ±1% du capital initial sature le terme.
+        # =================================================================
+        # LE TERME EN R EST UNE MOYENNE, PLUS UNE SOMME — et c'est ce qui le
+        # rend neutre au levier.
+        #
+        # CE QUE LA SOMME COUTAIT, mesure du 2026-09-20 (`mesure_objectif.py`,
+        # 12 episodes de 8 000 barres, entrees neutres identiques d'un palier
+        # a l'autre) :
+        #
+        #   budget   somme des R   log-richesse   creux max
+        #     3 %            5.7         +0.133      11.8 %
+        #     6 %           10.1         +0.206      21.2 %
+        #    15 %            7.3         +0.444      45.3 %
+        #    40 %          113.9         +0.472      76.5 %
+        #
+        # 113.9 CONTRE 5.7 : l'objectif payait onze a vingt fois plus pour le
+        # levier maximum. Ce n'est pas le modele qui se trompait en choisissant
+        # 40 % — c'est la recompense qui le lui achetait. Quatre positions a
+        # +1 R rapportaient +4, sans aucune concavite pour freiner.
+        #
+        # POURQUOI PAS SUPPRIMER LE TERME. Il densifie le signal : un trade
+        # ferme donne un +/-1 a +/-3 net, la ou `log_ret` sur une barre vaut
+        # une fraction. Le retirer rendrait l'apprentissage beaucoup plus lent.
+        # Mais son unite — le R — est DELIBEREMENT independante de la taille,
+        # et c'est precisement ce qui le rendait lineaire en nombre de
+        # positions. La moyenne garde l'unite et la densite, et retire la
+        # prime au nombre.
+        #
+        # LE PORTEFEUILLE RESTE COMPTE, mais par `log_ret`, qui est
+        # equity-relatif : deux positions qui gagnent font monter l'equite
+        # deux fois plus, et ce terme-la le voit. Le R, lui, dit desormais
+        # "mes trades sont-ils bons", pas "combien j'en ai ouvert".
+        # =================================================================
         if realized_trade != 0.0:
             # Exprimé en R : le montant risqué sur CE trade sert d'unité. Un
             # stop touché vaut -1, la cible (R:R 2.0) vaut +2, une sortie au
@@ -4150,7 +4496,9 @@ class BTCTradingEnvDiscrete(gym.Env):
             # constante en dollars, comme avant, rendait ce terme dépendant du
             # prix du symbole : 0.81 sur Bitcoin, 0.007 sur l'or.
             reward += float(np.clip(
-                realized_trade / max(getattr(self, "risk_amount", 0.0), 1e-8),
+                realized_trade
+                / max(getattr(self, "risk_amount", 0.0), 1e-8)
+                / max(n_fermes, 1),
                 -3.0, 3.0
             ))
 
@@ -4170,8 +4518,21 @@ class BTCTradingEnvDiscrete(gym.Env):
         # cible à +2 R au niveau d'un stop à -1 R, c'est-a-dire qu'elle
         # enseignerait un R:R de 1.0 alors que la configuration en vise 2.0 —
         # et ferait passer le winrate d'équilibre de 33 % à 50 %.
+        # L'ECRETAGE DUR EST REMPLACE PAR UNE COMPRESSION QUI GARDE L'ORDRE.
+        #
+        # `clip(reward, -3.5, 3.5)` rendait identiques toutes les barres
+        # au-dela de la borne : -35 % et -91 % d'equite recevaient la meme
+        # recompense. Or la ruine est exactement ce qu'on veut enseigner, et
+        # la penalite de creux ne peut pas la porter seule — a d proche de 1,
+        # son terme est deja dans la zone ecretee.
+        #
+        # `comprime` est strictement croissante : elle borne la magnitude sans
+        # borner la DISTINCTION. Un ecretage large subsiste derriere, contre
+        # les valeurs aberrantes, mais a un niveau ou il ne mord plus sur des
+        # resultats de trade plausibles.
         if hasattr(self.cfg, "current_epoch") and self.cfg.current_epoch >= 10:
-            reward = float(np.clip(reward, -3.5, 3.5))
+            reward = comprime(reward, 3.5)
+            reward = float(np.clip(reward, -12.0, 12.0))
 
         # ==================================================================
         # LA RECOMPENSE SE REPARTIT ENTRE LES EMPLACEMENTS.
@@ -4239,9 +4600,86 @@ class BTCTradingEnvDiscrete(gym.Env):
         # sommet et 1 a la ruine. Plus de division par 40 % — la penalite
         # saturait alors des 40 % de creux, donc elle cessait de mordre
         # exactement quand la situation empirait.
+        # =================================================================
+        # LA PENALITE DE CREUX N'EST PLUS A POTENTIEL, ET C'EST TOUT LE POINT.
+        #
+        # Elle valait `lambda (d_t^2 - d_{t-1}^2)`, une difference de potentiel.
+        # Ng, Harada & Russell (1999) etablissent que cette classe de shaping
+        # ne change PAS la politique optimale : elle telescope, donc elle
+        # redistribue le meme total dans le temps. Le commentaire precedent
+        # s'en felicitait. C'etait une erreur de but : on ne cherchait pas a
+        # accelerer la convergence vers la meme politique, on cherchait a
+        # obtenir une AUTRE politique — une qui ne traverse pas 90 % de creux.
+        #
+        # Aucune valeur de `penalite_creux` ne pouvait y parvenir. exec31 le
+        # montre : creux de validation de 63 a 94 % avec la penalite active.
+        #
+        # CE QUI LA REMPLACE : un COUT D'ETAT, paye a chaque barre passee en
+        # creux, proportionnel a d^2. Il ne telescope pas, donc il deplace
+        # reellement l'optimum — un chemin qui plonge et remonte coute
+        # desormais plus cher qu'un chemin plat, a resultat final egal.
+        #
+        # MESURE DU 2026-09-20 (`mesure_objectif.py`, 12 episodes de 8 000
+        # barres par palier, entrees neutres identiques d'un palier a l'autre) :
+        #
+        #   budget   log-richesse   log - temps en creux   creux max
+        #     3 %         +0.133                  +0.119       11.8 %
+        #     6 %         +0.206                  +0.150       21.2 %
+        #    15 %         +0.444                  +0.130       45.3 %
+        #    40 %         +0.472                  -0.695       76.5 %
+        #
+        # LA LOG-RICHESSE SEULE CHOISIT 40 %, le levier maximum — passer a un
+        # critere de croissance n'aurait donc rien change. Kelly ne s'auto-
+        # limite que si la variance mord assez ; sur cette fenetre l'or monte,
+        # aucun episode ne ruine, et 40 % reste en deca du retournement.
+        #
+        # C'EST LE COUT DU TEMPS PASSE EN CREUX qui deplace l'optimum : il le
+        # ramene a 6 % avec 21 % de creux maximum, et rend 40 % franchement
+        # negatif. C'est la seule des trois formes testees qui fasse ce qu'on
+        # lui demande.
+        #
+        # LE PRIX A PAYER, ET IL EST REEL : cette penalite N'EST PAS neutre
+        # vis-a-vis de la politique optimale. C'est voulu, mais cela signifie
+        # que le modele n'optimise plus le rendement — il optimise le
+        # rendement SOUS CONTRAINTE DE CHEMIN. Les deux ne coincident pas, et
+        # `penalite_creux` regle desormais l'arbitrage entre eux au lieu de
+        # n'etre qu'une vitesse de convergence.
+        # =================================================================
+        # ELLE N'EST FACTUREE QUE PENDANT L'EXPOSITION, et c'est ce qui rend
+        # le cout d'etat utilisable.
+        #
+        # LE COMMENTAIRE CI-DESSUS DECRIT UNE EXPERIENCE DEJA FAITE, et j'ai
+        # failli la refaire a l'identique. `-lambda d^2` facture a chaque
+        # barre avait ete essaye puis rejete pour deux raisons mesurees :
+        #
+        #   UNE TAXE SUR UN CREUX HERITE. Compte plat, rien d'ouvert ni de
+        #   ferme, et -4.19e-05 preleve quand meme pour un creux laisse par un
+        #   trade deja clos. C'est l'invariant de repartition de
+        #   `test_concurrence` qui l'attrape — il l'a attrape de nouveau.
+        #
+        #   ELLE RENDAIT LA MORT ATTIRANTE. Si le seul moyen d'arreter de
+        #   payer est de refaire un sommet ou de terminer l'episode, terminer
+        #   devient l'option bon marche. On dissuade la ruine en la
+        #   recompensant.
+        #
+        # LA CONDITION D'EXPOSITION LEVE LES DEUX D'UN COUP. Un compte plat ne
+        # paie RIEN : le creux herite ne se facture plus, l'invariant est
+        # respecte, et surtout FERMER SES POSITIONS SUFFIT A ARRETER LE COUT.
+        # La mort n'est plus la seule issue — elle n'est meme plus une issue
+        # avantageuse, puisque se mettre a plat coute strictement moins cher.
+        #
+        # Et le sens economique suit : on paie le creux tant qu'on y est
+        # EXPOSE, pas tant qu'on s'en souvient.
+        #
+        # CE QUI RESTE VRAI DU REPROCHE : ce terme n'est PAS neutre vis-a-vis
+        # de la politique optimale. C'est voulu — c'etait tout l'objet du
+        # changement — mais cela signifie que le modele optimise desormais le
+        # rendement SOUS CONTRAINTE DE CHEMIN, et que `penalite_creux` arbitre
+        # entre les deux au lieu de n'etre qu'une vitesse de convergence.
         _dist_creux = min(max(dd, 0.0), 1.0)
+        _expose = bool(np.any(self._p_sens != 0))
         _pen = (float(getattr(self.cfg, "penalite_creux", 0.2))
-                * (_dist_creux * _dist_creux - self._d_prec * self._d_prec))
+                * _dist_creux * _dist_creux) if _expose else 0.0
         self._d_prec = _dist_creux
         reward -= _pen
 
@@ -4922,6 +5360,41 @@ def run_training_on_split(
         if len(_i) >= 500:
             _ra, _rv = _CIB.rendements(val_data.df, _i, cfg)
             _ok = np.isfinite(_ra) & np.isfinite(_rv)
+            # ON NE JUGE LA REGLE QUE SUR CE QU'ELLE PEUT PRENDRE.
+            #
+            # `rhoAux` et `sommet` se calculaient sur TOUTE la grille, y
+            # compris les occasions que le veto de tendance interdit. Or la
+            # tete n'y est jamais entrainee — aucune decision n'y existe — et
+            # le systeme deploye n'y entrera jamais. On la notait donc sur un
+            # domaine hors de sa question.
+            #
+            # MESURE DU 2026-09-20, grille horaire, veto `tend_mom_mois >= 0` :
+            #
+            #                  entrainee sur   jugee sur   R la ou elle apprend
+            #   entrainement          51.6 %       100 %   +0.412  (ailleurs -0.083)
+            #   validation            64.3 %       100 %   +0.543  (ailleurs +0.822)
+            #
+            # En validation, 36 % de la grille lui est INCONNUE et ces
+            # occasions rapportent PLUS (+0.822 contre +0.543). `sommet`
+            # piochait donc ses 5 % dans un vivier dont une part n'est pas
+            # deployable, et `rhoAux` la notait sur des questions qu'on ne lui
+            # posera jamais. C'est ce qui explique un rho negatif (-0.135
+            # mesure sur le checkpoint d'exec31) alors que la CIBLE, elle,
+            # transfere a +0.921.
+            #
+            # Le veto est lu sur la colonne BRUTE, comme dans l'environnement.
+            _vt = getattr(cfg, "veto_tendance", "")
+            if _vt and _vt in val_data.df.columns:
+                _mv = val_data.df[_vt].to_numpy(np.float64)
+                _seuil = float(getattr(cfg, "veto_tendance_seuil", 0.0))
+                _elig = np.zeros(len(_i), bool)
+                _j = np.maximum(_i - 1, 0)
+                _v = _mv[_j]
+                _elig = np.isfinite(_v) & (_v >= _seuil)
+                _ok = _ok & _elig
+                print(f"  • Classement : veto `{_vt}` applique a la grille — "
+                      f"{100*_elig.mean():.0f} % des occasions sont "
+                      f"deployables, les autres ne sont ni apprises ni jugees")
             if _ok.sum() >= 500:
                 _rang_idx = _i[_ok]
                 # Part SYMETRIQUE : (achat - vente) / 2. La derive du
@@ -5030,6 +5503,59 @@ def run_training_on_split(
               f"repart pas de zero.")
         print(f"    Les epochs a actor gele ne mesurent donc plus le hasard "
               f"mais la politique heritee.")
+
+    # =================================================================
+    # LA TETE DE RANG S'ENTRAINE SUR UNE GRILLE, PLUS SUR LA TRAJECTOIRE.
+    #
+    # LE DIAGNOSTIC QUI L'IMPOSE (2026-09-20, checkpoint d'exec31) :
+    #
+    #   fenetre          rho(tete, cible)  rho(tete, reel)  rho(cible, reel)
+    #   ENTRAINEMENT             -0.0969          -0.0743          +0.9541
+    #   VALIDATION               -0.1748          -0.1354          +0.9210
+    #
+    # LA CIBLE TRANSFERE PARFAITEMENT — +0.95 et +0.92, mieux que le +0.892
+    # que le code annoncait — et la tete la classe A L'ENVERS. Sur les DEUX
+    # fenetres, entrainement compris : ce n'est donc PAS du surapprentissage,
+    # elle aurait alors bien predit la ou elle apprend.
+    #
+    # LA CAUSE EST UN DECALAGE DE DISTRIBUTION. La perte auxiliaire ne voyait
+    # que les etats du TAMPON PPO — environ 4 100 decisions par epoch, celles
+    # que la politique visite, filtrees par le veto de tendance et par la
+    # capacite restante. `rhoAux` et `sommet`, eux, se mesurent sur une grille
+    # UNIFORME. Mesure : la tete ne s'entrainait que sur 51.6 % des occasions
+    # de la fenetre d'entrainement et 64.3 % de celles de validation.
+    #
+    # Une grille horaire dense, tiree independamment de ce que la politique
+    # choisit, supprime l'ecart : elle apprend exactement sur le domaine ou on
+    # la note, et ou la regle deployee l'interrogera.
+    #
+    # LE VETO Y EST APPLIQUE AUSSI, pour la meme raison : le systeme deploye
+    # n'entre jamais en tendance baissiere, donc entrainer la tete a y classer
+    # serait apprendre une question qu'on ne lui posera pas.
+    # =================================================================
+    _gr_idx = _gr_y = None
+    if getattr(cfg, "pas_grille_rang", 0) > 0:
+        import cibles as _CIBG
+        _gi = np.arange(cfg.lookback,
+                        train_data.length - _CIBG.BORNE_DEFAUT - 2,
+                        int(cfg.pas_grille_rang))
+        if len(_gi) >= 500:
+            _ga, _gv = _CIBG.rendements(train_data.df, _gi, cfg,
+                                        indicateur=True)
+            _gy = np.stack([_ga, _gv], axis=1).astype(np.float32)
+            _mc0 = np.array(cotes_permises(cfg.side), bool)
+            _gok = np.isfinite(_gy)[:, _mc0].all(axis=1)
+            _vt0 = getattr(cfg, "veto_tendance", "")
+            if _vt0 and _vt0 in train_data.df.columns:
+                _vv = train_data.df[_vt0].to_numpy(np.float64)[
+                    np.maximum(_gi - 1, 0)]
+                _gok &= np.isfinite(_vv) & (
+                    _vv >= float(getattr(cfg, "veto_tendance_seuil", 0.0)))
+            _gr_idx = _gi[_gok]
+            _gr_y = torch.tensor(np.nan_to_num(_gy[_gok]), device=device)
+            print(f"  • Tete de rang : grille dense de {len(_gr_idx):,} "
+                  f"occasions (une toutes les {cfg.pas_grille_rang} barres), "
+                  f"INDEPENDANTE de la politique")
 
     optimizer = optim.Adam(policy.parameters(), lr=cfg.lr, eps=1e-8)
 
@@ -6014,8 +6540,34 @@ def run_training_on_split(
                     #
                     # Les occasions non resolues sont MASQUEES et non mises a
                     # zero : un zero serait une prediction, pas une absence.
+                    # LA PERTE AUXILIAIRE DE PPO EST COUPEE QUAND LA
+                    # GRILLE EXISTE, et c'est la moitie manquante du
+                    # correctif.
+                    #
+                    # La passe supervisee sur grille dense a ete ajoutee parce
+                    # que la tete, entrainee sur les etats que la POLITIQUE
+                    # visite, classait sa propre cible A L'ENVERS sur une
+                    # grille uniforme — rho -0.097 en entrainement, -0.175 en
+                    # validation, quand la cible, elle, transfere a +0.92.
+                    #
+                    # Mais ce terme-ci est reste actif, et il entraine la meme
+                    # tete sur EXACTEMENT la distribution incriminee. Compte
+                    # fait sur exec33 :
+                    #
+                    #     pas de gradient sur la GRILLE       :  40
+                    #     pas de gradient sur la TRAJECTOIRE  : 264
+                    #
+                    # 33 lots par mise a jour, 8 mises a jour par epoch : la
+                    # trajectoire pesait 6.6 fois plus que la grille. Les deux
+                    # tiraient la meme tete dans deux directions, et la
+                    # mauvaise gagnait. Le symptome etait visible des la
+                    # deuxieme epoch — `AuxL` MONTAIT (2.1132 puis 2.1371) au
+                    # lieu de descendre.
+                    #
+                    # La grille REMPLACE donc la trajectoire, elle ne s'y
+                    # ajoute pas. Sans grille, ce terme reprend son role.
                     aux_loss = torch.zeros((), device=device)
-                    if cibles_aux is not None:
+                    if cibles_aux is not None and _gr_idx is None:
                         y_b, ok_b = cibles_aux[0][ids], cibles_aux[1][ids]
                         if ok_b.any():
                             pred = _rend_u
@@ -6104,7 +6656,8 @@ def run_training_on_split(
 
                 epoch_actor_loss.append(actor_loss.item())
                 epoch_critic_loss.append(critic_loss.item())
-                epoch_aux_loss.append(aux_loss.item())
+                if _gr_idx is None:
+                    epoch_aux_loss.append(aux_loss.item())
                 epoch_entropy.append(entropy.item())
                 epoch_entropy_flat.append(entropy_flat.item())
                 epoch_entropy_budget.append(float(entropy_budget.item()))
@@ -6231,7 +6784,133 @@ def run_training_on_split(
         # garder val_episodes=7 (nécessaire à la stabilité du Sortino30).
         n_val = len(val_envs)
 
+
         _chrono["maj PPO"] = time.time() - _t_phase; _t_phase = time.time()
+
+        # LA PASSE SUPERVISEE TOURNE APRES PPO, ET NON AVANT.
+        #
+        # `tete_aux` est posee sur le TRONC PARTAGE — `tete_aux(mlp(norm(encode(x))))`.
+        # Le journal d'exec34 donne les gradients que PPO y depose :
+        #
+        #     g[actor 1.72e-06   critic 2.87e-01   tronc 1.47e+00]
+        #     g[actor 5.45e-06   critic 1.17e+00   tronc 1.81e+00]
+        #
+        # LE TRONC BOUGE DE 1.5 A 1.8 A CHAQUE MISE A JOUR, six ordres de
+        # grandeur au-dessus de l'acteur, essentiellement sous la perte du
+        # critic. La tete de rang ne se bat plus contre une autre perte sur
+        # elle-meme — ce terme a ete coupe — mais contre un socle qui se
+        # deforme sous elle.
+        #
+        # ET L'ORDRE AGGRAVAIT TOUT. La passe tournait AVANT les 264 pas de
+        # PPO, et la validation APRES : la tete etait donc notee 264 pas
+        # apres son dernier pas d'entrainement. `AuxL` remontait d'une epoch
+        # a l'autre — 2.0787 puis 2.1426 — alors que plus rien ne la
+        # contrariait directement.
+        #
+        # Posee ici, elle est la DERNIERE a toucher le tronc avant que la
+        # validation ne le lise, et avant que la collecte suivante ne s'en
+        # serve pour decider des entrees. Ca ne supprime pas le partage du
+        # tronc — ce serait un autre chantier — mais ca cesse de mesurer la
+        # tete juste apres l'avoir defaite.
+
+        # ---------- PASSE SUPERVISEE SUR LA GRILLE DENSE ----------
+        # Elle tourne sur son PROPRE lot : la tete apprend donc sur un
+        # echantillon que la politique n'a pas choisi. La perte reste
+        # la MEME qu'avant — moindres carres sur l'indicateur, masquee par le
+        # cote — pour que le seul changement soit la DONNEE, et que l'effet
+        # soit attribuable.
+        _rang_perte = float("nan")
+        if _gr_idx is not None and getattr(cfg, "pas_rang_par_epoch", 0) > 0:
+            policy.train()
+            _xg = np.zeros((cfg.lookback, N_POS_FEATURES), np.float32)
+            _xg[:, 3] = 1.0
+            _xg[:, 5] = float(cfg.budget_risque
+                              / max(BUDGETS_RISQUE[-1], 1e-9))
+            _mcg = torch.tensor(
+                np.array(cotes_permises(cfg.side), np.float32), device=device)
+            _pg = []
+            _ng = min(cfg.batch_size, len(_gr_idx))
+            for _ in range(int(cfg.pas_rang_par_epoch)):
+                _b = np.random.choice(len(_gr_idx), _ng, replace=False)
+                _o = np.stack([
+                    np.concatenate([train_data.features[i - cfg.lookback:i],
+                                    _xg], axis=-1) for i in _gr_idx[_b]])
+                _, _, _, _pred = policy.sorties(
+                    torch.from_numpy(_o).to(device))
+                _err = (_pred - _gr_y[_b]).pow(2) * _mcg
+                _pr = (_err.sum(dim=1) / _mcg.sum()).mean()
+                # LE CRITERE DE DEPLOIEMENT S'AJOUTE A LA MOINDRE CARRE, il
+                # ne la remplace pas. La moindre carre garde le score dans
+                # l'unite de la cible — c'est elle qui l'empeche de deriver,
+                # et les consommateurs lui appliquent une sigmoide avant de le
+                # comparer a un quantile : un score parti a +-20 saturerait.
+                # Le terme top-k, lui, est exactement invariant par
+                # transformation affine du score, donc incapable de fixer une
+                # echelle. Les deux se completent au lieu de se concurrencer.
+                #
+                # LA CIBLE EST L'INDICATEUR BORNE, pas le R brut. Mesure du
+                # 2026-09-20 : l'indicateur va de -1.41 a +1.99 et se classe
+                # avec le rendement reellement encaisse a rho +0.921, quand le
+                # R brut monte a +18.93. Sur du R brut, la moyenne des k
+                # meilleurs est dominee par une poignee d'evenements extremes
+                # et devient instable — c'est ce qui avait impose un ecretage
+                # ailleurs. Borne, le probleme ne se pose pas.
+                if float(getattr(cfg, "coef_top_k", 0.0)) > 0.0:
+                    _pr = _pr + float(cfg.coef_top_k) * perte_top_k(
+                        _pred, _gr_y[_b], _mcg,
+                        float(getattr(cfg, "selectivite_top_k", 0.05)))
+                    # L'ANCRE D'ETENDUE, ET POURQUOI ELLE EST A SENS UNIQUE.
+                    #
+                    # `perte_top_k` est exactement invariante par
+                    # transformation affine du score : elle ne juge que
+                    # l'ORDRE. Elle ne peut donc fixer aucune echelle, et rien
+                    # ne l'empeche de resserrer les scores les uns sur les
+                    # autres. Or les consommateurs — validation, test, live —
+                    # appliquent une SIGMOIDE au score avant de le comparer a
+                    # un quantile : des convictions trop serrees s'egalisent
+                    # a la precision machine et la selectivite disparait.
+                    #
+                    # MESURE DU 2026-09-20, exec36 contre exec35 aux MEMES
+                    # epochs (acteur gele dans les deux, tout le reste
+                    # identique) — etendue des convictions en validation :
+                    #
+                    #     sans top-k   0.35  0.15  0.23  0.22  0.22
+                    #     avec top-k   0.027 0.044 0.037 0.093 0.078
+                    #
+                    # Un facteur QUATRE. Rien n'etait casse — le seuil separait
+                    # encore, les trades se faisaient — mais la marge fondait.
+                    #
+                    # RESERVE SUR MA PREMIERE LECTURE : j'avais annonce un
+                    # facteur 1 500 en comparant `etendue[tr]`. C'etait faux.
+                    # Cette colonne mesure les probabilites de la POLITIQUE,
+                    # quasi uniformes tant que l'acteur est gele, et je
+                    # comparais des epochs de phases differentes.
+                    #
+                    # L'ANCRE NE MORD QUE VERS LE BAS. Celle de l'autre
+                    # variante forcait moyenne 0 et ecart-type 1 ; ici elle se
+                    # battrait contre la moindre carre, qui vise une cible
+                    # d'ecart-type 1.44. On penalise donc uniquement
+                    # l'etendue MANQUANTE par rapport a celle de la cible :
+                    # quand la moindre carre fait son travail, ce terme vaut
+                    # exactement zero et ne contraint rien.
+                    _sd_y = _gr_y[_b][:, _mcg > 0].std()
+                    _sd_p = _pred[:, _mcg > 0].std()
+                    _pr = _pr + float(getattr(cfg, "coef_ancre", 1.0)) * (
+                        torch.relu(_sd_y - _sd_p).pow(2))
+                optimizer.zero_grad(set_to_none=True)
+                (cfg.aux_coef * _pr).backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(),
+                                               cfg.max_grad_norm)
+                optimizer.step()
+                _pg.append(float(_pr.item()))
+            _rang_perte = float(np.mean(_pg)) if _pg else float("nan")
+        # `AuxL` RAPPORTE LA PASSE SUPERVISEE quand la grille existe. Il
+        # reportait la perte auxiliaire calculee DANS la boucle PPO ; ce n'est
+        # plus la qu'elle s'entraine, et laisser l'ancien compteur afficherait
+        # une grandeur qui ne pilote plus rien.
+        if np.isfinite(_rang_perte):
+            epoch_aux_loss.append(_rang_perte)
+        _chrono["rang"] = time.time() - _t_phase; _t_phase = time.time()
 
         # ---------- PASSE 1 : calibration sur la policy COURANTE ----------
         # Calibrer sur l'epoch précédente ne marche pas : la policy bouge trop
@@ -7224,6 +7903,7 @@ def run_training_on_split(
         _score_rang = _rho_aux if np.isfinite(_rho_aux) else _rho_ep
         _retenu, _pourquoi = retient_checkpoint(
             gain_top=_gain_top, score_rang=_score_rang,
+            gain_tous=_gain_tous,
             val_num_trades=val_num_trades, val_ruine=val_ruine,
             best_metric=best_metric,
             min_trades=cfg.min_val_trades_save)
@@ -7910,7 +8590,7 @@ if __name__ == "__main__":
     # Reprend exec16 : revision horaire du budget, bonus d'entropie sur les
     # deux tetes, `H` ramenee a la direction seule, budget d'episodes compte
     # sur les transitions versees.
-    cfg_long.model_prefix = "saintv2_or_exec17"
+    cfg_long.model_prefix = "saintv2_or_exec39_sel20"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant

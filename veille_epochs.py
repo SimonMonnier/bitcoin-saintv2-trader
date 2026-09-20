@@ -97,8 +97,22 @@ RE_META = re.compile(
     r"etendue\[tr ([\d.-]+) val ([\d.-]+)\].*?"
     r"KL\s+(" + NB + r").*?gnorm\s+([\d.]+)\s+"
     r"g\[actor ([\d.e+-]+).*?clipfrac ([\d.]+)%\s+"
-    r"temps\[collecte (\d+)s maj PPO (\d+)s calibration (\d+)s "
-    r"validation (\d+)s\].*?gpu\[(\d+)C (\d+)/"
+    # `.*?` ENTRE CHAQUE PHASE, et ce n'est pas de la coquetterie. Le chrono
+    # s'ecrit en parcourant un dictionnaire : toute phase ajoutee a
+    # l'entrainement s'insere dans la ligne, et un motif rigide cesse alors de
+    # mordre — la veille se tait, sans rien signaler. C'est arrive quand la
+    # phase `rang` est apparue entre `collecte` et `maj PPO`, et ca se
+    # reproduira a la prochaine phase. Le motif ne nomme donc plus que les
+    # phases qu'il LIT, et tolere tout ce qui se glisse entre elles.
+    r"temps\[collecte (\d+)s.*?maj PPO (\d+)s.*?calibration (\d+)s.*?"
+    # LE BLOC GPU EST FACULTATIF. `nvidia-smi` echoue parfois — carte
+    # occupee, delai de 3 s depasse — et `training` ecrit alors `gpu[?]`. Le
+    # motif exigeait `gpu[<temp>C <freq>/`, donc TOUTE la ligne META cessait
+    # de se lire et plus une seule epoch ne s'affichait. C'est arrive le
+    # 2026-09-20 sur exec32, et le symptome est toujours le meme : la veille
+    # se tait, sans rien signaler, et on cherche du cote de l'entrainement.
+    # Les deux groupes restent captures pour ne pas decaler les indices.
+    r"validation (\d+)s\](?:.*?gpu\[(\d+)C (\d+)/)?"
     r".*?ENV \[B\s+([\d.]+)% S\s+([\d.]+)% H\s+([\d.]+)%\]")
 
 # Le critere de SELECTION depuis le 2026-09-19 : ce que rapportent, en
@@ -265,7 +279,10 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     kl, gnorm, g_actor = float(m[10]), float(m[11]), float(m[12])
     clipfrac = float(m[13])
     t_col, t_ppo, t_cal, t_val = (int(m[14]), int(m[15]), int(m[16]), int(m[17]))
-    temp, mhz = int(m[18]), int(m[19])
+    # ABSENTS QUAND `nvidia-smi` ECHOUE. Une carte muette n'est pas une
+    # raison de ne rien afficher de l'epoch.
+    temp = int(m[18]) if m[18] is not None else None
+    mhz = int(m[19]) if m[19] is not None else None
     b_pct, s_pct, h_pct = float(m[20]), float(m[21]), float(m[22])
 
     par_trade = pnl / max(trades, 1)
@@ -493,7 +510,7 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     if not math.isnan(err) and abs(par_trade) < err:
         notes.append(f"gain par trade ({par_trade:+.2f}$) sous l'erreur-type de "
                      f"cette epoch ({err:.2f}$) — non separable de zero.")
-    if mhz < 500:
+    if mhz is not None and mhz < 500:
         notes.append(f"GPU BRIDE : {mhz} MHz a {temp} C. Les durees ne sont pas "
                      f"comparables entre epochs si la temperature derive.")
     if clipfrac > 30:
@@ -541,6 +558,7 @@ class Veilleur:
     """
 
     def __init__(self):
+        self._meta_muettes = set()
         self.vus = set()
         self.vals, self.metas, self.trains, self.rhos = {}, {}, {}, {}
         self.cotes = {}         # par fold : long / short / both, lu du tag
@@ -596,6 +614,19 @@ class Veilleur:
                 blocs.append(([f"{C.VERT}{C.GRAS}  {ligne.strip()}{C.FIN}"],
                               None))
             mv, mm = RE_VAL.search(ligne), RE_META.search(ligne)
+            # UNE LIGNE META QUI NE SE LIT PAS DOIT LE DIRE. C'est la panne
+            # qui s'est repetee huit fois : un champ change de forme dans
+            # `training`, le motif ne mord plus, et la veille n'affiche plus
+            # rien SANS RIEN SIGNALER. Desormais elle nomme la ligne fautive,
+            # une fois, et continue.
+            if mm is None and "  META  " in ligne:
+                _cle = ligne[:40]
+                if _cle not in self._meta_muettes:
+                    self._meta_muettes.add(_cle)
+                    print(f"{C.ROUGE}  VEILLE : ligne META illisible, "
+                          f"motif a reajuster{C.FIN}")
+                    print(f"{C.GRIS}  {ligne.strip()[:200]}{C.FIN}")
+                    print()
             mt = RE_TRAIN.search(ligne)
             if mv:
                 self.vals[(mv.group(1), int(mv.group(2)))] = mv.groups()

@@ -83,54 +83,87 @@ ne pas y aller. Ce qui l'en empêche entre-temps est l'appel de marge, le
 appel de marge, l'impossibilité de financer le lot minimum, et une pénalité
 de creux **portée par chaque position** — donc croissante avec l'exposition.
 
-### La pénalité de creux facture le creusement, pas le creux
+### La récompense, refaite le 2026-09-20 — trois défauts qui se renforçaient
 
-Elle valait `−0.2 si creux > 40 %` : une marche sans gradient, qui ne disait
-rien au modèle tant qu'il n'était pas déjà mort. Pire, elle rendait la mort
-désirable — la politique perdait −0.0417 par barre juste avant d'être coupée,
-donc être tué lui épargnait un futur négatif.
+Le modèle traversait des creux de validation de 63 à 94 % **tout en gagnant de
+l'argent**. Aucune valeur de `penalite_creux` ne les avait jamais fait baisser.
+Trois causes distinctes, mesurées séparément.
 
-La remplacer par une rampe sur le niveau (`−λ·d²`) était pire encore : un
-compte **plat**, sans aucune position, se voyait prélever à chaque barre pour
-un creux hérité d'un trade déjà clos. Une taxe sur un état est une intégrale
-sur le temps — à mi-chemin du garde-fou elle pèse −43 500 sur une epoch — et
-elle ne s'interrompt qu'en refaisant un sommet, ou en mourant.
+**Le terme en R payait le levier.** La récompense contenait
+`realized_trade / risk_amount`, le résultat du trade en unités de risque,
+**sommé** sur les positions fermées. Quatre positions à +1 R rapportaient +4 :
+linéaire en nombre de positions, aucune concavité pour freiner. Mesure sur
+12 épisodes de 8 000 barres, entrées neutres identiques d'un palier à l'autre :
 
-La forme retenue est celle du **potentiel** : `Φ(s) = −λ·d²`, et la récompense
-reçoit `Φ(s′) − Φ(s)`, la seule variation. Creusement : coût. Résorption :
-crédit égal. Compte plat : rien. Le terme télescope, donc un épisode paie au
-total `λ·d_final²` quel que soit le chemin, jamais selon le temps passé sous
-l'eau. C'est la seule classe de shaping connue pour ne pas déplacer la
-politique optimale : elle ne crée aucune valeur, elle redistribue dans le
-temps une magnitude déjà présente.
+| budget | somme des R | log-richesse | creux max |
+|---|---|---|---|
+| 3 % | 5.7 | +0.133 | 11.8 % |
+| 6 % | 10.1 | +0.206 | 21.2 % |
+| 15 % | 7.3 | +0.444 | 45.3 % |
+| 40 % | **113.9** | +0.472 | 76.5 % |
 
-`d` est le **creux du compte** — 0 au sommet, 1 quand il ne reste rien — et
-c'est **la 5ᵉ colonne d'observation** : le modèle voit au bit près la grandeur
-sur laquelle il est facturé. L'équité qui la calcule inclut toutes les
-positions ouvertes.
+L'objectif payait **vingt fois plus** pour le levier maximum. Ce n'était pas le
+modèle qui se trompait en choisissant 40 %, c'était la récompense qui le lui
+achetait. Le terme est devenu une **moyenne** : il garde son unité et sa
+densité, il perd la prime au nombre. Le portefeuille reste compté par
+`log_ret`, qui est relatif à l'équité.
 
-`λ = 6.5` est **ancré sur un rapport, pas sur un chiffre** — et il a fallu
-deux essais ratés pour l'admettre. Ancré d'abord sur l'ancienne falaise
-(0.2, puis 1.25 après extension de `d` jusqu'à la ruine), il héritait d'une
-magnitude réglée quand `|R|` valait 1,36. Le levier illimité a porté `|R|` à
-6,77 : la pénalité ne pesait plus que **4 %** du signal qu'elle devait
-contrebalancer, et sur sept epochs le creux de validation n'a pas bougé d'un
-point (104,9 → 112,0 %) pendant que le PnL médian par épisode restait à
-−950 $ sur 1 000 $. Recalé par le rapport `1.25 × (6.77 / 1.36) ≈ 6.5`, il
-pèse ~21 % du signal d'une décision.
+**La log-richesse seule n'aurait rien changé** — elle choisit aussi 40 %.
+Kelly ne s'auto-limite que si la variance mord assez ; sur cette fenêtre l'or
+monte, aucun épisode ne ruine, et 40 % reste en deçà du retournement.
 
-| creux | pénalité |
-|---|---|
-| 25 % | 0,41 |
-| 40 % | 1,04 |
-| 70 % | 3,19 |
-| 100 % (ruine) | 6,50 |
+**La pénalité de creux ne pouvait pas agir.** Elle avait la forme du
+potentiel, `Φ(s′) − Φ(s)` — la seule classe de shaping dont Ng, Harada &
+Russell (1999) établissent qu'elle **ne déplace pas la politique optimale**.
+Le commentaire du code s'en félicitait. C'était une erreur de but : on ne
+cherchait pas à converger plus vite vers la même politique, on en cherchait
+une autre.
 
-**Le symptôme à surveiller** : λ trop grand n'est pas visible comme une
-erreur, il écrase le gradient monétaire dans le bruit. Si le nombre de trades
-s'effondre pendant que le creux descend, c'est ce terme qu'il faut
-soupçonner — pas s'en réjouir. Vérifié par `test_potentiel_creux.py`, qui
-contrôle que la part du signal reste dans une plage de 5 à 40 %.
+Elle est devenue un **coût d'état**, `−λ·d²`, payé à chaque barre — mais
+**uniquement pendant l'exposition**. Cette condition lève les deux objections
+qui avaient fait rejeter cette forme la première fois : un compte plat ne paie
+rien pour un creux hérité, et surtout **fermer ses positions suffit à arrêter
+le coût**. La mort n'est plus la seule issue, ni même une issue avantageuse.
+
+`λ = 0.05`, et non 6.5 : l'ancien réglage valait pour une *différence* de
+potentiel, minuscule par barre. En coût d'état sur un trade de ~372 barres, la
+pénalité effective vaut `372 × λ × d²`. Balayage mesuré :
+
+| λ | 3 % | 6 % | 15 % | 40 % | choisi | gagnants punis |
+|---|---|---|---|---|---|---|
+| 0.000 | +7.2 | +5.6 | −0.0 | −4.7 | 3 % | 3.7 % |
+| 0.050 | +6.6 | +3.8 | −11.7 | −38.0 | 3 % | 5.6 % |
+| 0.150 | +5.5 | +0.0 | −35.2 | −104.6 | 3 % | 7.4 % |
+
+À λ = 0, **sans aucune pénalité, l'objectif choisit déjà 3 %** : c'est la
+correction du terme en R qui a réglé le levier. La limite haute de λ n'est
+donc pas le budget mais le **signe des gagnants** — la part des trades gagnants
+dont la récompense cumulée est négative. À 0.15 elle double, et l'acteur
+apprend que gagner est mauvais.
+
+**L'écrêtage effaçait la ruine.** `clip(reward, −3.5, 3.5)` donnait la même
+note à une barre perdant 35 % de l'équité et à une perdant 91 %. Remplacé par
+`comprime(x, b) = b·signe(x)·log1p(|x|/b)`, strictement croissante : elle
+borne la magnitude sans borner la **distinction**, et vaut l'identité près de
+zéro (0.1 % d'écart à 0.01).
+
+| récompense brute | ancien `clip` | `comprime` |
+|---|---|---|
+| −40 | **−3.500** | −8.820 |
+| −20 | **−3.500** | −6.665 |
+| −10 | **−3.500** | −4.725 |
+| −0.1 | −0.100 | −0.099 |
+
+**Ce que ça a produit.** Sur exec35, le creux de validation est passé de 79-88 %
+(epochs 1-13) à **37-59 %** (epochs 14-18), avec un profit factor monté de
+1.8-2.5 à 2.43-2.89 et un PnL en hausse. Il aura fallu huit epochs de gradient
+d'acteur pour que la tête de budget entende : le palier 40 % est tombé de 26 %
+à 11 % des choix, `Hbudget` de 1.386 à 1.268.
+
+**Ce qui n'est pas réglé** : ce terme n'est plus neutre vis-à-vis de la
+politique optimale. C'est voulu, mais cela signifie que le modèle optimise
+désormais le rendement **sous contrainte de chemin**, et que `penalite_creux`
+arbitre entre les deux au lieu d'être une vitesse de convergence.
 
 ### Un seul modèle, du plus ancien au plus récent
 
@@ -154,22 +187,59 @@ avoir vu une seule de ses barres.
 
 Le critère n'est ni le PnL ni le Sortino — tous deux calculés sur quelques
 dizaines de trades, donc dominés par le bruit. C'est le **rendement moyen des
-occasions que le checkpoint mettrait effectivement en position**, mesuré sur
-les quelques milliers de points de décision de la fenêtre de validation,
-sous deux gardes : le classement doit être positif, et **aucun épisode de
-validation ne doit avoir détruit le compte** — appel de marge, lot minimum
-infinançable, équité à zéro.
+occasions que le checkpoint mettrait effectivement en position** (`sommet`
+dans le journal), mesuré sur les points de décision de la fenêtre de
+validation, sous trois gardes.
 
-Cette dernière garde existe parce que le critère mesure les occasions **une à
-une** et ne sait rien du nombre tenu simultanément : un modèle au classement
-excellent qui vide le compte en ouvrant des dizaines de positions corrélées
-serait autrement retenu, puis transmis au fold suivant. `test_retenue.py`
-l'exerce sur quatorze cas.
+**Il doit battre le hasard sur les mêmes occasions.** Ce garde était
+`rho > 0`, et il a coûté un run entier. Sur exec31 : **263 epochs, 263 refus
+pour « classement », un seul checkpoint retenu**, les folds 1 et 2 n'en ayant
+produit aucun. `rhoAux` était négatif en permanence pendant que le fold 3
+triait réellement — `sommet` +0.95 à +1.10 R contre +0.673 au hasard, stable
+sur dix epochs.
 
-Sélectionner sur la validation reste sélectionner sur la validation : ce
-dépôt a mesuré que ce choix coûte, et c'est pourquoi `checkpoints.py` déploie
-par défaut `last_`, la moyenne des derniers jeux de poids, qui ne dépend
-d'aucun tirage particulier.
+Les deux grandeurs se séparent parce qu'elles ne mesurent pas la même chose :
+rho pèse **toutes** les occasions à égalité, le déploiement ne regarde que les
+5 % du haut. Une tête qui ordonne parfaitement le sommet et au hasard le reste
+a rho nul — et c'est exactement la tête qu'on veut. Les deux sens de l'erreur
+ont été observés :
+
+| | rho | sommet | hasard |
+|---|---|---|---|
+| exec23 ep.5 | **+0.0720** « classe nettement » | +1.401 R | +1.499 R → perd |
+| exec26 ep.1 | **−0.0101** « n'ordonne rien » | +2.255 R | +1.229 R → **+1.026 R** |
+
+`score_rang` reste calculé et affiché : il diagnostique, il ne décide plus.
+
+**Assez de trades**, et **aucun épisode de validation n'a détruit le compte** —
+appel de marge, lot minimum infinançable, équité à zéro. Cette dernière garde
+existe parce que le critère mesure les occasions **une à une** et ne sait rien
+du nombre tenu simultanément. `test_retenue.py` l'exerce sur dix-huit cas.
+
+**Le problème non résolu : ce critère est bruité, et on en prend le maximum.**
+Mesuré sur exec35 : `sommet` a un écart-type de **0.31 d'une epoch à l'autre**.
+Prendre le maximum d'une série bruitée est biaisé vers le haut par
+construction — on ne retient pas le meilleur modèle, on retient le tirage le
+plus chanceux. Simulation de 20 000 séries **sans aucun progrès réel**, même
+moyenne et même dispersion :
+
+| | maximum attendu du hasard seul | surestimation |
+|---|---|---|
+| max brut sur 15 epochs | 1.779 | +0.541 |
+| max d'une moyenne glissante de 5 | 1.402 | +0.164 |
+
+Le meilleur `sommet` d'exec35 valait **1.826**. Le hasard seul en produit
+**1.779**. La part attribuable au modèle est donc d'environ **+0.047** — sous
+l'hypothèse que toute la variation d'une epoch à l'autre soit du bruit, ce qui
+en fait une borne basse et non une mesure.
+
+La règle qui corrige cela — présélectionner sur une moyenne glissante de cinq
+epochs, puis départager les trois finalistes sur quatre fois plus d'épisodes —
+divise le biais de sélection par dix. **Elle n'est pas encore implémentée.**
+
+Et sélectionner sur la validation reste sélectionner sur la validation :
+`checkpoints.py` déploie par défaut `last_`, la moyenne des derniers jeux de
+poids, qui ne dépend d'aucun tirage particulier.
 
 ### Pourquoi l'or, et pourquoi seul
 
@@ -259,6 +329,49 @@ reste plat » ne pouvait structurellement jamais se déclencher.
 
 **Le live ouvrait une position et passait son tour**, et la colonne qui porte
 la capacité y valait une constante.
+
+**La tête de tri s'entraînait hors du domaine où on la jugeait.** La perte
+auxiliaire ne voyait que le tampon PPO — environ 4 100 décisions par epoch,
+celles que la politique visite. `rhoAux` et `sommet` se mesurent sur une
+grille **uniforme**. Mesure : la tête ne s'entraînait que sur 51.6 % des
+occasions de la fenêtre d'entraînement et 64.3 % de celles de validation, et
+en validation **les occasions qu'elle ne voyait jamais rapportaient davantage**
+(+0.822 R contre +0.543). Elle classait donc sa propre cible à l'envers — rho
+−0.097 en entraînement, −0.175 en validation — alors que cette cible, elle,
+transfère au rendement encaissé à **+0.92**. Ce n'était pas du
+surapprentissage : elle aurait bien prédit là où elle apprend. Corrigé par une
+grille dense indépendante de la politique.
+
+**Et le correctif a été posé à moitié.** La grille ajoutée, la perte
+auxiliaire de PPO restait active — 264 pas de gradient sur la distribution
+incriminée contre 40 sur la grille, soit **6.6 fois plus**. Les deux tiraient
+la même tête en sens opposés et la mauvaise gagnait. Symptôme visible dès la
+deuxième epoch : `AuxL` **montait** au lieu de descendre.
+
+**Et l'ordonnancement aggravait le tout.** La passe supervisée tournait
+**avant** les 264 pas de PPO, la validation **après** : la tête était notée
+264 pas après son dernier pas d'entraînement, sur un tronc partagé que PPO
+remodèle avec un gradient de 1.47 à 1.81. Déplacée après la mise à jour,
+`AuxL` est enfin descendue — 2.03 à 0.96 sur dix epochs, sans remontée durable.
+
+**Le portillon de déploiement donnait un quota à chaque côté.** Deux sites
+divisaient la sélectivité par le nombre de côtés, et `EntryDecisionPolicy`
+tenait un `SeuilRang` **par sens**. Sur exec28, bilatéral : **50.2 % des trades
+de validation étaient des ventes** — exactement la moitié accordée — et elles
+ont perdu aux **neuf** epochs (−15 342 $) pendant que les achats gagnaient aux
+neuf (+39 378 $). Un seul vivier désormais, une barre calibrée sur le maximum
+des côtés permis à la sélectivité pleine.
+
+**La veille se taisait sans rien signaler, neuf fois.** Un champ change de
+forme dans `training` — une phase de chrono qui s'insère, `nvidia-smi` qui
+échoue et fait écrire `gpu[?]` — le motif ne mord plus, et plus aucune epoch
+ne s'affiche. Le symptôme est toujours le même et on cherche du côté de
+l'entraînement. Le remède n'est pas le motif : c'est que la veille **nomme
+désormais toute ligne META illisible**.
+
+**Le bloc de position écrivait cinq colonnes pour six** dans la table de
+décision par lots — la faute exacte qui avait fait tomber exec12, à un autre
+endroit.
 
 ### Le vrai sujet ouvert
 
@@ -526,10 +639,53 @@ Implémentation maison avec :
 
 ---
 
-## 🧬 Jeu de features — 260 colonnes, trois échelles
+## 🧬 Jeu de features — 259 colonnes, trois échelles
 
 `saint_core.FEATURE_COLS` est la **source unique**. L'observation ajoute
-4 scalaires de position → `OBS_N_FEATURES = 264`.
+6 scalaires de position → `OBS_N_FEATURES = 265`.
+
+**Trois colonnes de régime ajoutées le 2026-09-20.** Le plus long horizon que
+le modèle voyait était `mom_5_h4` — cinq bougies H4, soit **vingt heures**. Il
+ne pouvait pas savoir dans quel régime il se trouvait. Neuf détecteurs ont été
+comparés sur le seul critère qui compte ici : est-ce que le régime **sépare**
+les deux sens ? Sur cette fenêtre l'or monte (achat au hasard +0.236 R, vente
+−0.207 R), donc un détecteur qui répondrait « haussier » en permanence
+paraîtrait excellent sans rien détecter.
+
+| détecteur | séparation achat−vente | σ |
+|---|---|---|
+| prix vs nuage (Ichimoku) | +0.089 | +0.4 |
+| pente de Kijun | +0.068 | +0.3 |
+| momentum 1 jour | +0.076 | +0.3 |
+| momentum 1 semaine | +0.308 | +1.4 |
+| **momentum 1 mois** | **+0.456** | **+2.1** |
+| prix vs moyenne 1 mois | +0.325 | +1.5 |
+
+**Aucun détecteur Ichimoku ne sépare quoi que ce soit.** Le momentum si, et la
+séparation croît **monotonement avec l'horizon** — c'est cette structure qui
+convainc, plus que le +2.1 σ qui est à peine au-dessus du seuil de bruit pour
+neuf essais (~1.9). Du bruit ne se range pas par horizon.
+
+**Ce que le régime ne dit pas**, et qu'il ne faut pas lui faire dire : en
+tendance baissière, l'achat reste meilleur que la vente (**+0.049 contre
+−0.244 R**). Aucun régime ne rend le short préférable ici. C'est une **jauge de
+force**, pas un aiguillage de sens — d'où un veto en abstention, `peut_entrer`
+refusant toute entrée quand le momentum mensuel est négatif, et reproduit dans
+`kairos_live` sur la **même colonne brute**. Lire la colonne normalisée
+couperait à la *moyenne* du momentum, pas à zéro, sans que rien ne le signale.
+
+| seuil | gardées | R par trade | R par occasion |
+|---|---|---|---|
+| aucun filtre | 100 % | +0.247 | +0.247 |
+| **momentum ≥ 0** | 54 % | **+0.412** | +0.223 |
+| momentum ≥ +3 % | 34 % | +0.483 | +0.162 |
+
+Le rendement **par trade** double presque ; le rendement **par occasion**
+baisse, parce qu'une occasion refusée ne rapporte rien. C'est le premier qui
+compte ici : le budget borne les positions simultanées et la règle déployée ne
+retient déjà que 5 % des occasions. On ne manque pas d'occasions, on manque de
+places. Seuil à 0 plutôt que +1 % qui mesure un peu mieux : zéro ne se règle
+pas.
 
 | bloc | colonnes | contenu |
 |---|---|---|

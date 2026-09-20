@@ -1576,3 +1576,235 @@ couvre désormais les deux cas et refuse explicitement un fichier ambigu.
 - Que le spot Binance se comporte comme le CFD du courtier. Les prix diffèrent
   de quelques points de base et les frais n'ont rien à voir ; on n'en reprend
   que la forme du marché.
+
+---
+
+## 2026-09-20 — Sept fuites colmatées, et ce qu'elles avaient coûté
+
+Journée entière de diagnostic. Aucune capacité ajoutée : sept défauts trouvés,
+chacun avec une mesure avant et après. Le constat général est que ce dépôt
+gagne bien plus à réparer qu'à construire — et que la contrainte qui borne
+tout n'a pas bougé.
+
+### Le portillon jetait 263 checkpoints sur 264
+
+`retient_checkpoint` exigeait `rho > 0`. Sur exec31 : **263 epochs, 263 refus
+pour « classement », un seul checkpoint retenu**, folds 1 et 2 vides. `rhoAux`
+était négatif en permanence (−0.055, −0.145, −0.037 selon le fold) pendant que
+le fold 3 triait réellement — `sommet` +0.95 à +1.10 R contre +0.673 au
+hasard, stable sur dix epochs.
+
+Les deux grandeurs se séparent parce qu'elles ne mesurent pas la même chose :
+rho pèse toutes les occasions à égalité, le déploiement ne regarde que les 5 %
+du haut. Les deux sens de l'erreur ont été observés — exec23 ep.5 « classe
+nettement » (rho +0.072) et perd contre le hasard (+1.401 contre +1.499) ;
+exec26 ep.1 « n'ordonne rien » (rho −0.010) et le bat de +1.026 R.
+
+Le garde est devenu : **le sommet doit battre le hasard sur les mêmes
+occasions**. `test_retenue.py` porte les deux cas historiques en dur.
+
+### La récompense payait vingt fois le levier
+
+Mesure sur 12 épisodes de 8 000 barres, entrées neutres identiques par palier :
+
+| budget | somme des R | log-richesse | log − temps en creux | creux max |
+|---|---|---|---|---|
+| 3 % | 5.7 | +0.133 | +0.119 | 11.8 % |
+| 6 % | 10.1 | +0.206 | **+0.150** | 21.2 % |
+| 15 % | 7.3 | +0.444 | +0.130 | 45.3 % |
+| 40 % | **113.9** | **+0.472** | −0.695 | 76.5 % |
+
+Le terme en R était **sommé** sur les positions fermées : quatre positions à
++1 R rapportaient +4. Devenu une **moyenne**.
+
+**La log-richesse seule n'aurait rien changé** — elle choisit aussi 40 %.
+Hypothèse posée puis réfutée par la mesure : Kelly ne s'auto-limite que si la
+variance mord assez, et sur cette fenêtre aucun épisode ne ruine (0/12).
+
+### La pénalité de creux ne pouvait pas agir
+
+Forme du potentiel, `Phi(s') - Phi(s)` : Ng, Harada & Russell (1999)
+établissent que cette classe **ne déplace pas la politique optimale**. Le
+commentaire du code s'en félicitait — erreur de but.
+
+Devenue un coût d'état pendant l'**exposition seulement**. Cette condition lève
+les deux objections qui avaient fait rejeter cette forme la première fois, et
+qui étaient documentées dans le code : un compte plat ne paie pas un creux
+hérité, et **fermer suffit à arrêter le coût** — la mort n'est plus une issue
+avantageuse.
+
+λ recalibré de 6.5 à 0.05. Sur un trade de ~372 barres, la pénalité effective
+vaut 372 fois λ fois d². À λ = 0, **sans aucune pénalité, l'objectif choisit
+déjà 3 %** : c'est la correction du terme en R qui règle le levier. La limite
+haute de λ est le **signe des gagnants** — part des trades gagnants à
+récompense cumulée négative : 3.7 % à λ=0, 5.6 % à 0.05, 7.4 % à 0.15.
+
+### L'écrêtage effaçait la ruine
+
+`clip(reward, -3.5, 3.5)` donnait la même note à −35 % et −91 % d'équité.
+Remplacé par une compression logarithmique strictement croissante : elle borne
+la magnitude sans borner la distinction, et vaut l'identité près de zéro
+(0.1 % d'écart à 0.01).
+
+### Résultat de la refonte
+
+Sur exec35 : creux de validation **79-88 % (ep 1-13) → 37-59 % (ep 14-18)**,
+profit factor de 1.8-2.5 à 2.43-2.89, PnL en hausse. Huit epochs de gradient
+d'acteur ont été nécessaires : palier 40 % de 26 % à 11 % des choix, `Hbudget`
+de 1.386 à 1.268.
+
+### La tête de tri s'entraînait hors de son domaine d'emploi
+
+| fenêtre | rho(tête, cible) | rho(tête, réel) | rho(cible, réel) |
+|---|---|---|---|
+| entraînement | **−0.097** | −0.074 | **+0.954** |
+| validation | **−0.175** | −0.135 | **+0.921** |
+
+La cible transfère mieux que le code ne l'annonçait (+0.892), et la tête la
+classe **à l'envers sur les deux fenêtres**. Donc pas de surapprentissage :
+elle aurait bien prédit là où elle apprend.
+
+Cause : la perte auxiliaire ne voyait que le tampon PPO — ~4 100 décisions par
+epoch, celles que la politique visite. `rhoAux` et `sommet` se mesurent sur une
+grille uniforme. La tête ne s'entraînait que sur **51.6 %** des occasions
+d'entraînement et **64.3 %** de validation — et en validation les occasions
+jamais vues rapportaient **davantage** (+0.822 R contre +0.543).
+
+Corrigé en trois temps, chacun mesuré :
+
+1. grille dense indépendante de la politique ;
+2. perte auxiliaire de PPO **coupée** — elle pesait 264 pas contre 40, soit
+   6.6 fois plus, et `AuxL` **montait** ;
+3. passe supervisée déplacée **après** la mise à jour PPO, le tronc partagé
+   recevant un gradient de 1.47 à 1.81 qui défaisait la tête entre son
+   entraînement et sa notation.
+
+`AuxL` est alors descendue de 2.03 à 0.96 sur dix epochs sans remontée
+durable, et `rhoAux` a franchi zéro.
+
+### Le portillon donnait un quota à chaque côté
+
+Deux sites divisaient la sélectivité par le nombre de côtés, et
+`EntryDecisionPolicy` tenait un seuil **par sens**. Sur exec28 :
+
+| | LONG | SHORT |
+|---|---|---|
+| epochs positives | **9 / 9** | **0 / 9** |
+| PnL de validation cumulé | +39 378 | −15 342 |
+| part des trades | 49.8 % | **50.2 %** |
+
+50.2 % n'est pas une coïncidence : c'est exactement la moitié accordée. Un
+seul vivier désormais — vérifié sur une distribution où les achats convainquent
+davantage, la répartition passe de 49/51 à 77/23 pour un taux d'entrée
+inchangé (5.1 % contre 5.5 %).
+
+### La perte top-k : posée, puis diagnostiquée
+
+`AuxL` descendait pendant que `sommet` baissait — la moindre carrée optimise le
+gros de la distribution, le déploiement les 5 % du haut. Vérifié sur la série
+**lissée sur cinq epochs** (écart-type 0.120) : 1.126 → 0.864, soit 2.2 σ,
+après deux fausses alertes lues sur la série brute (écart-type 0.31, où trois
+points ne disent rien).
+
+Le top-k porte sur l'**indicateur borné** (−1.41 à +1.99, transfert +0.921) et
+non sur le R brut (jusqu'à +18.93), ce qui rend un écrêtage inutile ici.
+Coefficient 1.0 = 26 % du gradient, mesuré sur un vrai lot.
+
+**Puis il s'est effondré au réveil de l'acteur.** `rhoAux` d'exec38 : le
+meilleur de tous les runs tant que l'acteur dort (+0.135 à l'ep 6), puis
+effondrement monotone de l'ep 7 à l'ep 14 (−0.011 → −0.169). exec35, qui
+traverse le même réveil sans top-k, ne se dégrade pas. Ce n'est donc ni
+l'acteur ni l'ancre : le terme top-k concentre son gradient sur **6 occasions
+par lot de 128** et ne résiste pas au tronc remodelé par PPO. Sélectivité
+d'entraînement élargie à 20 % — 26 occasions au lieu de 6.
+
+### Le twist Ichimoku n'annonce pas le range sur l'or en M5
+
+Directionnalité des 24 h suivantes, 0 = range parfait :
+
+| situation | n | directionnalité | écart |
+|---|---|---|---|
+| toutes barres | 199 712 | 0.0681 | — |
+| twist récent | 52 211 | 0.0691 | +0.0009 |
+| nuage qui twiste sans cesse | 26 165 | 0.0700 | +0.0019 |
+
+**+0.3 σ**, et du mauvais signe. Le livre parle d'actions en daily.
+
+### La stratégie du livre appliquée telle quelle ne trie rien
+
+42 combinaisons testées (3 échelles, 2 sens, 7 règles). Meilleur résultat
+**+0.4 σ**, quand le maximum de 42 tirages de bruit pur vaut ~2.2 σ. Et la
+règle Chikou, que l'auteur appelle « absolue et fondamentale », **dégrade** :
++0.142 R contre +0.338 au hasard.
+
+Trois écarts avec l'ouvrage ont quand même été corrigés — Chikou n'était
+confrontée qu'aux chandeliers (23.6 % des occasions tenues pour validées
+étaient barrées par un plat), la SSA n'existait pas comme niveau, le nuage
+futur se résumait à une pente.
+
+### Le M1 ne peut pas payer sa friction
+
+La friction en R vaut « coût fixe divisé par N fois ATR ». L'ATR relatif du M1
+est **2.39 fois plus petit** que celui du M5 (loi d'échelle ajustée sur quatre
+échelles, exposant 0.544).
+
+| échelle | stop | friction/R | avantage requis |
+|---|---|---|---|
+| M5 | 10×ATR | 0.061 | +0.061 ← en vigueur |
+| M1 | 10×ATR | 0.146 | +0.146 |
+| M1 | 2×ATR | 0.731 | **+0.731** |
+
+Le meilleur avantage jamais mesuré ici vaut +0.3 à +0.4 R au-dessus du hasard.
+Et pour ramener la friction du M1 au niveau actuel il faudrait un stop de
+~24×ATR(M1) — **la même distance en prix** que le stop M5, donc la même durée.
+
+### Le break-even ne se défend à aucun niveau
+
+| armement | R moyen | perte moyenne | **p10** | Sortino |
+|---|---|---|---|---|
+| aucun | **+0.228** | −1.051 | −1.10 | **+0.267** |
+| 0.25 R | +0.033 | −0.283 | −1.06 | +0.070 |
+| 1 R | +0.171 | −0.726 | −1.09 | +0.231 |
+| 1.5 R | +0.212 | −0.915 | −1.10 | +0.262 |
+
+Il divise la perte **moyenne** par presque quatre, mais **le p10 ne bouge pas**.
+Un trade qui part contre soi n'atteint jamais le seuil d'armement. Le
+break-even ne coupe donc que les trades d'abord allés dans le bon sens — les
+meilleurs. À 0.25 R il en coupe 64 % à l'entrée et fait tomber le p99 de
++11.05 à +6.47.
+
+### La sélection de checkpoint choisit du bruit
+
+`sommet` a un écart-type de **0.31 d'une epoch à l'autre**. Prendre le maximum
+d'une série bruitée est biaisé vers le haut par construction. Simulation de
+20 000 séries sans aucun progrès réel, même moyenne et dispersion :
+
+| | maximum du hasard seul | surestimation |
+|---|---|---|
+| max brut sur 15 epochs | 1.779 | +0.541 |
+| max d'une moyenne glissante de 5 | 1.402 | +0.164 |
+
+Le meilleur `sommet` d'exec35 vaut **1.826**. Le hasard seul en produit
+**1.779**. La part attribuable au modèle est d'environ **+0.047** — borne
+basse, sous l'hypothèse que toute la variation soit du bruit.
+
+**Et compter les checkpoints retenus est un mauvais critère.** Retenir veut
+dire battre son propre record : une série qui démarre bas et grimpe doucement
+bat le sien à chaque fois. exec37 monte à **chaque** epoch et plafonne à 0.846,
+quand exec36 et exec38 dépassent 1.5. Le compte de retenues récompense un run
+qui commence mal.
+
+### Ce que la journée n'a pas changé
+
+Le mur reste le nombre d'occasions **indépendantes** : ~930, erreur-type de
+0.065 R sur une moyenne. Seuls les effets au-delà de +0.15 R environ sont
+détectables à 2 σ. Toutes les mesures prédictives du jour sont tombées entre
+0.1 et 1.3 σ ; toutes les mesures mécaniques ont donné une réponse franche.
+C'est la résolution de l'instrument, et aucune architecture ne la déplace.
+
+58 884 paramètres pour ~700 occasions indépendantes font **83 pour 1**, quand
+la version qui avait rendu +2.2 points en test en portait 11.6.
+
+La seule voie qui déplace ce plancher est le nombre d'**instruments**, pas la
+finesse du temps : 25 actifs au même horizon diviseraient l'erreur-type par
+cinq, et un avantage de +0.05 R deviendrait détectable.

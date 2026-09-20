@@ -203,6 +203,11 @@ class LiveConfig:
     # le fichier `_calib.json` du checkpoint et relue au chargement : le
     # lookback n'est PAS deductible des poids — n'importe quelle profondeur se
     # reconstruit en ajustant le pas — donc c'est le fichier qui fait foi.
+    # MIROIR DE `training.PPOConfig.veto_tendance`. Les deux DOIVENT dire la
+    # meme chose : le modele n'a jamais vu d'occasion en tendance baissiere.
+    veto_tendance: str = "tend_mom_mois"
+    veto_tendance_seuil: float = 0.0
+
     lookback: int = 4
 
     # Bougies d'echauffement demandees a chaque cycle. Le bloc H4 reclame
@@ -1164,6 +1169,31 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
                 sens, entree, n_pos, age_sec, marge, equity = etat_compte(
                     cfg, magic)
                 prix_courant = float(df_closed["close"].iloc[-1])
+                # LE VETO DE TENDANCE, LU DE LA MEME COLONNE QU'A
+                # L'ENTRAINEMENT. `BTCTradingEnvDiscrete.tendance_favorable`
+                # refuse toute entree quand le momentum sur un mois est
+                # negatif ; si le live ne le faisait pas, il trad erait des
+                # occasions que le modele n'a jamais vues — la divergence
+                # exacte que ce depot a deja payee.
+                #
+                # La valeur est lue BRUTE, comme a l'entrainement : la colonne
+                # normalisee comparerait le seuil zero a la moyenne du
+                # momentum, donc a tout autre chose.
+                _vt = getattr(cfg, "veto_tendance", "")
+                if _vt and n_pos == 0:
+                    if _vt not in df_closed.columns:
+                        raise RuntimeError(
+                            f"veto_tendance='{_vt}' absent du flux live. "
+                            f"L'entrainement l'utilise : ne pas trader a "
+                            f"l'aveugle.")
+                    _v = float(df_closed[_vt].iloc[-1])
+                    _seuil = float(getattr(cfg, "veto_tendance_seuil", 0.0))
+                    if not (np.isfinite(_v) and _v >= _seuil):
+                        print(f"  [{agent_name.upper()}] tendance defavorable "
+                              f"({_vt} = {100*_v:+.2f} % < "
+                              f"{100*_seuil:+.2f} %) → HOLD")
+                        continue
+
                 libres = capacite_ouvrable(cfg, prix_courant, marge, equity)
                 if libres <= 0:
                     print(f"  [{agent_name.upper()}] {n_pos} position(s), le "

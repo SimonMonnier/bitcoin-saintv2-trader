@@ -286,7 +286,13 @@ FEATURE_COLS_EXT = []
 # `nb_trades`, deux champs que seul Binance publie — retires le 2026-09-16
 # pour la meme raison que FEATURE_COLS_EXT. `heure_sin`/`heure_cos` se
 # calculent a partir de l'horodatage seul et restent.
-FEATURE_COLS_LIQ_TEMPS = ["heure_sin", "heure_cos"]
+# LE REGIME DE TENDANCE, en horizons longs. Le plus long que le modele voyait
+# etait `mom_5_h4`, soit vingt heures : il ne pouvait pas savoir dans quel
+# regime il se trouvait. Mesure du 2026-09-20 dans `prepare_m5.construit` :
+# seuls les horizons LONGS separent les deux sens, et la separation croit
+# monotonement avec l'horizon la ou les detecteurs Ichimoku ne donnent rien.
+FEATURE_COLS_LIQ_TEMPS = ["tend_mom_sem", "tend_mom_mois", "tend_vs_ma_mois",
+                          "heure_sin", "heure_cos"]
 
 # ============================================================
 #  ECHELLE DE DECISION — H1 depuis exec10

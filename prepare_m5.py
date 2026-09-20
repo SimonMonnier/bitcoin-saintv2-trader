@@ -181,6 +181,50 @@ def construit(m5, avec_flux=None):
         m5, noms = _joint_echelle(m5, regle, sfx, jour_sup)
         cols_sup += noms
 
+    # ---------- Le REGIME de tendance, en horizons longs ----------
+    #
+    # POURQUOI IL MANQUAIT, ET CE QUE CA COUTAIT. Le plus long horizon que le
+    # modele voyait etait `mom_5_h4` — cinq bougies H4, soit vingt heures. Il
+    # ne pouvait donc pas savoir dans quel regime il se trouvait.
+    #
+    # MESURE DU 2026-09-20 (`mesure_tendance.py`, 28 099 occasions, train +
+    # validation, la fenetre de test n'est pas lue). On cherche un detecteur
+    # qui SEPARE les deux sens, et non un qui gagne — sur cette fenetre l'or a
+    # monte, donc acheter au hasard rapporte deja +0.236 R et un detecteur qui
+    # dirait "haussier" en permanence paraitrait excellent sans rien detecter.
+    # La grandeur qui compte est l'ecart achat-vente, et sa DIFFERENCE d'un
+    # regime a l'autre :
+    #
+    #     detecteur                         separation   sigma
+    #     prix vs nuage (Ichimoku)              +0.089    +0.4
+    #     pente de Kijun                        +0.068    +0.3
+    #     momentum 1 jour                       +0.076    +0.3
+    #     momentum 1 semaine                    +0.308    +1.4
+    #     momentum 1 mois                       +0.456    +2.1
+    #     prix vs moyenne 1 semaine             +0.281    +1.3
+    #     prix vs moyenne 1 mois                +0.325    +1.5
+    #
+    # LES DETECTEURS ICHIMOKU NE SEPARENT RIEN. Le momentum si, et la
+    # separation croit MONOTONEMENT avec l'horizon — un jour, une semaine, un
+    # mois — et les deux familles (momentum et moyenne mobile) s'ordonnent
+    # pareil. C'est cette structure qui convainc, plus que le +2.1 sigma, qui
+    # est a peine au-dessus du seuil de bruit pour neuf essais (~1.9). Du
+    # bruit ne se range pas par horizon.
+    #
+    # CE QUE LE REGIME NE DIT PAS, et il ne faut pas le lui faire dire : en
+    # regime BAISSIER, l'achat reste meilleur que la vente (+0.049 contre
+    # -0.244). Aucun regime ne rend le short preferable ici. Ce n'est donc pas
+    # un aiguillage de sens, c'est une JAUGE DE FORCE : l'avantage a l'achat
+    # passe de +0.750 R en haussier a +0.294 R en baissier.
+    #
+    # CAUSALITE : ces trois colonnes ne lisent que du passe. Elles coutent
+    # 8 640 barres d'amorcage, soit 1.7 % du jeu, perdues au dropna.
+    for nom, n in (("tend_mom_sem", 2016), ("tend_mom_mois", 8640)):
+        prec = m5["close"].shift(n)
+        m5[nom] = (m5["close"] - prec) / prec.replace(0, np.nan)
+    _ma = m5["close"].rolling(8640).mean()
+    m5["tend_vs_ma_mois"] = (m5["close"] - _ma) / _ma.replace(0, np.nan)
+
     # ---------- Temps ----------
     heure = m5["time"].dt.hour + m5["time"].dt.minute / 60.0
     m5["heure_sin"] = np.sin(2 * np.pi * heure / 24.0)
@@ -192,7 +236,8 @@ def construit(m5, avec_flux=None):
     # Les colonnes de carnet ne sont plus dans l'observation : la liste
     # rendue doit donc s'accorder avec `saint_core.FEATURE_COLS`, que `main`
     # verifie colonne par colonne.
-    liq = ["heure_sin", "heure_cos"]
+    liq = ["tend_mom_sem", "tend_mom_mois", "tend_vs_ma_mois",
+           "heure_sin", "heure_cos"]
     return (m5, BASES + cols_sup + liq + cols_rng + cols_ich, cols_ich)
 
 
