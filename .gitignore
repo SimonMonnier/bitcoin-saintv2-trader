@@ -87,3 +87,7 @@ run_saintv2_*.json
 
 # Reglages locaux de la session Claude Code — propres a la machine.
 .claude/
+
+# Sauvegarde du cache faite avant sa reconstruction par prepare_or.py : 1.3 Go,
+# et `*.pkl` ne l'attrape pas a cause du suffixe.
+*.pkl.avant_reconstruction

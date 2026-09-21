@@ -552,8 +552,87 @@ N_BASE_FEATURES = len(FEATURE_COLS)
 # l'ouverture.
 #
 #     log pi(a) = log pi_dir(d) + log pi_budget(b)
-N_BUDGETS = 4
-BUDGETS_RISQUE = (0.03, 0.06, 0.15, 0.40)
+N_BUDGETS = 6          # accord verifie apres BUDGETS_POSITIONS
+# ZERO EST UN PALIER, ET C'EST LE MECANISME D'ABSTENTION DU MODELE.
+#
+# Le budget etait le seul levier de DOSAGE ; il devient aussi le levier
+# d'ARRET. A 0 %, aucune place n'est ouvrable : le modele choisit de ne pas
+# trader, et ce choix est appris comme les autres, par la meme tete.
+#
+# L'ECHELLE EST EN NOMBRE DE POSITIONS MINIMALES, PLUS EN POURCENTAGE
+# D'EQUITE — et c'est une mesure qui l'a imposee, pas un gout.
+#
+# CE QUI NE MARCHAIT PAS. Les paliers valaient (0, 1, 3, 6, 15, 40) % du
+# compte. Or le budget de risque plafonne la somme des pertes si TOUS les
+# stops etaient touches, et une position au lot MINIMUM risque deja un
+# montant incompressible. A 1 000 $ de capital, stop 10 x ATR sur l'or :
+#
+#     ATR  4 $  ->  une position risque   40 $  =  4 % du compte
+#     ATR  8 $  ->  une position risque   80 $  =  8 % du compte
+#     ATR 15 $  ->  une position risque  150 $  = 15 % du compte
+#
+# Un budget SOUS ce montant n'ouvre pas une position plus petite : il n'en
+# ouvre AUCUNE. Les paliers 1 % et 3 % etaient donc inoperants en permanence,
+# 6 % l'etait des que l'ATR depassait 6 $. Trois paliers sur six faisaient la
+# meme chose que le palier 0 — ne pas trader — sans le dire. L'echelle de
+# risque que PPO croyait apprendre n'existait pas.
+#
+# CE QUE LE JOURNAL DISAIT, et que personne n'avait lu ainsi (exec47, ep. 1) :
+#
+#     budgets[0%:14(100) 1%:18(100) 3%:21(99) 6%:14(97) 15%:14(80) 40%:18]
+#
+# Le nombre entre parentheses est la part des entrees refusees par le palier
+# lui-meme. PLUS LE BUDGET EST GROS, MOINS IL REFUSE — l'inverse de
+# l'intuition, et la signature exacte d'un plancher de lot minimum. La
+# validation etait tombee de 300-450 trades a 56.
+#
+# CE QUE L'ECHELLE VEUT DIRE MAINTENANT : « combien de positions minimales
+# suis-je pret a avoir en risque a la fois ». Zero reste l'abstention. Chaque
+# palier au-dessus ouvre au moins une position des que la marge le permet,
+# quels que soient l'ATR ET LE CAPITAL — une echelle en pourcentage se
+# comporte differemment a 1 000 $ et a 10 000 $ sans que rien ne le signale.
+BUDGETS_POSITIONS = (0, 1, 2, 4, 7, 12)
+# LE HAUT DE L'ECHELLE VAUT CE QUE VALAIT L'ANCIEN PALIER 40 %.
+#
+# Premiere version : (0, 1, 2, 3, 5, 8). Mesure sur exec49, epoch 1 : 141
+# trades de validation contre 300-450 sur les runs precedents. La cause n'est
+# pas un blocage mais une AMPLITUDE trop faible — a 1 000 $ et ATR 4,
+# l'ancienne echelle ouvrait 0 / 1 / 3 / 10 positions selon le palier, donc un
+# plafond de 10, et la tete non entrainee tombait sur 40 % une fois sur
+# quatre. La nouvelle plafonnait a 8, et son argmax est tombe sur 5.
+#
+# 12 est ramene a 10 par la garde de survie a 1 000 $ et ATR 4 — soit
+# exactement ce que l'ancien palier le plus haut permettait — et reste 12 sur
+# un compte plus gros, ou la garde ne mord pas.
+
+# LE PLAFOND QU'AUCUN CHOIX NE FRANCHIT, exprime lui en fraction d'equite.
+#
+# Sans lui, 8 positions a ATR 15 engageraient 8 x 150 $ = 120 % d'un compte de
+# 1 000 $ : la ruine, choisie par une tete de reseau a l'epoch 1. Ce plafond
+# vaut ce que valait l'ancien palier le plus haut — 40 % — donc il ne
+# restreint rien de ce qui etait deja permis ; il empeche seulement l'echelle
+# en positions de sortir de l'enveloppe qui avait ete mesuree.
+#
+# EFFET VISIBLE : en marche calme (ATR 4) les huit paliers sont distincts ; en
+# marche agite (ATR 15) ils s'ecrasent sur deux positions. C'est voulu — a
+# 1 000 $ on ne TIENT pas huit positions sur un or qui bouge de 15 $ — et cela
+# se lit dans les taux de refus du journal.
+PLAFOND_RISQUE_EQUITE = 0.40
+
+# Conserve sous son ancien nom pour les points de reprise et les mesures
+# anterieures, qui le lisent. Il ne commande plus rien.
+BUDGETS_RISQUE = BUDGETS_POSITIONS
+# LA DERIVE LEVE AU CHARGEMENT. `N_BUDGETS` est defini plus haut — il dimensionne
+# la tete — et la liste plus bas. Les desaccorder produirait une tete dont la
+# taille ne correspond a rien, sans qu'aucune erreur ne se declenche.
+assert N_BUDGETS == len(BUDGETS_POSITIONS), (
+    f"N_BUDGETS={N_BUDGETS} mais {len(BUDGETS_POSITIONS)} paliers")
+assert BUDGETS_POSITIONS[0] == 0, (
+    "le premier palier DOIT etre l'abstention : c'est le seul moyen qu'a le "
+    "modele de choisir de ne pas trader")
+assert all(b < a for b, a in zip(BUDGETS_POSITIONS, BUDGETS_POSITIONS[1:])), (
+    "les paliers doivent etre strictement croissants, sinon deux actions "
+    "differentes font la meme chose")
 
 # LA SIXIEME COLONNE PORTE LE BUDGET COURANT. La quatrieme porte deja la
 # capacite restante, mais deux budgets differents peuvent donner la meme
@@ -789,8 +868,27 @@ def merge_m1_h1(rates_m1, rates_h1,
     # (build_binance_features.py detecte le decalage en correlant les rendements
     # M1), donc pas de merge_asof : il masquerait un defaut d'alignement en
     # collant la valeur la plus proche.
-    if feats_ext is not None and len(feats_ext) > 0:
-        fx = feats_ext[[c for c in FEATURE_COLS_EXT if c in feats_ext.columns]]
+    _cols_ext = ([c for c in FEATURE_COLS_EXT if c in feats_ext.columns]
+                 if feats_ext is not None else [])
+    # AUCUNE COLONNE RETENUE : IL N'Y A RIEN A FUSIONNER NI A GARDER.
+    #
+    # `FEATURE_COLS_EXT` est VIDE dans la configuration or — les features
+    # Binance sont des features BTC, on ne les utilise pas ici. Le bloc
+    # s'executait quand meme des que le fichier existait : il fusionnait zero
+    # colonne, puis le garde-fou lisait `COL_GARDE_EXT` dans un dataframe qui
+    # ne l'avait pas, et levait `KeyError: 'taker_ratio'`.
+    #
+    # CELA NE S'ETAIT JAMAIS VU parce que le cache M5 court-circuite cette
+    # fusion. Le jour ou il a expire — 48 h de retard — le rechargement est
+    # tombe ici, et aucun run ne pouvait plus demarrer. Une panne qui attend
+    # l'expiration d'un cache pour se declarer est la pire espece : elle ne
+    # correle avec aucun changement de code.
+    #
+    # LE GARDE-FOU N'EST PAS AFFAIBLI : il verifie l'alignement des colonnes
+    # QU'ON UTILISE. Quand on n'en utilise aucune, il n'y a pas d'alignement a
+    # verifier. Des qu'une seule revient dans `FEATURE_COLS_EXT`, il reprend.
+    if feats_ext is not None and len(feats_ext) > 0 and _cols_ext:
+        fx = feats_ext[_cols_ext]
         merged = merged.merge(fx, left_on="time", right_index=True, how="left")
 
         chevauche = merged["time"].between(fx.index.min(), fx.index.max())
@@ -799,6 +897,16 @@ def merge_m1_h1(rates_m1, rates_h1,
             # laisserait toutes les colonnes a NaN puis le dropna viderait le
             # dataframe SANS erreur. C'est le piege qui s'est deja referme sur
             # les ticks.
+            # LA COLONNE TEMOIN DOIT ETRE PARMI CELLES RETENUES. Si elle
+            # ne l'est pas, on ne peut pas mesurer l'alignement : on le dit
+            # au lieu de lever un `KeyError` a trois niveaux de pandas.
+            if COL_GARDE_EXT not in merged.columns:
+                raise ValueError(
+                    f"la colonne temoin d'alignement `{COL_GARDE_EXT}` n'est "
+                    f"pas dans les colonnes retenues {_cols_ext} : "
+                    f"l'alignement de {SOURCE_EXT_NOM} ne peut pas etre "
+                    f"verifie. Ajouter la colonne a FEATURE_COLS_EXT, ou "
+                    f"changer COL_GARDE_EXT pour une colonne utilisee.")
             couv = merged.loc[chevauche, COL_GARDE_EXT].notna().mean()
             if couv < 0.5:
                 raise ValueError(
@@ -2397,12 +2505,73 @@ def load_decision_policy(checkpoint, fallback=None, side=None):
                                 'thresholds': list(load_calib_thresholds(checkpoint, fallback))})
 
 
+def score_retenue_grille(budgets, rendements):
+    """Le critere qui CHOISIT le checkpoint. Rend (gain, baisse, net).
+
+    UNE SEULE ECRITURE, et c'est la raison d'etre de cette fonction. Elle
+    vivait en ligne dans la boucle d'entrainement, et son test la
+    reimplementait — deux descriptions du meme calcul, qui doivent s'accorder
+    par convention. C'est la faute que ce depot passe son temps a payer.
+
+    CE QU'ELLE MESURE. Pour chaque occasion RETENUE par la tete de rang :
+
+        b_i   nombre de positions minimales que le modele y miserait
+        R_i   rendement de l'occasion, en unites de risque
+
+        gain   = somme(b_i x R_i) / somme(b_i)
+        baisse = racine( somme(b_i x min(R_i, 0)^2) / somme(b_i) )
+        net    = gain - baisse
+
+    Soit le R moyen par POSITION MISEE, moins la taille typique des pertes,
+    la meme ponderation des deux cotes.
+
+    ELLE EST INVARIANTE AU LEVIER, et ca a coute une version pour s'en
+    apercevoir. La premiere sommait `b_i x R_i` sans normaliser : les deux
+    termes etaient alors lineaires en budget, donc leur difference aussi, et
+    doubler tous les budgets doublait le score. Mesure sur exec55 :
+
+        epoch   bud    gain    baisse   gain/baisse    net (ancienne version)
+          1     1.94   1.417    1.435      0.988         -0.019
+          2    12.00   9.518    9.350      1.018         +0.168
+
+    `gain/baisse` vaut 1.0 aux deux epochs — aucune competence ni dans un cas
+    ni dans l'autre — mais l'ancien `net` passait de negatif a positif parce
+    que le budget avait ete multiplie par six. Le checkpoint a ete retenu
+    la-dessus, avec un creux de validation a 85 %.
+
+    L'ABSTENTION PAIE, et c'est tout l'objet du critere. Miser zero sur une
+    occasion la retire des DEUX sommes : une mauvaise occasion ecartee monte
+    `gain` et vide la queue gauche, donc baisse `baisse`. Payee deux fois.
+    Miser gros au mauvais moment est puni deux fois par la meme mecanique.
+
+    NE RIEN MISER DU TOUT rend exactement zero — pas une division par zero,
+    pas un score negatif. Mieux vaut ne pas trader que trader mal ; le
+    portillon du hasard, en amont, empeche qu'on retienne un modele inerte.
+    """
+    b = np.asarray(budgets, dtype=np.float64)
+    r = np.asarray(rendements, dtype=np.float64)
+    if b.shape != r.shape:
+        raise ValueError(
+            f"budgets {b.shape} et rendements {r.shape} doivent avoir la "
+            f"meme forme : une valeur par occasion retenue")
+    somme = float(b.sum())
+    if not np.isfinite(somme) or somme <= 0.0:
+        return 0.0, 0.0, 0.0
+    gain = float((b * r).sum() / somme)
+    neg = np.minimum(r, 0.0)
+    baisse = float(np.sqrt((b * neg * neg).sum() / somme))
+    return gain, baisse, gain - baisse
+
+
 def places_ouvrables_compte(equity: float, marge_utilisee: float,
                             prix: float, lot_min: float, contrat: float,
                             marge_frac: float, niveau_marge: float,
-                            budget_risque: float = 0.0,
+                            budget_positions: int = 0,
                             risque_engage: float = 0.0,
-                            risque_une: float = 0.0) -> int:
+                            risque_une: float = 0.0,
+                            plafond_equite: float = PLAFOND_RISQUE_EQUITE,
+                            capital_reference: float = 0.0
+                            ) -> int:
     """Combien de positions de plus le COMPTE permet, ici et maintenant.
 
     SOURCE UNIQUE. L'environnement d'entrainement et `kairos_live` appellent
@@ -2419,31 +2588,89 @@ def places_ouvrables_compte(equity: float, marge_utilisee: float,
     nombre. C'est ce qui la rend testable des deux cotes avec les memes
     entrees.
 
-    DEUX BORNES, et la seconde peut etre desactivee.
+    TROIS BORNES.
 
       LA MARGE, contrainte du COURTIER. On s'arrete avant que le niveau de
       marge ne descende sous `niveau_marge` : la marge disponible vaut alors
       `equity / niveau_marge - marge_utilisee`, et chaque position de plus en
       consomme `prix x lot_min x contrat x marge_frac`.
 
-      LE BUDGET DE RISQUE, qui est NOTRE politique et non une contrainte de
-      marche. A zero — le reglage courant — il disparait : seul le courtier
-      borne, et le modele doit apprendre a ne pas aller au bout. Au-dessus de
-      zero, la somme des montants a perdre si tous les stops etaient touches
-      reste sous `budget_risque` de l'equite.
+      LE BUDGET, qui est NOTRE politique : `budget_positions` dit combien de
+      positions MINIMALES on accepte d'avoir en risque a la fois. Ce qui est
+      deja engage se compte dans la meme unite — une position deux fois plus
+      grosse que le minimum en consomme deux.
+
+      LE PLAFOND DE SURVIE, en fraction d'equite, qu'aucun choix ne franchit.
+
+    ZERO N'EST PLUS UN PIEGE. `budget_risque = 0` signifiait ici « PAS DE
+    CONTRAINTE » et non « pas de risque » : le test mesurait 129 places
+    ouvrables a 0 % contre 4 a 3 %. Le palier zero etant devenu le mecanisme
+    d'ABSTENTION du modele, la fonction aurait rendu l'inverse exact de
+    l'intention. Deux appelants posaient un garde-fou explicite avant
+    d'appeler ; c'etait deux endroits ou se tromper. Le zero est traite ici,
+    une fois.
+
+    LE BUDGET SUIT LA CROISSANCE DU COMPTE, et il a fallu une mesure pour
+    s'en apercevoir. La premiere version comptait `n` positions, point : un
+    nombre FIXE, que le compte vaille 1 000 $ ou 8 000 $.
+
+    CE QUE CELA A COUTE. L'ancienne echelle, en fraction d'equite, donnait
+    `(fraction x equite - engage) / risque_une` — donc PROPORTIONNEL a
+    l'equite. Une passe de validation partie de 1 000 $ et finie a 3 562 $
+    voyait sa capacite passer de 10 a 35 positions EN COURS DE ROUTE. C'est le
+    cercle vertueux : plus le compte monte, plus il peut ouvrir. La version
+    fixe la supprimait sans le dire.
+
+        equite     ancien 40 %   fixe 12 pos
+         1 000              10            10     identiques au depart
+         2 500              25            12
+         3 562              35            12     x2.9
+         8 000              80            12     x6.7
+
+    La mesure qui avait valide l'echelle en positions ne testait qu'un seul
+    capital — 1 000 $ — ou les deux coincident exactement. Le nombre de trades
+    de validation est tombe de 300-450 a 99-173, et c'est la, entierement.
+
+    CE QUE `capital_reference` PRESERVE. A l'ouverture du compte, `n` positions
+    valent `n` positions : la propriete voulue — la meme action veut dire la
+    meme chose a 1 000 $ et a 10 000 $ — est intacte. Quand le compte double,
+    la capacite double. A zero, le terme est neutre et on retrouve l'echelle
+    fixe.
+
+    LE PLAFOND DE SURVIE, LUI, BORNE TOUJOURS EN FRACTION D'EQUITE : la
+    capacite grandit, la part du compte reellement en risque ne depasse pas
+    `plafond_equite`. C'est exactement ce que faisait l'ancien palier le plus
+    haut.
     """
     if equity <= 0:
+        return 0
+    # L'ABSTENTION, TRAITEE ICI ET NULLE PART AILLEURS.
+    if budget_positions <= 0:
         return 0
     m_une = max(prix * lot_min * contrat * marge_frac, 1e-12)
     marge_max = equity / max(niveau_marge, 1e-9)
     par_marge = math.floor((marge_max - marge_utilisee) / m_une)
 
-    par_risque = float("inf")
-    if budget_risque > 0.0:
-        par_risque = math.floor(
-            (budget_risque * equity - risque_engage) / max(risque_une, 1e-12))
+    r_une = max(risque_une, 1e-12)
+    # CE QUI EST DEJA EN RISQUE, COMPTE EN POSITIONS MINIMALES. Une position
+    # deux fois plus grosse que le minimum en occupe deux : c'est le meme
+    # accounting qu'avant, change d'unite.
+    deja = risque_engage / r_une
+    # LE BUDGET SUIT LA CROISSANCE DU COMPTE. `capital_reference` est le
+    # capital de DEPART : a l'ouverture le facteur vaut 1 et `n` positions
+    # valent `n`. A zero, le terme est neutre.
+    _n = float(budget_positions)
+    if capital_reference > 0:
+        _n *= equity / capital_reference
+    par_budget = math.floor(_n - deja)
 
-    return int(max(0, min(par_marge, par_risque)))
+    # LE PLAFOND DE SURVIE. Il ne restreint rien de ce qui etait deja permis
+    # — il vaut l'ancien palier le plus haut — mais il empeche huit positions
+    # a 15 % chacune d'engager 120 % du compte.
+    par_survie = math.floor(
+        (plafond_equite * equity - risque_engage) / r_une)
+
+    return int(max(0, min(par_marge, par_budget, par_survie)))
 
 
 def compute_risk_volume(equity: float, risk_frac: float, sl_dist: float,

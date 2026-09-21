@@ -121,6 +121,32 @@ RE_META = re.compile(
 # meme raison que rho — ne pas decaler les indices de `analyse`.
 RE_SOMMET = re.compile(r"sommet\s+(" + NB + r")R/(" + NB + r")R")
 
+# LE CRITERE DE SELECTION DEPUIS LE 2026-09-20, et la raison du changement.
+#
+# `sommet` note la QUALITE DU TRI, occasion par occasion. Il ignore l'ORDRE
+# dans lequel elles arrivent — donc le creux — et la TAILLE misee sur chacune
+# — donc l'abstention. Or la tete de budget est la seule que PPO entraine
+# encore, et elle a un palier 0 % : un modele qui apprendrait a ne rien miser
+# aux mauvais moments rendait exactement le meme `sommet` qu'un modele misant
+# pareil partout.
+#
+# `net` = gain - baisse, PAR OCCASION RETENUE, en R d'une POSITION MINIMALE :
+# ce qu'une occasion rapporte misee comme le modele la mise, moins la taille
+# typique de ses pertes. `bud` est le nombre moyen de positions posees, `abst`
+# la part des occasions ou le modele ne mise rien — les deux disent POURQUOI
+# `net` a bouge.
+#
+# L'UNITE EST CELLE DE L'ACTION DU MODELE et ne depend ni du capital ni de la
+# volatilite. Ce n'est pas un rendement de fenetre : il y a ~160 occasions, les
+# lire comme un total serait une erreur d'un facteur 160 — et une vraie courbe
+# d'equite serait fausse, les occasions se chevauchant cinq fois.
+#
+# MOTIF SEPARE, comme rho et sommet : l'inclure dans RE_META decalerait les
+# indices que `analyse` lit par position, en silence.
+RE_NET = re.compile(
+    r"net\s+(" + NB + r")R\s+\(gain\s+(" + NB + r")R baisse\s+([\d.]+)R\)"
+    r"\s+bud\s+([\d.]+)pos abst\s+([\d.]+)%")
+
 # Combien de scores sont venus de la table groupee, et combien ont du
 # repasser par un forward. Le second doit rester petit : il compte les
 # barres ou l'etat de l'environnement n'etait pas celui que la table
@@ -133,6 +159,37 @@ RE_TABLE = re.compile(r"table\s+(\d+)/(\d+)")
 # presente trois fois le meme resultat comme trois mesures — et pire, elle
 # l'ADDITIONNE trois fois au cumul du run.
 RE_REPRISE = re.compile(r"\[val ep(\d+)\]")
+
+# ============================================================
+# LA RETENUE DU MEILLEUR MODELE : ce qui a ete sauve, et sur quoi.
+#
+# POURQUOI DES MOTIFS PLUTOT QU'UN ECHO. La veille recopiait la ligne
+# `NEW BEST` telle quelle, en vert. On y lisait un `sommet` — et depuis le
+# 2026-09-20 ce n'est plus lui qui decide. On croyait donc savoir sur quoi le
+# modele avait ete retenu, et c'etait faux. En lisant les champs un par un, la
+# veille dit le CRITERE, ce qu'il a battu, et le fichier ecrit.
+#
+# CHAQUE MORCEAU EST OPTIONNEL A LA LECTURE : si un seul ne mord pas, on
+# reaffiche la ligne brute au lieu de la perdre. Une ligne de retenue avalee
+# en silence serait la pire des pannes de ce fichier — c'est celle qui dit
+# quel modele sera deploye.
+RE_BEST = re.compile(
+    r"NEW BEST\s+retenu sur le SCORE NET\s+(" + NB + r") R par occasion\s+"
+    r"\(gain\s+(" + NB + r") R - baisse\s+([\d.]+) R\)\s+"
+    r"bat (premier retenu du fold|[+-][\d.]+ R)\s+"
+    r"\[bud ([\d.]+) pos abst ([\d.]+)%\s+"
+    r"portillons : sommet (" + NB + r")R > hasard (" + NB + r")R, "
+    r"(\d+) trades, compte intact\]\s+-> (\S+)")
+
+# Le refus ordinaire — quatre-vingts epochs sur quatre-vingt-dix. Il passait
+# en silence : on regardait defiler un run entier en croyant qu'un meilleur
+# modele etait garde alors que rien ne l'etait.
+RE_GARDE = re.compile(r"garde\s+le modele en place reste le meilleur — (.+)$")
+
+# Le refus GRAVE : le modele etait meilleur au score, et c'est le
+# portefeuille qui l'a disqualifie.
+RE_REFUS = re.compile(r"REFUSE\s+score net\s+(" + NB + r") R par occasion, "
+                      r"meilleur que\s+(" + NB + r") R, mais (.+?) —")
 
 RE_RHO = re.compile(r"META\s+rho\s+(" + NB + r")")
 RE_RHO_AUX = re.compile(r"rhoAux\s+(" + NB + r")")
@@ -264,7 +321,7 @@ def _point_mort(avg_w, avg_l):
 
 def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
             ent_prec=None, rho=None, cote="both", herite=False,
-            sommet=None, reprise=None):
+            sommet=None, reprise=None, net=None):
     """Rend (lignes colorees, lignes brutes, gain par trade, ecart, gele)."""
     ep = int(v[1])
     pnl, trades, wr, pf, dd = (float(v[2]), int(v[3]), float(v[4]),
@@ -374,25 +431,37 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
             coul, quoi = C.ROUGE, "classe A L'ENVERS"
         sup = ""
         if aux is not None:
-            # La tete auxiliaire est entrainee a PREDIRE le rendement, la
-            # politique a AGIR. Si la seconde colonne monte pendant que la
-            # premiere reste plate, c'est la tete qui doit trier.
+            # DEUX TETES, DEUX QUESTIONS DIFFERENTES.
+            #
+            # `rhoAux` est celle de la TETE DE RANG, qui decide des entrees :
+            # classe-t-elle les occasions ? C'est la colonne qui compte, et
+            # c'est sur son sommet que le checkpoint est retenu.
+            #
+            # `rho` portait la tete de DIRECTION, qui a ete supprimee. Il
+            # porte maintenant le BUDGET : le modele mise-t-il gros quand
+            # l'occasion paie ? Un `rho` nul avec un `rhoAux` positif n'est
+            # pas un echec — cela dit que tout le gain vient de la selection
+            # et que le dimensionnement suit le hasard.
             ca = C.VERT if aux > 0.02 else (C.ROUGE if aux < -0.02 else C.GRIS)
-            sup = f"   tete auxiliaire {ca}{aux:+.4f}{C.FIN}"
-        L.append(f"  classement rho {coul}{rho:+.4f}{C.FIN} "
+            sup = f"   tete de rang {ca}{aux:+.4f}{C.FIN}"
+        L.append(f"  classement budget {coul}{rho:+.4f}{C.FIN} "
                  f"(+/- 0.024 env.)  -> {quoi}{sup}")
 
-    # CE QUE RAPPORTE LE SOMMET, et c'est sur lui que le checkpoint est
-    # retenu depuis le 2024-09-19. Le rho dit si l'ORDRE est bon ; celui-ci
+    # CE QUE RAPPORTE LE SOMMET. Le rho dit si l'ORDRE est bon ; celui-ci
     # dit si les occasions effectivement prises PAIENT. Les lire separement
-    # evite la confusion qui a coute le run precedent : un tri juste dont le
-    # sommet ne rapporte rien n'est pas une strategie.
+    # evite la confusion qui a coute un run : un tri juste dont le sommet ne
+    # rapporte rien n'est pas une strategie.
+    #
+    # IL NE CHOISIT PLUS LE CHECKPOINT depuis le 2026-09-20 : il note la
+    # qualite du tri et rien d'autre, ni l'ordre des occasions donc pas le
+    # creux, ni la taille misee donc pas l'abstention. C'est `net`, ci-
+    # dessous, qui decide. `sommet` garde le portillon du hasard.
     if sommet is not None:
         g_top, g_hasard = sommet
         ecart = g_top - g_hasard
         cs = (C.VERT if ecart > 0.05 else
               (C.ROUGE if ecart < -0.05 else C.GRIS))
-        L.append(f"  sommet retenu  {cs}{g_top:+.3f} R{C.FIN} par occasion  "
+        L.append(f"  sommet du tri  {cs}{g_top:+.3f} R{C.FIN} par occasion  "
                  f"contre {g_hasard:+.3f} au hasard  "
                  f"-> {cs}{ecart:+.3f} R{C.FIN} de mieux"
                  f"   [c'est ce qui selectionne le checkpoint]")
@@ -428,13 +497,51 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     # uniforme choisit ses trades presque au hasard, et son resultat mesure le
     # tirage. Les enterrer dans une note conditionnelle les rendait invisibles
     # exactement quand elles importaient le plus.
+    # `H` EST L'ENTROPIE DE LA REGLE D'ENTREE, plus celle d'un acteur.
+    # La tete de direction a ete supprimee : `H` porte desormais la
+    # repartition des decisions reellement prises — acheter, vendre,
+    # attendre. A 0 la regle s'est figee, au plafond elle est a pile ou face.
+    # `g_actor` est le gradient de la tete de BUDGET, seule politique que PPO
+    # entraine encore.
     d_ent = "" if ent_prec is None else f" ({H - ent_prec:+.3f})"
-    L.append(f"  politique  H {H:.3f}/{h_max:.3f}{d_ent}"
+    L.append(f"  entrees  H {H:.3f}/{h_max:.3f}{d_ent}"
              f" ({100*H/max(h_max,1e-9):.0f} % du plafond a {cote})"
              f"   etendue {et_val:.4f} "
              f"({et_val/TREMBLEMENT_SEUIL:.0f}x le tremblement)   "
              f"KL {kl:+.4f}   clipfrac {clipfrac:.1f}%   "
-             f"g_actor {g_actor:.1e}")
+             f"g_budget {g_actor:.1e}")
+
+    # LE CRITERE QUI CHOISIT LE CHECKPOINT, et ce qui le compose.
+    #
+    # `net` = gain - baisse, PAR OCCASION retenue, en R d'une position
+    # minimale.
+    # Un modele qui s'abstient au bon moment est paye DEUX FOIS : il retire un
+    # rendement negatif, ce qui monte la moyenne ET vide la queue gauche.
+    #
+    # LA `baisse` EST UN DEMI-ECART-TYPE SOUS ZERO, pas un creux de courbe.
+    # Une courbe d'equite sur cette grille serait fausse : 160 occasions
+    # retenues sur une fenetre qui n'en tient que ~34 sans chevauchement, donc
+    # le meme capital compte cinq fois — elle affichait un creux de 164 %. Une
+    # moyenne et une demi-variance, elles, supportent le chevauchement : il les
+    # rend moins PRECISES, il ne les fausse pas.
+    #
+    # `bud` et `abst` disent POURQUOI il a bouge. `net` qui monte avec `abst`
+    # qui monte : c'est l'abstention qui paie. `net` qui monte avec `bud` qui
+    # monte : c'est le levier, et le creux dira bientot ce qu'il coute. Sans
+    # ces deux nombres, les deux histoires sont indiscernables.
+    if net is not None:
+        v_net, v_gain, v_creux, v_bud, v_abst = net
+        cn = C.VERT if v_net > 0 else (C.ROUGE if v_net < 0 else C.GRIS)
+        # Le creux se lit RELATIVEMENT au gain : 8 % de creux pour 40 % de
+        # gain n'est pas 8 % de creux pour 3 % de gain.
+        _rap = (v_gain / v_creux) if v_creux > 1e-9 else float("inf")
+        _lr = ("aucune perte" if not math.isfinite(_rap)
+               else f"{_rap:.2f}x la baisse")
+        L.append(f"  critere net  {cn}{v_net:+6.3f} R{C.FIN} par occasion  "
+                 f"= gain {v_gain:+.3f} R - baisse {v_creux:.3f} R  ({_lr})")
+        L.append(f"  dimension    {v_bud:.2f} position(s) minimale(s) en "
+                 f"moyenne sur les occasions retenues, abstention totale sur "
+                 f"{v_abst:.0f} % d'entre elles")
 
     if tr is not None:
         t_wr, t_pf = float(tr[4]), float(tr[5])
@@ -446,7 +553,7 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     notes = []
     if desaccord:
         notes.append(
-            f"DESACCORD SUR L'ETAT DE L'ACTOR : l'epoch {ep} est "
+            f"DESACCORD SUR L'ETAT DE LA POLITIQUE : l'epoch {ep} est "
             f"{'dans' if gele else 'hors'} le warmup ({WARMUP} epochs) mais "
             f"son gradient vaut {g_actor:.1e}. La configuration lue par la "
             f"veille n'est peut-etre pas celle du run.")
@@ -456,20 +563,27 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
         # fenetre qu'elle n'a pas encore vue. C'est une reference utile — le
         # niveau avant tout nouvel apprentissage — mais l'appeler "hasard"
         # ferait lire un transfert reussi comme un coup de chance.
-        notes.append(f"ACTOR GELE, POIDS HERITES : warmup du critic, gradient "
+        notes.append(f"POLITIQUE GELEE, POIDS HERITES : warmup du critic, gradient "
                      f"{g_actor:.1e}. Cette epoch mesure la politique du fold "
                      f"PRECEDENT sur cette fenetre — pas le hasard. C'est le "
                      f"niveau de depart que la suite doit battre.")
     elif gele:
-        notes.append(f"ACTOR GELE : warmup du critic, gradient {g_actor:.1e}. "
+        notes.append(f"POLITIQUE GELEE : warmup du critic, gradient {g_actor:.1e}. "
                      f"Cette epoch ne mesure aucun apprentissage — elle sert de "
                      f"reference au hasard pour les suivantes.")
     elif H > 0.99 * h_max:
-        notes.append(f"APPREND MAIS RESTE PLAT : le gradient passe "
-                     f"({g_actor:.1e}) mais l'entropie tient a {H:.3f} sur "
-                     f"{h_max:.3f}. La politique se differencie trop lentement pour "
-                     f"que le filtre ait un sens — c'est un probleme de pas "
-                     f"d'apprentissage ou d'echelle, pas de tirage.")
+        # LES DEUX CHIFFRES PORTENT SUR DEUX TETES, et c'est le
+        # rapprochement qui est informatif. Le gradient est celui du BUDGET,
+        # que PPO entraine ; l'entropie est celle de la REGLE D'ENTREE, que
+        # la tete de rang produit. PPO apprend donc a dimensionner pendant
+        # que la selection entre au hasard — et c'est la selection, pas le
+        # dimensionnement, qui fait le resultat.
+        notes.append(f"LE BUDGET APPREND, L'ENTREE TIRE A PILE OU FACE : le "
+                     f"gradient de budget passe ({g_actor:.1e}) mais "
+                     f"l'entropie des entrees tient a {H:.3f} sur "
+                     f"{h_max:.3f}. La tete de rang ne differencie pas encore "
+                     f"les occasions — regarder `rhoAux` et l'etendue, pas le "
+                     f"PnL, qui ne mesure ici que le tirage.")
     # Mesure du 2026-09-15 sur les 5 epochs gelees d'exec12, qui partagent le
     # meme reseau : le seuil calibre s'est deplace de 0.0010 alors que
     # l'etendue totale des convictions valait 0.0002. Les 5 % retenus
@@ -561,6 +675,7 @@ class Veilleur:
         self._meta_muettes = set()
         self.vus = set()
         self.vals, self.metas, self.trains, self.rhos = {}, {}, {}, {}
+        self.nets = {}          # (net, gain, creux, budget moyen, abstention)
         self.cotes = {}         # par fold : long / short / both, lu du tag
         self.herites = set()    # folds dont les poids viennent du precedent
         self.sommets = {}       # par (fold, epoch) : (gain du sommet, au hasard)
@@ -577,11 +692,58 @@ class Veilleur:
         self.vus.clear()
         for d in (self.vals, self.metas, self.trains, self.rhos, self.cotes,
                   self.precedent, self.geles, self.cumul, self.entropie,
-                  self.sommets, self.reprises):
+                  self.sommets, self.reprises, self.nets):
             d.clear()
         self.herites.clear()
         self.attend_moyenne.clear()
         self.fold_courant = None
+
+    def _bloc_retenue(self, ligne: str):
+        """Ce qui vient d'etre sauve, et sur quel critere.
+
+        SI LE MOTIF NE MORD PAS, ON REAFFICHE LA LIGNE BRUTE. Une ligne de
+        retenue avalee en silence serait la pire panne de ce fichier : c'est
+        elle qui dit quel modele sera deploye.
+        """
+        m = RE_BEST.search(ligne)
+        if m is None:
+            return [f"{C.VERT}{C.GRAS}  {ligne.strip()}{C.FIN}",
+                    f"{C.ROUGE}  VEILLE : ligne NEW BEST illisible, motif a "
+                    f"reajuster{C.FIN}"]
+        (net, gain, baisse, bat, bud, abst,
+         sommet, hasard, trades, fichier) = m.groups()
+        net, gain, baisse = float(net), float(gain), float(baisse)
+        sommet, hasard = float(sommet), float(hasard)
+        ou = (f" — {self.fold_courant.upper()}" if self.fold_courant else "")
+        mieux = ""
+        if bat != "premier retenu du fold":
+            try:
+                mieux = f"   -> {net - float(bat.rstrip(' R')):+.3f} R de mieux"
+            except ValueError:
+                mieux = ""
+        return [
+            "",
+            f"{C.VERT}{C.GRAS}  ★ MODELE RETENU{ou}{C.FIN}",
+            f"{C.VERT}    critere     SCORE NET {C.GRAS}{net:+.3f} R{C.FIN}"
+            f"{C.VERT} par occasion  "
+            f"= gain {gain:+.3f} R - baisse {baisse:.3f} R{C.FIN}",
+            f"{C.GRIS}                en R d'une POSITION MINIMALE : ce qu'une "
+            f"occasion rapporte, misee comme le modele la mise,{C.FIN}",
+            f"{C.GRIS}                moins la taille typique de ses "
+            f"pertes{C.FIN}",
+            f"    a battu     " + ("le premier retenu de ce fold"
+                                   if bat == "premier retenu du fold"
+                                   else f"le record precedent, {bat}{mieux}"),
+            f"    dimension   {float(bud):.2f} position(s) minimale(s) "
+            f"en moyenne sur les occasions retenues, abstention totale sur "
+            f"{float(abst):.0f} % d'entre elles",
+            f"{C.GRIS}    portillons  sommet {sommet:+.3f} R > {hasard:+.3f} "
+            f"au hasard   {trades} trades   compte intact{C.FIN}",
+            f"{C.GRIS}    fichier     {fichier}{C.FIN}",
+            f"{C.VERT}    C'est CE modele qui part au fold suivant, et c'est "
+            f"lui qu'on deploierait.{C.FIN}",
+            "",
+        ]
 
     def avale(self, texte):
         blocs = []
@@ -607,12 +769,36 @@ class Veilleur:
             if "[TEST]" in ligne:
                 blocs.append(([f"{C.CYAN}{C.GRAS}  {ligne.strip()}{C.FIN}"],
                               None))
-            if "NEW BEST" in ligne:
-                # Le checkpoint retenu, et sur quoi il l'a ete. Depuis que la
-                # selection se fait sur le CLASSEMENT et non sur le Sortino,
-                # c'est la ligne qui dit quel modele partira au fold suivant.
-                blocs.append(([f"{C.VERT}{C.GRAS}  {ligne.strip()}{C.FIN}"],
-                              None))
+            if "NEW BEST PROFIT" in ligne:
+                # LE TEMOIN, PAS LE CRITERE. Deux etoiles se suivaient dans le
+                # journal sans que rien ne dise laquelle comptait. Celle-ci
+                # suit le PnL par trade — ~55 trades, erreur-type 2.81 $ pour
+                # un gain de 5.30 $ — et selectionner la-dessus coute -3.3
+                # points mesures ici.
+                blocs.append(([f"{C.GRIS}  {ligne.strip()}{C.FIN}"], None))
+            elif "NEW BEST" in ligne:
+                blocs.append((self._bloc_retenue(ligne), None))
+            mg = RE_GARDE.search(ligne)
+            if mg:
+                blocs.append(([f"{C.GRIS}  non retenu — {mg.group(1)}"
+                               f"{C.FIN}"], None))
+            mrf = RE_REFUS.search(ligne)
+            if mrf:
+                blocs.append(([
+                    "",
+                    f"{C.ROUGE}{C.GRAS}  × REFUSE MALGRE UN MEILLEUR SCORE"
+                    f"{C.FIN}",
+                    f"{C.ROUGE}    score net {float(mrf.group(1)):+.3f} R "
+                    f"par occasion, contre {float(mrf.group(2)):+.3f} R au "
+                    f"record — mais {mrf.group(3)}.{C.FIN}",
+                    f"{C.GRIS}    Le classement etait meilleur et c'est le "
+                    f"PORTEFEUILLE qui l'a disqualifie. Ce modele n'est ni "
+                    f"retenu{C.FIN}",
+                    f"{C.GRIS}    ni transmis au fold suivant : le score par "
+                    f"occasion ne voit pas combien de positions sont tenues "
+                    f"ensemble.{C.FIN}",
+                    "",
+                ], None))
             mv, mm = RE_VAL.search(ligne), RE_META.search(ligne)
             # UNE LIGNE META QUI NE SE LIT PAS DOIT LE DIRE. C'est la panne
             # qui s'est repetee huit fois : un champ change de forme dans
@@ -643,6 +829,10 @@ class Veilleur:
                 if ms:
                     self.sommets[(mm.group(1), int(mm.group(2)))] = (
                         float(ms.group(1)), float(ms.group(2)))
+                mn = RE_NET.search(ligne)
+                if mn:
+                    self.nets[(mm.group(1), int(mm.group(2)))] = tuple(
+                        float(x) for x in mn.groups())
                 mrp = RE_REPRISE.search(ligne)
                 if mrp:
                     self.reprises[(mm.group(1), int(mm.group(2)))] = int(
@@ -679,7 +869,8 @@ class Veilleur:
                 self.precedent.get(fold), ref, self.cumul[fold], est_moyenne,
                 self.entropie.get(fold), self.rhos.get(cle),
                 self.cotes.get(fold, "both"), fold in self.herites,
-                self.sommets.get(cle), self.reprises.get(cle))
+                self.sommets.get(cle), self.reprises.get(cle),
+                self.nets.get(cle))
             self.entropie[fold] = float(self.metas[cle][5])
             self.precedent[fold] = par_trade
             if gele:

@@ -17,7 +17,7 @@ import checkpoints
 import flux_live
 import prepare_m5
 from saint_core import (
-    BUDGETS_RISQUE,
+    BUDGETS_POSITIONS,
     MASK_VALUE,
     NORM_STATS_PATH,
     FEATURE_COLS,
@@ -205,7 +205,7 @@ class LiveConfig:
     # reconstruit en ajustant le pas — donc c'est le fichier qui fait foi.
     # MIROIR DE `training.PPOConfig.veto_tendance`. Les deux DOIVENT dire la
     # meme chose : le modele n'a jamais vu d'occasion en tendance baissiere.
-    veto_tendance: str = "tend_mom_mois"
+    veto_tendance: str = ""
     veto_tendance_seuil: float = 0.0
 
     lookback: int = 4
@@ -235,11 +235,6 @@ class LiveConfig:
     atr_sl_mult: float = 10.0    # SL = 10 x ATR    — training.PPOConfig.atr_sl_mult
     atr_tp_mult: float = 60.0    # inutilise tant que use_tp vaut False
     use_tp: bool = False         # training.PPOConfig.use_tp
-    # Le tri par la tete auxiliaire — training.PPOConfig.tri_par_tete_aux.
-    # Doit valoir la meme chose qu'a l'entrainement, sinon on deploierait un
-    # tri different de celui sur lequel les barres ont ete calibrees.
-    tri_par_tete_aux: bool = True
-
     spread_bps: float = 0.0
     slippage_bps: float = 0.0
 
@@ -374,7 +369,8 @@ def etat_compte(cfg, magic=None):
 
 
 def capacite_ouvrable(cfg, prix: float, marge_utilisee: float,
-                      equity: float) -> int:
+                      equity: float, n_positions: int = 0,
+                      risque_une: float = 0.0) -> int:
     """Combien de positions de plus le compte permet — MEME regle qu'a
     l'entrainement.
 
@@ -391,6 +387,14 @@ def capacite_ouvrable(cfg, prix: float, marge_utilisee: float,
     import training as _T
     p = _I.INSTRUMENTS[cfg.symbol]
     c = _T.PPOConfig()
+
+    # LE ZERO EST TRAITE DANS LA FONCTION PURE, PLUS ICI.
+    #
+    # Le garde-fou vivait a deux endroits — l'environnement et ce fichier —
+    # pour une regle qui doit etre la meme. Deux endroits ou se tromper.
+    # `places_ouvrables_compte` rend 0 pour un budget de 0 position, une fois
+    # pour tout le monde.
+
     return places_ouvrables_compte(
         equity=equity,
         marge_utilisee=marge_utilisee,
@@ -402,8 +406,21 @@ def capacite_ouvrable(cfg, prix: float, marge_utilisee: float,
         # LE BUDGET COURANT, celui que la tete de budget a choisi, et non
         # le reglage de la config : celui-ci n'est plus que le point de
         # depart. Lire la config ici ferait borner le live par une valeur que
-        # le modele a deja remplacee.
-        budget_risque=budget_courant_live())
+        # le modele a deja remplacee. Il se compte en POSITIONS MINIMALES
+        # depuis le 2026-09-20 — voir `BUDGETS_POSITIONS` dans saint_core.
+        budget_positions=int(budget_courant_live()),
+        # CE QUI EST DEJA EN RISQUE. Il valait ZERO ici, toujours : le live
+        # ne passait ni `risque_engage` ni `risque_une`, donc le terme de
+        # budget etait `(b x equity - 0) / 1e-12`, un nombre astronomique.
+        # AUTREMENT DIT LE BUDGET NE BORNAIT RIEN EN LIVE pendant que
+        # l'entrainement s'y tenait — deux strategies sous le meme nom, la
+        # faute exacte que cette fonction partagee devait empecher.
+        risque_engage=float(n_positions) * max(risque_une, 1e-12),
+        risque_une=max(risque_une, 1e-12),
+        # LE MEME CAPITAL DE REFERENCE QU'A L'ENTRAINEMENT, lu dans la
+        # configuration d'entrainement et non recopie ici : deux valeurs a
+        # garder d'accord, c'est une de trop.
+        capital_reference=float(getattr(c, "initial_capital", 0.0)))
 
 
 # LE PIC D'EQUITE, QUE METATRADER NE DONNE PAS.
@@ -438,13 +455,13 @@ _BUDGET_LIVE = [None]
 def budget_courant_live() -> float:
     if _BUDGET_LIVE[0] is None:
         import training as _T
-        _BUDGET_LIVE[0] = float(_T.PPOConfig().budget_risque)
+        _BUDGET_LIVE[0] = int(_T.PPOConfig().budget_positions)
     return float(_BUDGET_LIVE[0])
 
 
-def pose_budget_live(b: float) -> None:
-    """Enregistre le budget choisi par le reseau pour les entrees a venir."""
-    _BUDGET_LIVE[0] = float(max(b, 0.0))
+def pose_budget_live(b) -> None:
+    """Enregistre le budget choisi par le reseau, en NOMBRE DE POSITIONS."""
+    _BUDGET_LIVE[0] = int(max(round(float(b)), 0))
 
 
 def distance_garde_fou(equity: float, fenetre_s: float = 20 * 24 * 3600.0,
@@ -577,7 +594,8 @@ def build_live_obs(
     # des paliers. Le modele le CHOISIT en entrainement via sa tete de budget,
     # et il doit lire ici la MEME grandeur — sinon il deciderait en live sur
     # une entree dont le sens a change.
-    budget_norm = float(budget_courant_live() / max(BUDGETS_RISQUE[-1], 1e-9))
+    budget_norm = float(budget_courant_live()
+                        / max(BUDGETS_POSITIONS[-1], 1e-9))
 
     extra_vec = np.array(
         [pos_feature, unrealized_atr, bars_held_norm, risk_feature,
@@ -1194,11 +1212,32 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
                               f"{100*_seuil:+.2f} %) → HOLD")
                         continue
 
-                libres = capacite_ouvrable(cfg, prix_courant, marge, equity)
+                # CE QUE RISQUE UNE POSITION AU LOT MINIMUM, ICI ET
+                # MAINTENANT. C'est l'unite dans laquelle le modele exprime
+                # son budget, et elle bouge avec l'ATR : a 1 000 $ de
+                # capital, une position minimale sur l'or risque 4 % du
+                # compte quand l'ATR vaut 4 $ et 15 % quand il vaut 15 $.
+                #
+                # ELLE MANQUAIT, et c'etait un vrai ecart. Le live appelait
+                # `capacite_ouvrable` sans `risque_une` ni `risque_engage`,
+                # donc le terme de budget valait `(b x equity) / 1e-12` : le
+                # budget ne bornait RIEN en live pendant que l'entrainement
+                # s'y tenait. Deux strategies sous le meme nom, exactement ce
+                # que la fonction partagee devait empecher.
+                import instruments as _Icap
+                _pi = _Icap.INSTRUMENTS[cfg.symbol]
+                _atr_cap = compute_entry_atr(df_closed)
+                _r_une = max(
+                    cfg.atr_sl_mult * max(_atr_cap, 1e-8)
+                    * float(_pi["lot_min"]) * float(_pi["contrat"]), 1e-12)
+                libres = capacite_ouvrable(cfg, prix_courant, marge, equity,
+                                           n_positions=n_pos,
+                                           risque_une=_r_une)
                 if libres <= 0:
                     print(f"  [{agent_name.upper()}] {n_pos} position(s), le "
                           f"compte n'en permet pas d'autre "
-                          f"(equite {equity:.2f}, marge {marge:.2f}) → HOLD")
+                          f"(budget {budget_courant_live():.0f} pos, "
+                          f"equite {equity:.2f}, marge {marge:.2f}) → HOLD")
                     continue
 
                 # L'ETAT TRANSMIS AU RESEAU EST CELUI DE TOUTES LES
@@ -1222,8 +1261,6 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
 
                 with torch.no_grad():
                     s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                    logits_d, _ = policy(s)
-                    logits_d = logits_d[0]
                     # LE BUDGET DE RISQUE, choisi par le reseau comme en
                     # validation : par ARGMAX, donc de facon deterministe. Le
                     # rollout le TIRE, la mesure et le live le prennent au
@@ -1231,45 +1268,52 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
                     # echantillonnee a l'entrainement et passe une barre
                     # calibree ici.
                     _ib = int(policy.budget(s).argmax(-1).item())
-                    pose_budget_live(BUDGETS_RISQUE[_ib])
+                    pose_budget_live(BUDGETS_POSITIONS[_ib])
+                    _np_ = BUDGETS_POSITIONS[_ib]
                     print(f"  [{agent_name.upper()}] budget de risque "
-                          f"{100*BUDGETS_RISQUE[_ib]:.0f} % "
-                          f"(palier {_ib + 1}/{len(BUDGETS_RISQUE)})")
-                    # LE COTE, PAS "both" EN DUR. La substitution par la
-                    # tete auxiliaire, quinze lignes plus bas, ECRASE ce
-                    # tableau et le masque avec — c'est ainsi qu'un run
-                    # long-only s'est mis a vendre en validation. Le refus
-                    # definitif vient donc de `decision.decide`, qui porte le
-                    # cote lu dans le checkpoint ; ce masque-ci garde les
-                    # probabilites affichees coherentes avec ce qui peut
-                    # reellement etre joue.
-                    mask_d = build_mask_from_pos_scalar(0, device, cfg.side)
-                    logits_d_m = logits_d.masked_fill(~mask_d, MASK_VALUE)
-                    probs = torch.softmax(logits_d_m, dim=-1)
-                    pb, ps = float(probs[0]), float(probs[1])
+                          f"{_np_} position(s) minimale(s) "
+                          f"(palier {_ib + 1}/{len(BUDGETS_POSITIONS)})"
+                          + ("  -> ABSTENTION, aucune entree" if _np_ == 0
+                             else ""))
 
-                    # LE TRI VIENT DE LA TETE AUXILIAIRE, comme a
-                    # l'entrainement. Mesure du 2026-09-16 : une regression
-                    # lineaire classe a 2 sigma pendant que le rho de la
-                    # politique oscille dans le bruit — PPO optimise le
-                    # rendement de ses ACTIONS, jamais l'ORDRE de ses
-                    # probabilites, et c'est pourtant tout ce dont la
-                    # selectivite se sert.
+                    # LE SCORE D'ENTREE VIENT DE LA TETE DE RANG, et
+                    # d'elle seule — comme au rollout, en validation et au
+                    # test. La tete de DIRECTION a ete supprimee : elle
+                    # n'apportait rien a l'entree (+0.27 point contre une
+                    # reference de bruit a +0.7 sur exec40) et elle n'etait
+                    # entrainee par PPO qu'a decider, jamais a CLASSER — or
+                    # une barre de selectivite ne lit qu'un rang.
                     #
-                    # La sigmoide ramene la prediction dans [0, 1] comme les
+                    # La sigmoide ramene la prediction dans [0, 1] comme des
                     # probabilites, parce que la barre calibree raisonne sur
                     # des rangs : seule la monotonie compte.
                     #
-                    # SI LE CHECKPOINT N'A PAS DE TETE, on retombe sur les
-                    # probabilites — un modele d'avant cette date reste
-                    # jouable, avec le tri sous lequel il a ete calibre.
-                    if getattr(cfg, "tri_par_tete_aux", True):
-                        try:
-                            _a = policy.rendement(s)[0]
-                            _a = torch.sigmoid(_a.clamp(-30, 30))
-                            pb, ps = float(_a[0]), float(_a[1])
-                        except Exception:
-                            pass
+                    # IL N'Y A PLUS DE REPLI. Il en existait un : si le
+                    # checkpoint n'avait pas de tete de rang, on revenait aux
+                    # probabilites de la politique. Cette branche deploierait
+                    # maintenant une regle que PLUS AUCUN entrainement ne
+                    # produit, en silence, sur de l'argent reel. On refuse
+                    # plutot de trader — et le message dit quoi faire.
+                    try:
+                        _a = policy.rendement(s)[0]
+                        _a = torch.sigmoid(_a.clamp(-30, 30))
+                        pb, ps = float(_a[0]), float(_a[1])
+                    except Exception as _e:
+                        raise RuntimeError(
+                            "le checkpoint n'expose pas de tete de rang "
+                            "(`policy.rendement`) : c'est elle qui decide des "
+                            "entrees depuis la suppression de la direction. "
+                            "Ce modele est anterieur — le reentrainer, ou le "
+                            "deployer avec la version de kairos_live.py qui "
+                            "lui correspond.") from _e
+
+                    # LE COTE EST PORTE PAR `decision.decide`, qui lit le cote
+                    # inscrit dans le checkpoint. Le masque des logits le
+                    # portait aussi, mais ces logits ne sont plus lus : la
+                    # tete de rang predit les deux sens sans rien savoir du
+                    # cote autorise, et c'est exactement ainsi qu'un run
+                    # long-only s'est mis a vendre. Une seule regle, donc, et
+                    # c'est `decide_avec_barres`.
 
                 # Une instance par agent, jamais partagee : son historique
                 # glissant est propre a ce flux de decisions. Appelee une seule
@@ -1293,9 +1337,13 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
                 decision = entry_decisions[agent_name]
                 barres = decision.thresholds
                 a_pred = decision.decide(pb, ps)
+                # ON AFFICHE LES SCORES QUI DECIDENT, pas ceux d'une tete
+                # morte. La ligne montrait BUY/SELL/HOLD issus des logits de
+                # direction, trois nombres qui ne commandaient plus rien et
+                # qu'on aurait lus pour comprendre un refus d'entree.
                 print(
-                    f"  [{agent_name.upper()}] probas "
-                    f"BUY={probs[0]:.2f} SELL={probs[1]:.2f} HOLD={probs[2]:.2f}  "
+                    f"  [{agent_name.upper()}] rang "
+                    f"BUY={pb:.3f} SELL={ps:.3f}  "
                     f"barres B={barres[0]:.3f} S={barres[1]:.3f}  "
                     f"→ {action_labels[a_pred]}"
                 )
@@ -1328,6 +1376,30 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
 # ============================================================
 
 def live_loop(cfg: LiveConfig, should_continue):
+    """CHEMIN HISTORIQUE — IL NE PEUT PLUS TRADER, ET C'EST VOULU.
+
+    Cette boucle decide par ARGMAX sur les logits de la tete de DIRECTION.
+    Cette tete a ete supprimee : elle ne recoit plus aucun gradient et plus
+    rien ne lit ses sorties. Laissee en l'etat, cette fonction passerait des
+    ordres reels a partir d'un tenseur fige.
+
+    Elle avait d'ailleurs deja diverge avant cela — argmax sur trois actions
+    au lieu de `decide_avec_barres`, `seuil_calibre` au lieu des barres par
+    cote, et aucune tete de budget, donc un levier fixe. Elle n'executait plus
+    la strategie mesuree depuis longtemps.
+
+    LE MODE MULTI-AGENT EST LE CHEMIN DEPLOYE (`multi_agent` vaut True par
+    defaut) et il est a jour : score de rang, barres par cote, budget par la
+    tete. On y renvoie au lieu de porter ici une seconde copie de la regle —
+    c'est la duplication de cette regle qui a produit tous les ecarts que ce
+    depot documente.
+    """
+    raise RuntimeError(
+        "live_loop (mono-agent) decide par la tete de DIRECTION, qui a ete "
+        "supprimee : ses ordres viendraient d'un tenseur fige. Utiliser le "
+        "mode multi-agent (LiveConfig.multi_agent = True, la valeur par "
+        "defaut), qui porte la regle a jour.")
+
     print("Connexion MT5 (live)…")
     if not mt5.initialize():
         raise RuntimeError("Erreur MT5.initialize() en live.")
