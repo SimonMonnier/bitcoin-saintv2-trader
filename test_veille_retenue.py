@@ -49,17 +49,21 @@ ROUGE = "\033[31m\033[1m"
 GRIS = "\033[90m"
 
 
-def ligne_best(net, gain, baisse, bat, bud, abst, sommet, hasard, trades,
-               fichier):
-    """LA MEME f-string QUE `training.py`, couleurs comprises."""
+def ligne_best(net, gain, baisse, bat, sommet, hasard, trades, fichier):
+    """LA MEME f-string QUE `training.py`, couleurs comprises.
+
+    `bud` ET `abst` EN SONT SORTIS LE 2026-09-21, avec le budget. Ils
+    disaient la mise moyenne et la part d'abstention ; sans paliers ils
+    valaient zero par construction, et un champ mort qui garde l'air
+    vivant est pire qu'un champ absent.
+    """
     return (f"  {MAG}★{FIN} {MAG}NEW BEST{FIN}  "
             f"retenu sur le SCORE NET "
             f"{MAG}{net:+.3f} R{FIN} "
             f"par occasion "
             f"(gain {gain:+.3f} R - baisse "
             f"{baisse:.3f} R)  bat {bat}  "
-            f"[bud {bud:.2f} pos abst {100*abst:.0f}%  "
-            f"portillons : sommet {sommet:+.3f}R > hasard "
+            f"[portillons : sommet {sommet:+.3f}R > hasard "
             f"{hasard:+.3f}R, {trades} trades, compte intact]"
             f"  -> {fichier}")
 
@@ -94,8 +98,7 @@ def verifie(nom, condition, detail=""):
 def main() -> int:
     print("\n1. LE MODELE RETENU, ET SUR QUEL CRITERE")
     t = rendu(ligne_best(net=0.412, gain=0.687, baisse=0.275,
-                         bat="+0.318 R", bud=2.40, abst=0.12,
-                         sommet=0.842, hasard=0.623, trades=56,
+                         bat="+0.318 R",                          sommet=0.842, hasard=0.623, trades=56,
                          fichier="best_or_exec46_long_wf1.pth"))
     print("\n".join("      " + l for l in t.strip().split("\n")))
     print()
@@ -106,8 +109,6 @@ def main() -> int:
             "gain +0.687 R" in t and "baisse 0.275 R" in t)
     verifie("ce qu'il a battu", "+0.318 R" in t)
     verifie("de combien", "+0.094 R de mieux" in t)
-    verifie("le budget pose", "2.40 position" in t)
-    verifie("la part d'abstention", "12 %" in t)
     verifie("le fichier ecrit", "best_or_exec46_long_wf1.pth" in t)
     # LE PORTILLON RESTE VISIBLE MAIS N'EST PLUS PRESENTE COMME LE CRITERE.
     verifie("le sommet est montre comme PORTILLON",
@@ -118,8 +119,7 @@ def main() -> int:
 
     print("\n2. LE PREMIER RETENU D'UN FOLD N'A RIEN BATTU, ET LE DIT")
     t = rendu(ligne_best(net=0.412, gain=0.687, baisse=0.275,
-                         bat="premier retenu du fold", bud=2.40, abst=0.12,
-                         sommet=0.842, hasard=0.623, trades=56,
+                         bat="premier retenu du fold",                          sommet=0.842, hasard=0.623, trades=56,
                          fichier="best_wf1.pth"))
     verifie("pas de faux record battu", "premier retenu de ce fold" in t,
             "au lieu d'un `bat -1000000000.000 %`")

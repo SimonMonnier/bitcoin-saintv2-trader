@@ -156,7 +156,7 @@ def _joint_echelle(m5, regle, sfx, jour_sup):
     return m5.drop(columns=["_c_sup"]), noms + ["close" + sfx + "_dev"]
 
 
-def construit(m5, avec_flux=None):
+def construit(m5, avec_flux=None, jour=None):
     """Du brut M5 aux colonnes de `saint_core`. Rend (df, colonnes, ichimoku).
 
     `avec_flux` calcule les colonnes de carnet — part acheteuse agressive,
@@ -169,12 +169,22 @@ def construit(m5, avec_flux=None):
     de la liste rendue : elles restent dans le cache pour qui voudrait les
     remesurer, sans entrer dans l'observation.
     """
-    m5 = indicateurs(m5, JOUR_M5)
+    # `jour` EST LE NOMBRE DE BOUGIES DANS UNE JOURNEE A CETTE ECHELLE.
+    #
+    # Il valait `JOUR_M5 = 288` en dur, ce qui liait ce constructeur au M5
+    # alors que tout le reste — les regles de resample, `indicateurs` — est
+    # deja parametre. Le passer permet de batir les memes colonnes depuis du
+    # M1 (1 440 bougies par jour) sans dupliquer une ligne.
+    #
+    # Le defaut reste le M5 : aucun appelant existant ne change de
+    # comportement.
+    jour = JOUR_M5 if jour is None else int(jour)
+    m5 = indicateurs(m5, jour)
     if avec_flux is None:
         avec_flux = all(c in m5.columns
                         for c in ("taker_buy_base", "quote_vol", "nb_trades"))
     if avec_flux:
-        m5 = flux(m5)
+        m5 = flux(m5, jour=jour, semaine=jour * 7)
 
     cols_sup = []
     for regle, sfx, jour_sup in ECHELLES_SUP:

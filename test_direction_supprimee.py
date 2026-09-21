@@ -28,7 +28,7 @@ import torch
 
 from saint_core import (
     N_ACTIONS,
-    N_BUDGETS,
+    build_mask_from_pos_scalar,
     cotes_permises,
     decide_avec_barres,
 )
@@ -156,15 +156,18 @@ try:
             prm.requires_grad_(False)
 
     x = torch.randn(3, 4, 12)   # (B, T, F)
-    _logits, value, bud, rend = pol.sorties(x)
+    # TROIS TETES DEPUIS LE 2026-09-21. `tete_budget` a ete RETIREE du
+    # reseau, apres la direction et pour la meme raison mesuree : PPO
+    # optimise le rendement de ses ACTIONS, jamais l'ORDRE de ses sorties,
+    # et la selectivite ne consomme qu'un ordre. La taille se deduit
+    # desormais du RANG du score de la tete de rang — voir `part_du_rang`.
+    rend = pol.sorties(x)
 
-    # La perte de PPO telle qu'elle est maintenant : budget + critic. Les
-    # logits de direction n'y entrent pas.
-    dist_b = torch.distributions.Categorical(
-        logits=torch.log_softmax(bud, dim=-1))
-    perte = (-dist_b.log_prob(torch.zeros(3, dtype=torch.long)).mean()
-             + value.pow(2).mean() + rend.pow(2).mean())
-    perte.backward()
+    # LA SEULE PERTE QUI RESTE : celle des tetes d'entree. PPO a ete
+    # supprime le 2026-09-21, et le meme jour `actor` et `critic` ont
+    # cesse d'etre CALCULES — leurs tenseurs restent, mais `sorties` ne
+    # les traverse plus.
+    rend.pow(2).mean().backward()
 
     _g_dir = [n for n, prm in pol.named_parameters()
               if n.startswith("actor.") and prm.grad is not None
@@ -172,42 +175,111 @@ try:
     verifie("gradient de la tete `actor` exactement nul",
             not _g_dir, ", ".join(_g_dir) or "aucun tenseur touche")
 
-    _g_bud = sum(float(prm.grad.abs().sum())
-                 for n, prm in pol.named_parameters()
-                 if n.startswith("tete_budget.") and prm.grad is not None)
-    verifie("la tete de budget, elle, apprend", _g_bud > 0,
-            f"|g| = {_g_bud:.3e}")
+    verifie("la tete de budget n'existe plus dans le reseau",
+            not any(n.startswith("tete_budget.")
+                    for n, _ in pol.named_parameters()),
+            "retiree le 2026-09-21 : la taille vient du rang")
 
-    _g_aux = sum(float(prm.grad.abs().sum())
-                 for n, prm in pol.named_parameters()
-                 if n.startswith("tete_aux.") and prm.grad is not None)
-    verifie("la tete de rang, elle aussi", _g_aux > 0, f"|g| = {_g_aux:.3e}")
+    # LES TROIS TETES SONT NOMMEES, UNE PAR UNE.
+    #
+    # Cette assertion cherchait `tete_aux.`, qui n'existe plus : le
+    # 2026-09-21 elle a ete scindee en `tete_achat` et `tete_vente`, sur
+    # demande explicite, et `tete_cloture` s'est ajoutee. La somme portait
+    # donc sur un ensemble VIDE et valait zero — le test annoncait « la
+    # direction est revenue » pour un simple renommage.
+    #
+    # LE MEME PIEGE A DEJA MORDU DANS `training.py`, ou le diagnostic de
+    # gradient pointait encore `tete_aux.` apres le renommage et affichait
+    # un gradient nul sur des tetes qui apprenaient. On nomme desormais
+    # chaque tete, et on verifie qu'AUCUNE n'est oubliee.
+    _tetes = ("tete_achat.", "tete_vente.", "tete_cloture.")
+    _g = {}
+    for _t in _tetes:
+        _g[_t] = sum(float(prm.grad.abs().sum())
+                     for n, prm in pol.named_parameters()
+                     if n.startswith(_t) and prm.grad is not None)
+    # `tete_cloture` a son PROPRE chemin — `pol.cloture(x)`, jamais
+    # `sorties` — parce que les etats en position sont disjoints des etats
+    # plats. La perte ci-dessus ne la touche donc pas, et c'est correct :
+    # on lui fait sa propre passe plutot que de relacher l'assertion.
+    pol.cloture(x).pow(2).mean().backward()
+    _g["tete_cloture."] = sum(
+        float(prm.grad.abs().sum())
+        for n, prm in pol.named_parameters()
+        if n.startswith("tete_cloture.") and prm.grad is not None)
+
+    verifie("les trois tetes recoivent du gradient",
+            all(v > 0 for v in _g.values()),
+            "  ".join(f"{k.rstrip('.')} {v:.2e}" for k, v in _g.items()))
+
+    # ET QU'IL N'Y EN AIT PAS UNE DE PLUS QUE PERSONNE NE SURVEILLE.
+    #
+    # `tete_profit` EST CONNUE, ET ELLE EST HORS DE CE CHEMIN EXPRES. Elle
+    # ne traverse pas le tronc — une mesure du 2026-09-22 l'impose : sur la
+    # meme cible, nourrie des 274 colonnes de marche elle rend IC +0.1401
+    # sous un plancher de 0.2806 et s'arrete a UN arbre, alors que sur les
+    # quatre colonnes de l'etat seul elle rend +0.1911 sous un plancher de
+    # 0.0685 avec cent arbres. Les colonnes de marche n'affaiblissent pas
+    # son signal, elles l'effacent.
+    #
+    # Elle a donc sa propre passe et son propre optimiseur, et elle ne doit
+    # recevoir AUCUN gradient de la retropropagation des tetes d'entree ni
+    # de la cloture. C'est ce que la ligne suivante verifie — si elle en
+    # recevait, c'est que quelqu'un l'aurait rebranchee sur le tronc et que
+    # la mesure ci-dessus ne s'appliquerait plus.
+    _hors_tronc = ("tete_profit.", "mlp_profit.")
+    _connues = _tetes + ("actor.", "critic.") + _hors_tronc
+    _orphelines = sorted({n.split(".")[0] for n, _ in pol.named_parameters()
+                          if n.startswith("tete_")
+                          and not n.startswith(_tetes + _hors_tronc)})
+    verifie("aucune tete hors de la liste surveillee",
+            not _orphelines, ", ".join(_orphelines) or "toutes declarees")
+
+    _g_prof = sum(float(prm.grad.abs().sum())
+                  for nm, prm in pol.named_parameters()
+                  if nm.startswith(_hors_tronc) and prm.grad is not None)
+    verifie("la tete de profit ne recoit RIEN du tronc",
+            _g_prof == 0.0,
+            "gradient %.2e — elle a sa propre passe et son propre optimiseur"
+            % _g_prof)
 
     verifie("la tete de direction existe encore dans le reseau",
             any(n.startswith("actor.") for n, _ in pol.named_parameters()),
             "les points de reprise anterieurs restent chargeables")
+    verifie("`sorties` ne rend plus QUE les scores d'entree",
+            pol.sorties(x).shape[-1] == 2,
+            "achat et vente — ni direction, ni valeur")
+
+    # ET LES TETES MORTES NE SONT PLUS TRAVERSEES.
+    #
+    # `self.mlp` fait 8 472 parametres, 15.9 % du reseau. Il ne nourrissait
+    # plus que `actor`, gelee, et `critic`, dont la valeur alimentait trois
+    # tableaux que la suppression de PPO avait laisses sans lecteur. Les
+    # tenseurs restent chargeables ; le calcul, lui, a disparu.
+    _mlp_mort = [p_ for n, p_ in pol.named_parameters()
+                 if n.startswith("mlp.")]
+    for _p in _mlp_mort:
+        _p.grad = None
+    pol.sorties(x).pow(2).mean().backward()
+    _g_mort = sum(float(p_.grad.abs().sum()) for p_ in _mlp_mort
+                  if p_.grad is not None)
+    verifie("le MLP des tetes mortes n'est plus traverse",
+            _g_mort == 0.0,
+            f"|g| = {_g_mort:.3e} sur {sum(p_.numel() for p_ in _mlp_mort):,} "
+            f"parametres")
 except Exception as e:                                    # pragma: no cover
     verifie("construction du reseau de test", False, repr(e))
 
 
 # ============================================================
-print("\n5. LE RATIO DE PPO EST CELUI DU BUDGET, ET IL EST EXACT")
-print("   La direction n'est plus tiree d'une loi : elle est une fonction")
-print("   deterministe du score. Y laisser un terme supposerait qu'elle vient")
-print("   des logits de l'acteur, et corrigerait un ecart inexistant.")
+# LA SECTION 5 A ETE RETIREE LE 2026-09-21.
+#
+# Elle verifiait que le ratio de PPO valait exactement 1 au premier
+# pas interne, sur les logits de la TETE DE BUDGET. Les deux objets
+# ont disparu : PPO le matin, le budget le soir. Un test qui tire un
+# tenseur de la bonne forme et verifie une identite mathematique sur
+# lui aurait continue de passer sans rien mesurer du depot.
 # ============================================================
-torch.manual_seed(1)
-_bud = torch.randn(64, N_BUDGETS)
-_logt = torch.log_softmax(_bud, dim=-1)
-_tir = torch.multinomial(_logt.exp(), 1).squeeze(-1)
-# Ce que le rollout stocke, et ce que la mise a jour recalcule au premier pas.
-_stocke = _logt.gather(1, _tir[:, None]).squeeze(-1)
-_recalcule = torch.distributions.Categorical(logits=_logt).log_prob(_tir)
-_ratio = (_recalcule - _stocke).exp()
-verifie("ratio = 1 au premier pas interne, au bit pres",
-        bool(torch.allclose(_ratio, torch.ones_like(_ratio), atol=1e-6)),
-        f"ecart max {float((_ratio - 1).abs().max()):.2e}")
-
 
 # ============================================================
 print("\n6. `H` MESURE ENCORE QUELQUE CHOSE DE VIVANT")
@@ -231,10 +303,39 @@ verifie("regle figee sur ACHETER  -> H = 0", h_entree([500, 0, 0]) == 0.0)
 verifie("moitie-moitie en long-only -> H = ln 2",
         abs(h_entree([250, 0, 250]) - math.log(2)) < 1e-9,
         f"{h_entree([250, 0, 250]):.4f}")
+# LE PLAFOND COMPTE LES ACTIONS D'ENTREE, PAS TOUTES LES ACTIONS.
+#
+# Cette assertion posait `ln(cotes+1) == ln(N_ACTIONS)`, ce qui etait vrai
+# tant que `N_ACTIONS` valait 3 : ACHETER, VENDRE, ATTENDRE. Le passage au
+# scalping du 2026-09-21 a ajoute CLOTURER en quatrieme, et l'assertion a
+# echoue en annoncant « la direction est revenue quelque part ».
+#
+# ELLE AVAIT TORT, ET LE CODE AVAIT RAISON. `H` mesure l'entropie des
+# decisions prises DEPUIS UN ETAT PLAT, et `build_mask_from_pos_scalar`
+# n'y ouvre jamais CLOTURER : hors position il n'y a rien a clore. Le
+# plafond vaut donc ln(cotes permis + ATTENDRE), soit ln(2) en long-only
+# et ln(3) des deux cotes — jamais ln(4).
+#
+# On verifie desormais les deux valeurs pour elles-memes, plus par une
+# identite avec une constante qui peut bouger sous le test.
 verifie("le plafond affiche par META vaut ln(cotes+1)",
         abs(math.log(sum(cotes_permises("long")) + 1) - math.log(2)) < 1e-9
         and abs(math.log(sum(cotes_permises("both")) + 1)
-                - math.log(N_ACTIONS)) < 1e-9)
+                - math.log(3)) < 1e-9,
+        f"long ln{sum(cotes_permises('long')) + 1}  "
+        f"both ln{sum(cotes_permises('both')) + 1}  "
+        f"(N_ACTIONS={N_ACTIONS}, dont CLOTURER hors etat plat)")
+
+# ET QUE CLOTURER SOIT BIEN ABSENT DE L'ETAT PLAT, puisque le plafond
+# ci-dessus en depend. Sans cette ligne, l'assertion precedente serait une
+# convention plutot qu'une propriete verifiee.
+_m_plat = build_mask_from_pos_scalar(0, "cpu", "both")
+_m_pos = build_mask_from_pos_scalar(1, "cpu", "both")
+verifie("hors position, CLOTURER est masque ; en position, ouvert",
+        (not bool(_m_plat[3])) and bool(_m_pos[3])
+        and sum(bool(x) for x in _m_plat) == 3,
+        f"plat {[bool(x) for x in _m_plat]}  "
+        f"en position {[bool(x) for x in _m_pos]}")
 
 
 # ============================================================

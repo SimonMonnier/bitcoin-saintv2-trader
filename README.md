@@ -1,12 +1,18 @@
-# KAIROS — Agent RL long-only sur XAUUSD M5
+# KAIROS — Agent RL long-only sur BTCUSD M1
 
 > *Le modèle ne prédit pas le marché. Il attend le moment.*
 
-> **PPO + SAINTv2 + PatchTST** : deux réseaux qui votent dans le même rollout,
-> entraînés en walk-forward **chaîné** sur sept ans d'or en barres de cinq
-> minutes, lus à trois échelles (M5, H1, H4), avec un compte partagé qui ouvre
-> **plusieurs positions simultanées** selon ce que le solde permet. Déployable
-> sur MetaTrader 5 via une interface graphique dédiée.
+> **SAINTv2, quatre têtes, une position à la fois.** Entraîné en walk-forward
+> **chaîné** sur deux ans de BTCUSD en barres d'une minute, nourri de trois
+> sources — les prix et le spread réellement coté par le courtier, la
+> microstructure de ses ticks, et le **vrai flux de transactions de Binance**.
+> Achat seul : aucun signal à la vente n'a résisté à la mesure. Déployable sur
+> MetaTrader 5 via une interface graphique dédiée.
+
+> **Ce document a décrit l'or en M5 pendant que le code tradait le BTC en M1.**
+> C'est le défaut que ce dépôt combat le plus souvent, sous sa forme
+> documentaire : une phrase qui affirme ce que le code ne fait plus. Les
+> sections ci-dessous portent la date de leur dernière vérification.
 
 ---
 
@@ -430,6 +436,20 @@ confrontés à une mesure.
 
 ---
 
+## 🗺️ Le système en une image
+
+![Architecture de KAIROS](architecture.svg)
+
+Ce qui est inhabituel dans ce schéma tient en un trait pointillé : **`tete_profit`
+contourne le tronc**. Elle ne lit que quatre colonnes — latent, âge, `creux_rang`,
+`flux_rang`. Ce n'est pas une économie, c'est une mesure. Nourrie des 274 colonnes
+de marché, la même cible tombe à `IC +0.14` sous un plancher de bruit de `0.28`, et
+le modèle s'arrête à **un seul arbre**. Sur l'état seul : `IC +0.19` au-dessus d'un
+plancher de `0.069`, cent arbres. Les colonnes de marché n'affaiblissent pas son
+signal, elles l'**effacent**.
+
+---
+
 ## 📑 Table des matières
 
 1. [Vue d'ensemble](#-vue-densemble)
@@ -465,36 +485,99 @@ confrontés à une mesure.
 
 ## 🎯 Vue d'ensemble
 
-**KAIROS** est un système complet de trading algorithmique BTCUSD M1 (1 minute) basé sur l'apprentissage par renforcement profond. Il combine :
+**KAIROS** est un système de trading algorithmique BTCUSD M1 dont l'organe central
+n'est plus un algorithme de contrôle mais **quatre têtes supervisées**, chacune
+entraînée sur une cible dont on a d'abord mesuré qu'elle était prédictible.
 
-- **PPO** (Proximal Policy Optimization) — algorithme on-policy stable de référence pour le contrôle
-- **SAINTv2** — transformer dual-axis (row + column attention) reconnu pour la modélisation de séries financières tabulaires
-- **Walk-forward** institutionnel en 3 folds → robustesse temporelle
-- **Stress-test V3** institutionnel pour valider sans illusion (slippage, news spikes, gaps, trous)
-- **MetaTrader 5** pour les données historiques et l'exécution live
-- **GUI PySide6** avec logs colorés et stats LONG/SHORT temps réel
+- **SAINTv2** — transformer dual-axis (attention sur le temps et sur les colonnes)
+- **Quatre têtes** — achat, vente (sans gradient), clôture, profit
+- **Aucun PPO** — retiré le 2026-09-21 ; l'acteur et le critique restent dans le
+  réseau pour que les points de reprise anciens se chargent, mais plus rien ne lit
+  leur sortie
+- **Walk-forward chaîné** en 3 folds — le meilleur checkpoint de chacun ouvre le suivant
+- **MetaTrader 5** pour les données et l'exécution, **Binance** pour le flux
+- **GUI PySide6** et une fenêtre de veille qui lit le journal en direct
 
-Le système est conçu pour fonctionner **24/7** sur cryptos (BTCUSD), avec gestion automatique du SL initial (ATR-based), break-even, et trailing stop.
+**Une seule position à la fois.** Le compte multi-positions et son budget de risque
+ont été retirés le 2026-09-21 : ils décrivaient une stratégie que personne ne jouait.
+
+### ⚠️ Ce que la mesure établit — et rien de plus
+
+L'entrée validée est un **creux racheté** : `close_ema_dev` dans son décile le plus
+bas *en rang glissant*, conditionné à un **flux acheteur fort**. Jugée par test du
+signe mois par mois, sur 23 mois, l'avantage sur le marché du même mois vaut
+**+11.95 bps, positif dans 20 mois sur 23, p = 0.0003**.
+
+Trois bornes à lire avec :
+
+1. **Aucun signal à la vente**, à aucun horizon, dans aucune condition testée. Le
+   décile haut monte lui aussi — ce n'est pas de la réversion.
+2. **Rien de tout cela ne marche sur l'or.** Le flux n'y existe pas : un CFD n'a pas
+   de marché central, donc pas de transactions publiques.
+3. **Aucun chiffre de performance n'est établi**, et la fenêtre de TEST n'a pas été
+   lue.
 
 ### Caractéristiques principales
+
+*Vérifié le 2026-09-22.*
 
 | Aspect | Valeur |
 |--------|--------|
 | Marché | BTCUSD (crypto, 24/7) |
-| Timeframe principal | M1 |
-| Contexte multi-TF | M1 + H1 (concat features) |
-| Algorithme RL | PPO clippé + GAE λ |
-| Backbone | SAINTv2 (RowAttn + ColAttn + GatedFFN) |
-| Espace d'action | **3 actions** : `BUY` / `SELL` / `HOLD` |
-| Période d'entraînement | 2022-12-15 → 2026-09 (~3.7 ans, 1.83 M bougies M1 après filtrage) |
-| Méthodologie | Walk-forward 3 folds (55/15/10) |
-| Backbone size | d_model=80, 2 blocks, 4 heads — 407 780 paramètres |
-| Features | 12 M1 + 13 H1 + 2 Binance + 3 liquidité/temps + 4 position = **34** |
-| Lookback | 25 bougies M1 |
+| Timeframe | M1, contexte H1 et H4 par concaténation |
+| Côté | **achat seul** — la tête de vente n'a pas de matière |
+| Apprentissage | supervisé, quatre têtes ; **aucun PPO** |
+| Backbone | SAINTv2 (attention temps + colonnes, GatedFFN) |
+| Espace d'action | **4 actions** : `BUY` / `SELL` / `HOLD` / `CLOTURER` |
+| Historique | 2024-10 → 2026-09, **979 236 barres M1** |
+| Méthodologie | Walk-forward 3 folds chaînés (55/15/10) |
+| Backbone size | d_model=8, 1 bloc, 1 tête |
+| Features | 274 colonnes de marché + 5 de position = **279** |
+| Lookback | **4** barres |
+| Détention | plafond 480 min, **une seule position** |
+| Friction | spread **réellement coté**, lu barre par barre — 4.18 bps médian |
 
 ---
 
 ## 🏗️ Architecture du modèle
+
+### Les quatre têtes
+
+*Vérifié le 2026-09-22.*
+
+| Tête | Ce qu'elle prédit | Ce qu'elle lit | État |
+|------|-------------------|----------------|------|
+| `tete_achat` | le rang de l'occasion | le tronc | active |
+| `tete_vente` | idem, côté vente | le tronc | **sans gradient** |
+| `tete_cloture` | le **risque** — excursion adverse, en ATR | le tronc | active |
+| `tete_profit` | ce qu'il **reste à prendre**, en ATR | **4 colonnes, hors tronc** | active |
+
+**Les deux têtes de sortie prédisent des AMPLITUDES, jamais un signe.** Ce n'est pas
+un choix esthétique, c'est le résultat d'un échec mesuré : une version antérieure de
+`tete_cloture` apprenait le *signe* de « gagne-t-on encore en tenant » et rendait
+50.8 %, 49.2 %, 53.1 %, 46.9 % sur quatre epochs — la cible elle-même est à 50.0 %
+de positifs. Le sens du prix n'est pas dans ces données ; l'amplitude y est, et
+fortement.
+
+### Les deux portes de sortie
+
+```
+1 · STOP      fermer si  latent < −(2.0 × risque_prédit)
+2 · PROFIT    fermer si  reste_prédit < 1.0 ATR
+filet         plafond de détention, 480 minutes
+```
+
+La règle du stop exige un latent **négatif** : elle ne peut mathématiquement jamais
+fermer une position en gain. Jusqu'au 2026-09-22 c'était la seule règle, et la
+conséquence se lisait dans les chiffres — médiane *et* moyenne de tenue des gagnants
+**égales au plafond**, sans une exception. « Gagnant » ne voulait pas dire « la tête
+a décidé de sortir avec un gain », mais « le trade a survécu au chronomètre ».
+
+`tete_profit` est le seul organe capable de solder un gagnant. Son seuil de 1.0 ATR
+**n'est pas mesuré** : toutes les prises de profit à *seuil fixe* testées dégradent
+le résultat, et une tête apprise est autre chose qu'un seuil, mais rien ne le prouve
+encore. Le journal compte ses déclenchements à chaque epoch — c'est ce compteur qui
+tranchera.
 
 ### SAINTv2 (Self-Attention and Intersample Attention Transformer v2)
 
@@ -639,7 +722,22 @@ Implémentation maison avec :
 
 ---
 
-## 🧬 Jeu de features — 259 colonnes, trois échelles
+## 🧬 Jeu de features — 274 colonnes, trois échelles
+
+*Vérifié le 2026-09-22.* Le compte est passé de 259 à 274 en trois temps :
+**+7** colonnes de microstructure MT5 (ticks agrégés par minute), **+6** colonnes
+de flux Binance — transactions réelles, remises après avoir été retirées le
+2026-09-16 pour que l'or puisse partager le même jeu — et **+2** rangs glissants,
+`creux_rang` et `flux_rang`.
+
+Ces deux derniers méritent un mot, parce qu'ils **existaient déjà** sous une autre
+forme. `close_ema_dev` est dans le jeu depuis le début et le modèle ne s'en est
+jamais servi : le signal ne vit pas dans le *niveau* de la colonne mais dans sa
+**position locale**. « Le cours est dans son dixième le plus bas des 20 000
+dernières barres » est un événement ; `close_ema_dev = -0.004` n'en est pas un,
+parce que la valeur qui marquait un creux en 2024 n'en marque plus un en 2026. Et
+comme la normalisation est *figée sur le train du fold 1*, le modèle voyait la
+**dérive** de la colonne au lieu de sa position.
 
 `saint_core.FEATURE_COLS` est la **source unique**. L'observation ajoute
 6 scalaires de position → `OBS_N_FEATURES = 265`.

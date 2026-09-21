@@ -47,7 +47,7 @@ import pandas as pd
 import cibles as C
 import instruments as I
 import training as T
-from saint_core import BUDGETS_RISQUE, FEATURE_COLS
+from saint_core import BUDGETS_PART, FEATURE_COLS
 
 LONGUEUR = 8000
 GRAINES = tuple(range(1, 13))
@@ -79,13 +79,13 @@ def main() -> int:
     print("-" * 82)
 
     res = {}
-    for b in BUDGETS_RISQUE:
+    for b in BUDGETS_PART:
         sR, sLog, sPen, dmax, dmoy, morts = [], [], [], [], [], 0
         for g in GRAINES:
             np.random.seed(g)
             env = T.BTCTradingEnvDiscrete(data, cfg)
             T.reset_au_depart(env, 3000 + g * 2500)
-            env.set_budget_risque(b)
+            env.set_budget_part(b)
             rng = np.random.default_rng(g)
             e0 = _equite(env)
             courbe = [e0]

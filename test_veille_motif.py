@@ -59,7 +59,7 @@ def _champs_net(net, gain, baisse, bud, abst) -> str:
     """
     return (f"net {net:>+6.3f}R "
             f"(gain {gain:>+6.3f}R baisse {baisse:>5.3f}R)  "
-            f"bud {bud:>4.2f}pos abst {100*abst:>4.0f}%  ")
+            f"bud {100*bud:>3.0f}%cap abst {100*abst:>4.0f}%  ")
 
 
 def verifie(nom, condition, detail=""):
@@ -89,14 +89,18 @@ def main() -> int:
     # LES VALEURS SONT PAR OCCASION, donc petites : a 3 % de risque et
     # +0.8 R une occasion rend 2.4 % du compte. Les cas couvrent la plage
     # reelle, plus les bords qui cassent les formats.
-    # LES VALEURS SONT EN R D'UNE POSITION MINIMALE, par occasion : une
-    # occasion a +0.8 R misee a 3 positions vaut +2.4.
+    # LES VALEURS SONT EN R D'UNE POSITION MINIMALE, par occasion.
+    #
+    # `bud` A CHANGE D'UNITE le 2026-09-21 : c'etait un NOMBRE de positions,
+    # c'est une PART DU PLAFOND DE SURVIE, donc un nombre de [0, 1]. Voir
+    # `BUDGETS_PART` dans saint_core. Les cas couvrent les six paliers reels
+    # plus les bords qui cassent les formats.
     cas = [
-        ("valeurs plausibles", 0.412, 0.687, 0.275, 2.40, 0.18),
-        ("net negatif", -0.810, 0.310, 1.120, 3.10, 0.02),
-        ("aucune perte", 0.800, 0.800, 0.000, 1.00, 0.00),
+        ("valeurs plausibles", 0.412, 0.687, 0.275, 0.40, 0.18),
+        ("net negatif", -0.810, 0.310, 1.120, 0.60, 0.02),
+        ("aucune perte", 0.800, 0.800, 0.000, 0.20, 0.00),
         ("abstention totale", 0.000, 0.000, 0.000, 0.00, 1.00),
-        ("gros levier", 4.870, 6.240, 1.370, 8.00, 0.00),
+        ("plafond entier", 4.870, 6.240, 1.370, 1.00, 0.00),
     ]
     for nom, net, gain, creux, bud, abst in cas:
         ligne = base.replace(
@@ -108,7 +112,7 @@ def main() -> int:
         if ok:
             lu = tuple(float(x) for x in m_net.groups())
             cible = (round(net, 3), round(gain, 3), round(creux, 3),
-                     round(bud, 2), round(100 * abst))
+                     round(100 * bud), round(100 * abst))
             ok = all(abs(a - b) < 0.01 for a, b in zip(lu, cible))
         verifie(nom, ok,
                 f"META={'oui' if m_meta else 'NON'} "
@@ -126,6 +130,45 @@ def main() -> int:
     verifie("META mord encore", V.RE_META.search(ligne) is not None)
     verifie("net ne mord pas", V.RE_NET.search(ligne) is None)
     verifie("sommet mord encore", V.RE_SOMMET.search(ligne) is not None)
+
+    print("\nUN INDICATEUR QU'ON CESSE DE MESURER S'ECRIT `nan`")
+    print("  C'est la NEUVIEME fois que la veille se tait, le 2026-09-21 :")
+    print("  `ppo_actif` est passe a False, donc `epoch_kl` et")
+    print("  `epoch_grad_norm` restent vides, donc `np.mean([])` rend nan, et")
+    print("  le journal ecrit `KL   +nan  ... gnorm   +nan`. Le motif exigeait")
+    print("  des chiffres a ces deux endroits.")
+    print()
+    print("  LA REGLE QUE CECI GARDE : tout champ numerique du motif doit")
+    print("  accepter `nan`. Eteindre UNE grandeur ne doit jamais empecher de")
+    print("  lire les vingt-deux autres.")
+    print()
+    # ON ECRIT LE MOTIF DE SUBSTITUTION EN TOUTES LETTRES.
+    #
+    # La premiere version le DERIVAIT du nom du champ — `H` devenait
+    # `H\s+[+-]?[\d.]+` — et ce motif-la attrape le H de « EPOCH 017 ». Le
+    # test annoncait alors une veille cassee alors que la ligne reelle se
+    # lisait parfaitement. Un test trop large est un test qui ment, et il
+    # aurait fait corriger un defaut qui n'existe pas.
+    import re as _re
+    for champ, motif, apres in (
+            ("KL",        r"KL\s+[+-]?[\d.]+",        "KL   +nan"),
+            ("gnorm",     r"gnorm\s+[+-]?[\d.]+",     "gnorm   +nan"),
+            ("gnorm nu",  r"gnorm\s+[+-]?[\d.]+",     "gnorm   nan"),
+            ("Sortino",   r"Sortino\s+[+-]?[\d.]+",   "Sortino    +nan"),
+            ("H",         r"\sH [+-]?[\d.]+",         " H nan"),
+            ("etendue",   r"etendue\[tr [+-]?[\d.-]+", "etendue[tr nan"),
+            ("clipfrac",  r"clipfrac [\d.]+%",         "clipfrac nan%"),
+    ):
+        if _re.search(motif, base) is None:
+            # Un cas qu'on ne peut pas fabriquer doit le DIRE, pas passer au
+            # vert en silence.
+            verifie(f"{champ} eteint", False,
+                    f"motif introuvable dans la reference : {motif}")
+            continue
+        ligne = _re.sub(motif, apres, base, count=1)
+        verifie(f"{champ} a nan : META mord encore",
+                V.RE_META.search(ligne) is not None,
+                apres)
 
     print()
     if echecs:

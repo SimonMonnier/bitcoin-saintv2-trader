@@ -36,7 +36,7 @@ from __future__ import annotations
 import math
 
 import training as T
-from saint_core import score_retenue_grille
+from saint_core import score_retenue
 
 MIN_TRADES = 20
 # Le critere n'est plus un pourcentage de creux mais la DESTRUCTION du
@@ -141,10 +141,46 @@ def main() -> int:
     cas("s'abstenir toujours -> score net nul, ne bat rien", False,
         "score net", gain_top=0.50, score_retenue=0.0, creux=0.0,
         best_metric=0.04)
-    # ... mais il bat un modele qui perd, et c'est voulu : mieux vaut ne pas
-    # trader que trader mal.
-    cas("s'abstenir toujours bat un modele qui perd", True,
-        gain_top=0.50, score_retenue=0.0, creux=0.0, best_metric=-0.03)
+    # ------------------------------------------------------------------
+    # LE PLANCHER ABSOLU, AJOUTE LE 2026-09-21.
+    #
+    # CE QUE CE BLOC TESTAIT AVANT : « s'abstenir bat un modele qui perd »,
+    # avec `best_metric=-0.03`. L'intention etait juste — mieux vaut ne pas
+    # trader que trader mal — mais la regle qui la portait etait purement
+    # RELATIVE, et elle a produit exactement le contraire sur exec69 fold 2 :
+    # huit checkpoints retenus d'affilee, tous a score negatif, de -0.215 a
+    # -0.083. Le « meilleur modele du fold » etait une configuration
+    # perdante, et c'est elle qui aurait ete deployee.
+    #
+    # LA SITUATION QUE CE CAS DECRIVAIT EST DESORMAIS INATTEIGNABLE :
+    # `best_metric` ne peut plus valoir -0.03, puisqu'un modele a -0.03
+    # n'aurait jamais ete retenu. On teste donc le contrat REEL.
+    # ------------------------------------------------------------------
+    cas("un modele perdant n'est jamais retenu, meme sans record a battre",
+        False, "PERDANTE",
+        gain_top=0.50, score_retenue=-0.03, creux=0.10, best_metric=-9e9)
+    cas("l'abstention totale non plus : elle ne trade rien",
+        False, "PERDANTE",
+        gain_top=0.50, score_retenue=0.0, creux=0.0, best_metric=-9e9)
+    cas("un modele gagnant, lui, passe des le premier", True,
+        gain_top=0.50, score_retenue=0.02, creux=0.10, best_metric=-9e9)
+
+    # ------------------------------------------------------------------
+    # LE PORTILLON DU HASARD EXIGE UNE MARGE.
+    #
+    # Sur exec69 fold 2, le sommet a franchi le hasard de +0.020 R et le
+    # checkpoint a ete retenu — alors que l'erreur-type de cette moyenne
+    # vaut ~0.24 R, les occasions du haut se chevauchant trente-trois fois.
+    # ------------------------------------------------------------------
+    cas("un ecart au hasard sous la marge ne passe pas", False, "marge",
+        gain_top=0.523, gain_tous=0.503, marge_hasard=0.24,
+        score_retenue=0.50, best_metric=-9e9)
+    cas("le meme ecart passe si la marge est nulle", True,
+        gain_top=0.523, gain_tous=0.503, marge_hasard=0.0,
+        score_retenue=0.50, best_metric=-9e9)
+    cas("un ecart franc passe malgre la marge", True,
+        gain_top=1.200, gain_tous=0.503, marge_hasard=0.24,
+        score_retenue=0.50, best_metric=-9e9)
 
     cas("score net non mesurable -> refuse", False, "score net non mesurable",
         gain_top=0.50, score_retenue=float("nan"), best_metric=-9e9)
@@ -187,33 +223,60 @@ def main() -> int:
     _rng = _np.random.default_rng(3)
     _R = _rng.normal(0.15, 1.0, 160)
 
-    _refs = [score_retenue_grille(_np.full(160, 2.0 * m), _R)[2]
-             for m in (1, 2, 6, 12)]
-    cas_direct("le levier ne change pas le score",
-               max(_refs) - min(_refs) < 1e-12,
-               f"x1 x2 x6 x12 -> {_refs[0]:+.4f} partout")
+    # CE QUE CES CAS TESTAIENT AVANT, ET POURQUOI ILS ONT CHANGE.
+    #
+    # `score_retenue_grille(budgets, rendements)` ponderait chaque occasion
+    # par la mise du modele, et les cas verifiaient l'invariance au levier,
+    # le gain de l'abstention et la punition d'une grosse mise au mauvais
+    # moment. Le budget a ete retire le 2026-09-21 : la taille posee valait
+    # 1.0000 unite, p5 0.9999, p95 1.0001, sur 7 363 trades — les six
+    # paliers rendaient tous la meme taille, parce que la taille voulue par
+    # le risque tombe sous le lot minimum du courtier.
+    #
+    # `score_retenue(rendements)` ne pondere plus. L'abstention n'a pas
+    # disparu pour autant : elle est passee de « miser zero sur une
+    # occasion retenue » a « ne pas la retenir », et c'est `_top` qui la
+    # porte. Les cas ci-dessous testent donc la MEME propriete economique,
+    # au bon endroit.
+    _gain, _baisse, _net = score_retenue(_R)
+    cas_direct("gain = moyenne des rendements retenus",
+               abs(_gain - float(_R.mean())) < 1e-12,
+               f"{_gain:+.4f}")
+    cas_direct("baisse = moyenne quadratique des seules PERTES",
+               abs(_baisse - float(_np.sqrt(
+                   (_np.minimum(_R, 0.0) ** 2).mean()))) < 1e-12,
+               f"{_baisse:.4f}")
+    cas_direct("net = gain - baisse", abs(_net - (_gain - _baisse)) < 1e-12,
+               f"{_gain:+.4f} - {_baisse:.4f} = {_net:+.4f}")
 
-    _plat = score_retenue_grille(_np.full(160, 4.0), _R)[2]
-    _abst = score_retenue_grille(_np.where(_R < -0.5, 0.0, 4.0), _R)[2]
-    _gros = score_retenue_grille(_np.where(_R < -0.5, 12.0, 4.0), _R)[2]
-    cas_direct("s'abstenir sur les mauvaises occasions PAIE",
-               _abst > _plat,
-               f"{_plat:+.4f} -> {_abst:+.4f}")
-    cas_direct("miser gros sur les mauvaises occasions PUNIT",
-               _gros < _plat,
-               f"{_plat:+.4f} -> {_gros:+.4f}")
-    cas_direct("ne rien miser rend exactement zero",
-               score_retenue_grille(_np.zeros(160), _R) == (0.0, 0.0, 0.0),
-               "pas de division par zero, pas de score negatif")
-    cas_direct("un budget negatif ou nul partout rend zero",
-               score_retenue_grille(_np.full(5, -1.0), _np.ones(5))[2] == 0.0)
-    _ok_forme = False
-    try:
-        score_retenue_grille(_np.ones(5), _np.ones(4))
-    except ValueError:
-        _ok_forme = True
-    cas_direct("des tailles qui ne correspondent pas levent", _ok_forme,
-               "une valeur de budget par occasion, verifie")
+    # ECARTER LES MAUVAISES OCCASIONS PAIE, et c'est tout l'objet du critere.
+    _tout = score_retenue(_R)[2]
+    _trie = score_retenue(_R[_R > -0.5])[2]
+    cas_direct("ecarter les occasions perdantes monte le score",
+               _trie > _tout,
+               f"{_tout:+.4f} -> {_trie:+.4f} en jetant "
+               f"{int((_R <= -0.5).sum())} occasions sur {len(_R)}")
+
+    # SANS AUCUNE PERTE, LA BAISSE EST NULLE et le net vaut le gain.
+    _g2, _b2, _n2 = score_retenue(_np.abs(_R))
+    cas_direct("aucune perte -> baisse nulle, net = gain",
+               _b2 == 0.0 and abs(_n2 - _g2) < 1e-12,
+               f"gain {_g2:+.4f}  baisse {_b2:.4f}")
+
+    # LE SCORE EST DANS L'UNITE DU RENDEMENT, et ce n'est plus une
+    # invariance mais une propriete voulue : sans budget il n'y a plus de
+    # levier a neutraliser, et le critere doit dire combien on gagne.
+    _k = score_retenue(3.0 * _R)[2]
+    cas_direct("le score suit l'echelle des rendements",
+               abs(_k - 3.0 * _net) < 1e-9,
+               f"x3 -> {_net:+.4f} devient {_k:+.4f}")
+
+    # RIEN A NOTER REND EXACTEMENT ZERO, pas une division par zero.
+    cas_direct("une liste vide rend zero",
+               score_retenue(_np.array([])) == (0.0, 0.0, 0.0))
+    cas_direct("des rendements tous non finis rendent zero",
+               score_retenue(_np.full(5, _np.nan)) == (0.0, 0.0, 0.0),
+               "les NaN sont ecartes, pas comptes pour zero")
 
     print()
     if echecs:

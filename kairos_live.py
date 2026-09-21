@@ -17,8 +17,8 @@ import checkpoints
 import flux_live
 import prepare_m5
 from saint_core import (
-    BUDGETS_POSITIONS,
     MASK_VALUE,
+    N_POS_FEATURES,
     NORM_STATS_PATH,
     FEATURE_COLS,
     SCALPING_MAX_HOLDING,
@@ -403,12 +403,6 @@ def capacite_ouvrable(cfg, prix: float, marge_utilisee: float,
         contrat=float(p["contrat"]),
         marge_frac=float(p["marge_frac"]),
         niveau_marge=float(getattr(c, "niveau_marge_ouverture", 3.0)),
-        # LE BUDGET COURANT, celui que la tete de budget a choisi, et non
-        # le reglage de la config : celui-ci n'est plus que le point de
-        # depart. Lire la config ici ferait borner le live par une valeur que
-        # le modele a deja remplacee. Il se compte en POSITIONS MINIMALES
-        # depuis le 2026-09-20 — voir `BUDGETS_POSITIONS` dans saint_core.
-        budget_positions=int(budget_courant_live()),
         # CE QUI EST DEJA EN RISQUE. Il valait ZERO ici, toujours : le live
         # ne passait ni `risque_engage` ni `risque_une`, donc le terme de
         # budget etait `(b x equity - 0) / 1e-12`, un nombre astronomique.
@@ -416,11 +410,11 @@ def capacite_ouvrable(cfg, prix: float, marge_utilisee: float,
         # l'entrainement s'y tenait — deux strategies sous le meme nom, la
         # faute exacte que cette fonction partagee devait empecher.
         risque_engage=float(n_positions) * max(risque_une, 1e-12),
-        risque_une=max(risque_une, 1e-12),
-        # LE MEME CAPITAL DE REFERENCE QU'A L'ENTRAINEMENT, lu dans la
-        # configuration d'entrainement et non recopie ici : deux valeurs a
-        # garder d'accord, c'est une de trop.
-        capital_reference=float(getattr(c, "initial_capital", 0.0)))
+        # `capital_reference` A DISPARU DES DEUX COTES. La part se
+        # rapporte au plafond de survie, qui est lui-meme proportionnel a
+        # l'equite : la capacite compose sans qu'on ait a la multiplier par
+        # un rapport de capitaux. Voir `BUDGETS_PART`.
+        risque_une=max(risque_une, 1e-12))
 
 
 # LE PIC D'EQUITE, QUE METATRADER NE DONNE PAS.
@@ -444,24 +438,19 @@ _EQUITE_RECENTE: List[Tuple[float, float]] = []      # (horodatage, equite)
 
 
 # LE BUDGET DE RISQUE COURANT DU LIVE.
+# LE BUDGET LIVE A ETE RETIRE LE 2026-09-21.
 #
-# Choisi par la tete de budget du reseau, exactement comme a l'entrainement,
-# il PERSISTE entre deux decisions : c'est un etat de portefeuille, pas un
-# parametre d'ouverture. Tant qu'aucune decision n'a ete prise, il vaut le
-# reglage par defaut de `PPOConfig` — le palier le plus prudent.
-_BUDGET_LIVE = [None]
+# `budget_courant_live` et `pose_budget_live` portaient la part du plafond
+# que le reseau s'etait donnee, pour que le live mise comme l'entrainement.
+# Il n'y a plus de part : une position a la fois, et sa taille vient du
+# risque — `compute_risk_volume`, la meme regle qu'a l'entrainement.
+#
+# CE QUE LA MESURE A MONTRE, sur 7 363 trades du fold 1 : la taille posee
+# valait 1.0000 unite, p5 0.9999, p95 1.0001. Les six paliers rendaient
+# tous la meme taille, parce que la taille voulue par le risque (0.003 lot
+# a 1 000 $) tombe sous le lot minimum du courtier. Le plancher s'impose
+# jusqu'a 3 377 $ de capital.
 
-
-def budget_courant_live() -> float:
-    if _BUDGET_LIVE[0] is None:
-        import training as _T
-        _BUDGET_LIVE[0] = int(_T.PPOConfig().budget_positions)
-    return float(_BUDGET_LIVE[0])
-
-
-def pose_budget_live(b) -> None:
-    """Enregistre le budget choisi par le reseau, en NOMBRE DE POSITIONS."""
-    _BUDGET_LIVE[0] = int(max(round(float(b)), 0))
 
 
 def distance_garde_fou(equity: float, fenetre_s: float = 20 * 24 * 3600.0,
@@ -590,18 +579,21 @@ def build_live_obs(
     ai = mt5.account_info()
     distance_creux = (distance_garde_fou(float(ai.equity)) if ai else 0.0)
 
-    # SIXIEME COLONNE : le budget de risque courant, rapporte au plus large
-    # des paliers. Le modele le CHOISIT en entrainement via sa tete de budget,
-    # et il doit lire ici la MEME grandeur — sinon il deciderait en live sur
-    # une entree dont le sens a change.
-    budget_norm = float(budget_courant_live()
-                        / max(BUDGETS_POSITIONS[-1], 1e-9))
-
+    # CINQ COLONNES D'ETAT, et c'etait six. La sixieme portait le budget,
+    # retire le 2026-09-21 : voir `N_POS_FEATURES` dans saint_core.
+    #
+    # LA LARGEUR EST VERIFIEE, PAS SUPPOSEE. Le live et l'entrainement
+    # doivent construire EXACTEMENT la meme observation ; une colonne de
+    # trop ou de moins ici ferait decider le reseau sur une entree dont le
+    # sens a change, et rien ne le signalerait avant les pertes.
     extra_vec = np.array(
         [pos_feature, unrealized_atr, bars_held_norm, risk_feature,
-         distance_creux, budget_norm],
+         distance_creux],
         dtype=np.float32
     )
+    assert extra_vec.shape[0] == N_POS_FEATURES, (
+        f"{extra_vec.shape[0]} colonnes d'etat en live contre "
+        f"{N_POS_FEATURES} a l'entrainement")
     extra_block = np.repeat(extra_vec[None, :], cfg.lookback, axis=0)
 
     obs = np.concatenate([base, extra_block], axis=-1).astype(np.float32)
@@ -1236,8 +1228,7 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
                 if libres <= 0:
                     print(f"  [{agent_name.upper()}] {n_pos} position(s), le "
                           f"compte n'en permet pas d'autre "
-                          f"(budget {budget_courant_live():.0f} pos, "
-                          f"equite {equity:.2f}, marge {marge:.2f}) → HOLD")
+                          f"(equite {equity:.2f}, marge {marge:.2f}) → HOLD")
                     continue
 
                 # L'ETAT TRANSMIS AU RESEAU EST CELUI DE TOUTES LES
@@ -1261,20 +1252,6 @@ def live_loop_multi(cfg: LiveConfig, should_continue):
 
                 with torch.no_grad():
                     s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                    # LE BUDGET DE RISQUE, choisi par le reseau comme en
-                    # validation : par ARGMAX, donc de facon deterministe. Le
-                    # rollout le TIRE, la mesure et le live le prennent au
-                    # maximum — meme regle que pour la direction, qui est
-                    # echantillonnee a l'entrainement et passe une barre
-                    # calibree ici.
-                    _ib = int(policy.budget(s).argmax(-1).item())
-                    pose_budget_live(BUDGETS_POSITIONS[_ib])
-                    _np_ = BUDGETS_POSITIONS[_ib]
-                    print(f"  [{agent_name.upper()}] budget de risque "
-                          f"{_np_} position(s) minimale(s) "
-                          f"(palier {_ib + 1}/{len(BUDGETS_POSITIONS)})"
-                          + ("  -> ABSTENTION, aucune entree" if _np_ == 0
-                             else ""))
 
                     # LE SCORE D'ENTREE VIENT DE LA TETE DE RANG, et
                     # d'elle seule — comme au rollout, en validation et au

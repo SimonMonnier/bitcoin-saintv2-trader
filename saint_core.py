@@ -30,7 +30,17 @@ import torch.nn as nn
 # ============================================================
 
 # 0:BUY  1:SELL  2:HOLD
-N_ACTIONS = 3
+# 3 -> 4 : ACHETER, VENDRE, ATTENDRE, CLOTURER.
+#
+# LA QUATRIEME EST NOUVELLE, ET ELLE CHANGE LA NATURE DU SYSTEME. Jusqu'au
+# 2026-09-21 une position ne se fermait que par une REGLE GEOMETRIQUE —
+# stop, objectif, stop suiveur — et le modele n'avait aucun mot a dire : le
+# masque ne lui laissait qu'ATTENDRE des qu'il etait en position.
+#
+# Le scalping M1 n'a ni stop ni trailing. La sortie devient donc une
+# DECISION, portee par `tete_cloture`, et il lui faut une action pour
+# s'exprimer.
+N_ACTIONS = 4
 MASK_VALUE = -1e4  # valeur de masquage compatible float16
 
 NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
@@ -457,11 +467,119 @@ FEATURE_COLS_SUP_LOINTAINES = [c for sfx in ECHELLES_SUP[1:]
 # plus dans laquelle un gradient de politique nourri par ~1 000 decisions par
 # epoch peut se perdre. C'est pourquoi les blocs se mesurent avant de se
 # garder, et sur la VALIDATION uniquement.
+# LA MICROSTRUCTURE, AJOUTEE LE 2026-09-21, ET C'EST LA PREMIERE FAMILLE
+# QUI NE SOIT PAS UNE TRANSFORMATION DU PRIX.
+#
+# POURQUOI ELLE EXISTE. Les 259 colonnes precedentes sont toutes des
+# fonctions de l'OHLC — Ichimoku, ranges, volatilite, momentum. Mesure du
+# 2026-09-21, occasions DISJOINTES et plancher par ROTATION : aucune ne
+# porte de direction, a aucun horizon de 1 a 60 minutes. Et le modele
+# entraine choisissait le mauvais cote — -1.235 bps contre +0.011 pour un
+# tirage au sort, soit 5.1 ecarts-types. Une 260e fonction du meme OHLC
+# n'y changerait rien.
+#
+# CE QUE MT5 DONNE ET QUE LE DEPOT JETAIT. `copy_rates` renvoie `spread`
+# depuis toujours ; le preparateur selectionnait six colonnes et le
+# laissait tomber. Et `copy_ticks_range` rend bid et ask a chaque
+# cotation : 257.8 millions de ticks sur l'historique, agreges par minute.
+#
+# CE QU'ON NE PEUT PAS EN TIRER, et il faut l'ecrire. Le champ `last` vaut
+# zero sur ce CFD : ce sont des COTATIONS, pas des transactions. Il n'y a
+# donc pas de volume a l'ask contre volume au bid, donc pas de vraie
+# classification acheteur/vendeur. `tick_desequilibre` compte l'asymetrie
+# des MISES A JOUR du carnet — un proxy plus faible, mais qui n'est pas
+# dans le prix.
+FEATURE_COLS_MICRO = [
+    "spread_bar",         # le spread cote sur la barre, en bps
+    "tick_n",             # nombre de cotations dans la minute
+    "tick_spread_moy",    # ecart bid-ask moyen sur la minute
+    "tick_spread_max",    # son maximum
+    "tick_ask_part",      # part des cotations ou SEUL l'ask a bouge
+    "tick_bid_part",      # part des cotations ou SEUL le bid a bouge
+    "tick_desequilibre",  # ask_part - bid_part : la pression de carnet
+]
+
+# LE FLUX D'ORDRES, REMIS LE 2026-09-21 APRES AVOIR ETE RETIRE LE 09-16.
+#
+# CE QUI L'AVAIT FAIT RETIRER. Le commentaire de `prepare_m5.construit` le
+# dit : « elles n'existent QUE sur Binance : aucun CFD ne publie
+# `taker_buy_base` ni `nb_trades`. Elles ont ete retirees pour que l'or
+# puisse partager exactement le meme jeu de colonnes ». On a donc supprime
+# la seule information qui ne fut pas du prix, pour qu'un instrument qui
+# n'en a pas puisse suivre.
+#
+# CE QUI LES FAIT REVENIR. Une journee de mesures sur l'or M1, le
+# 2026-09-21, occasions disjointes et plancher par rotation :
+#
+#   les 266 colonnes une par une   0 au-dessus du plancher, 1 a 480 min
+#   une combinaison (ridge)        aucun horizon au-dessus de son plancher
+#   le modele entraine             +0.004 bps a 0.0 ecart-type
+#
+# Ce n'est pas un defaut d'apprentissage : il n'y a rien a apprendre. Les
+# sept colonnes de microstructure ajoutees le meme jour ne portent que des
+# COTATIONS — le champ `last` d'un CFD vaut zero, il n'y a pas de
+# transactions publiques, parce qu'un CFD n'a pas de marche central.
+#
+# BINANCE PUBLIE SES TRANSACTIONS, gratuitement et depuis 2017 : combien
+# d'echanges, quel volume achete a l'AGRESSION. C'est la seule classe
+# d'information de ce depot qui ne soit pas une fonction de l'OHLC.
+#
+# ELLES N'EXISTENT QUE SUR LE BTC, et il faut l'assumer : un cache d'or
+# ne les portera jamais. `prepare_btc_m1` les construit ; `MarketData`
+# leve si une colonne de `FEATURE_COLS` manque, donc l'or ne peut plus
+# tourner avec ce jeu. C'est voulu — le partage force etait justement la
+# faute.
+FEATURE_COLS_FLUX = [
+    "nb_trades",          # nombre de TRANSACTIONS dans la minute
+    "taker_buy_base",     # volume achete a l'agression
+    "taker_ratio",        # sa part du volume : la pression acheteuse
+    "taker_ma5",          # la meme, lissee sur cinq minutes
+    "flux_taille_trade",  # taille moyenne d'une transaction
+    "flux_intensite",     # transactions par minute, en rang sur la journee
+]
+
+# LES RANGS GLISSANTS, ET C'EST UNE MESURE QUI LES IMPOSE.
+#
+# Ces deux colonnes existent DEJA dans le jeu — `close_ema_dev` et
+# `taker_buy_base` — et le modele ne s'en est jamais servi. Voici
+# pourquoi.
+#
+# Le signal ne vit pas dans le NIVEAU de ces colonnes, il vit dans leur
+# POSITION LOCALE. « Le cours est dans son dixieme le plus bas des 20 000
+# dernieres barres » est un evenement ; « close_ema_dev vaut -0.004 » n'en
+# est pas un, parce que la valeur qui correspondait a un creux en 2024 ne
+# correspond plus a rien en 2026. La soiree du 2026-09-22 a montre la
+# meme derive sur le spread : un seuil au 40e centile calcule deux ans
+# plus tot n'attrapait PLUS AUCUNE occasion sur le BTC, et 96 % des
+# occasions sur l'or.
+#
+# ET `training.py` FIGE LA NORMALISATION sur le train du fold 1 — ce qui
+# protege de la fuite, et c'est indispensable, mais fait voir au modele la
+# DERIVE de la colonne au lieu de sa position. Il recevait l'information
+# sous une forme ou elle n'etait pas lisible.
+#
+# CE QUE LE RANG DEBLOQUE, mesure sur 23 mois, ecart au marche du MEME
+# mois, friction reelle, horizon 480 min, test du signe :
+#
+#     creux seul                    +6.48 bps   17/23 mois   p 0.017
+#     creux + flux fort            +11.95 bps   20/23 mois   p 0.0003
+#
+# LA FENETRE EST DE 20 000 BARRES, soit deux semaines de M1. Assez long
+# pour que le rang soit stable, assez court pour suivre le regime. Elle
+# ne regarde QUE LE PASSE : `rolling` ferme la fenetre sur la barre
+# courante.
+FEATURE_COLS_RANGS = [
+    "creux_rang",   # rang glissant de `close_ema_dev` : la profondeur du creux
+    "flux_rang",    # rang glissant du volume agressif : purge ou erosion
+]
+
 FEATURE_COLS = (FEATURE_COLS_TF + FEATURE_COLS_SUP
                 + FEATURE_COLS_EXT + FEATURE_COLS_LIQ_TEMPS
                 + FEATURE_COLS_RANGE + FEATURE_COLS_ICHIMOKU
                 + FEATURE_COLS_RANGE_SUP + FEATURE_COLS_ICHIMOKU_SUP
-                + FEATURE_COLS_SUP_LOINTAINES)
+                + FEATURE_COLS_SUP_LOINTAINES
+                + FEATURE_COLS_MICRO + FEATURE_COLS_FLUX
+                + FEATURE_COLS_RANGS)
 
 N_BASE_FEATURES = len(FEATURE_COLS)
 
@@ -552,7 +670,9 @@ N_BASE_FEATURES = len(FEATURE_COLS)
 # l'ouverture.
 #
 #     log pi(a) = log pi_dir(d) + log pi_budget(b)
-N_BUDGETS = 6          # accord verifie apres BUDGETS_POSITIONS
+# `N_BUDGETS` a ete retire le 2026-09-21 avec la tete de budget, les
+# paliers et la colonne d'etat. Le nom est garde en commentaire parce que
+# d'anciens points de reprise le portent dans leur manifeste.
 # ZERO EST UN PALIER, ET C'EST LE MECANISME D'ABSTENTION DU MODELE.
 #
 # Le budget etait le seul levier de DOSAGE ; il devient aussi le levier
@@ -589,21 +709,73 @@ N_BUDGETS = 6          # accord verifie apres BUDGETS_POSITIONS
 # CE QUE L'ECHELLE VEUT DIRE MAINTENANT : « combien de positions minimales
 # suis-je pret a avoir en risque a la fois ». Zero reste l'abstention. Chaque
 # palier au-dessus ouvre au moins une position des que la marge le permet,
-# quels que soient l'ATR ET LE CAPITAL — une echelle en pourcentage se
-# comporte differemment a 1 000 $ et a 10 000 $ sans que rien ne le signale.
-BUDGETS_POSITIONS = (0, 1, 2, 4, 7, 12)
-# LE HAUT DE L'ECHELLE VAUT CE QUE VALAIT L'ANCIEN PALIER 40 %.
+# quels que soient l'ATR ET LE CAPITAL.
+# LE BUDGET EST UNE PART DU PLAFOND DE SURVIE, ET NON UN NOMBRE ABSOLU.
 #
-# Premiere version : (0, 1, 2, 3, 5, 8). Mesure sur exec49, epoch 1 : 141
-# trades de validation contre 300-450 sur les runs precedents. La cause n'est
-# pas un blocage mais une AMPLITUDE trop faible — a 1 000 $ et ATR 4,
-# l'ancienne echelle ouvrait 0 / 1 / 3 / 10 positions selon le palier, donc un
-# plafond de 10, et la tete non entrainee tombait sur 40 % une fois sur
-# quatre. La nouvelle plafonnait a 8, et son argmax est tombe sur 5.
+# CE QUE L'ECHELLE ABSOLUE COUTAIT, mesure le 2026-09-21. Le plafond de
+# survie borne le total a `PLAFOND_RISQUE_EQUITE` de l'equite, donc il vaut
+# `0.40 x equite / risque_une` POSITIONS — et `risque_une` suit l'ATR. Quand
+# l'or s'agite, le plafond descend et ECRASE le haut de l'echelle :
 #
-# 12 est ramene a 10 par la garde de survie a 1 000 $ et ATR 4 — soit
-# exactement ce que l'ancien palier le plus haut permettait — et reste 12 sur
-# un compte plus gros, ou la garde ne mord pas.
+#     equite 1 000 $    paliers (0, 1, 2, 4, 7, 12) absolus
+#     ATR  4 $   ->  0   1   2   4   7  10      6 paliers distincts sur 6
+#     ATR  8 $   ->  0   1   2   4   5   5      5
+#     ATR 15 $   ->  0   1   2   2   2   2      3
+#
+# QUATRE PALIERS SUR SIX FONT LA MEME CHOSE en marche agite. PPO recoit alors
+# la MEME recompense pour quatre actions differentes : son gradient sur ces
+# etats est du bruit pur, et aucun reglage d'entropie n'y change rien. C'est
+# la troisieme cause mesuree du budget qui n'apprend pas — les deux autres
+# etant le bonus d'entropie a 3x le gradient de politique et les 23 trades
+# fermes par epoch.
+#
+# L'ASSERTION DE STRICTE CROISSANCE NE L'AVAIT PAS VU : les paliers croissent
+# bien, c'est leur IMAGE par la capacite qui s'ecrase. Le test mesurait la
+# monotonie (<=), pas l'injectivite.
+#
+# CE QUE LA PART CORRIGE. Les six paliers sont des fractions du MEME plafond,
+# donc ils restent distincts tant que le plafond vaut au moins six positions,
+# et se degradent ensuite au rythme de l'arithmetique — jamais par le haut.
+#
+#     ATR  4 $   ->  0   2   4   6   8  10      6
+#     ATR  8 $   ->  0   1   2   3   4   5      6
+#     ATR 15 $   ->  0   1   1   1   2   2      3   (le maximum possible)
+#
+# LINEAIRE, ET NON GEOMETRIQUE. Une echelle geometrique garderait plus de
+# finesse en bas, mais elle perd des paliers des que le plafond est petit :
+# a cinq positions, (0, 1/12, 1/6, 1/3, 7/12, 1) rend 0, 1, 1, 1, 2, 5. Le
+# defaut qu'on corrige etant precisement l'ecrasement, on choisit l'echelle
+# qui le minimise.
+#
+# LA COMPOSITION EST AUTOMATIQUE, et c'est ce qui permet de supprimer
+# `capital_reference`. Tant que le courtier impose son lot minimum — jusque
+# vers 6 700 $ sur l'or — `risque_une` ne depend pas du capital, donc le
+# plafond croit lineairement avec l'equite et une part de ce plafond aussi.
+# Au-dela, `_compute_dynamic_size` fait grossir la TAILLE de chaque position
+# avec le capital : `risque_une` devient proportionnel a l'equite, le plafond
+# se stabilise en NOMBRE, et c'est correct — le compte compose par la taille.
+# L'ancienne echelle multipliait en plus le compte de positions par
+# `equite / capital_reference` : une croissance en equite au CARRE, que seul
+# le plafond de survie empechait de se voir.
+# `BUDGETS_PART` A ETE RETIREE LE 2026-09-21.
+#
+# Elle donnait six paliers de mise, choisis par le rang de la conviction.
+# CE QU'ELLE VALAIT, MESURE trade par trade sur 7 363 trades du fold 1 :
+# la taille posee valait 1.0000 unite, p5 0.9999, p95 1.0001. Les six
+# paliers se projetaient sur UNE seule taille.
+#
+# DEUX RAISONS, ET AUCUNE N'EST LE BUDGET. D'abord l'environnement est
+# passe a UNE position a la fois : la regle de capacite demande desormais
+# la capacite a plein (`_b = 1.0`), donc le palier n'entrait plus dans le
+# calcul. Ensuite, et c'est le fond, la taille voulue par le risque vaut
+# `capital x risk_per_trade / distance_de_stop` = 0.003 lot a 1 000 $,
+# soit TROIS FOIS MOINS que le lot minimum du courtier. Le plancher
+# s'impose, et aucun mecanisme de dimensionnement ne peut rien y changer
+# tant que le capital n'atteint pas 3 377 $.
+#
+# LA CAPITALISATION SURVIT : `size = capital x risk_per_trade / sl_dist`
+# ne depend pas du budget. Quand le compte depassera le plancher, la
+# taille suivra l'equite comme avant.
 
 # LE PLAFOND QU'AUCUN CHOIX NE FRANCHIT, exprime lui en fraction d'equite.
 #
@@ -617,28 +789,86 @@ BUDGETS_POSITIONS = (0, 1, 2, 4, 7, 12)
 # marche agite (ATR 15) ils s'ecrasent sur deux positions. C'est voulu — a
 # 1 000 $ on ne TIENT pas huit positions sur un or qui bouge de 15 $ — et cela
 # se lit dans les taux de refus du journal.
-PLAFOND_RISQUE_EQUITE = 0.40
+# 0.40 -> 0.20. LE CREUX DE VALIDATION ETAIT INVIVABLE.
+#
+# MESURE SUR exec69, creux maximal par epoch de validation :
+#
+#     fold 1    59.6 % en moyenne, jusqu'a 80.1 %
+#     fold 2    71.6 % en moyenne, jusqu'a 86.5 %
+#
+# Sur un compte de 1 000 $, 72 % de creux veut dire etre descendu a 280 $
+# avant de remonter. Personne ne tient une telle trajectoire, et un modele
+# qu'on ne peut pas suivre ne rapporte rien.
+#
+# CE QUE `baisse` NE VOYAIT PAS. Le critere de retenue soustrait une
+# demi-deviation PAR OCCASION — 0.74 R, stable — qui ne regarde jamais le
+# CHEMIN. Elle ignore que les pertes s'enchainent. Le critere a donc retenu
+# sans broncher un modele a 80 % de creux.
+#
+# POURQUOI DIVISER PAR DEUX, ET PAS AUTRE CHOSE. Le creux d'un portefeuille
+# est a peu pres proportionnel a l'exposition tant que la regle de sortie ne
+# change pas : 72 % x 0.5 ~ 36 %, et la progression naturelle du tri en avait
+# deja retire 12 points au fold 1. On vise donc 25-35 %, ce qui est tenable.
+#
+# CE QUE CELA COUTE : moins de positions simultanees, donc moins de
+# rendement en valeur absolue. Les grandeurs qui jugent le MODELE — `rho`,
+# `sommet`, `PF`, `net` — sont invariantes d'echelle et ne bougeront pas.
+PLAFOND_RISQUE_EQUITE = 0.20
 
-# Conserve sous son ancien nom pour les points de reprise et les mesures
-# anterieures, qui le lisent. Il ne commande plus rien.
-BUDGETS_RISQUE = BUDGETS_POSITIONS
-# LA DERIVE LEVE AU CHARGEMENT. `N_BUDGETS` est defini plus haut — il dimensionne
-# la tete — et la liste plus bas. Les desaccorder produirait une tete dont la
-# taille ne correspond a rien, sans qu'aucune erreur ne se declenche.
-assert N_BUDGETS == len(BUDGETS_POSITIONS), (
-    f"N_BUDGETS={N_BUDGETS} mais {len(BUDGETS_POSITIONS)} paliers")
-assert BUDGETS_POSITIONS[0] == 0, (
-    "le premier palier DOIT etre l'abstention : c'est le seul moyen qu'a le "
-    "modele de choisir de ne pas trader")
-assert all(b < a for b, a in zip(BUDGETS_POSITIONS, BUDGETS_POSITIONS[1:])), (
-    "les paliers doivent etre strictement croissants, sinon deux actions "
-    "differentes font la meme chose")
+# CINQ COLONNES D'ETAT DEPUIS LE 2026-09-21, et c'etait six.
+#
+# La sixieme portait `budget_courant`, la part du plafond que le modele
+# s'etait donnee. Elle part avec tout l'appareil de budget.
+#
+# UNE CONSTANTE NE PORTE PAS D'INFORMATION, elle agit comme un biais. Le
+# budget ne commandait plus rien depuis que l'environnement est passe a UNE
+# position — la regle de capacite demande la capacite a plein — donc la
+# colonne ne variait plus qu'au gre d'un chiffre que personne ne lisait.
+#
+# LES CINQ QUI RESTENT : sens, gain latent en ATR, age normalise, capacite
+# restante, distance au garde-fou de creux. Les trois premieres sont celles
+# que `cibles_m1.echantillon_cloture` remplit ; les deux dernieres decrivent
+# le compte et valent zero dans cet echantillon.
+# CE QUE LA TETE DE PROFIT REGARDE, ET RIEN D'AUTRE.
+#
+# Elle ne passe PAS par le tronc, et c'est une mesure qui l'impose. Le
+# 2026-09-22, la meme cible apprise sur les memes occasions :
+#
+#     274 colonnes de marche + l'etat   IC +0.1401   plancher 0.2806   1 arbre
+#     l'etat SEUL                       IC +0.1911   plancher 0.0685 100 arbres
+#
+# Les colonnes de marche ne diluent pas le signal, elles l'EFFACENT : le
+# modele tombe a un arbre et passe sous son propre plancher. Brancher
+# cette tete sur le tronc partage reviendrait a la nourrir de bruit.
+#
+# AVEC LES SEULES QUATRE COLONNES QUE L'ETAT PORTE, le signal tient — et
+# c'est une INTERACTION, aucune ne le porte seule :
+#
+#     les 4 ensemble      IC +0.1523   plancher 0.0581    47 arbres
+#     latent + age        IC +0.1038   plancher 0.0554   168 arbres
+#     latent seul         IC +0.0436   plancher 0.0459   au plancher
+#     age seul            IC -0.0007   plancher 0.0178   au plancher
+#
+# C'est exactement ce qui justifie une tete APPRISE plutot qu'un seuil.
+IDX_PROFIT_POS = (1, 2)      # latent en ATR d'entree, age normalise
+COLS_PROFIT_MARCHE = ("creux_rang", "flux_rang")
+N_PROFIT_FEATURES = len(IDX_PROFIT_POS) + len(COLS_PROFIT_MARCHE)
 
-# LA SIXIEME COLONNE PORTE LE BUDGET COURANT. La quatrieme porte deja la
-# capacite restante, mais deux budgets differents peuvent donner la meme
-# capacite : le modele ne saurait pas lequel il a choisi. C'est la meme lecon
-# que pour le creux — on ne peut pas gerer ce qu'on ne voit pas.
-N_POS_FEATURES = 6
+# OU LIRE LES DEUX COLONNES DE LA TETE DE PROFIT, dans le bloc de features.
+#
+# ELLES SONT LUES NORMALISEES, DES DEUX COTES, ET C'EST LE POINT. La
+# fabrique d'echantillons pourrait rendre le rang BRUT entre 0 et 1, tandis
+# que l'environnement montre le bloc normalise par les statistiques figees
+# du fold 1. Apprendre sur l'un et decider sur l'autre ferait la faute que
+# `cibles_m1` documente le plus souvent : deux ecritures de la meme regle,
+# qui divergent sans jamais lever d'erreur.
+#
+# Les deux cotes lisent donc AU MEME ENDROIT — le bloc de features de
+# l'etat — et ces indices sont le seul endroit qui sache ou.
+IDX_PROFIT_MARCHE = tuple(FEATURE_COLS.index(_c) for _c in COLS_PROFIT_MARCHE)
+
+
+N_POS_FEATURES = 5
 OBS_N_FEATURES = N_BASE_FEATURES + N_POS_FEATURES
 
 
@@ -1624,13 +1854,42 @@ class SAINTPolicySingleHead(nn.Module):
         self.dim_lecture = dim_lecture
         self.norm = RMSNorm(dim_lecture)
 
-        self.mlp = nn.Sequential(
-            nn.Linear(dim_lecture, mlp_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(mlp_dim, mlp_dim),
-            nn.GELU(),
-        )
+        # UN MLP DE LECTURE PAR TETE, DEPUIS LE 2026-09-21.
+        #
+        # CE QUI A MOTIVE LA SEPARATION. Les « trois tetes » etaient trois
+        # couches de CINQ parametres chacune, posees sur un tronc de
+        # 28 014 : 99.95 % du reseau leur etait commun. Ce ne sont pas
+        # trois reseaux, ce sont trois lectures d'une meme representation,
+        # et elles se disputaient la derniere couche.
+        #
+        # CE QUI RESTE PARTAGE, ET C'EST VOULU : l'encodeur — plongement,
+        # blocs d'attention axiale, banque de reference. Il apprend « a
+        # quoi ressemble le marche maintenant », une question commune aux
+        # trois. Le TRIPLER couterait un passage avant de plus par barre,
+        # et le passage avant est deja le goulot : la carte tourne a 28 %
+        # d'utilisation avec `gpu_idle` actif, on paie le LANCEMENT.
+        #
+        # CE QUI CESSE DE L'ETRE : la lecture. « Faut-il acheter »,
+        # « faut-il vendre » et « faut-il fermer » sont trois questions
+        # differentes posees a la meme representation, et rien n'oblige
+        # leur derniere transformation a etre la meme.
+        def _lecture():
+            return nn.Sequential(
+                nn.Linear(dim_lecture, mlp_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(mlp_dim, mlp_dim),
+                nn.GELU(),
+            )
+
+        # `self.mlp` RESTE, et sert `actor` et `critic`. Les deux sont
+        # gelees ou mortes depuis la suppression de PPO, mais leurs
+        # tenseurs doivent survivre pour que les points de reprise
+        # anterieurs se chargent encore.
+        self.mlp = _lecture()
+        self.mlp_achat = _lecture()
+        self.mlp_vente = _lecture()
+        self.mlp_cloture = _lecture()
 
         # Intersample attention, forme deployable : voir ReferenceMemory.
         # n_ref = 0 -> aucune memoire, le modele est strictement celui d'avant.
@@ -1672,8 +1931,33 @@ class SAINTPolicySingleHead(nn.Module):
         # PPO N'EST PAS RETIRE. Les deux pertes partagent le tronc ; si la tete
         # auxiliaire porte tout, la comparaison entre ses scores et ceux de la
         # politique le dira.
-        self.tete_aux = nn.Linear(mlp_dim, 2)
-        self.tete_budget = nn.Linear(mlp_dim, N_BUDGETS)
+        # TROIS TETES, UNE PAR DECISION. Elles etaient deux : un
+        # `Linear(d, 2)` portait l'achat et la vente ensemble. Le calcul
+        # est identique — deux applications lineaires independantes de la
+        # meme representation — mais la structure ne disait pas ce
+        # qu'elle faisait, et un gradient mort d'un SEUL cote n'aurait
+        # pas ete lisible dans le diagnostic.
+        self.tete_achat = nn.Linear(mlp_dim, 1)
+        self.tete_vente = nn.Linear(mlp_dim, 1)
+        # LA TROISIEME TETE : elle decide de FERMER. Une sortie, en
+        # points de base bruts a venir. Voir `cloture`.
+        self.tete_cloture = nn.Linear(mlp_dim, 1)
+        # LA QUATRIEME : ELLE DECIDE DE PRENDRE LE PROFIT.
+        #
+        # Elle est le seul organe du reseau qui ne traverse PAS le tronc.
+        # Voir `N_PROFIT_FEATURES` pour la mesure qui l'impose : nourrie
+        # des 274 colonnes de marche, la meme cible tombe sous son propre
+        # plancher de bruit.
+        #
+        # ELLE PREDIT UNE AMPLITUDE : ce qu'il reste a prendre, en ATR
+        # d'entree, positif. Jamais un signe — ce depot porte l'echec
+        # d'une cible signee, a 50.8 / 49.2 / 53.1 / 46.9 % sur quatre
+        # epochs. Le softplus est applique par l'appelant, comme pour le
+        # risque.
+        self.mlp_profit = nn.Sequential(
+            nn.Linear(N_PROFIT_FEATURES, 32), nn.GELU(),
+            nn.Linear(32, 32), nn.GELU())
+        self.tete_profit = nn.Linear(32, 1)
 
         self._init_poids()
 
@@ -1759,46 +2043,131 @@ class SAINTPolicySingleHead(nn.Module):
         return logits, value
 
     def sorties(self, x: torch.Tensor):
-        """Les QUATRE tetes en UN SEUL passage dans le tronc.
+        """Les scores d'ENTREE — achat et vente — en un passage. (B, 2).
 
-        POURQUOI. Le rollout appelait `policy(x)` puis `policy.budget(x)`, et
-        la validation y ajoutait `policy.rendement(x)` : deux et trois
-        traversees completes du tronc pour des tetes qui ne sont que des
-        couches lineaires sur la MEME representation. Avec un ensemble de deux
-        reseaux, cela faisait quatre et six encodages par lot de decision.
+        ELLE EN RENDAIT TROIS, PUIS DEUX, PUIS UN SEUL TENSEUR. La tete de
+        direction a ete supprimee le 2026-09-20, celle de budget le
+        2026-09-21, et le meme jour `actor` et `critic` ont cesse d'etre
+        CALCULES — leurs tenseurs restent, mais plus rien ne lit leur
+        sortie. Ce qui reste est ce que la decision consomme.
 
-        Profil du 2026-09-19 : le passage avant pese 95 % de la collecte, soit
-        87 ms par lot pour un reseau de 46 000 parametres — un cout de
-        LANCEMENT, pas de calcul. Le tronc est traverse une fois ici.
+        POURQUOI UN SEUL PASSAGE. Le rollout appelait `policy(x)` puis
+        `policy.budget(x)`, et la validation y ajoutait `policy.rendement(x)`
+        — deux et trois traversees completes du tronc pour des tetes qui ne
+        sont que des couches lineaires sur la MEME representation. Profil du
+        2026-09-19 : le passage avant pese 95 % de la collecte, un cout de
+        LANCEMENT et non de calcul. Le tronc est traverse une fois ici.
 
-        Les sorties sont identiques, terme pour terme, a celles des methodes
-        separees : meme `h`, memes couches, meme ordre.
+        ELLES ETAIENT QUATRE. `tete_budget` a ete retiree le 2026-09-21,
+        apres la tete de direction. Le raisonnement est le meme dans les
+        deux cas, et il a ete mesure deux fois :
+
+          PPO optimise le rendement de ses ACTIONS ; rien dans son objectif
+          ne recompense un bon ORDRE de ses sorties. Or c'est un ORDRE que
+          la selectivite consomme, et `rho` est une correlation de rang.
+
+          exec40, 23 epochs, tete de DIRECTION : +0.27 point contre une
+          reference de bruit a +0.7. Supprimee.
+          exec67, 22 epochs, tete de BUDGET : elle apprend — `Hbudget`
+          descend de 1.781 a 1.656 des que le gradient lui parvient — mais
+          ce qu'elle apprend est de MISER LE MINIMUM, et `rho` se degrade
+          avec : negatif 10 fois sur 11 sur la seconde moitie du run.
+
+        CE QUI LA REMPLACE. La taille se deduit du RANG du score de la tete
+        de rang, la meme grandeur qui decide de l'entree. Voir
+        `part_du_rang` : plus l'occasion est haut classee, plus on mise, et
+        `rho` suit le signe du classement sans qu'aucune tete l'apprenne.
+
+        `actor` RESTE, GELEE. La direction a ete supprimee de la DECISION
+        mais ses tenseurs restent dans le reseau — les retirer casserait le
+        chargement des points de reprise, et le journal verifie a chaque
+        lancement qu'aucune de ses sorties n'est lue.
         """
         h = self.encode(x)
         if self.memoire is not None:
             h = self.memoire(h)
-        z = self.mlp(self.norm(h))
-        return (self.actor(z), self.critic(z).squeeze(-1),
-                self.tete_budget(z), self.tete_aux(z))
+        # L'ENCODEUR EST TRAVERSE UNE FOIS, les lectures sont separees.
+        # C'est tout l'objet du compromis : le cout d'un passage avant est
+        # celui du LANCEMENT, pas du calcul, et trois MLP de 8 472
+        # parametres sur une representation deja calculee ne relancent
+        # rien — ils s'ajoutent au meme noyau.
+        # `self.mlp`, `actor` ET `critic` NE SONT PLUS CALCULES ICI.
+        #
+        # CE QU'ILS COUTAIENT. `self.mlp` fait 8 472 parametres — 15.9 %
+        # du reseau — traverses a CHAQUE decision. Il ne nourrissait plus
+        # que deux tetes mortes : `actor`, gelee et dont aucune sortie
+        # n'est lue depuis la suppression de la direction, et `critic`,
+        # dont la valeur alimentait `advantages`, `values_old` et
+        # `returns` — trois tableaux calcules puis jamais relus depuis la
+        # suppression de PPO.
+        #
+        # LES TENSEURS RESTENT DANS LE RESEAU. On cesse de les CALCULER,
+        # on ne les retire pas : les points de reprise anterieurs les
+        # portent, et `test_direction_supprimee` verifie que la tete de
+        # direction existe encore pour qu'ils restent chargeables.
+        zn = self.norm(h)
+        return torch.cat([self.tete_achat(self.mlp_achat(zn)),
+                          self.tete_vente(self.mlp_vente(zn))], -1)
 
     def rendement(self, x: torch.Tensor) -> torch.Tensor:
-        """Rendement net attendu (achat, vente), en unites de risque. (B, 2)."""
-        h = self.encode(x)
-        if self.memoire is not None:
-            h = self.memoire(h)
-        return self.tete_aux(self.mlp(self.norm(h)))
+        """Rendement attendu (ACHAT, VENTE). (B, 2).
 
-    def budget(self, x: torch.Tensor) -> torch.Tensor:
-        """Logits sur les paliers de budget de risque. (B, N_BUDGETS).
+        DEUX TETES DISTINCTES, `tete_achat` et `tete_vente`, recomposees
+        ici en un seul tenseur parce que tous les consommateurs lisent
+        `(achat, vente)` ensemble. Les garder separees rend lisible un
+        gradient mort d'un seul cote, qu'un `Linear(d, 2)` unique masquait.
 
-        Meme chemin que `rendement` : un second passage dans le tronc. Il ne
-        coute que sur les etats de DECISION, qui sont rares — la politique
-        n'est sollicitee que sur les environnements plats.
+        L'UNITE A CHANGE AVEC LE SCALPING M1 : sans stop, `R` n'a plus de
+        denominateur. Ces sorties se lisent en POINTS DE BASE de rendement
+        net, friction deduite. Voir `cibles_m1`.
         """
         h = self.encode(x)
         if self.memoire is not None:
             h = self.memoire(h)
-        return self.tete_budget(self.mlp(self.norm(h)))
+        zn = self.norm(h)
+        return torch.cat([self.tete_achat(self.mlp_achat(zn)),
+                          self.tete_vente(self.mlp_vente(zn))], -1)
+
+    def cloture(self, x: torch.Tensor) -> torch.Tensor:
+        """Faut-il fermer la position ouverte ? (B, 1), en points de base.
+
+        CE QU'ELLE PREDIT : ce qu'on gagne ENCORE en tenant l'horizon de
+        plus, en BRUT. Negatif, il faut fermer ; positif, tenir. Voir
+        `cibles_m1.cible_cloture` pour pourquoi la cible est brute — le cout
+        de sortie sera paye de toute facon, donc il s'annule entre les deux
+        branches de la decision, et le facturer ferait fermer trop tot.
+
+        POURQUOI ELLE N'EST PAS DANS `sorties`. Les tetes d'entree sont
+        interrogees sur les etats PLATS, celle-ci sur les etats EN POSITION.
+        Les deux ensembles sont disjoints : les reunir dans un seul appel
+        calculerait systematiquement une tete pour rien. Le tronc est
+        traverse une fois dans chaque cas, ce qui est le but de `sorties`.
+
+        ELLE LIT L'ETAT DE LA POSITION, et c'est ce qui la distingue d'une
+        tete d'entree appliquee a l'envers : les six colonnes d'etat portent
+        le sens, le gain latent, les barres tenues et la capacite restante.
+        Sans elles la question « faut-il fermer » n'a pas de sens.
+        """
+        h = self.encode(x)
+        if self.memoire is not None:
+            h = self.memoire(h)
+        return self.tete_cloture(self.mlp_cloture(self.norm(h)))
+
+    def profit(self, p: torch.Tensor) -> torch.Tensor:
+        """Ce qu'il reste a prendre sur la position ouverte. (B, 1).
+
+        ELLE NE PREND PAS L'ETAT COMPLET, mais les QUATRE colonnes de
+        `N_PROFIT_FEATURES`, deja extraites par l'appelant : latent, age,
+        `creux_rang`, `flux_rang`. C'est le seul chemin du reseau qui
+        ignore le tronc, et une mesure l'impose — voir
+        `N_PROFIT_FEATURES`.
+
+        LA SORTIE EST UN LOGIT. L'appelant lui applique un softplus pour
+        obtenir une amplitude positive, exactement comme pour le risque :
+        les deux grandeurs vivent en ATR d'entree et la regle de sortie
+        les compare sans conversion.
+        """
+        return self.tete_profit(self.mlp_profit(p))
 
     def definit_banque(self, obs: torch.Tensor):
         """Fixe les references. UNIQUEMENT des observations de la fenetre train."""
@@ -1888,18 +2257,53 @@ class PatchTSTPolicy(nn.Module):
         # et le modele memorisait — mesure : entropie de 1.10 a 0.50 en quinze
         # epochs, et l'ecart au point mort passant de -1.3 a -8.2 pendant que
         # l'etendue montait a 0.95. Signature de surapprentissage.
-        self.mlp = nn.Sequential(
-            nn.Linear(n_features * d_model, mlp_dim), nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(mlp_dim, mlp_dim), nn.GELU(),
-        )
+        # UN MLP DE LECTURE PAR TETE, comme dans SAINT — voir la-bas pour
+        # la mesure. Les deux membres de l'ensemble doivent lire de la
+        # MEME facon, sans quoi leur moyenne fait voter deux modeles qui
+        # ne posent pas la meme question.
+        def _lecture():
+            return nn.Sequential(
+                nn.Linear(n_features * d_model, mlp_dim), nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(mlp_dim, mlp_dim), nn.GELU(),
+            )
+
+        self.mlp = _lecture()          # `actor` et `critic`, gelees
+        self.mlp_achat = _lecture()
+        self.mlp_vente = _lecture()
+        self.mlp_cloture = _lecture()
         self.actor = nn.Linear(mlp_dim, n_actions)
         self.critic = nn.Linear(mlp_dim, 1)
         # Meme tete auxiliaire que SAINT : voir le commentaire la-bas. Les
         # deux membres doivent predire la MEME quantite pour que leur
         # moyenne ait un sens.
-        self.tete_aux = nn.Linear(mlp_dim, 2)
-        self.tete_budget = nn.Linear(mlp_dim, N_BUDGETS)
+        # TROIS TETES, UNE PAR DECISION. Elles etaient deux : un
+        # `Linear(d, 2)` portait l'achat et la vente ensemble. Le calcul
+        # est identique — deux applications lineaires independantes de la
+        # meme representation — mais la structure ne disait pas ce
+        # qu'elle faisait, et un gradient mort d'un SEUL cote n'aurait
+        # pas ete lisible dans le diagnostic.
+        self.tete_achat = nn.Linear(mlp_dim, 1)
+        self.tete_vente = nn.Linear(mlp_dim, 1)
+        # LA TROISIEME TETE : elle decide de FERMER. Une sortie, en
+        # points de base bruts a venir. Voir `cloture`.
+        self.tete_cloture = nn.Linear(mlp_dim, 1)
+        # LA QUATRIEME : ELLE DECIDE DE PRENDRE LE PROFIT.
+        #
+        # Elle est le seul organe du reseau qui ne traverse PAS le tronc.
+        # Voir `N_PROFIT_FEATURES` pour la mesure qui l'impose : nourrie
+        # des 274 colonnes de marche, la meme cible tombe sous son propre
+        # plancher de bruit.
+        #
+        # ELLE PREDIT UNE AMPLITUDE : ce qu'il reste a prendre, en ATR
+        # d'entree, positif. Jamais un signe — ce depot porte l'echec
+        # d'une cible signee, a 50.8 / 49.2 / 53.1 / 46.9 % sur quatre
+        # epochs. Le softplus est applique par l'appelant, comme pour le
+        # risque.
+        self.mlp_profit = nn.Sequential(
+            nn.Linear(N_PROFIT_FEATURES, 32), nn.GELU(),
+            nn.Linear(32, 32), nn.GELU())
+        self.tete_profit = nn.Linear(32, 1)
 
         # MEME INTERFACE QUE SAINT. L'entrainement interroge `policy.memoire`
         # et appelle `rafraichit_banque()` a chaque epoch : sans ces deux
@@ -1961,32 +2365,27 @@ class PatchTSTPolicy(nn.Module):
         return self.actor(h), self.critic(h).squeeze(-1)
 
     def sorties(self, x: torch.Tensor):
-        """Les QUATRE tetes en UN SEUL passage dans le tronc.
+        """Les TROIS tetes en UN SEUL passage dans le tronc.
 
-        POURQUOI. Le rollout appelait `policy(x)` puis `policy.budget(x)`, et
-        la validation y ajoutait `policy.rendement(x)` : deux et trois
-        traversees completes du tronc pour des tetes qui ne sont que des
-        couches lineaires sur la MEME representation. Avec un ensemble de deux
-        reseaux, cela faisait quatre et six encodages par lot de decision.
-
-        Profil du 2026-09-19 : le passage avant pese 95 % de la collecte, soit
-        87 ms par lot pour un reseau de 46 000 parametres — un cout de
-        LANCEMENT, pas de calcul. Le tronc est traverse une fois ici.
-
-        Les sorties sont identiques, terme pour terme, a celles des methodes
-        separees : meme `h`, memes couches, meme ordre.
+        Voir `SAINTPolicySingleHead.sorties` : meme raison d'etre, et meme
+        histoire — `tete_budget` retiree le 2026-09-21 apres la direction.
         """
-        z = self.mlp(self.encode(x))
-        return (self.actor(z), self.critic(z).squeeze(-1),
-                self.tete_budget(z), self.tete_aux(z))
+        # Voir `SAINTPolicySingleHead.sorties` : ni `mlp`, ni `actor`, ni
+        # `critic` ne sont calcules, leurs tenseurs restent chargeables.
+        zn = self.encode(x)
+        return torch.cat([self.tete_achat(self.mlp_achat(zn)),
+                          self.tete_vente(self.mlp_vente(zn))], -1)
 
     def rendement(self, x: torch.Tensor) -> torch.Tensor:
-        """Rendement net attendu (achat, vente), en unites de risque. (B, 2)."""
-        return self.tete_aux(self.mlp(self.encode(x)))
+        """Rendement attendu (ACHAT, VENTE), en bps nets. (B, 2)."""
+        zn = self.encode(x)
+        return torch.cat([self.tete_achat(self.mlp_achat(zn)),
+                          self.tete_vente(self.mlp_vente(zn))], -1)
 
-    def budget(self, x: torch.Tensor) -> torch.Tensor:
-        """Logits sur les paliers de budget de risque. (B, N_BUDGETS)."""
-        return self.tete_budget(self.mlp(self.encode(x)))
+    def cloture(self, x: torch.Tensor) -> torch.Tensor:
+        """Faut-il fermer ? (B, 1), en bps bruts. Voir l'autre reseau."""
+        return self.tete_cloture(self.mlp_cloture(self.encode(x)))
+
 
 
 N_REF_DEFAUT = 256
@@ -2073,37 +2472,30 @@ class PolitiqueEnsemble(nn.Module):
         """
         return torch.stack([m.rendement(x) for m in self.membres], 0).mean(0)
 
-    def budget(self, x):
-        """Logits de budget de l'ensemble. (B, N_BUDGETS).
+    def cloture(self, x):
+        """La tete de cloture de l'ensemble. (B, 1).
 
-        On moyenne les PROBABILITES puis on rend leur log, exactement comme
-        `forward` le fait pour la direction : moyenner des logits n'aurait pas
-        de sens, ils ne vivent pas sur la meme echelle d'un membre a l'autre.
+        MOYENNE DIRECTE, comme la valeur et le rendement : les membres
+        estiment la MEME quantite — des points de base a venir — et non des
+        logits sur des echelles qui leur seraient propres.
         """
-        p = torch.stack([torch.softmax(m.budget(x), dim=-1)
-                         for m in self.membres], 0).mean(0).clamp_min(1e-9)
-        return torch.log(p)
+        return torch.stack([m.cloture(x) for m in self.membres], 0).mean(0)
 
     def sorties(self, x):
-        """Les quatre tetes de l'ensemble, un seul passage par membre.
+        """Les scores d'entree de l'ensemble : moyenne des membres. (B, 2).
 
-        CHAQUE TETE EST COMBINEE COMME ELLE L'ETAIT SEPAREMENT : moyenne des
-        PROBABILITES pour la direction et le budget — moyenner des logits
-        n'aurait pas de sens, ils ne vivent pas sur la meme echelle d'un
-        membre a l'autre — et moyenne directe pour la valeur et le rendement,
-        qui estiment la meme quantite.
+        ELLE COMBINAIT TROIS TETES. La direction passait par une moyenne
+        des PROBABILITES — moyenner des logits n'a pas de sens, ils ne
+        vivent pas sur la meme echelle d'un membre a l'autre — et la
+        valeur par une moyenne directe. Les deux ont cesse d'etre
+        calculees le 2026-09-21 : plus rien ne lisait leur sortie.
+
+        LE RENDEMENT SE MOYENNE DIRECTEMENT, lui, parce que les membres
+        estiment la MEME quantite dans la MEME unite — des points de base
+        de rendement net. C'est la condition pour qu'une moyenne ait un
+        sens, et elle n'est pas remplie par des logits.
         """
-        pd_, vs, pb_, rs = [], [], [], []
-        for m in self.membres:
-            lo, v, bu, re = m.sorties(x)
-            pd_.append(torch.softmax(lo, dim=-1))
-            pb_.append(torch.softmax(bu, dim=-1))
-            vs.append(v)
-            rs.append(re)
-        p = torch.stack(pd_, 0).mean(0).clamp_min(1e-9)
-        pb = torch.stack(pb_, 0).mean(0).clamp_min(1e-9)
-        return (torch.log(p), torch.stack(vs, 0).mean(0),
-                torch.log(pb), torch.stack(rs, 0).mean(0))
+        return torch.stack([m.sorties(x) for m in self.membres], 0).mean(0)
 
     def forward(self, x):
         probs, valeurs = [], []
@@ -2316,7 +2708,13 @@ def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
     mask = torch.zeros(N_ACTIONS, dtype=torch.bool, device=device)
 
     if pos != 0:
-        mask[2] = True  # En position : seulement HOLD (sortie par SL/TP)
+        # EN POSITION : ATTENDRE ou CLOTURER, et rien d'autre.
+        #
+        # Le masque ne laissait qu'ATTENDRE, parce que la sortie venait du
+        # stop. Elle vient maintenant du modele — voir `N_ACTIONS`. Ouvrir
+        # reste interdit : une seule position a la fois.
+        mask[2] = True
+        mask[3] = True
         return mask
 
     if side == "long":
@@ -2413,6 +2811,28 @@ class SeuilRang:
         self.observe(conviction)
         return bool(ok)
 
+    def rang(self, conviction: float) -> float:
+        """OU se situe cette conviction dans la fenetre, entre 0 et 1.
+
+        `accepte` dit SI l'occasion passe ; ceci dit DE COMBIEN. C'est ce qui
+        permet de miser gros sur le haut du classement et petit sur le bas,
+        sans qu'aucune tete n'ait a l'apprendre — voir `part_du_rang`.
+
+        MEME DISCIPLINE QUE `accepte` : on lit AVANT d'enregistrer, donc une
+        occasion ne participe jamais au rang qui la juge. L'appelant doit
+        appeler `observe` ensuite, exactement comme `accepte` le fait.
+
+        REND `nan` TANT QUE LA FENETRE EST TROP COURTE, et non 0.5 : un rang
+        invente placerait toutes les premieres occasions au milieu de
+        l'echelle, et le palier qui en sortirait aurait l'air mesure.
+        """
+        if not np.isfinite(conviction):
+            raise ValueError('Conviction non finie')
+        if not self.pret():
+            return float('nan')
+        vus = np.asarray(self._vus, dtype=np.float64)
+        return float(np.mean(vus <= float(conviction)))
+
     def observe(self, conviction: float) -> None:
         """Enregistre une conviction sans decider (occasions non evaluees)."""
         if not np.isfinite(conviction):
@@ -2505,7 +2925,7 @@ def load_decision_policy(checkpoint, fallback=None, side=None):
                                 'thresholds': list(load_calib_thresholds(checkpoint, fallback))})
 
 
-def score_retenue_grille(budgets, rendements):
+def score_retenue(rendements):
     """Le critere qui CHOISIT le checkpoint. Rend (gain, baisse, net).
 
     UNE SEULE ECRITURE, et c'est la raison d'etre de cette fonction. Elle
@@ -2548,29 +2968,22 @@ def score_retenue_grille(budgets, rendements):
     pas un score negatif. Mieux vaut ne pas trader que trader mal ; le
     portillon du hasard, en amont, empeche qu'on retienne un modele inerte.
     """
-    b = np.asarray(budgets, dtype=np.float64)
     r = np.asarray(rendements, dtype=np.float64)
-    if b.shape != r.shape:
-        raise ValueError(
-            f"budgets {b.shape} et rendements {r.shape} doivent avoir la "
-            f"meme forme : une valeur par occasion retenue")
-    somme = float(b.sum())
-    if not np.isfinite(somme) or somme <= 0.0:
+    r = r[np.isfinite(r)]
+    if r.size == 0:
         return 0.0, 0.0, 0.0
-    gain = float((b * r).sum() / somme)
+    gain = float(r.mean())
     neg = np.minimum(r, 0.0)
-    baisse = float(np.sqrt((b * neg * neg).sum() / somme))
+    baisse = float(np.sqrt((neg * neg).mean()))
     return gain, baisse, gain - baisse
 
 
 def places_ouvrables_compte(equity: float, marge_utilisee: float,
                             prix: float, lot_min: float, contrat: float,
                             marge_frac: float, niveau_marge: float,
-                            budget_positions: int = 0,
                             risque_engage: float = 0.0,
                             risque_une: float = 0.0,
-                            plafond_equite: float = PLAFOND_RISQUE_EQUITE,
-                            capital_reference: float = 0.0
+                            plafond_equite: float = PLAFOND_RISQUE_EQUITE
                             ) -> int:
     """Combien de positions de plus le COMPTE permet, ici et maintenant.
 
@@ -2595,12 +3008,14 @@ def places_ouvrables_compte(equity: float, marge_utilisee: float,
       `equity / niveau_marge - marge_utilisee`, et chaque position de plus en
       consomme `prix x lot_min x contrat x marge_frac`.
 
-      LE BUDGET, qui est NOTRE politique : `budget_positions` dit combien de
-      positions MINIMALES on accepte d'avoir en risque a la fois. Ce qui est
-      deja engage se compte dans la meme unite — une position deux fois plus
-      grosse que le minimum en consomme deux.
+      LE BUDGET, qui est NOTRE politique : `budget_part` dit QUELLE PART du
+      plafond de survie on accepte d'occuper. Ce qui est deja engage se
+      compte dans la meme unite — une position deux fois plus grosse que le
+      minimum en consomme deux.
 
       LE PLAFOND DE SURVIE, en fraction d'equite, qu'aucun choix ne franchit.
+      C'est desormais l'UNITE du budget : `budget_part = 1.0` vaut exactement
+      le plafond, et les deux bornes coincident.
 
     ZERO N'EST PLUS UN PIEGE. `budget_risque = 0` signifiait ici « PAS DE
     CONTRAINTE » et non « pas de risque » : le test mesurait 129 places
@@ -2610,42 +3025,22 @@ def places_ouvrables_compte(equity: float, marge_utilisee: float,
     d'appeler ; c'etait deux endroits ou se tromper. Le zero est traite ici,
     une fois.
 
-    LE BUDGET SUIT LA CROISSANCE DU COMPTE, et il a fallu une mesure pour
-    s'en apercevoir. La premiere version comptait `n` positions, point : un
-    nombre FIXE, que le compte vaille 1 000 $ ou 8 000 $.
+    POURQUOI UNE PART ET NON UN NOMBRE — et pourquoi `capital_reference` a
+    disparu. Voir `BUDGETS_PART` pour la mesure complete ; en deux lignes :
+    un nombre absolu de positions se fait ecraser par le plafond de survie
+    des que l'ATR monte — quatre paliers sur six rendaient la meme capacite
+    en marche agite — et `capital_reference` ajoutait au compte de positions
+    une croissance en equite que la TAILLE des positions portait deja.
 
-    CE QUE CELA A COUTE. L'ancienne echelle, en fraction d'equite, donnait
-    `(fraction x equite - engage) / risque_une` — donc PROPORTIONNEL a
-    l'equite. Une passe de validation partie de 1 000 $ et finie a 3 562 $
-    voyait sa capacite passer de 10 a 35 positions EN COURS DE ROUTE. C'est le
-    cercle vertueux : plus le compte monte, plus il peut ouvrir. La version
-    fixe la supprimait sans le dire.
-
-        equite     ancien 40 %   fixe 12 pos
-         1 000              10            10     identiques au depart
-         2 500              25            12
-         3 562              35            12     x2.9
-         8 000              80            12     x6.7
-
-    La mesure qui avait valide l'echelle en positions ne testait qu'un seul
-    capital — 1 000 $ — ou les deux coincident exactement. Le nombre de trades
-    de validation est tombe de 300-450 a 99-173, et c'est la, entierement.
-
-    CE QUE `capital_reference` PRESERVE. A l'ouverture du compte, `n` positions
-    valent `n` positions : la propriete voulue — la meme action veut dire la
-    meme chose a 1 000 $ et a 10 000 $ — est intacte. Quand le compte double,
-    la capacite double. A zero, le terme est neutre et on retrouve l'echelle
-    fixe.
-
-    LE PLAFOND DE SURVIE, LUI, BORNE TOUJOURS EN FRACTION D'EQUITE : la
-    capacite grandit, la part du compte reellement en risque ne depasse pas
-    `plafond_equite`. C'est exactement ce que faisait l'ancien palier le plus
-    haut.
+    LA COMPOSITION RESTE, PAR CONSTRUCTION. Le plafond vaut
+    `plafond_equite x equite / risque_une` positions. Sous le lot minimum du
+    courtier `risque_une` ne depend pas du capital, donc le plafond — et
+    toute part de ce plafond — croit avec l'equite : le cercle vertueux est
+    intact. Au-dessus, `risque_une` devient proportionnel au capital et c'est
+    la taille de chaque position qui compose. Dans les deux regimes la part
+    du compte reellement en risque reste bornee par `plafond_equite`.
     """
     if equity <= 0:
-        return 0
-    # L'ABSTENTION, TRAITEE ICI ET NULLE PART AILLEURS.
-    if budget_positions <= 0:
         return 0
     m_une = max(prix * lot_min * contrat * marge_frac, 1e-12)
     marge_max = equity / max(niveau_marge, 1e-9)
@@ -2656,21 +3051,22 @@ def places_ouvrables_compte(equity: float, marge_utilisee: float,
     # deux fois plus grosse que le minimum en occupe deux : c'est le meme
     # accounting qu'avant, change d'unite.
     deja = risque_engage / r_une
-    # LE BUDGET SUIT LA CROISSANCE DU COMPTE. `capital_reference` est le
-    # capital de DEPART : a l'ouverture le facteur vaut 1 et `n` positions
-    # valent `n`. A zero, le terme est neutre.
-    _n = float(budget_positions)
-    if capital_reference > 0:
-        _n *= equity / capital_reference
-    par_budget = math.floor(_n - deja)
 
-    # LE PLAFOND DE SURVIE. Il ne restreint rien de ce qui etait deja permis
-    # — il vaut l'ancien palier le plus haut — mais il empeche huit positions
-    # a 15 % chacune d'engager 120 % du compte.
+    # DEUX BORNES, ET PLUS TROIS. La troisieme etait le BUDGET — une part
+    # du plafond, choisie par le modele. Elle a ete retiree le 2026-09-21 :
+    # l'environnement ne tient qu'UNE position, l'appelant demandait donc
+    # deja la capacite a plein, et la borne coincidait exactement avec le
+    # plafond de survie. Une borne qui ne mord jamais est un chemin de code
+    # qu'on ne teste pas.
+    #
+    # L'ABSTENTION NE PASSE PLUS PAR ICI. Elle etait le palier zero ; elle
+    # est maintenant l'appartenance au sommet du classement — une occasion
+    # hors des `q %` du haut n'est simplement pas prise. C'est la meme
+    # decision, prise a un seul endroit au lieu de deux.
     par_survie = math.floor(
         (plafond_equite * equity - risque_engage) / r_une)
 
-    return int(max(0, min(par_marge, par_budget, par_survie)))
+    return int(max(0, min(par_marge, par_survie)))
 
 
 def compute_risk_volume(equity: float, risk_frac: float, sl_dist: float,

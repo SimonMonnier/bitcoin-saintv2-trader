@@ -37,7 +37,11 @@ import cibles as C
 import training as T
 from saint_core import FEATURE_COLS
 
-BUDGETS = (0.05, 0.10, 0.20, 0.30)
+# LES PALIERS REELS, lus a la source. Ce tuple portait encore
+# (0.05, 0.10, 0.20, 0.30) — l'echelle en FRACTION D'EQUITE d'avant le
+# passage aux positions, jamais reprise depuis. Le recopier, c'est
+# mesurer une echelle que le modele n'utilise pas.
+from saint_core import BUDGETS_PART as BUDGETS
 GRAINES = (1, 2)
 TAUX_ENTREE = 1.0      # on tente une entree a chaque barre ; le solde arbitre
 
@@ -104,7 +108,7 @@ def main() -> int:
     print("-" * 76)
     for b in BUDGETS:
         cfg = T.PPOConfig()
-        cfg.budget_risque = b
+        cfg.budget_part = b
         cfg.episode_length = n_bars + 10
         for g in GRAINES:
             t0 = time.perf_counter()

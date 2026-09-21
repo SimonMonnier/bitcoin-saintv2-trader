@@ -31,8 +31,22 @@ class NetLearningTests(unittest.TestCase):
         f=self.frame()
         for c in t.FEATURE_COLS:
             if c not in f:f[c]=0.
+        # `initial_capital` RELEVE LE 2026-09-21. La trame synthetique cote
+        # a 9 722 avec un ATR de 25 : une position au lot minimum y risque
+        # 250 $, soit 25 % d'un compte de 1 000 $. Depuis que
+        # `PLAFOND_RISQUE_EQUITE` est passe de 40 a 20 %, l'environnement
+        # refuse donc d'ouvrir — a juste titre — et le test echouait sur une
+        # liste de trades VIDE, ce qui ressemblait a un desaccord cible /
+        # environnement alors qu'il n'y avait aucun trade a comparer.
+        #
+        # SUR LES VRAIES DONNEES LE PLAFOND NE BLOQUE PAS : capacite mediane
+        # de 14 positions a 1 000 $, et 0.23 % des barres seulement
+        # n'autorisent rien. C'est la trame du test qui est extreme.
+        #
+        # Ce test porte sur l'ACCORD entre la cible et l'environnement, pas
+        # sur la politique de risque : on lui donne de quoi ouvrir.
         cfg=t.PPOConfig(episode_length=300,max_holding_bars=20,use_vol_curriculum=False,
-                        tick_noise_bps=0,use_be_trail=False)
+                        tick_noise_bps=0,use_be_trail=False,initial_capital=100_000.0)
         indices=np.array([100,160,200,250,350])
         targets,exits=net_trade_targets(f,indices,cfg)
         data=t.MarketData(f,t.FEATURE_COLS)

@@ -1808,3 +1808,115 @@ la version qui avait rendu +2.2 points en test en portait 11.6.
 La seule voie qui déplace ce plancher est le nombre d'**instruments**, pas la
 finesse du temps : 25 actifs au même horizon diviseraient l'erreur-type par
 cinq, et un avantage de +0.05 R deviendrait détectable.
+
+---
+
+## 2026-09-22 — Le flux ne predit pas la direction. Conditionne a un creux, il paie.
+
+### Ce qui a ete cherche, et pourquoi
+
+Le passage de l'or au BTC a coute **2.56 bps de friction par trade** — aller-retour
+4.18 bps contre 1.62 — et se justifiait par une seule chose : Binance publie ses
+**transactions**, la ou un CFD sur l'or ne publie que des cotations. On esperait la
+direction dans le flux d'ordres.
+
+### Premiere reponse : non
+
+Occasions **disjointes**, plancher par **rotation circulaire**, horizon 30 minutes.
+Les treize nouvelles colonnes — six de flux Binance, sept de microstructure MT5 —
+sont **toutes sous leur plancher** :
+
+```
+taker_ratio        rho 0.0006   plancher 0.0108    0.05x
+taker_buy_base     rho 0.0016   plancher 0.0111    0.15x
+nb_trades          rho 0.0053   plancher 0.0098    0.53x
+```
+
+Teste a 5, 15, 30, 120 et 240 minutes, les meilleures arrivent **50e, 64e et 101e
+sur 272**. Le seul point au-dessus du plancher est `rsi_14`, deja present.
+
+### Seconde reponse : oui, mais seulement CONDITIONNEE
+
+La premiere question etait trop large. Le flux ne predit pas la direction ; il
+**separe deux evenements que le prix confond**. Une purge violente a fort volume et
+une erosion lente donnent le meme `close_ema_dev`. La premiere est une cascade de
+liquidations — vendeurs contraints, desequilibre qui se resorbe. La seconde est de
+la vente informee, et elle continue.
+
+Horizon 480 min, ecart au marche du **meme mois**, friction reelle a l'entree ET a
+la sortie, **test du signe mois par mois** sur 23 mois :
+
+```
+creux seul                    +6.48 bps   17/23 mois   p 0.017
+creux + vol_20 fort          +10.29 bps   19/23 mois   p 0.001
+creux + nb_trades fort       +11.06 bps   20/23 mois   p 0.0003
+creux + taker_buy_base fort  +11.95 bps   20/23 mois   p 0.0003
+```
+
+Le flux **bat `vol_20`** : ce n'est pas de la volatilite deguisee.
+
+### Le rang glissant etait le verrou
+
+`close_ema_dev` est dans le jeu depuis le debut et n'a jamais servi. Le signal ne
+vit pas dans le NIVEAU mais dans la POSITION LOCALE. Le meme piege a ete pris en
+flagrant delit sur le spread le meme jour : un seuil au 40e centile calcule deux ans
+plus tot n'attrapait **plus aucune occasion** sur le BTC, et **96 %** sur l'or.
+
+Et `training.py` fige la normalisation sur le train du fold 1 — ce qui protege de la
+fuite, et c'est indispensable, mais fait voir au modele la **derive** de la colonne
+au lieu de sa position.
+
+### Une mesure fausse a failli faire supprimer le stop
+
+Un premier balayage annoncait « avantage -3.84, le stop detruit tout ». La tete de
+risque simulee y etait ajustee **sans intercept** : la colonne de uns, passee dans
+la standardisation, valait `(1-1)/1e-12 = 0`. Elle predisait **1.64 ATR** la ou la
+cible en vaut 11.87, donc le stop balaye etait **huit fois trop serre**. La vraie
+tete du depot annonce bien 13.95 ATR dans son journal.
+
+Refait avec un intercept :
+
+```
+0.25 x risque   stop  4.91 ATR   avantage  +2.80   12/23  p 0.50    stoppe 76.2 %
+2.00 x risque   stop 39.28 ATR   avantage +13.00   17/23  p 0.017   stoppe 11.8 %
+aucun stop                       avantage +25.04   18/23  p 0.005   stoppe  0.0 %
+```
+
+Monotone. `coupe_risque` passe de 0.25 a **2.0** : premier palier significatif ou le
+stop garde un sens. A 4x il vaut 78 ATR, il ne protege plus, il decore.
+
+### Le systeme n'avait aucune prise de profit
+
+Lecture de `demande_cloture` : le seuil vaut `marge + coupe x risque`, toujours
+positif, et la condition exige un latent **negatif**. Une position en gain ne peut
+donc **jamais** declencher de cloture. Mesure sur la regle telle qu'elle est codee :
+mediane ET moyenne de tenue des gagnants **egales au plafond**, sans une exception.
+
+Ce que le plafond coute : le sommet du rebond tombe a **49 minutes** au dixieme
+centile et **2 770** au quatre-vingt-dixieme, ecart-type 991. Un oracle parfait
+ajouterait **+246.84 bps par trade**.
+
+Predit **a l'entree**, l'instant du sommet est au plancher (IC -0.052 contre 0.154).
+Predit **depuis la position**, ce qu'il reste a prendre ne l'est pas :
+
+```
+274 colonnes + l'etat   IC +0.1401   plancher 0.2806     1 arbre
+l'etat SEUL             IC +0.1911   plancher 0.0685   100 arbres
+les 4 colonnes reelles  IC +0.1523   plancher 0.0581    47 arbres
+```
+
+Aucune colonne ne porte le signal seule — `latent` seul est au plancher, `age` seul
+ne vaut rien. C'est une **interaction**, et c'est ce qui justifie une tete apprise
+plutot qu'un seuil.
+
+`tete_profit` est donc construite : quatre colonnes, **hors du tronc**, cible en
+amplitude, optimiseur dedie. Son seuil de 1.0 ATR **n'est pas mesure** — toutes les
+prises de profit a seuil fixe testees degradent le resultat.
+
+### Ce qui reste faux malgre tout
+
+- **Aucun signal a la vente**, a aucun horizon, dans aucune condition.
+- **Rien ne marche sur l'or** : le flux n'y existe pas.
+- La fenetre d'evaluation est un **BTC qui monte**. L'ecart au marche du meme mois
+  controle cette derive — c'est pourquoi c'est lui qu'on publie, et pas le net.
+- **Aucun chiffre de performance n'est etabli.** La fenetre de TEST n'a pas ete lue.

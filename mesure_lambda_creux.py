@@ -33,7 +33,7 @@ import pandas as pd
 
 import instruments as I
 import training as T
-from saint_core import BUDGETS_RISQUE, FEATURE_COLS
+from saint_core import BUDGETS_PART, FEATURE_COLS
 
 LONGUEUR = 4000
 GRAINES = tuple(range(1, 7))
@@ -59,13 +59,13 @@ def main() -> int:
     print(f"{len(GRAINES)} episodes de {LONGUEUR:,} barres par (lambda, budget)")
     print(f"recompense sommee TELLE QUE L'ENVIRONNEMENT LA REND")
     print(f"La fenetre de test n'est pas lue.\n")
-    print(f"{'lambda':>8} " + "".join(f"{100*b:>9.0f}%" for b in BUDGETS_RISQUE)
+    print(f"{'lambda':>8} " + "".join(f"{100*b:>9.0f}%" for b in BUDGETS_PART)
           + f" {'choisi':>8} {'creux max':>11} {'gagnants punis':>15}")
     print("-" * 84)
 
     for lam in LAMBDAS:
         tot, dmax, pun = {}, {}, {}
-        for b in BUDGETS_RISQUE:
+        for b in BUDGETS_PART:
             r_s, d_s, punis, gagn = [], [], 0, 0
             for g in GRAINES:
                 np.random.seed(g)
@@ -75,7 +75,7 @@ def main() -> int:
                 cfg.penalite_creux = lam
                 env = T.BTCTradingEnvDiscrete(data, cfg)
                 T.reset_au_depart(env, 3000 + g * 2500)
-                env.set_budget_risque(b)
+                env.set_budget_part(b)
                 rng = np.random.default_rng(g)
                 c = [_equite(env)]
                 somme = 0.0
@@ -107,7 +107,7 @@ def main() -> int:
             dmax[b] = float(np.mean(d_s))
             pun[b] = 100.0 * punis / max(gagn, 1)
         best = max(tot, key=tot.get)
-        print(f"{lam:>8.3f} " + "".join(f"{tot[b]:>10.1f}" for b in BUDGETS_RISQUE)
+        print(f"{lam:>8.3f} " + "".join(f"{tot[b]:>10.1f}" for b in BUDGETS_PART)
               + f" {100*best:>7.0f}% {100*dmax[best]:>10.1f}% "
               f"{pun[best]:>14.1f}%")
     print("-" * 84)

@@ -40,7 +40,7 @@ import cibles as C
 import instruments as I
 import training as T
 import saint_core as S
-from saint_core import FEATURE_COLS, N_POS_FEATURES, BUDGETS_RISQUE
+from saint_core import FEATURE_COLS, N_POS_FEATURES, BUDGETS_PART
 
 PAS = 12
 
@@ -86,7 +86,7 @@ def main() -> int:
 
     xp = np.zeros((cfg.lookback, N_POS_FEATURES), np.float32)
     xp[:, 3] = 1.0
-    xp[:, 5] = float(cfg.budget_risque / max(BUDGETS_RISQUE[-1], 1e-9))
+    xp[:, 5] = float(cfg.budget_part)
     a0, a1 = [], []
     with torch.no_grad():
         for d in range(0, len(idx), 2048):

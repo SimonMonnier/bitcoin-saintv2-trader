@@ -59,7 +59,24 @@ PAS_SONDAGE = 20             # secondes
 TREMBLEMENT_SEUIL = 0.0010
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-NB = r"[+-]?[\d.]+"
+# `nan` EST UNE VALEUR, PAS UNE PANNE — et l'oublier a rendu la veille
+# muette une neuvieme fois, le 2026-09-21.
+#
+# CE QUI S'EST PASSE. `ppo_actif` est passe a False : plus aucune mise a
+# jour, donc `epoch_kl` et `epoch_grad_norm` restent vides, donc
+# `np.mean([])` rend nan et le journal ecrit `KL   +nan`. Le motif exigeait
+# des chiffres, il n'a plus mordu, et la veille a cesse d'afficher les
+# epochs — avec, cette fois, le message qui nomme la ligne fautive, sans
+# lequel on aurait encore cherche du cote de l'entrainement.
+#
+# LA LECON, ET ELLE VAUT POUR TOUT CHAMP FUTUR : un indicateur qu'on cesse
+# de mesurer ne disparait pas du journal, il s'y ecrit `nan`. Le motif doit
+# donc accepter `nan` et `inf` PARTOUT ou il accepte un nombre, sinon
+# chaque grandeur qu'on eteint casse la lecture de toutes les autres.
+#
+# `float("+nan")` rend bien nan en Python : les consommateurs en aval n'ont
+# rien a changer, ils traitaient deja des nan venus d'epochs sans grille.
+NB = r"[+-]?(?:nan|inf|[\d.]+)"
 
 # Les trois lignes que le training ecrit par epoch. Chaque motif est ancre sur
 # le fold pour que deux folds ne se confondent pas.
@@ -92,11 +109,11 @@ RE_META = re.compile(
     # `RE_RHO` et `RE_SOMMET` : c'est la seule facon d'en ajouter sans
     # decaler les indices que `analyse` lit par position.
     r".*?Sortino\s+(" + NB + r").*?"
-    r"AvgW\s+(" + NB + r")\$\s+AvgL\s+(" + NB + r")\$.*?H ([\d.]+).*?"
-    r"sel\[train\s+([\d.]+)% val\s+([\d.]+)%\].*?"
-    r"etendue\[tr ([\d.-]+) val ([\d.-]+)\].*?"
-    r"KL\s+(" + NB + r").*?gnorm\s+([\d.]+)\s+"
-    r"g\[actor ([\d.e+-]+).*?clipfrac ([\d.]+)%\s+"
+    r"AvgW\s+(" + NB + r")\$\s+AvgL\s+(" + NB + r")\$.*?H (" + NB + r").*?"
+    r"sel\[train\s+(" + NB + r")% val\s+(" + NB + r")%\].*?"
+    r"etendue\[tr (" + NB + r") val (" + NB + r")\].*?"
+    r"KL\s+(" + NB + r").*?gnorm\s+(" + NB + r")\s+"
+    r"g\[actor ([\d.e+-]+|nan).*?clipfrac (" + NB + r")%\s+"
     # `.*?` ENTRE CHAQUE PHASE, et ce n'est pas de la coquetterie. Le chrono
     # s'ecrit en parcourant un dictionnaire : toute phase ajoutee a
     # l'entrainement s'insere dans la ligne, et un motif rigide cesse alors de
@@ -113,13 +130,40 @@ RE_META = re.compile(
     # se tait, sans rien signaler, et on cherche du cote de l'entrainement.
     # Les deux groupes restent captures pour ne pas decaler les indices.
     r"validation (\d+)s\](?:.*?gpu\[(\d+)C (\d+)/)?"
-    r".*?ENV \[B\s+([\d.]+)% S\s+([\d.]+)% H\s+([\d.]+)%\]")
+    # LE BLOC ENV ETAIT LE DERNIER MOTIF RIGIDE DU FICHIER, et il a casse
+    # exactement comme les quatre precedents. Le 2026-09-21, CLOTURER est
+    # devenue une action a part entiere et l'entrainement ecrit desormais
+    # `ENV [B .. S .. H .. C ..]`. Le motif exigeait `]` juste apres H : il
+    # a cesse de mordre, et toute la ligne META avec lui.
+    #
+    # LA DIFFERENCE AVEC LES FOIS PRECEDENTES, c'est qu'on l'a SU. Le garde
+    # « ligne META illisible, motif a reajuster » a parle des la premiere
+    # epoch, au lieu des heures de silence qu'ont coutees `rho`, `table`,
+    # la phase `rang` et le bloc `gpu[?]`.
+    #
+    # `C` EST OPTIONNEL ET EN DERNIER : optionnel pour continuer de lire les
+    # journaux anterieurs, en dernier pour ne decaler aucun des indices que
+    # `analyse` lit par position. Et `[^\]]*` avale tout champ futur avant
+    # le crochet, pour que le SIXIEME ajout ne casse plus rien.
+    r".*?ENV \[B\s+(" + NB + r")% S\s+(" + NB + r")% H\s+(" + NB + r")%"
+    r"(?:\s+C\s+(" + NB + r")%)?[^\]]*\]")
 
 # Le critere de SELECTION depuis le 2026-09-19 : ce que rapportent, en
 # unites de risque, les occasions que le checkpoint mettrait en position, et
 # ce que rapporte une occasion au hasard. Lu par un motif separe pour la
 # meme raison que rho — ne pas decaler les indices de `analyse`.
 RE_SOMMET = re.compile(r"sommet\s+(" + NB + r")R/(" + NB + r")R")
+
+# LA TENUE PAR ISSUE : mediane/moyenne des gagnants, puis des perdants.
+#
+# Elle repond a une question posee quatre fois et resolue quatre fois par
+# simulation hors ligne, alors que la boucle de validation avait le
+# chiffre. Ce qu'elle montre au plafond de 480 : les gagnants tiennent
+# TOUS jusqu'au bout, mediane ET moyenne egales au plafond. La regle de
+# sortie n'a aucune prise de profit — elle ne sait que couper les pertes.
+RE_TENUE = re.compile(
+    r"tenue\[G (" + NB + r")/(" + NB + r") P (" + NB + r")/(" + NB + r") "
+    r"x(" + NB + r")\]")
 
 # LE CRITERE DE SELECTION DEPUIS LE 2026-09-20, et la raison du changement.
 #
@@ -144,8 +188,7 @@ RE_SOMMET = re.compile(r"sommet\s+(" + NB + r")R/(" + NB + r")R")
 # MOTIF SEPARE, comme rho et sommet : l'inclure dans RE_META decalerait les
 # indices que `analyse` lit par position, en silence.
 RE_NET = re.compile(
-    r"net\s+(" + NB + r")R\s+\(gain\s+(" + NB + r")R baisse\s+([\d.]+)R\)"
-    r"\s+bud\s+([\d.]+)pos abst\s+([\d.]+)%")
+    r"net\s+(" + NB + r")R\s+\(gain\s+(" + NB + r")R baisse\s+([\d.]+)R\)")
 
 # Combien de scores sont venus de la table groupee, et combien ont du
 # repasser par un forward. Le second doit rester petit : il compte les
@@ -177,8 +220,7 @@ RE_BEST = re.compile(
     r"NEW BEST\s+retenu sur le SCORE NET\s+(" + NB + r") R par occasion\s+"
     r"\(gain\s+(" + NB + r") R - baisse\s+([\d.]+) R\)\s+"
     r"bat (premier retenu du fold|[+-][\d.]+ R)\s+"
-    r"\[bud ([\d.]+) pos abst ([\d.]+)%\s+"
-    r"portillons : sommet (" + NB + r")R > hasard (" + NB + r")R, "
+    r"\[portillons : sommet (" + NB + r")R > hasard (" + NB + r")R, "
     r"(\d+) trades, compte intact\]\s+-> (\S+)")
 
 # Le refus ordinaire — quatre-vingts epochs sur quatre-vingt-dix. Il passait
@@ -282,8 +324,16 @@ H_MAX = _plafond_entropie()
 try:
     from training import PPOConfig as _Cfg
     WARMUP = int(_Cfg().critic_warmup_epochs)
+    # PPO PEUT ETRE COUPE — et alors un gradient d'acteur nul est NORMAL.
+    # Sans cette lecture, la veille signale un « desaccord sur l'etat de la
+    # politique » a chaque epoch du run : un avertissement rouge, repete
+    # quatre-vingt-dix fois, pour un comportement voulu. Un indicateur qui
+    # crie au loup a chaque epoch cesse d'etre lu — et le jour ou il aurait
+    # raison, personne ne le verra.
+    PPO_ACTIF = bool(getattr(_Cfg(), "ppo_actif", True))
 except Exception:
     WARMUP = 5
+    PPO_ACTIF = True
 
 
 class Couleur:
@@ -321,7 +371,7 @@ def _point_mort(avg_w, avg_l):
 
 def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
             ent_prec=None, rho=None, cote="both", herite=False,
-            sommet=None, reprise=None, net=None):
+            sommet=None, reprise=None, net=None, tenue=None):
     """Rend (lignes colorees, lignes brutes, gain par trade, ecart, gele)."""
     ep = int(v[1])
     pnl, trades, wr, pf, dd = (float(v[2]), int(v[3]), float(v[4]),
@@ -341,6 +391,8 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     temp = int(m[18]) if m[18] is not None else None
     mhz = int(m[19]) if m[19] is not None else None
     b_pct, s_pct, h_pct = float(m[20]), float(m[21]), float(m[22])
+    # LA PART DE CLOTURES, absente des journaux d'avant le 2026-09-21.
+    c_pct = float(m[23]) if m[23] is not None else None
 
     par_trade = pnl / max(trades, 1)
     # LE POINT MORT SE CALCULE SUR LA FENETRE QU'IL JUGE, corrige le 2026-09-16.
@@ -420,32 +472,35 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     aux = None
     if isinstance(rho, tuple):
         rho, aux = rho
-    if rho is not None:
-        if rho > 0.05:
+
+    # `rho` A DISPARU DU BANDEAU LE 2026-09-21, AVEC LE BUDGET.
+    #
+    # Il correlait la PART DEPLOYEE au rendement : « le modele mise-t-il
+    # gros quand l'occasion paie ? ». Sans paliers il n'y a plus de part —
+    # toute occasion retenue est prise a la meme taille, celle du lot
+    # minimum, mesuree a 1.0000 unite (p5 0.9999, p95 1.0001) sur 7 363
+    # trades.
+    #
+    # LE BLOC ETAIT CONDITIONNE A `rho`, donc `rhoAux` serait parti avec
+    # lui — et `rhoAux` est celui qui compte : il correle le SCORE de la
+    # tete de rang au rendement, c'est-a-dire la seule question qui reste,
+    # « classe-t-elle les occasions ? ». C'est sur son sommet que le
+    # checkpoint est retenu. On affiche donc celui qui existe.
+    _rho_lu = aux if aux is not None else rho
+    if _rho_lu is not None:
+        if _rho_lu > 0.05:
             coul, quoi = C.VERT, "classe nettement"
-        elif rho > 0.02:
+        elif _rho_lu > 0.02:
             coul, quoi = C.VERT, "classe"
-        elif rho > -0.02:
+        elif _rho_lu > -0.02:
             coul, quoi = C.GRIS, "n'ordonne rien"
         else:
             coul, quoi = C.ROUGE, "classe A L'ENVERS"
-        sup = ""
-        if aux is not None:
-            # DEUX TETES, DEUX QUESTIONS DIFFERENTES.
-            #
-            # `rhoAux` est celle de la TETE DE RANG, qui decide des entrees :
-            # classe-t-elle les occasions ? C'est la colonne qui compte, et
-            # c'est sur son sommet que le checkpoint est retenu.
-            #
-            # `rho` portait la tete de DIRECTION, qui a ete supprimee. Il
-            # porte maintenant le BUDGET : le modele mise-t-il gros quand
-            # l'occasion paie ? Un `rho` nul avec un `rhoAux` positif n'est
-            # pas un echec — cela dit que tout le gain vient de la selection
-            # et que le dimensionnement suit le hasard.
-            ca = C.VERT if aux > 0.02 else (C.ROUGE if aux < -0.02 else C.GRIS)
-            sup = f"   tete de rang {ca}{aux:+.4f}{C.FIN}"
-        L.append(f"  classement budget {coul}{rho:+.4f}{C.FIN} "
-                 f"(+/- 0.024 env.)  -> {quoi}{sup}")
+        # L'INCERTITUDE EST CELLE DU RHO, pas une convention : environ
+        # 0.024, mesuree par bootstrap par blocs sur exec32. Sans elle un
+        # +0.019 se lirait comme un resultat.
+        L.append(f"  classement de la tete de rang {coul}{_rho_lu:+.4f}"
+                 f"{C.FIN} (+/- 0.024 env.)  -> {quoi}")
 
     # CE QUE RAPPORTE LE SOMMET. Le rho dit si l'ORDRE est bon ; celui-ci
     # dit si les occasions effectivement prises PAIENT. Les lire separement
@@ -456,6 +511,24 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     # qualite du tri et rien d'autre, ni l'ordre des occasions donc pas le
     # creux, ni la taille misee donc pas l'abstention. C'est `net`, ci-
     # dessous, qui decide. `sommet` garde le portillon du hasard.
+    # LA TENUE PAR ISSUE — ce que AvgW et AvgL ne peuvent pas montrer.
+    #
+    # Un rapport de gain de 26 pour 1 se lit deja dans AvgW/AvgL. Ce qu'il
+    # ne dit pas, c'est SI la tete a decide de sortir avec un gain ou si le
+    # trade a simplement survecu au chronometre. Quand la mediane ET la
+    # moyenne des gagnants valent le plafond, la reponse est la seconde :
+    # la regle de sortie n'a pas de prise de profit, elle ne sait que
+    # couper les pertes.
+    if tenue is not None:
+        _mg, _yg, _mp, _yp, _rap = tenue
+        _ct = (C.VERT if _rap >= 3.0 else
+               (C.ROUGE if _rap < 1.0 else C.GRIS))
+        _fin = ("   les gagnants vont TOUS au plafond — aucune prise de profit"
+                if (_mg > 0 and abs(_mg - _yg) < 1.0) else "")
+        L.append(f"  tenue          gagnant {_mg:.0f} min (mediane) / "
+                 f"{_yg:.0f} (moyenne)   perdant {_mp:.0f} / {_yp:.0f}   "
+                 f"{_ct}x{_rap:.1f}{C.FIN}{_fin}")
+
     if sommet is not None:
         g_top, g_hasard = sommet
         ecart = g_top - g_hasard
@@ -490,8 +563,20 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
              f"{ll:>4d} perdants  {_wr(lw, ll):5.1f}%  {lpnl:+10.2f}$")
     L.append(f"          SHORT {n_s:>4d} trades  {sw:>4d} gagnants "
              f"{sl_:>4d} perdants  {_wr(sw, sl_):5.1f}%  {spnl:+10.2f}$")
-    L.append(f"  actions B {b_pct:.1f}%  S {s_pct:.1f}%  H {h_pct:.1f}%"
+    # LA PART DE CLOTURES EST LE TEMOIN DE LA SORTIE.
+    #
+    # A zero, la tete de cloture ne ferme jamais : sans stop ni objectif ni
+    # trailing, la position vit alors jusqu'au plafond de detention, et un
+    # episode de 5 760 barres ne fait plus qu'un seul trade. C'est
+    # exactement ce qui s'est passe avant que la tete soit branchee, et ce
+    # chiffre l'aurait montre d'un coup d'oeil.
+    _c = "" if c_pct is None else f"  C {c_pct:.1f}%"
+    L.append(f"  actions B {b_pct:.1f}%  S {s_pct:.1f}%  H {h_pct:.1f}%{_c}"
              f"   |   selectivite  train {sel_tr:.1f}%  val {sel_val:.1f}%")
+    if c_pct is not None and c_pct <= 0.0:
+        L.append("          C a 0 % : la tete de cloture ne ferme JAMAIS. "
+                 "Sans stop ni objectif, la position court jusqu'au plafond "
+                 "de detention et l'episode ne fait qu'un trade.")
     # L'ETAT DE LA POLITIQUE, sur sa propre ligne. L'entropie et l'etendue
     # decident de ce que les autres chiffres VEULENT DIRE : une politique quasi
     # uniforme choisit ses trades presque au hasard, et son resultat mesure le
@@ -530,7 +615,7 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     # monte : c'est le levier, et le creux dira bientot ce qu'il coute. Sans
     # ces deux nombres, les deux histoires sont indiscernables.
     if net is not None:
-        v_net, v_gain, v_creux, v_bud, v_abst = net
+        v_net, v_gain, v_creux = net
         cn = C.VERT if v_net > 0 else (C.ROUGE if v_net < 0 else C.GRIS)
         # Le creux se lit RELATIVEMENT au gain : 8 % de creux pour 40 % de
         # gain n'est pas 8 % de creux pour 3 % de gain.
@@ -539,9 +624,11 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
                else f"{_rap:.2f}x la baisse")
         L.append(f"  critere net  {cn}{v_net:+6.3f} R{C.FIN} par occasion  "
                  f"= gain {v_gain:+.3f} R - baisse {v_creux:.3f} R  ({_lr})")
-        L.append(f"  dimension    {v_bud:.2f} position(s) minimale(s) en "
-                 f"moyenne sur les occasions retenues, abstention totale sur "
-                 f"{v_abst:.0f} % d'entre elles")
+        # LA LIGNE `dimension` A ETE RETIREE LE 2026-09-21, avec le budget.
+        # Elle disait la mise moyenne et la part d'abstention ; les deux
+        # valaient 60 % et 0 % a chaque epoch — deux constantes affichees
+        # comme des mesures. La selectivite, ligne `actions`, porte
+        # desormais seule la question « combien d'occasions sont prises ».
 
     if tr is not None:
         t_wr, t_pf = float(tr[4]), float(tr[5])
@@ -551,7 +638,15 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
 
     # ---- lecture des diagnostics ----
     notes = []
-    if desaccord:
+    if not PPO_ACTIF:
+        # RIEN A SIGNALER : `ppo_actif = False`, donc aucune mise a jour, donc
+        # un gradient nul est la seule valeur possible. On le rappelle une
+        # fois par epoch en gris plutot que de crier au desaccord.
+        notes.append(
+            "PPO COUPE : aucune mise a jour de politique ni de critic. Le "
+            "gradient d'acteur nul est voulu. Le tronc n'apprend que par la "
+            "tete de rang, et le budget se deduit du rang du score.")
+    elif desaccord:
         notes.append(
             f"DESACCORD SUR L'ETAT DE LA POLITIQUE : l'epoch {ep} est "
             f"{'dans' if gele else 'hors'} le warmup ({WARMUP} epochs) mais "
@@ -675,10 +770,11 @@ class Veilleur:
         self._meta_muettes = set()
         self.vus = set()
         self.vals, self.metas, self.trains, self.rhos = {}, {}, {}, {}
-        self.nets = {}          # (net, gain, creux, budget moyen, abstention)
+        self.nets = {}          # (net, gain, creux)
         self.cotes = {}         # par fold : long / short / both, lu du tag
         self.herites = set()    # folds dont les poids viennent du precedent
         self.sommets = {}       # par (fold, epoch) : (gain du sommet, au hasard)
+        self.tenues = {}        # (med G, moy G, med P, moy P, rapport)
         self.reprises = {}      # par (fold, epoch) : epoch dont le PnL est repris
         self.precedent = {}     # par fold : gain par trade de l'epoch d'avant
         self.geles = {}         # par fold : ecarts des epochs a actor gele
@@ -692,7 +788,7 @@ class Veilleur:
         self.vus.clear()
         for d in (self.vals, self.metas, self.trains, self.rhos, self.cotes,
                   self.precedent, self.geles, self.cumul, self.entropie,
-                  self.sommets, self.reprises, self.nets):
+                  self.sommets, self.reprises, self.nets, self.tenues):
             d.clear()
         self.herites.clear()
         self.attend_moyenne.clear()
@@ -710,7 +806,7 @@ class Veilleur:
             return [f"{C.VERT}{C.GRAS}  {ligne.strip()}{C.FIN}",
                     f"{C.ROUGE}  VEILLE : ligne NEW BEST illisible, motif a "
                     f"reajuster{C.FIN}"]
-        (net, gain, baisse, bat, bud, abst,
+        (net, gain, baisse, bat,
          sommet, hasard, trades, fichier) = m.groups()
         net, gain, baisse = float(net), float(gain), float(baisse)
         sommet, hasard = float(sommet), float(hasard)
@@ -734,9 +830,6 @@ class Veilleur:
             f"    a battu     " + ("le premier retenu de ce fold"
                                    if bat == "premier retenu du fold"
                                    else f"le record precedent, {bat}{mieux}"),
-            f"    dimension   {float(bud):.2f} position(s) minimale(s) "
-            f"en moyenne sur les occasions retenues, abstention totale sur "
-            f"{float(abst):.0f} % d'entre elles",
             f"{C.GRIS}    portillons  sommet {sommet:+.3f} R > {hasard:+.3f} "
             f"au hasard   {trades} trades   compte intact{C.FIN}",
             f"{C.GRIS}    fichier     {fichier}{C.FIN}",
@@ -825,6 +918,10 @@ class Veilleur:
                 self.rhos[(mm.group(1), int(mm.group(2)))] = (
                     float(mr.group(1)) if mr else None,
                     float(ma.group(1)) if ma else None)
+                mt = RE_TENUE.search(ligne)
+                if mt:
+                    self.tenues[(mm.group(1), int(mm.group(2)))] = tuple(
+                        float(x) for x in mt.groups())
                 ms = RE_SOMMET.search(ligne)
                 if ms:
                     self.sommets[(mm.group(1), int(mm.group(2)))] = (
@@ -870,7 +967,7 @@ class Veilleur:
                 self.entropie.get(fold), self.rhos.get(cle),
                 self.cotes.get(fold, "both"), fold in self.herites,
                 self.sommets.get(cle), self.reprises.get(cle),
-                self.nets.get(cle))
+                self.nets.get(cle), self.tenues.get(cle))
             self.entropie[fold] = float(self.metas[cle][5])
             self.precedent[fold] = par_trade
             if gele:

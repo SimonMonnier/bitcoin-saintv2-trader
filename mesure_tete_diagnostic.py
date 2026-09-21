@@ -45,7 +45,7 @@ import cibles as C
 import instruments as I
 import training as T
 import saint_core as S
-from saint_core import FEATURE_COLS, N_POS_FEATURES, BUDGETS_RISQUE
+from saint_core import FEATURE_COLS, N_POS_FEATURES, BUDGETS_PART
 
 PAS = 12
 
@@ -77,7 +77,7 @@ def main() -> int:
     pol.eval()
     xp = np.zeros((cfg.lookback, N_POS_FEATURES), np.float32)
     xp[:, 3] = 1.0
-    xp[:, 5] = float(cfg.budget_risque / max(BUDGETS_RISQUE[-1], 1e-9))
+    xp[:, 5] = float(cfg.budget_part)
 
     print(f"{'fenetre':<14} {'n':>7} {'rho(tete, cible)':>19} "
           f"{'rho(tete, reel)':>18} {'rho(cible, reel)':>18}")

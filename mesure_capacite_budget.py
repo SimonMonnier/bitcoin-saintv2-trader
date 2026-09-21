@@ -1,27 +1,46 @@
 # -*- coding: utf-8 -*-
 """Chaque palier de budget ouvre-t-il VRAIMENT un nombre different de positions ?
 
-POURQUOI CETTE MESURE. Le journal d'exec47 disait ceci, a l'epoch 1 :
+POURQUOI CETTE MESURE, ET CE QU'ELLE A LAISSE PASSER DEUX FOIS.
 
-    budgets[0%:14(100) 1%:18(100) 3%:21(99) 6%:14(97) 15%:14(80) 40%:18]
+  PREMIERE FOIS — l'echelle en FRACTION D'EQUITE. Le journal d'exec47 disait,
+  a l'epoch 1 :
 
-Le nombre entre parentheses est la part des fois ou le palier choisi a
-lui-meme REFUSE l'entree. A 3 % de risque, 99 % des entrees voulues etaient
-refusees ; a 40 %, aucune. PLUS LE BUDGET ETAIT GROS, MOINS IL REFUSAIT —
-l'inverse de l'intuition, et la signature exacte d'un plancher de lot minimum.
-La validation etait tombee de 300-450 trades a 56.
+      budgets[0%:14(100) 1%:18(100) 3%:21(99) 6%:14(97) 15%:14(80) 40%:18]
 
-LA CAUSE. Le budget plafonne la somme des pertes si TOUS les stops etaient
-touches. Une position au lot MINIMUM risque deja un montant incompressible :
-si le budget est en dessous, le compte n'ouvre pas une position plus petite,
-il n'en ouvre AUCUNE. A 1 000 $ avec un stop de 10 x ATR sur l'or, les paliers
-1 % et 3 % etaient donc inoperants en permanence — trois paliers sur six
-faisaient la meme chose que le palier 0, sans le dire.
+  Le nombre entre parentheses est la part des fois ou le palier choisi a
+  lui-meme REFUSE l'entree. A 3 % de risque, 99 % des entrees voulues etaient
+  refusees ; a 40 %, aucune. PLUS LE BUDGET ETAIT GROS, MOINS IL REFUSAIT —
+  la signature exacte d'un plancher de lot minimum. Trois paliers sur six
+  faisaient la meme chose que le palier 0, sans le dire.
 
-LE CORRECTIF. L'echelle compte maintenant des POSITIONS MINIMALES :
-(0, 1, 2, 4, 7, 12), de meme amplitude que l'ancienne. Ce fichier verifie
-que chaque palier au-dessus de zero ouvre ce qu'il annonce, a tout ATR et
-a tout capital.
+  SECONDE FOIS — l'echelle en POSITIONS ABSOLUES (0, 1, 2, 4, 7, 12), qui a
+  corrige la premiere. Le plafond de survie borne le total a 40 % de l'equite,
+  donc il vaut `0.40 x equite / risque_une` POSITIONS — et `risque_une` suit
+  l'ATR. Quand l'or s'agite, le plafond descend et ECRASE LE HAUT :
+
+      equite 1 000 $     ATR  4 $ ->  0  1  2  4  7 10     6 paliers sur 6
+                         ATR  8 $ ->  0  1  2  4  5  5     5
+                         ATR 15 $ ->  0  1  2  2  2  2     3
+
+  CE FICHIER NE POUVAIT PAS LE VOIR : il testait la MONOTONIE (un palier plus
+  haut n'ouvre jamais moins, avec un <=), jamais l'INJECTIVITE. Un ecrasement
+  passe la monotonie sans broncher.
+
+  CE QUE CELA COUTAIT A L'APPRENTISSAGE. PPO recevait la MEME recompense pour
+  quatre actions differentes : son gradient sur ces etats etait du bruit pur,
+  et aucun reglage d'entropie n'y pouvait rien. C'est l'une des trois causes
+  mesurees du budget qui n'apprenait pas.
+
+LE CORRECTIF. Le budget est desormais une PART DU PLAFOND DE SURVIE :
+(0, 0.2, 0.4, 0.6, 0.8, 1.0). Les six paliers sont des fractions du MEME
+nombre, donc ils restent distincts tant que ce nombre vaut au moins six
+positions, et se degradent ensuite au rythme de l'arithmetique — jamais par
+le haut.
+
+CE QUE CE FICHIER VERIFIE MAINTENANT, en plus du reste : que le nombre de
+paliers DISTINCTS vaut le maximum arithmetiquement possible, a tout ATR et a
+tout capital. C'est le test qui manquait.
 
     python mesure_capacite_budget.py
 """
@@ -30,7 +49,7 @@ from __future__ import annotations
 import sys
 
 from saint_core import (
-    BUDGETS_POSITIONS,
+    BUDGETS_PART,
     PLAFOND_RISQUE_EQUITE,
     places_ouvrables_compte,
 )
@@ -55,18 +74,33 @@ def risque_une(atr: float) -> float:
 CAPITAL_DEPART = 1000.0
 
 
-def places(equity: float, n: int, atr: float,
-           capital_reference: float = 0.0) -> int:
+def places(equity: float, part: float, atr: float) -> int:
     return places_ouvrables_compte(
         equity=equity, marge_utilisee=0.0, prix=PRIX, lot_min=LOT_MIN,
         contrat=CONTRAT, marge_frac=MARGE_FRAC, niveau_marge=NIVEAU_MARGE,
-        budget_positions=n, risque_engage=0.0, risque_une=risque_une(atr),
-        capital_reference=capital_reference)
+        budget_part=part, risque_engage=0.0, risque_une=risque_une(atr))
 
+
+def ancien(equity: float, n: int, atr: float) -> int:
+    """L'ECHELLE D'AVANT, rejouee : un nombre ABSOLU de positions.
+
+    Elle est reproduite ici plutot que lue, parce qu'elle n'existe plus dans
+    le depot. Sans elle on ne pourrait pas MONTRER ce que la correction
+    change, seulement affirmer qu'elle change quelque chose.
+    """
+    if n <= 0:
+        return 0
+    r1 = risque_une(atr)
+    par_budget = int(n * equity / CAPITAL_DEPART)
+    par_survie = int(PLAFOND_RISQUE_EQUITE * equity / r1)
+    return max(0, min(par_budget, par_survie))
+
+
+ANCIENS_PALIERS = (0, 1, 2, 4, 7, 12)
 
 print(f"\nor a {PRIX:,.0f} $   lot minimum {LOT_MIN} "
       f"({LOT_MIN*CONTRAT:.0f} once)   stop {MULT_STOP:.0f} x ATR")
-print(f"paliers {BUDGETS_POSITIONS}   plafond de survie "
+print(f"paliers {BUDGETS_PART}   plafond de survie "
       f"{100*PLAFOND_RISQUE_EQUITE:.0f} % de l'equite")
 print("=" * 78)
 
@@ -74,17 +108,15 @@ for equity in CAPITAUX:
     print(f"\nCOMPTE {equity:,.0f} $")
     for atr in ATRS:
         r1 = risque_une(atr)
-        ouvertes = [places(equity, n, atr) for n in BUDGETS_POSITIONS]
-        detail = "  ".join(
-            f"{n}pos->{o}" for n, o in zip(BUDGETS_POSITIONS, ouvertes))
+        nouv = [places(equity, f, atr) for f in BUDGETS_PART]
+        vieux = [ancien(equity, n, atr) for n in ANCIENS_PALIERS]
         print(f"  ATR {atr:>4.0f} $   une position risque {r1:>6.2f} $ "
-              f"({100*r1/equity:>5.1f} % du compte)")
-        print(f"              {detail}")
-        # Ce que le plafond de survie autorise, en positions.
-        plafond = int(PLAFOND_RISQUE_EQUITE * equity / r1)
-        distincts = len(set(ouvertes))
-        print(f"              plafond de survie : {plafond} position(s)   "
-              f"-> {distincts} niveaux distincts sur {len(BUDGETS_POSITIONS)}")
+              f"({100*r1/equity:>5.1f} % du compte)   "
+              f"plafond {int(PLAFOND_RISQUE_EQUITE*equity/r1)} position(s)")
+        print("              avant   " + "  ".join(f"{v:>3}" for v in vieux)
+              + f"   -> {len(set(vieux))} distincts")
+        print("              apres   " + "  ".join(f"{v:>3}" for v in nouv)
+              + f"   -> {len(set(nouv))} distincts")
 
 print("\n" + "=" * 78)
 print("\nCE QUI DOIT ETRE VRAI")
@@ -100,121 +132,142 @@ def verifie(nom, condition, detail=""):
 
 # 1. L'abstention abstient, partout.
 verifie("le palier 0 n'ouvre jamais rien",
-        all(places(e, 0, a) == 0 for e in CAPITAUX for a in ATRS))
+        all(places(e, 0.0, a) == 0 for e in CAPITAUX for a in ATRS))
 
-# 2. Le palier 1 ouvre une position des que la marge le permet, a tout ATR
-#    et a tout capital — c'est tout l'objet du changement d'unite.
-mauvais = [(e, a) for e in CAPITAUX for a in ATRS if places(e, 1, a) < 1]
-verifie("le palier 1 ouvre toujours au moins une position",
+# 2. Tout palier non nul ouvre au moins une position : le plancher explicite
+#    de `places_ouvrables_compte`. Sans lui, une petite part d'un plafond
+#    etroit rendrait zero — donc l'abstention — alors que le modele a
+#    explicitement choisi de trader.
+mauvais = [(e, a, f) for e in CAPITAUX for a in ATRS
+           for f in BUDGETS_PART[1:] if places(e, f, a) < 1]
+verifie("tout palier non nul ouvre au moins une position",
         not mauvais, f"defaillant pour {mauvais}" if mauvais else "")
 
 # 3. L'echelle est monotone : un palier plus haut n'ouvre jamais moins.
-mono = all(
-    places(e, BUDGETS_POSITIONS[i], a) <= places(e, BUDGETS_POSITIONS[i+1], a)
-    for e in CAPITAUX for a in ATRS
-    for i in range(len(BUDGETS_POSITIONS) - 1))
-verifie("l'echelle est monotone", mono)
+verifie("l'echelle est monotone",
+        all(places(e, BUDGETS_PART[i], a) <= places(e, BUDGETS_PART[i+1], a)
+            for e in CAPITAUX for a in ATRS
+            for i in range(len(BUDGETS_PART) - 1)))
 
-# 4. LE POINT DU CHANGEMENT : la meme action veut dire la meme chose a
-#    1 000 $ et a 10 000 $ — TANT QUE LE PLAFOND DE SURVIE NE MORD PAS.
-#
-#    L'assertion portait sur TOUS les paliers, et elle etait vraie tant que le
-#    plus haut valait 8. A 12, elle tombe : a 1 000 $ et ATR 4 la garde de
-#    survie autorise 10 positions, donc 12 est ramene a 10, alors qu'a
-#    10 000 $ il reste 12. Ce n'est pas une incoherence de l'echelle, c'est la
-#    GARDE qui fait son travail — et c'est precisement la difference entre
-#    "le palier ne veut rien dire" et "le compte ne peut pas se le permettre".
-#
-#    On verifie donc l'egalite la ou la garde ne mord d'aucun cote, et on
-#    verifie SEPAREMENT que la garde mord bien au-dessus.
-_cap_1k = int(PLAFOND_RISQUE_EQUITE * 1000.0 / risque_une(4.0))
-_sous_garde = [n for n in BUDGETS_POSITIONS if n <= _cap_1k]
-egaux = all(places(1000.0, n, 4.0) == places(10000.0, n, 4.0)
-            for n in _sous_garde)
-verifie("un palier veut dire la meme chose a 1 000 $ et a 10 000 $",
-        egaux, f"(ATR 4, paliers {_sous_garde} sous la garde de {_cap_1k})")
+# 4. LE TEST QUI MANQUAIT. Le nombre de paliers DISTINCTS doit valoir le
+#    maximum arithmetiquement possible. Le plafond vaut P positions ; les
+#    paliers non nuls prennent leurs valeurs dans [1, P], donc on ne peut pas
+#    depasser 1 + min(5, P) valeurs distinctes. Toute perte AU-DELA de cette
+#    borne est un ecrasement, c'est-a-dire un defaut.
+print()
+perdus = []
+for e in CAPITAUX:
+    for a in ATRS:
+        obs = len(set(places(e, f, a) for f in BUDGETS_PART))
+        att = 1 + min(len(BUDGETS_PART) - 1, places(e, 1.0, a))
+        if obs < att:
+            perdus.append((e, a, obs, att))
+verifie("aucun palier n'est perdu par ecrasement",
+        not perdus,
+        "  ".join(f"{e:,.0f}$/ATR{a:.0f}: {o} au lieu de {t}"
+                  for e, a, o, t in perdus) if perdus
+        else "le compte de paliers distincts est le maximum possible")
 
-_au_dessus = [n for n in BUDGETS_POSITIONS if n > _cap_1k]
-verifie("au-dessus, c'est la garde qui tranche, pas l'echelle",
-        all(places(1000.0, n, 4.0) == _cap_1k for n in _au_dessus),
-        f"paliers {_au_dessus} ramenes a {_cap_1k} a 1 000 $, "
-        f"intacts a 10 000 $" if _au_dessus else "aucun palier au-dessus")
+#    ET LA PREUVE PAR LA REGRESSION : l'ancienne echelle, elle, en perdait.
+perdus_avant = []
+for e in CAPITAUX:
+    for a in ATRS:
+        obs = len(set(ancien(e, n, a) for n in ANCIENS_PALIERS))
+        att = 1 + min(len(ANCIENS_PALIERS) - 1,
+                      int(PLAFOND_RISQUE_EQUITE * e / risque_une(a)))
+        if obs < att:
+            perdus_avant.append((e, a, obs, att))
+verifie("l'ancienne echelle en perdait bien, elle",
+        bool(perdus_avant),
+        "  ".join(f"{e:,.0f}$/ATR{a:.0f}: {o} au lieu de {t}"
+                  for e, a, o, t in perdus_avant))
 
-# 5. Le plafond de survie mord quand il doit : le palier le plus haut a
-#    ATR 15 sur 1 000 $ engagerait 12 x 150 = 1 800 $, soit 180 % du compte.
-_haut = BUDGETS_POSITIONS[-1]
+# 5. Le haut de l'echelle EST le plafond de survie. Les deux bornes doivent
+#    coincider exactement : si le haut valait moins, une part de la capacite
+#    autorisee resterait inatteignable ; s'il valait plus, le plafond serait
+#    franchi.
+print()
+ecarts = [(e, a, places(e, 1.0, a),
+           int(PLAFOND_RISQUE_EQUITE * e / risque_une(a)))
+          for e in CAPITAUX for a in ATRS]
+verifie("le palier le plus haut vaut exactement le plafond de survie",
+        all(v == p for _e, _a, v, p in ecarts),
+        "  ".join(f"{e:,.0f}$/ATR{a:.0f}: {v}!={p}"
+                  for e, a, v, p in ecarts if v != p) or "sur les six cas")
+
+# 6. LE PLAFOND DE SURVIE PROTEGE TOUJOURS. A ATR 15 sur 1 000 $, douze
+#    positions engageraient 1 800 $ — 180 % du compte.
 _cap_15 = int(PLAFOND_RISQUE_EQUITE * 1000.0 / risque_une(15.0))
 verifie("le plafond de survie empeche la ruine",
-        places(1000.0, _haut, 15.0) <= _cap_15,
-        f"{places(1000.0, _haut, 15.0)} position(s) au lieu de {_haut} "
-        f"({_haut} x {risque_une(15.0):.0f} $ vaudrait "
-        f"{100*_haut*risque_une(15.0)/1000.0:.0f} % du compte)")
+        places(1000.0, 1.0, 15.0) <= _cap_15,
+        f"{places(1000.0, 1.0, 15.0)} position(s) au lieu de 12 "
+        f"(12 x {risque_une(15.0):.0f} $ vaudrait "
+        f"{100*12*risque_une(15.0)/1000.0:.0f} % du compte)")
 
-# 6. L'AMPLITUDE EST CELLE D'AVANT. L'ancienne echelle ouvrait 0 / 1 / 3 / 10
-#    positions a 1 000 $ et ATR 4. Le haut de la nouvelle doit valoir autant,
-#    sinon on trade structurellement moins — c'est ce qui a fait tomber la
-#    validation de 300-450 trades a 141.
-verifie("le haut de l'echelle vaut l'ancien palier 40 %",
-        places(1000.0, _haut, 4.0) >= 10,
-        f"{places(1000.0, _haut, 4.0)} positions contre 10 avant")
-
-# 7. Ce que l'ancienne echelle faisait, pour memoire : un budget en fraction
-#    d'equite sous le cout d'une position n'ouvrait rien.
-ancien_3pct = 0.03 * 1000.0
-verifie("l'ancien palier 3 % etait bien inoperant a 1 000 $",
-        ancien_3pct < risque_une(4.0),
-        f"{ancien_3pct:.0f} $ de budget pour une position a "
-        f"{risque_une(4.0):.0f} $")
+# 7. L'AMPLITUDE A ETE DIVISEE PAR DEUX, ET C'EST VOULU.
+#
+#    Ce controle exigeait `>= 10 positions`, le niveau de l'ancien palier
+#    40 %. Il gardait donc une AMPLITUDE, a une epoque ou la crainte etait de
+#    trader trop peu.
+#
+#    LA CRAINTE A CHANGE DE SENS, et la mesure avec. Sur exec69 le creux de
+#    validation valait 59.6 % au fold 1 et 71.6 % au fold 2, jusqu'a 86.5 % :
+#    sur un compte de 1 000 $, etre descendu a 280 $ avant de remonter.
+#    `PLAFOND_RISQUE_EQUITE` est passe de 40 % a 20 % pour cette raison.
+#
+#    Ce qu'on verifie n'est donc plus un plancher d'amplitude — le test 5
+#    verifie deja que le haut de l'echelle VAUT exactement le plafond — mais
+#    que la reduction a bien eu lieu, et dans la bonne proportion.
+_haut_1k = places(1000.0, 1.0, 4.0)
+_attendu = int(PLAFOND_RISQUE_EQUITE * 1000.0 / risque_une(4.0))
+verifie("l'exposition a bien ete divisee par deux",
+        _haut_1k == _attendu and abs(PLAFOND_RISQUE_EQUITE - 0.20) < 1e-9,
+        f"{_haut_1k} positions a {100*PLAFOND_RISQUE_EQUITE:.0f} % "
+        f"(contre 10 a 40 %)")
 
 
 # ============================================================
 print()
-print("8. LA CAPACITE SUIT LA CROISSANCE DU COMPTE")
-print("   C'est le test qui MANQUAIT, et son absence a coute la moitie des")
-print("   trades. L'echelle en positions n'etait verifiee qu'a 1 000 $ — le")
-print("   seul capital ou elle coincide avec l'ancienne echelle en fraction")
-print("   d'equite. Des que le compte monte, une echelle FIXE cesse de")
-print("   suivre : 12 positions a 3 562 $ contre 35 pour l'ancien 40 %.")
+print("8. LA CAPACITE SUIT LA CROISSANCE DU COMPTE, SANS `capital_reference`")
+print("   Le plafond vaut 40 % de l'equite divises par le risque d'UNE")
+print("   position. Sous le lot minimum du courtier ce risque ne depend pas")
+print("   du capital, donc le plafond croit avec l'equite — et toute part de")
+print("   ce plafond aussi. La composition est automatique : le parametre")
+print("   `capital_reference` qui la portait a la main a pu disparaitre.")
 # ============================================================
-_haut2 = BUDGETS_POSITIONS[-1]
 _atr = 4.0
 print()
-print("   equite     fixe   suit le compte   ancien 40 %")
+print("   equite      20 %   40 %   60 %   80 %  100 %   ancien 40 %")
 for eq in (1000.0, 2500.0, 3562.0, 8000.0):
-    _fixe = places(eq, _haut2, _atr)
-    _suit = places(eq, _haut2, _atr, capital_reference=CAPITAL_DEPART)
+    _l = "  ".join(f"{places(eq, f, _atr):>5}" for f in BUDGETS_PART[1:])
     _anc = int(PLAFOND_RISQUE_EQUITE * eq / risque_une(_atr))
-    print(f"   {eq:>8,.0f}   {_fixe:>6}   {_suit:>14}   {_anc:>11}")
+    print(f"   {eq:>8,.0f}   {_l}   {_anc:>11}")
 print()
 
-verifie("au capital de depart, rien ne change",
-        places(CAPITAL_DEPART, _haut2, _atr, CAPITAL_DEPART)
-        == places(CAPITAL_DEPART, _haut2, _atr),
-        "la propriete voulue est intacte")
-
-_base = places(CAPITAL_DEPART, _haut2, _atr)
-_croiss = [(eq, places(eq, _haut2, _atr, CAPITAL_DEPART),
+_base = places(CAPITAL_DEPART, 1.0, _atr)
+_croiss = [(eq, places(eq, 1.0, _atr),
             int(PLAFOND_RISQUE_EQUITE * eq / risque_une(_atr)))
            for eq in (2500.0, 3562.0, 8000.0)]
 verifie("quand le compte monte, la capacite monte",
         all(v > _base for _e, v, _a in _croiss),
         ", ".join(f"{e:,.0f}$->{v}" for e, v, _a in _croiss))
 
-verifie("et elle retrouve l'ancien palier 40 %",
+verifie("et elle vaut l'ancien palier 40 %",
         all(v == a for _e, v, a in _croiss),
         "identique a l'echelle en fraction d'equite d'avant")
 
-verifie("un palier veut la meme chose quel que soit le capital DE DEPART",
-        places(1000.0, 4, _atr, 1000.0) == places(10000.0, 4, _atr, 10000.0),
-        "4 positions au depart, a 1 000 $ comme a 10 000 $")
+# LA PROPRIETE QUE L'ANCIENNE ECHELLE DEFENDAIT — « un palier veut dire la
+# meme chose quel que soit le capital de depart » — est desormais VRAIE PAR
+# CONSTRUCTION, puisque la part se rapporte a un plafond qui suit le compte.
+verifie("une part veut dire la meme chose a tout capital",
+        all(places(1000.0, f, _atr) * 10 == places(10000.0, f, _atr)
+            for f in BUDGETS_PART[1:]),
+        "x10 de capital, x10 de positions, a chaque palier")
+
 
 print()
 if echecs:
-    print(f"{len(echecs)} ECHEC(S) : {', '.join(echecs)}")
-    print("\nL'ECHELLE DE RISQUE N'EXISTE PAS. Plusieurs paliers font la meme")
-    print("chose, et PPO croit apprendre un dimensionnement qu'il ne peut pas")
-    print("exercer — c'est exactement ce qui a fait tomber la validation a 56")
-    print("trades.")
+    print(f"{len(echecs)} ECHEC(S) : " + " | ".join(echecs))
     sys.exit(1)
-print("Chaque palier ouvre ce qu'il annonce, a tout ATR et a tout capital,")
-print("et le plafond de survie borne le tout sans effacer l'echelle.")
+print("Tout est verifie.")
+sys.exit(0)
