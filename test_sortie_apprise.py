@@ -141,8 +141,47 @@ verifie("il domine largement la derive du marche",
         "loyer %.5f contre derive %.5f ATR/barre — tenir sans raison coute"
         % (c.loyer_temps_atr, _derive))
 verifie("la recompense telescope",
-        '_lat - float(lat_prec[_k]) - _loyer' in src,
+        '_lat - float(lat_prec[_k])' in src,
         "la somme d'un trade vaut le net realise moins le loyer")
+
+# ============================================================
+print("\n4b. LA DECISION EST SEMI-MDP, ET C'EST CE QUI REND LE LOYER VISIBLE")
+# ============================================================
+# LE PROBLEME ETAIT LA FREQUENCE, PAS LE TARIF. Mesure du 2026-09-22 :
+# |delta latent| vaut 0.650 ATR par barre en moyenne, le loyer 0.0066 —
+# 98 fois plus petit. PPO ne pouvait pas le voir, et en quatre epochs
+# l'entropie est tombee de 0.572 a 0.192 pendant que le taux de fermeture
+# passait de 40 % a 10.9 %.
+#
+# En decidant tous les K barres, le cout croit en K et le bruit en RACINE
+# de K : le rapport s'ameliore en racine de K.
+_K = int(c.pas_decision_sortie)
+verifie("la sortie ne decide plus a chaque barre",
+        _K > 1, "une decision tous les %d barres" % _K)
+verifie("mais assez souvent pour couper vite",
+        _K <= 30, "%d barres — au-dela le scalping perd son sens" % _K)
+_bruit = 0.650
+_r1 = c.loyer_temps_atr / _bruit
+_rK = (c.loyer_temps_atr + c.derive_atr_barre) * _K / (_bruit * np.sqrt(_K))
+verifie("le rapport signal/bruit du loyer a gagne un facteur",
+        _rK > 3 * _r1,
+        "%.1f %% par decision contre %.1f %% par barre" % (100 * _rK, 100 * _r1))
+verifie("la duree entre decisions entre dans la recompense",
+        "(_loyer + _derive) * _dt" in src,
+        "sans quoi une decision couvrant 15 barres n'en paierait qu'une")
+
+# LA DERIVE EST RETIREE. Sans cela, tenir une position longue dans un BTC
+# qui monte rapporte en moyenne, et la politique apprend a ne jamais
+# fermer — ce qu'elle a fait.
+verifie("la derive du marche est retiree de la recompense",
+        float(c.derive_atr_barre) > 0.0 and "_derive" in src,
+        "%.5f ATR/barre — on veut le TIMING, pas le beta" % c.derive_atr_barre)
+
+# ET L'ENTROPIE NE DOIT PAS S'EFFONDRER AVANT D'AVOIR APPRIS.
+verifie("la sortie a son propre poids d'entropie",
+        float(c.entropie_sortie) > float(getattr(c, "entropy_coef", 0.003)),
+        "%.3f contre %.3f pour l'entree — a 0.003 elle est tombee a 0.192"
+        % (c.entropie_sortie, getattr(c, "entropy_coef", 0.003)))
 
 # ============================================================
 print("\n5. LA GEOMETRIE EST REVENUE AU SCALPING")

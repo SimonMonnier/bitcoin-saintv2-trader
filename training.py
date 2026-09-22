@@ -1102,7 +1102,56 @@ class PPOConfig:
     # A COMPARER A LA DERIVE DU MARCHE : +0.231 bps par heure, soit
     # 0.00073 ATR par barre. Le loyer vaut NEUF FOIS la derive — tenir
     # sans raison coute donc reellement quelque chose.
+    # LA SORTIE NE DECIDE PLUS A CHAQUE BARRE.
+    #
+    # C'EST UN PROBLEME DE FREQUENCE, PAS DE TARIF. Mesure du 2026-09-22 :
+    #
+    #     |delta latent| par barre   moyenne 0.650 ATR   mediane 0.483
+    #     loyer du temps             0.0066 ATR par barre
+    #
+    # Le loyer est 98 FOIS plus petit que le bruit qu'il doit traverser.
+    # PPO ne peut pas le voir, donc il n'optimise que le rebond, et tenir
+    # gagne toujours. Resultat en quatre epochs : entropie effondree de
+    # 0.572 a 0.192, taux de fermeture de 40 % a 10.9 %, et 16 trades tous
+    # tenus jusqu'a la fin d'episode.
+    #
+    # EN DECIDANT TOUS LES K BARRES, le loyer d'une decision vaut K fois
+    # plus pendant que le bruit ne croit qu'en RACINE de K. Le rapport
+    # s'ameliore donc en racine de K :
+    #
+    #     K =  1   loyer 0.0066   bruit 0.650   ->  1 %
+    #     K = 15   loyer 0.099    bruit 2.52    ->  4 %
+    #     K = 60   loyer 0.396    bruit 5.03    ->  8 %
+    #
+    # C'est exactement la formulation semi-MDP que ce depot utilise deja
+    # pour les entrees : une decision couvre plusieurs barres, et sa
+    # recompense les accumule.
+    #
+    # QUINZE, ET PAS SOIXANTE. A 60 la politique ne peut plus couper une
+    # perte avant une heure, ce qui contredit le scalping. A 15 elle garde
+    # une granularite de quart d'heure et gagne un facteur quatre sur le
+    # rapport signal/bruit.
+    pas_decision_sortie: int = 15
     loyer_temps_atr: float = 0.0066
+    # LA DERIVE DU MARCHE EST RETIREE DE LA RECOMPENSE.
+    #
+    # Sans cela, tenir une position longue dans un BTC qui monte rapporte
+    # en moyenne, et la politique apprend a ne jamais fermer — ce qu'elle
+    # a fait. On ne veut pas qu'elle capte le BETA, on veut qu'elle capte
+    # le TIMING.
+    #
+    # C'est la meme correction que l'« ecart au marche du meme mois » qui
+    # sert de juge a toutes les mesures d'entree de cette session. La
+    # valeur vient de la : +0.231 bps par heure sur 23 mois, soit
+    # 0.00073 ATR par barre pour un ATR median de 5.3 bps.
+    derive_atr_barre: float = 0.00073
+    # L'ENTROPIE NE DOIT PAS S'EFFONDRER AVANT D'AVOIR APPRIS.
+    #
+    # `entropy_coef` vaut 0.003 pour l'acteur d'entree. Sur une politique a
+    # DEUX actions, ce poids n'a pas empeche l'entropie de tomber a 0.192
+    # sur 0.693 en quatre epochs — la politique est devenue deterministe
+    # avant que le critique n'ait fini de se caler.
+    entropie_sortie: float = 0.02
     pas_profit_par_epoch: int = 0
     # L'HORIZON SUR LEQUEL ELLE JUGE — ET IL FIXE AUSSI CELUI DE L'ENTREE.
     #
@@ -7687,11 +7736,17 @@ def run_training_on_split(
         # `cibles_m1.echantillon_cloture` documente pour le prix d'entree,
         # et du meme ordre de grandeur.
         sortie_buf = [[] for _ in range(n_envs)]
-        # Le latent de la barre PRECEDENTE, par environnement. NaN veut
+        # Le latent de la DERNIERE DECISION, par environnement. NaN veut
         # dire « pas de position en cours » — on ne peut alors pas calculer
         # de difference.
         lat_prec = np.full(n_envs, np.nan, dtype=np.float64)
+        # Barres ecoulees depuis la derniere decision de sortie. La
+        # politique n'est interrogee que tous les `pas_decision_sortie` ;
+        # entre deux, la position tient et la recompense s'accumule.
+        depuis_dec = np.zeros(n_envs, dtype=np.int64)
         _loyer = float(getattr(cfg, "loyer_temps_atr", 0.0))
+        _derive = float(getattr(cfg, "derive_atr_barre", 0.0))
+        _pas_s = max(1, int(getattr(cfg, "pas_decision_sortie", 1)))
 
         # Sélectivité visée cette epoch, et seuil absolu qui la réalise.
         # Le seuil vient du quantile mesuré à l'epoch PRÉCÉDENTE : à l'epoch 1 il
@@ -7904,30 +7959,42 @@ def run_training_on_split(
                 # LA SORTIE EST DECIDEE PAR LA POLITIQUE, plus par deux
                 # seuils ecrits a la main. Voir `decide_sortie` pour les
                 # quatre calibrations successives qui ont echoue.
-                _ep = [states[k] for k in _en_pos]
-                _sa, _slp, _sv = decide_sortie(
-                    policy, _ep, device, N_BASE_FEATURES, explore=True)
-                _pin = entree_profit(_ep, N_BASE_FEATURES)
-                for _bi, _k in enumerate(_en_pos):
-                    _lat = float(_pin[_bi, 0])
-                    # LA RECOMPENSE DE LA TRANSITION PRECEDENTE se calcule
-                    # ICI, une barre plus tard : c'est maintenant qu'on
-                    # connait le latent qui a suivi.
-                    if sortie_buf[_k] and np.isfinite(lat_prec[_k]):
-                        sortie_buf[_k][-1]["r"] = (
-                            _lat - float(lat_prec[_k]) - _loyer)
-                    _ferme = int(_sa[_bi]) == FERMER
-                    sortie_buf[_k].append({
-                        "p": _pin[_bi].copy(), "a": int(_sa[_bi]),
-                        "lp": float(_slp[_bi]), "v": float(_sv[_bi]),
-                        # A la fermeture il ne reste que le loyer : le gain
-                        # accumule l'a deja ete, barre apres barre.
-                        "r": (-_loyer) if _ferme else 0.0,
-                        "done": bool(_ferme),
-                    })
-                    lat_prec[_k] = np.nan if _ferme else _lat
-                    if _ferme:
-                        actions_env[_k] = 3
+                # QUI DECIDE A CETTE BARRE. Une position fraiche decide
+                # tout de suite ; ensuite seulement tous les `_pas_s`.
+                _a_decider = [k for k in _en_pos
+                              if (not np.isfinite(lat_prec[k]))
+                              or (depuis_dec[k] >= _pas_s)]
+                for _k in _en_pos:
+                    depuis_dec[_k] += 1
+                if _a_decider:
+                    _ep = [states[k] for k in _a_decider]
+                    _sa, _slp, _sv = decide_sortie(
+                        policy, _ep, device, N_BASE_FEATURES, explore=True)
+                    _pin = entree_profit(_ep, N_BASE_FEATURES)
+                    for _bi, _k in enumerate(_a_decider):
+                        _lat = float(_pin[_bi, 0])
+                        # LA RECOMPENSE DE LA DECISION PRECEDENTE se solde
+                        # ICI : elle couvre les `depuis_dec` barres ecoulees
+                        # depuis elle. Le loyer ET la derive se comptent
+                        # PAR BARRE, donc multiplies par cette duree.
+                        if sortie_buf[_k] and np.isfinite(lat_prec[_k]):
+                            _dt = float(max(depuis_dec[_k] - 1, 1))
+                            sortie_buf[_k][-1]["r"] = (
+                                _lat - float(lat_prec[_k])
+                                - (_loyer + _derive) * _dt)
+                        _ferme = int(_sa[_bi]) == FERMER
+                        sortie_buf[_k].append({
+                            "p": _pin[_bi].copy(), "a": int(_sa[_bi]),
+                            "lp": float(_slp[_bi]), "v": float(_sv[_bi]),
+                            # A la fermeture il ne reste rien a accumuler :
+                            # le gain l'a deja ete, decision apres decision.
+                            "r": 0.0,
+                            "done": bool(_ferme),
+                        })
+                        lat_prec[_k] = np.nan if _ferme else _lat
+                        depuis_dec[_k] = 0
+                        if _ferme:
+                            actions_env[_k] = 3
 
             if deciding:
                 batch_np = np.stack([states[k] for k in deciding], axis=0)
@@ -8851,7 +8918,11 @@ def run_training_on_split(
             # mordrait differemment selon un reglage qui n'a rien a voir.
             _ADV = (_ADV - _ADV.mean()) / (_ADV.std() + 1e-8)
             _eps = float(getattr(cfg, "clip_eps", 0.2))
-            _ce = float(getattr(cfg, "entropy_coef", 0.01))
+            # SON PROPRE POIDS, plus celui de l'acteur d'entree. Voir
+            # `entropie_sortie` : a 0.003 l'entropie est tombee a 0.192 sur
+            # 0.693 en quatre epochs.
+            _ce = float(getattr(cfg, "entropie_sortie",
+                                getattr(cfg, "entropy_coef", 0.01)))
             _cv = float(getattr(cfg, "value_coef", 0.5))
             _nlot = max(1, len(_A) // max(1, int(cfg.batch_size)))
             _la, _lc, _lh, _lk, _lcl, _np_ = [], [], [], [], [], 0

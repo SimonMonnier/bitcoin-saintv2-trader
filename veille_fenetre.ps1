@@ -39,10 +39,28 @@
 # autre date — et le tunneling n'y peut rien. La taille qui RECULE reste
 # verifiee en second : elle attrape la troncature sur place.
 #
+# DEUX VUES, ET C'EST UNE MESURE QUI LES IMPOSE — 2026-09-22.
+#
+# Le bloc d'analyse fait VINGT-SIX LIGNES par epoch. Sur cinquante epochs
+# cela fait 1 400 lignes qui defilent, et le chiffre qu'on cherche — le
+# PnL, le sommet, la decision de retenue — se noie dans les diagnostics.
+# La fenetre etait devenue illisible, et les six lignes de phase ajoutees
+# le matin meme n'ont fait que precipiter ce qui etait deja trop dense.
+#
+# PAR DEFAUT : SIX LIGNES. L'epoch, l'argent, le tri, la tenue, la
+# decision, et toute panne. C'est ce qu'on lit pour savoir si ca marche.
+#
+# AVEC -Detail : TOUT. Les phases du reseau, la cadence, la collecte, les
+# diagnostics d'entropie et d'etendue. C'est ce qu'on lit pour savoir
+# POURQUOI ca ne marche pas.
+#
 #   powershell -ExecutionPolicy Bypass -File veille_fenetre.ps1
+#   powershell -ExecutionPolicy Bypass -File veille_fenetre.ps1 -Detail
+
+param([switch]$Detail)
 
 $journal = Join-Path $PSScriptRoot 'training_btc.log'
-$Host.UI.RawUI.WindowTitle = 'KAIROS - veille'
+$Host.UI.RawUI.WindowTitle = if ($Detail) { 'KAIROS - veille (detail)' } else { 'KAIROS - veille' }
 
 # LA SORTIE EST EN UTF-8, sans quoi les accents du journal ressortent en
 # mojibake — le meme piege que `Set-Content -Encoding utf8` sur les .py.
@@ -66,16 +84,27 @@ Write-Host '  KAIROS - veille : analyse par epoch' -ForegroundColor Cyan
 Write-Host "  journal : $journal" -ForegroundColor DarkGray
 Write-Host '  LECTURE SEULE - fermer cette fenetre n arrete pas l entrainement' -ForegroundColor DarkGray
 Write-Host '  elle SUIT LE CHEMIN : une relance qui archive le journal ne la fige plus' -ForegroundColor DarkGray
+if ($Detail) {
+    Write-Host '  VUE DETAILLEE - 26 lignes par epoch' -ForegroundColor Yellow
+} else {
+    Write-Host '  vue ESSENTIELLE - 6 lignes par epoch   (VEILLE_DETAIL.bat pour tout voir)' -ForegroundColor DarkGray
+}
 Write-Host ''
 
-# Ce qu'on garde : le bloc d'analyse par epoch, les phases du reseau, les
-# decisions de retenue, les bornes de fold, et toute panne.
+# L'ESSENTIEL : six lignes par epoch, et rien d'autre.
 #
-# LES QUATRE MOTIFS AJOUTES LE 2026-09-22 : `phase` porte les pertes et les
-# rho des tetes, `PPO sortie` la mise a jour de la politique de sortie,
-# `cadence` le regulateur d'episodes, `COLLECTE` le compte de decisions.
-# Sans eux la fenetre montrait le resultat sans jamais montrer le travail.
-$garde = '^(EPOCH |  (PnL|point mort|classement|sommet du tri|vs |sens |actions |entrees |critere net|dimension|train |tenue |phase |cadence |\. |temps :)|\[COLLECTE\]|          SHORT|  (non )?retenu|  garde |  . NEW BEST|=== |--- Fold |Traceback|.*Error)'
+#   EPOCH           le resultat : $/trade, trades, WR, PF
+#   PnL             l'argent, le cumul, le creux
+#   tenue           gagnants contre perdants — la geometrie du trade
+#   sommet du tri   ce qui SELECTIONNE le checkpoint
+#   garde / retenu  la decision prise
+#   Fold / erreurs  les bornes et les pannes
+$essentiel = '^(EPOCH |  (PnL|tenue |sommet du tri)|  (non )?retenu|  garde |  . NEW BEST|=== |--- Fold |Traceback|.*Error)'
+
+# LE DETAIL : tout le reste — diagnostics, phases du reseau, cadence.
+$detaille = '^(EPOCH |  (PnL|point mort|classement|sommet du tri|vs |sens |actions |entrees |critere net|dimension|train |tenue |phase |cadence |\. |temps :)|\[COLLECTE\]|          SHORT|  (non )?retenu|  garde |  . NEW BEST|=== |--- Fold |Traceback|.*Error)'
+
+$garde = if ($Detail) { $detaille } else { $essentiel }
 $ansi = [regex]"$([char]27)\[[0-9;]*m"
 
 $flux = $null
@@ -145,7 +174,13 @@ while ($true) {
         # le second passe par la mise en forme de PowerShell, qui peut les
         # echapper selon l'hote.
         $nu = $ansi.Replace($ligne, '')
-        if ($nu -match $garde) { [Console]::Out.WriteLine($ligne) }
+        if ($nu -match $garde) {
+            # UNE LIGNE VIDE AVANT CHAQUE EPOCH. Sans separation les blocs
+            # se collent et l'oeil ne retrouve plus ou commence l'epoch
+            # suivante — c'est la moitie du probleme de lisibilite.
+            if ($nu -match '^EPOCH ') { [Console]::Out.WriteLine('') }
+            [Console]::Out.WriteLine($ligne)
+        }
     }
     if ($rien) { Start-Sleep -Milliseconds 400 }
 }
