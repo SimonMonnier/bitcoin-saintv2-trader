@@ -436,6 +436,56 @@ confrontés à une mesure.
 
 ---
 
+## ▶️ Lancer sans Claude — trois raccourcis
+
+*Ajouté le 2026-09-22.* Tout se fait par double-clic, depuis le dossier du
+projet. Aucune ligne de commande n'est nécessaire.
+
+| Fichier | Ce qu'il fait |
+|---|---|
+| **`LANCER.bat`** | arrête ce qui tourne, archive le journal, nettoie les manifestes, puis ouvre **deux fenêtres** : l'entraînement et la veille |
+| **`VEILLE.bat`** | ouvre *seulement* la fenêtre de veille — lecture seule, n'interfère avec rien |
+| **`ARRETER.bat`** | arrête l'entraînement, sans toucher aux journaux ni aux points de reprise |
+
+### Ce que `LANCER.bat` fait à ta place
+
+Chacune de ces étapes a déjà cassé un run quand elle a été oubliée :
+
+1. **Arrêter l'entraînement en cours.** Deux processus écrivent dans le même
+   journal et se disputent le GPU ; le second paraît lent sans raison.
+2. **Archiver le journal** dans `journaux/` avec la date. Rien n'est supprimé.
+3. **Déplacer les manifestes du run précédent.** `run_training_on_split`
+   *refuse* de démarrer si le manifeste existe déjà — c'est une protection
+   contre l'écrasement silencieux, et elle fait échouer toute relance tant
+   qu'on ne l'a pas levée.
+4. **Poser `PYTHONUNBUFFERED` et `PYTHONIOENCODING`.** Sans le premier, Python
+   garde sa sortie en tampon et la veille ne voit rien pendant des minutes ;
+   sans le second, les accents du journal cassent.
+5. **Fermer les anciennes fenêtres de veille.** Une fenêtre restée ouverte sur
+   un journal *archivé* donne l'illusion que l'entraînement est figé — c'est
+   exactement ce qui s'est produit le 2026-09-22.
+
+### Si l'interpréteur n'est pas au bon endroit
+
+`lancer.ps1` cherche `C:\Users\smonn\miniconda3\envs\trading_env\python.exe`. S'il a bougé, ouvrir `lancer.ps1` et
+corriger la ligne `$python` — le script le signale **en rouge** plutôt que
+d'échouer trente secondes plus tard sur un `import`.
+
+### À la main, si tu préfères
+
+```powershell
+$env:PYTHONUNBUFFERED='1'; $env:PYTHONIOENCODING='utf-8'
+& 'C:\Users\smonn\miniconda3\envs\trading_env\python.exe' training.py 2>&1 | Tee-Object training_btc.log
+```
+
+et dans une **autre** fenêtre :
+
+```powershell
+powershell -ExecutionPolicy Bypass -File veille_fenetre.ps1
+```
+
+---
+
 ## 🗺️ Le système en une image
 
 ![Architecture de KAIROS](architecture.svg)

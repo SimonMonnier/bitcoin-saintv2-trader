@@ -157,42 +157,66 @@ verifie("l'appelant n'est pas modifie",
         "`demande_cloture` copie, elle n'ecrit pas dans l'etat de l'env")
 
 # ============================================================
-print("\n4. UNE POSITION NE PEUT PAS DEVENIR IMMORTELLE")
+print("\n4. AUCUNE HORLOGE NE FERME A LA PLACE DES TETES")
 # ============================================================
+# CETTE SECTION AFFIRMAIT L'INVERSE JUSQU'AU 2026-09-22. Elle exigeait
+# « le plafond est la SEULE sortie qui ne depende pas du modele », et
+# c'etait juste tant que `tete_cloture` etait le seul organe de sortie :
+# elle ne peut pas fermer un gagnant — sa regle exige un latent NEGATIF —
+# donc sans horloge une position gagnante ne se fermait jamais.
+#
+# `tete_profit` a change ca. Il y a desormais DEUX portes, et la seconde
+# sait solder un gain. Le plafond n'est plus un garde-fou, il etait devenu
+# LA prise de profit : il decidait de 100 % des sorties gagnantes, mediane
+# ET moyenne de tenue des gagnants egales a sa valeur, sans une exception.
 c1 = T.PPOConfig()
 c1.timeframe_entrainement = "M1"
-c1.tenue_max_cloture = 30
 c1.max_holding_bars = 0
-verifie("en M1 le plafond vient de `tenue_max_cloture`",
-        T.plafond_detention(c1) == 30,
-        "et non de `max_holding_bars`, qui vaut %d" % c1.max_holding_bars)
-verifie("aucune sortie automatique n'est desactivee par accident",
-        not (c1.use_sl or c1.use_tp or c1.use_be_trail)
-        and T.plafond_detention(c1) > 0,
-        "sans stop, sans objectif, sans trailing -> le plafond est la SEULE "
-        "sortie qui ne depende pas du modele")
+verifie("en M1 aucune horloge ne ferme",
+        T.plafond_detention(c1) == 0,
+        "ce sont `tete_cloture` et `tete_profit` qui decident, seules")
 
 c5 = T.PPOConfig()
 c5.timeframe_entrainement = "M5"
 c5.max_holding_bars = 0
 verifie("en M5 rien ne change", T.plafond_detention(c5) == 0)
 
-# UN REGLAGE POSE A LA MAIN NE DOIT PAS ETRE REMPLACE EN SILENCE. La
-# premiere version prenait `tenue_max_cloture` des que le pas etait M1 et
-# ignorait un plafond explicite : `test_economic_learning` en fixe un a 20,
-# l'environnement sortait a 30, et la cible calculee a 20 ne concordait
-# plus avec ce que l'environnement jouait.
+# LA PORTE DE SORTIE RESTE, et c'est elle qui rend le retrait reversible :
+# qui veut un plafond le pose a la main, sans toucher au code.
 cx = T.PPOConfig()
 cx.timeframe_entrainement = "M1"
-cx.tenue_max_cloture = 30
 cx.max_holding_bars = 20
-verifie("un plafond explicite gagne sur la valeur deduite",
+verifie("un plafond EXPLICITE reste prioritaire",
         T.plafond_detention(cx) == 20,
-        "20 pose a la main, 30 deduit de l'echantillon")
+        "`max_holding_bars` pose a la main gagne toujours")
 
-verifie("le plafond suit l'echantillon, il ne le double pas",
-        T.plafond_detention(c1) == c1.tenue_max_cloture,
-        "la tete n'a jamais vu d'age au-dela, sa colonne y sature")
+# SANS HORLOGE, LES DEUX TETES DOIVENT ETRE ARMEES. Si l'une des deux
+# redevenait ornementale, une position pourrait courir jusqu'a la fin de
+# l'episode — c'est exactement ce que le fold 1 a vecu le 2026-09-21 :
+# 12 episodes, 12 decisions, un trade tenu 5 759 barres.
+verifie("la tete de risque commande vraiment",
+        float(c1.coupe_risque) > 0.0,
+        "coupe_risque %.2f" % c1.coupe_risque)
+verifie("la tete de profit commande vraiment",
+        float(getattr(c1, "coupe_profit", 0.0)) > 0.0,
+        "coupe_profit %.2f x latent — a zero, plus rien ne ferme un gagnant"
+        % getattr(c1, "coupe_profit", 0.0))
+verifie("aucun stop fixe ne se substitue a elles",
+        not (c1.use_sl or c1.use_tp or c1.use_be_trail)
+        and float(c1.marge_sortie) == 0.0)
+
+# L'ECHANTILLON DOIT COUVRIR LES AGES QUE L'ENVIRONNEMENT MONTRERA. Sans
+# horizon, une position depasse largement l'ancien plafond ; un
+# echantillon qui s'arreterait avant ferait decider les tetes sur des ages
+# qu'elles n'ont jamais vus.
+from saint_core import SCALPING_MAX_HOLDING as _SMH
+verifie("l'echantillon couvre la saturation de la colonne d'age",
+        int(c1.tenue_max_cloture) >= 3 * int(_SMH),
+        "tenue_max %d, saturation a 3 x %d = %d barres"
+        % (c1.tenue_max_cloture, _SMH, 3 * _SMH))
+verifie("l'echelle d'age n'est plus recopiee",
+        "tenue / 30.0" not in io.open("cibles_m1.py", encoding="utf-8").read(),
+        "`cibles_m1` lit `saint_core.SCALPING_MAX_HOLDING`")
 
 # ============================================================
 print("\n5. CLOTURER RESTE INTERDIT HORS POSITION")

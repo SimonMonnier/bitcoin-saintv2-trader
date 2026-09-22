@@ -111,6 +111,11 @@ def _moy(v):
     return float(_np.mean(v)) if len(v) else 0.0
 
 
+def _max(v):
+    import numpy as _np
+    return float(_np.max(v)) if len(v) else 0.0
+
+
 def _split_by_side(trades_pnl, trades_side):
     """Renvoie (pnl_long, pnl_short) avec chacun (wins, losses, total_pnl)."""
     long_w  = [p for p, s in zip(trades_pnl, trades_side) if s == 1 and p > 0]
@@ -134,6 +139,13 @@ torch.manual_seed(SEED)
 from saint_core import (
     PolitiqueEnsemble,
     N_POS_FEATURES,
+    SCALPING_MAX_HOLDING,
+    # LES DEUX ACTIONS DE SORTIE, importees et non recopiees. Un `1` en dur
+    # a la place de `FERMER` ne leverait aucune erreur : il ferait seulement
+    # fermer quand il faut tenir, si l'ordre changeait un jour.
+    TENIR,
+    FERMER,
+    N_ACTIONS_SORTIE,
     # LES TROIS CONSTANTES DE LA TETE DE PROFIT. Elles sont importees
     # plutot que recopiees : `entree_profit` s'en sert pour extraire les
     # quatre colonnes, et un indice recopie ici finirait par diverger de
@@ -978,7 +990,26 @@ class PPOConfig:
     # que sur un etat ou une position EXISTE. Voir
     # `cibles_m1.echantillon_cloture`, qui les fabrique sans passer par le
     # simulateur — donc independamment de la politique, comme la grille.
-    pas_cloture_par_epoch: int = 240
+    # LES DEUX TETES SUPERVISEES SONT DEBRANCHEES, PAS SUPPRIMEES.
+    #
+    # `tete_cloture` et `tete_profit` ont bien appris — rho +0.355 et
+    # +0.272, au-dessus de la mesure hors ligne. Ce ne sont pas elles qui
+    # ont echoue, ce sont les REGLES qui transformaient leurs predictions
+    # en decisions : quatre calibrations successives, toutes fausses, et la
+    # derniere laissait 74 % des GAGNANTS se faire solder par la fin
+    # d'episode.
+    #
+    # LA SORTIE EST DESORMAIS UNE POLITIQUE PPO sur les memes quatre
+    # colonnes. Les garder en parallele « comme diagnostic » a ete
+    # explicitement refuse, et c'est defendable : deux organes qui
+    # repondent a la meme question finissent par diverger, et on ne saurait
+    # plus lequel a decide.
+    #
+    # A ZERO, LEUR PASSE NE TOURNE PLUS. Les tenseurs restent dans le
+    # reseau pour que les points de reprise anterieurs se chargent — meme
+    # convention que `actor` et `critic` depuis la suppression de la
+    # direction. Remettre 240 les rallume sans rien toucher d'autre.
+    pas_cloture_par_epoch: int = 0
     # LA PRISE DE PROFIT : fermer quand il ne reste plus rien a prendre.
     #
     # `tete_profit` predit COMBIEN il reste a gagner d'ici l'epuisement, en
@@ -1005,8 +1036,74 @@ class PPOConfig:
     #
     # A ZERO, LA REGLE EST DESACTIVEE et la tete devient un ornement — le
     # meme etat que `tete_cloture` a connu pendant des jours.
-    seuil_profit: float = 1.0
-    pas_profit_par_epoch: int = 240
+    # LA PRISE DE PROFIT EST SANS ECHELLE, COMME LE STOP.
+    #
+    #     fermer si   reste_predit  <  coupe_profit x latent
+    #
+    # « Ce qu'il reste a prendre est petit devant ce que j'ai deja. » Un
+    # critere d'EPUISEMENT, pas un objectif de gain.
+    #
+    # ELLE ETAIT UNE CONSTANTE EN ATR, ET LE RUN L'A PAYE. Avec
+    # `reste < 1.00 ATR`, l'epoch 1 du 2026-09-22 rend :
+    #
+    #     tenue[G 3/15  P 52/88  x0.2]     WR 89.2 %   PF 0.60
+    #
+    # Le rapport INVERSE : on tenait les perdants six fois plus longtemps
+    # que les gagnants. Les deux portes ne parlaient pas la meme langue —
+    # le stop compare a un multiple du risque predit, donc il suit le
+    # marche ; la prise de profit comparait a une constante, donc non.
+    #
+    # LE BALAYAGE QUI A FIXE 0.25, entrees validees, aucun plafond,
+    # friction reelle, horizon 72 h :
+    #
+    #     aucune prise de profit        NET +22.25  avantage +12.13  0.0 %
+    #     reste < 0.25 x latent         NET +22.89  avantage +12.79  0.4 %
+    #     reste < 0.50 x latent         NET +22.90  avantage +11.11 18.9 %
+    #     reste < 1.00 x latent         NET  +9.20  avantage  -2.55 53.8 %
+    #     reste < 2.00 x latent         NET  -3.91  avantage -22.06 72.7 %
+    #
+    # ET IL FAUT LIRE CE TABLEAU POUR CE QU'IL EST. Aucune valeur ne
+    # RAPPORTE quoi que ce soit de mesurable : le gain de 0.25 vaut
+    # +0.64 bps sur sept mois d'evaluation, indiscernable du bruit. Ce que
+    # le tableau etablit, c'est qu'au-dela de 0.5 la regle DETRUIT. On
+    # prend donc la valeur la plus timide qui morde encore, pour que la
+    # porte existe sans pouvoir se deregler.
+    #
+    # A ZERO, LA REGLE EST DESACTIVEE et la tete redevient un ornement.
+    coupe_profit: float = 0.25
+    # LA TETE NE DECIDE QU'UNE FOIS QU'ELLE SAIT.
+    #
+    # A l'epoch 1 elle est a `rho +0.066` et predit `reste median 4.39 ATR`
+    # la ou une tete ajustee en predit 13.5 : elle declenchait parce
+    # qu'elle se TROMPAIT. A l'epoch 2, `rho +0.099`, et `fermerait`
+    # tombait deja de 10.2 % a 1.6 % — elle se corrige seule, mais elle
+    # avait le droit de decider pendant qu'elle etait fausse.
+    #
+    # C'est le SEUL defaut que la mesure etablisse clairement.
+    rho_profit_min: float = 0.10
+    # LE LOYER DU TEMPS, EN ATR PAR BARRE TENUE.
+    #
+    # C'EST ICI QUE LE SCALPING S'ECRIT, et nulle part ailleurs. Le plafond
+    # de detention a ete retire ; la duree n'est donc plus BORNEE, elle est
+    # TARIFEE. Une position qui paie son loyer vit, les autres non.
+    #
+    # LA VALEUR EST DERIVEE, PAS CHOISIE. On veut qu'une detention de
+    # trente minutes coute environ le quart d'un aller-retour :
+    #
+    #     aller-retour reel      4.18 bps
+    #     ATR median d'une barre 5.3 bps   ->  0.79 ATR par aller-retour
+    #     le quart, sur 30 barres           ->  0.0066 ATR par barre
+    #
+    # A ZERO, LA POLITIQUE REAPPREND A TENIR DES JOURS — c'est exactement
+    # ce que le run du 2026-09-22 a fait quand plus rien ne tarifait le
+    # temps. Le monter raccourcit les trades, le baisser les allonge : ce
+    # reglage EST le curseur scalping/swing, et il est explicite.
+    #
+    # A COMPARER A LA DERIVE DU MARCHE : +0.231 bps par heure, soit
+    # 0.00073 ATR par barre. Le loyer vaut NEUF FOIS la derive — tenir
+    # sans raison coute donc reellement quelque chose.
+    loyer_temps_atr: float = 0.0066
+    pas_profit_par_epoch: int = 0
     # L'HORIZON SUR LEQUEL ELLE JUGE — ET IL FIXE AUSSI CELUI DE L'ENTREE.
     #
     # Cette valeur est la source unique de trois choses : la cible de
@@ -1065,7 +1162,29 @@ class PPOConfig:
     # restait pas assez longtemps pour toucher. CE N'EST PLUS DU SCALPING
     # et il faut le savoir : huit heures de detention, une position a la
     # fois, environ 90 trades par mois reellement jouables.
-    horizon_cloture: int = 480
+    # ================================================================
+    # RETOUR AU SCALPING — ET C'EST UNE DERIVE QU'IL FAUT NOMMER.
+    # ================================================================
+    #
+    # Cette valeur a ete 30, puis 120, puis 480 dans la meme journee. Chaque
+    # pas etait justifie par une mesure — le creux paie a 120, l'avantage
+    # grandit jusqu'a 480 — et PERSONNE N'A VERIFIE LA DIRECTION CUMULEE.
+    # On est parti d'un scalpeur M1 et on est arrive a des positions de
+    # TROIS JOURS : `tenue[G 3330/3074 P 379/1086]`, maximum 5 517 minutes.
+    #
+    # C'est le mode d'echec classique de l'optimisation locale : quarante
+    # pas justifies un par un menent ou personne ne voulait aller. Le
+    # proprietaire du depot l'a vu avant moi.
+    #
+    # 60 MINUTES, ET PLUS 480. L'horizon d'etiquetage revient a une heure —
+    # une duree ou le mot scalping garde un sens. On sait ce que ca coute :
+    # l'avantage du creux mesure sur 23 mois valait +11.95 bps a 480 min et
+    # seulement +3.22 a 120. A 60 il sera plus faible encore.
+    #
+    # ON L'ASSUME, PARCE QUE L'ALTERNATIVE ETAIT DE CHANGER DE PRODUIT sans
+    # le decider. Un avantage plus mince sur la geometrie voulue vaut mieux
+    # qu'un avantage plus gros sur une strategie que personne n'a demandee.
+    horizon_cloture: int = 60
     # La tenue maximale tiree dans l'echantillon. Au-dela, la position est
     # plus vieille que tout ce que la tete verra.
     #
@@ -1074,7 +1193,17 @@ class PPOConfig:
     # s'arretait a 30 pendant que l'environnement tient 120, la colonne
     # d'age saturerait a un quart de la vie reelle des positions et la tete
     # deciderait sur une valeur qu'elle n'a jamais vue.
-    tenue_max_cloture: int = 480
+    # LA TENUE MAXIMALE TIREE DANS L'ECHANTILLON — ET PLUS LE PLAFOND.
+    #
+    # Ces deux roles etaient le meme reglage jusqu'au 2026-09-22 :
+    # `plafond_detention` rendait cette valeur en M1. Le plafond a ete
+    # retire ; il ne reste que le role d'echantillonnage.
+    #
+    # ELLE MONTE A 1440 POUR SUIVRE. Sans horloge, une position vit bien
+    # au-dela de 480 barres. Si l'echantillon s'arretait la, les deux tetes
+    # decideraient sur des ages qu'elles n'ont jamais vus — exactement ce
+    # que `echantillon_cloture` existe pour empecher.
+    tenue_max_cloture: int = 180
     # LA REGLE DE SORTIE :  fermer si  latent < -(marge + k x risque)
     #
     # Tout est en ATR D'ENTREE — `latent_atr` est la colonne 1 de l'etat,
@@ -2006,10 +2135,34 @@ class PPOConfig:
     # 200 s VISENT TROIS A QUATRE EPISODES. L'epoch passe d'environ 4 a 7
     # minutes ; c'est le prix d'une barre calibree sur quelques milliers
     # de decisions plutot que sur six cents.
-    secondes_collecte_max: int = 200
+    #
+    # LE RETRAIT DU PLAFOND DE DETENTION A TOUT CHANGE. Sans horloge, une
+    # position vit des heures, et comme l'environnement n'en tient qu'UNE
+    # a la fois, il passe l'essentiel de son temps a ne pas pouvoir
+    # decider. Mesure a l'epoch 1 du 2026-09-22 :
+    #
+    #     ENV [B 0.1 %  S 0.0 %  H 99.9 %  C 0.1 %]
+    #     524 decisions sur 7 episodes, contre 7 468 avant le retrait
+    #
+    # Ce n'est pas un defaut, c'est l'arithmetique : le nombre d'occasions
+    # vaut la duree de marche divisee par la duree d'un trade, et cette
+    # derniere a ete multipliee par vingt. `sommet` se mesurait sur 66
+    # occasions independantes — du bruit.
+    #
+    # LA REPONSE EST PLUS D'EPISODES EN PARALLELE, chacun tenant sa propre
+    # position. Le budget passe a 600 s : la collecte est desormais
+    # dominee par l'attente, pas par le calcul, donc un episode de plus
+    # coute peu.
+    secondes_collecte_max: int = 600
     # ET LA CROISSANCE EST BORNEE. Sans cela le premier ajustement saute au
     # plafond avant que la mesure de temps n'ait servi une seule fois.
-    croissance_episodes_max: float = 1.5
+    #
+    # ET ELLE MONTE A 3.0 AVEC LE RETRAIT DU PLAFOND. A 1.5, partant de 7
+    # episodes, il en faut huit epochs pour atteindre la centaine que la
+    # detention longue reclame — huit epochs pendant lesquelles la tete de
+    # rang se calibre sur du bruit. La borne existe pour empecher un saut
+    # AVANT la premiere mesure de temps ; a 3.0 elle le fait encore.
+    croissance_episodes_max: float = 3.0
     # ------------------------------------------------------------------
     # Idem pour la validation : 21-32 trades donnaient un Sortino purement
     # bruité (PF 3.10 puis 0.51 d'une epoch à l'autre), donc une sélection du
@@ -3108,7 +3261,13 @@ class PPOConfig:
     #
     # A 30 : ~0.23 pour un trade median, saturation au-dela de 90 barres
     # (environ 1 % des trades, 98.2 % se resolvant en 60 barres).
-    scalping_max_holding: int = 30
+    #
+    # ELLE N'EST PLUS ECRITE ICI. Elle vit dans `saint_core`, que le live
+    # lit aussi — voir la mesure de saturation qui l'a portee a 480. Le
+    # commentaire ci-dessus avertissait deja qu'un reglage duplique finit
+    # par diverger ; il avait raison, et il manquait la TROISIEME copie,
+    # en dur dans `cibles_m1`.
+    scalping_max_holding: int = SCALPING_MAX_HOLDING
 
     # SORTIE PAR LE TEMPS — DESACTIVEE (0 = pas de plafond).
     #
@@ -3654,8 +3813,36 @@ def plafond_detention(cfg) -> int:
     _exp = int(getattr(cfg, "max_holding_bars", 0))
     if _exp > 0:
         return _exp
-    if getattr(cfg, "timeframe_entrainement", "M5") == "M1":
-        return int(getattr(cfg, "tenue_max_cloture", 30))
+    # PLUS AUCUN PLAFOND DEDUIT, ET C'EST UNE DECISION ASSUMEE.
+    #
+    # En M1 cette fonction rendait `tenue_max_cloture`, donc une sortie
+    # FORCEE PAR L'HORLOGE. Mesure du 2026-09-22 : elle decidait de
+    # 100 % des sorties gagnantes — mediane ET moyenne de tenue des
+    # gagnants egales au plafond, sans une exception. « Gagnant » ne
+    # voulait pas dire « une tete a decide de sortir avec un gain » mais
+    # « le trade a survecu au chronometre ».
+    #
+    # LES DEUX PORTES SONT DESORMAIS DES TETES : `tete_cloture` coupe la
+    # perte, `tete_profit` prend le gain. Aucune horloge ne tranche a leur
+    # place. C'est ce que le proprietaire du depot a demande, deux fois, et
+    # c'est ce que la mesure du sommet soutient : il tombe a 49 minutes au
+    # dixieme centile et a 2 770 au quatre-vingt-dixieme, ecart-type 991.
+    # Un plafond constant ferme tous les gagnants au meme instant.
+    #
+    # CE QUE CA COUTE, ET IL FAUT LE LIRE AVEC. L'avantage de la strategie
+    # PLAFONNE entre 48 et 96 heures puis s'effondre — +25.38 bps a 2 880
+    # minutes, +17.10 a 5 760, et le test du signe n'y est plus
+    # significatif. Sans horloge, c'est `tete_profit` SEULE qui empeche une
+    # position de pourrir au-dela de l'epuisement. Elle est donc devenue
+    # portante, et son seuil n'est pas mesure.
+    #
+    # LE FILET QUI RESTE est la fin d'episode, pas une regle : le
+    # simulateur solde ce qui est encore ouvert. Le journal affiche la
+    # tenue MAXIMALE a chaque epoch — une position immortelle s'y verra.
+    #
+    # `max_holding_bars`, pose explicitement, reste prioritaire : c'est la
+    # porte de sortie pour qui veut retablir un plafond sans toucher au
+    # code.
     return 0
 
 
@@ -3716,12 +3903,54 @@ def entree_profit(x, n_base: int):
     ], axis=1).astype(_np.float32)
 
 
-def demande_profit(policy, etats, device, n_base: int, seuil: float = 0.0):
+def decide_sortie(policy, etats, device, n_base: int, explore: bool = True):
+    """Tenir ou fermer ? Rend (actions, logprobs, valeurs), un par etat.
+
+    ELLE REMPLACE DEUX REGLES ECRITES A LA MAIN, et c'est tout son objet.
+    `demande_cloture` seuillait un risque predit, `demande_profit` un
+    reste predit. Les deux tetes apprenaient bien — rho +0.355 et +0.272 —
+    et les quatre calibrations successives de leurs seuils ont echoue :
+
+        seuil absolu       tenue[G 3/15 P 52/88 x0.2], rapport INVERSE
+        + latent > 0       x0.5, toujours inverse
+        seuil relatif      `fermerait 0.0 %` sur 51 epochs sur 53
+        echelle redressee  74 % des GAGNANTS soldes par la fin d'episode
+
+    Le defaut n'etait pas dans la calibration mais dans l'idee de seuiller
+    une amplitude. Ici il n'y a plus de seuil : la politique SORT la
+    decision.
+
+    ON ECHANTILLONNE A L'ENTRAINEMENT, on prend l'argmax ailleurs. PPO a
+    besoin que l'action jouee vienne de la distribution qu'il met a jour —
+    sinon le rapport de vraisemblance perd son sens, et le depot documente
+    deja cette faute sous « l'action executee ne vient d'AUCUNE des
+    politiques mises a jour ». En validation et en test on veut la
+    decision, pas son bruit.
+    """
+    p = torch.from_numpy(entree_profit(etats, n_base)).to(device)
+    with torch.no_grad():
+        logits, valeur = policy.sortie(p)
+        dist = torch.distributions.Categorical(logits=logits)
+        a = dist.sample() if explore else logits.argmax(-1)
+        lp = dist.log_prob(a)
+    return (a.cpu().numpy().astype(np.int64),
+            lp.cpu().numpy().astype(np.float32),
+            valeur.cpu().numpy().astype(np.float32))
+
+
+def demande_profit(policy, etats, device, n_base: int, coupe: float = 0.0,
+                   rho_min: float = 0.0):
     """Faut-il PRENDRE LE PROFIT ? Un booleen par etat en position.
 
     LA REGLE EST SYMETRIQUE DU STOP, et se lit de la meme facon :
 
-        fermer si  reste_predit  <  seuil
+        fermer si  reste_predit  <  coupe x latent
+
+    SANS ECHELLE, exactement comme le stop compare le latent a un multiple
+    du risque predit. Une constante en ATR ne suit pas le marche et se
+    deregle des que la tete se trompe d'amplitude — c'est ce qui a inverse
+    le rapport des tenues le 2026-09-22, gagnants tenus 3 minutes et
+    perdants 52.
 
     `tete_profit` rend une amplitude — ce qu'il reste a prendre d'ici
     l'epuisement, en ATR d'entree — apres softplus, donc positive. Quand
@@ -3733,14 +3962,51 @@ def demande_profit(policy, etats, device, n_base: int, seuil: float = 0.0):
     hasard.
     """
     import numpy as _np
-    if float(seuil) <= 0.0:
+    # DEUX VERROUS AVANT MEME DE REGARDER L'ETAT.
+    #
+    # `coupe` a zero desactive la regle. Et tant que la tete n'a pas
+    # atteint `rho_min`, elle ne decide de rien : `_rho_profit` est pose
+    # par la passe supervisee a chaque epoch et vaut zero avant la
+    # premiere, donc une tete jamais entrainee est muette par defaut.
+    _rho = float(getattr(policy, "_rho_profit", 0.0))
+    if float(coupe) <= 0.0 or not _np.isfinite(_rho) or _rho < float(rho_min):
         n = 1 if _np.asarray(etats).ndim == 2 else len(etats)
         return _np.zeros(n, dtype=bool)
     p = entree_profit(etats, n_base)
     with torch.no_grad():
         z = policy.profit(torch.from_numpy(p).to(device)).squeeze(-1)
     reste = torch.nn.functional.softplus(z).float().cpu().numpy()
-    return reste < float(seuil)
+    # LE REDRESSEMENT D'ECHELLE, mesure par la passe supervisee a chaque
+    # epoch. Sans lui, une tete dont l'ORDRE est juste mais la MAGNITUDE
+    # quatre fois trop basse declenche cent fois trop souvent — c'est
+    # exactement ce qui s'est produit le 2026-09-22.
+    reste = reste * float(getattr(policy, "_echelle_profit", 1.0))
+
+    # ELLE NE FERME QU'UNE POSITION EN GAIN, ET C'EST VRAI PAR DEFINITION.
+    #
+    # LA PREMIERE VERSION N'AVAIT PAS CETTE CONDITION, et le run du
+    # 2026-09-22 l'a payee en une epoch :
+    #
+    #     tenue[G 1/11  P 1/10  x1.1]     le rapport valait 19.6 en simulation
+    #     ENV [B 28.0%  H 44.1%  C 27.9%] ouvrir et refermer a la barre suivante
+    #     PF 0.46, sommet -0.420 contre -0.154 au hasard
+    #
+    # A l'entree le latent est NEGATIF — on vient de payer le spread — et
+    # une tete encore incertaine predit volontiers moins d'un ATR de reste.
+    # La regle fermait donc immediatement, sur une perte.
+    #
+    # UNE PRISE DE PROFIT QUI FERME UNE PERTE N'EST PAS UNE PRISE DE
+    # PROFIT, C'EST UN SECOND MAUVAIS STOP. Le vrai stop, lui, a toujours
+    # exige un latent negatif ; son symetrique doit exiger un latent
+    # positif. J'ai construit l'un sans donner a l'autre la condition
+    # miroir.
+    #
+    # LE COUT DE SORTIE N'ENTRE PAS DANS LE SEUIL. Il sera paye de toute
+    # facon, donc il s'annule entre « fermer » et « tenir » — meme
+    # raisonnement que `cibles_m1.cible_cloture`, et le facturer ici ferait
+    # tenir trop longtemps.
+    latent = p[:, 0]
+    return (reste < float(coupe) * latent) & (latent > 0.0)
 
 
 def demande_cloture(policy, etats, device, n_base: int,
@@ -7392,6 +7658,41 @@ def run_training_on_split(
         last_reason = [None] * n_envs
         active = list(range(n_envs))
 
+        # ============================================================
+        # LE TAMPON DE LA POLITIQUE DE SORTIE
+        # ============================================================
+        #
+        # UNE TRANSITION PAR BARRE TENUE, et c'est ce qui rend ce probleme
+        # traitable la ou l'entree ne l'est pas :
+        #
+        #     decision d'ENTREE   ~55 occasions independantes par fenetre
+        #     decision de SORTIE  une par barre de chaque trade
+        #
+        # LA RECOMPENSE TELESCOPE, et c'est le point du schema :
+        #
+        #     a chaque barre tenue   latent_t - latent_{t-1} - loyer
+        #     a la fermeture         - loyer, et fin
+        #
+        # La somme sur un trade vaut exactement `latent_final -
+        # latent_entree - loyer x duree`. Comme `latent_entree` porte deja
+        # le spread paye a l'ouverture, ce total EST le net realise en ATR,
+        # moins le loyer du temps. Aucun terme de friction a ajouter a la
+        # main : il est deja dans le latent, et le cout de SORTIE sera paye
+        # de toute facon — il s'annule donc entre « fermer » et « tenir »,
+        # meme raisonnement que `cibles_m1.cible_cloture`.
+        #
+        # UNE APPROXIMATION ASSUMEE. Le latent est lu a la CLOTURE de la
+        # barre, l'environnement solde a l'OUVERTURE de la suivante : il
+        # manque un pas au dernier terme. C'est la meme convention que
+        # `cibles_m1.echantillon_cloture` documente pour le prix d'entree,
+        # et du meme ordre de grandeur.
+        sortie_buf = [[] for _ in range(n_envs)]
+        # Le latent de la barre PRECEDENTE, par environnement. NaN veut
+        # dire « pas de position en cours » — on ne peut alors pas calculer
+        # de difference.
+        lat_prec = np.full(n_envs, np.nan, dtype=np.float64)
+        _loyer = float(getattr(cfg, "loyer_temps_atr", 0.0))
+
         # Sélectivité visée cette epoch, et seuil absolu qui la réalise.
         # Le seuil vient du quantile mesuré à l'epoch PRÉCÉDENTE : à l'epoch 1 il
         # n'existe pas encore, on laisse alors passer toutes les décisions plutôt
@@ -7495,6 +7796,13 @@ def run_training_on_split(
         # A K=1 le dictionnaire n'a jamais plus d'une entree et la sequence
         # est celle d'avant : meme etat de decision, meme recompense
         # accumulee, meme drapeau de fin.
+        # SANS CETTE REMISE A ZERO, une position fermee puis rouverte
+        # verrait sa premiere difference de latent calculee contre le
+        # latent de la position PRECEDENTE — une recompense fabriquee de
+        # toutes pieces, et qu'aucune erreur ne signalerait.
+        def _oublie_sortie(k):
+            lat_prec[k] = np.nan
+
         pending: List[Dict[int, Dict]] = [dict() for _ in range(n_envs)]
         # Decision prise a cette barre, pas encore rattachee : on ne connait
         # son emplacement qu'APRES le pas, puisque c'est l'environnement qui
@@ -7593,18 +7901,32 @@ def run_training_on_split(
             _en_pos = [k for k in active
                        if k not in deciding and envs[k].n_positions > 0]
             if _en_pos:
-                _f = demande_cloture(
-                    policy, [states[k] for k in _en_pos], device, N_BASE_FEATURES,
-                    getattr(cfg, 'coupe_risque', 0.0),
-                    getattr(cfg, 'marge_sortie', 1.0))
-                # LA SECONDE PORTE DE SORTIE : il n'y a plus rien a
-                # prendre. C'est la seule qui puisse fermer une position
-                # EN GAIN — `demande_cloture` exige un latent negatif.
-                _fp = demande_profit(
-                    policy, [states[k] for k in _en_pos], device,
-                    N_BASE_FEATURES, getattr(cfg, 'seuil_profit', 0.0))
+                # LA SORTIE EST DECIDEE PAR LA POLITIQUE, plus par deux
+                # seuils ecrits a la main. Voir `decide_sortie` pour les
+                # quatre calibrations successives qui ont echoue.
+                _ep = [states[k] for k in _en_pos]
+                _sa, _slp, _sv = decide_sortie(
+                    policy, _ep, device, N_BASE_FEATURES, explore=True)
+                _pin = entree_profit(_ep, N_BASE_FEATURES)
                 for _bi, _k in enumerate(_en_pos):
-                    if bool(_f[_bi]) or bool(_fp[_bi]):
+                    _lat = float(_pin[_bi, 0])
+                    # LA RECOMPENSE DE LA TRANSITION PRECEDENTE se calcule
+                    # ICI, une barre plus tard : c'est maintenant qu'on
+                    # connait le latent qui a suivi.
+                    if sortie_buf[_k] and np.isfinite(lat_prec[_k]):
+                        sortie_buf[_k][-1]["r"] = (
+                            _lat - float(lat_prec[_k]) - _loyer)
+                    _ferme = int(_sa[_bi]) == FERMER
+                    sortie_buf[_k].append({
+                        "p": _pin[_bi].copy(), "a": int(_sa[_bi]),
+                        "lp": float(_slp[_bi]), "v": float(_sv[_bi]),
+                        # A la fermeture il ne reste que le loyer : le gain
+                        # accumule l'a deja ete, barre apres barre.
+                        "r": (-_loyer) if _ferme else 0.0,
+                        "done": bool(_ferme),
+                    })
+                    lat_prec[_k] = np.nan if _ferme else _lat
+                    if _ferme:
                         actions_env[_k] = 3
 
             if deciding:
@@ -8461,11 +8783,127 @@ def run_training_on_split(
 
 
         _chrono["maj PPO"] = time.time() - _t_phase; _t_phase = time.time()
+        # ============================================================
+        # PPO SUR LA SORTIE — ET SEULEMENT SUR LA SORTIE
+        # ============================================================
+        #
+        # L'ENTREE N'EST PAS ENTRAINEE PAR PPO, et ce n'est pas un oubli.
+        # Le journal du depot chiffre pourquoi : « toute conclusion tiree
+        # d'un ecart de validation inferieur a 0.2 R par trade est du
+        # bruit, y compris les "PPO degrade la validation" accumules
+        # depuis exec24. Ces runs n'ont pas montre que PPO nuit ; ils
+        # n'ont rien montre. » Le plancher venait de la RARETE des
+        # occasions d'entree — une cinquantaine par fenetre. La SORTIE en
+        # offre une par barre de chaque trade, et sa consequence se
+        # realise dans le trade meme : l'attribution de credit est courte
+        # et les donnees abondantes.
+        #
+        # L'ACTEUR D'ENTREE RESTE GELE. `actor` et `critic` ne sont
+        # toujours pas calcules ; seuls `mlp_sortie`, `acteur_sortie` et
+        # `critique_sortie` recoivent un gradient ici.
+        _ppo = {"n": 0, "actor": float("nan"), "critic": float("nan"),
+                "H": float("nan"), "kl": float("nan"), "clip": 0.0,
+                "ferme": float("nan")}
+        _tr = [t for k in range(n_envs) for t in sortie_buf[k]]
+        if len(_tr) >= 256:
+            policy.train()
+            _optim_s = optim.Adam(
+                list(policy.mlp_sortie.parameters())
+                + list(policy.acteur_sortie.parameters())
+                + list(policy.critique_sortie.parameters()),
+                lr=float(cfg.lr), eps=1e-8)
+            _gam = float(getattr(cfg, "gamma", 0.99))
+            # LE NOM EXACT EST `lambda_gae`, et `gae_lambda` n'existe pas
+            # dans cette configuration. Un `getattr` avec defaut aurait
+            # silencieusement pris 0.95 meme si le reglage valait autre
+            # chose — un repli muet de plus, exactement ce que ce depot
+            # paie le plus souvent.
+            _lam = float(cfg.lambda_gae)
+            _P, _A, _LP, _RET, _ADV = [], [], [], [], []
+            for _k in range(n_envs):
+                _b = sortie_buf[_k]
+                if not _b:
+                    continue
+                # LA DERNIERE TRANSITION EST TERMINALE MEME SI LA
+                # POLITIQUE N'A PAS FERME : l'episode s'arrete et
+                # l'environnement solde. Bootstrapper au-dela ferait
+                # esperer une suite qui n'existe pas.
+                _b[-1]["done"] = True
+                _adv, _n = 0.0, len(_b)
+                _av = [0.0] * _n
+                for _t in range(_n - 1, -1, -1):
+                    _nt = 0.0 if _b[_t]["done"] else 1.0
+                    _vn = _b[_t + 1]["v"] if (_t + 1 < _n) else 0.0
+                    _d = _b[_t]["r"] + _gam * _vn * _nt - _b[_t]["v"]
+                    _adv = _d + _gam * _lam * _nt * _adv
+                    _av[_t] = _adv
+                for _t in range(_n):
+                    _P.append(_b[_t]["p"]); _A.append(_b[_t]["a"])
+                    _LP.append(_b[_t]["lp"]); _ADV.append(_av[_t])
+                    _RET.append(_av[_t] + _b[_t]["v"])
+            _P = torch.tensor(np.asarray(_P, np.float32), device=device)
+            _A = torch.tensor(np.asarray(_A, np.int64), device=device)
+            _LP = torch.tensor(np.asarray(_LP, np.float32), device=device)
+            _RET = torch.tensor(np.asarray(_RET, np.float32), device=device)
+            _ADV = torch.tensor(np.asarray(_ADV, np.float32), device=device)
+            # L'AVANTAGE EST CENTRE REDUIT SUR LE LOT. Sans cela son
+            # echelle suit le loyer du temps, et le meme `clip_eps`
+            # mordrait differemment selon un reglage qui n'a rien a voir.
+            _ADV = (_ADV - _ADV.mean()) / (_ADV.std() + 1e-8)
+            _eps = float(getattr(cfg, "clip_eps", 0.2))
+            _ce = float(getattr(cfg, "entropy_coef", 0.01))
+            _cv = float(getattr(cfg, "value_coef", 0.5))
+            _nlot = max(1, len(_A) // max(1, int(cfg.batch_size)))
+            _la, _lc, _lh, _lk, _lcl, _np_ = [], [], [], [], [], 0
+            # QUATRE PASSES SUR LE MEME LOT. La configuration n'expose
+            # pas ce reglage — PPO ayant ete supprime, il avait disparu —
+            # et on le pose ici plutot que de le lire d'un champ absent.
+            for _ in range(4):
+                _perm = torch.randperm(len(_A), device=device)
+                for _i in range(_nlot):
+                    _m = _perm[_i::_nlot]
+                    _lg, _vv = policy.sortie(_P[_m])
+                    _dist = torch.distributions.Categorical(logits=_lg)
+                    _lpn = _dist.log_prob(_A[_m])
+                    _rt = torch.exp(_lpn - _LP[_m])
+                    _o1 = _rt * _ADV[_m]
+                    _o2 = torch.clamp(_rt, 1 - _eps, 1 + _eps) * _ADV[_m]
+                    _pa = -torch.min(_o1, _o2).mean()
+                    _pc = torch.nn.functional.mse_loss(_vv, _RET[_m])
+                    _ph = _dist.entropy().mean()
+                    _perte = _pa + _cv * _pc - _ce * _ph
+                    _optim_s.zero_grad(set_to_none=True)
+                    _perte.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        list(policy.mlp_sortie.parameters())
+                        + list(policy.acteur_sortie.parameters())
+                        + list(policy.critique_sortie.parameters()),
+                        float(cfg.max_grad_norm))
+                    _optim_s.step()
+                    _la.append(float(_pa)); _lc.append(float(_pc))
+                    _lh.append(float(_ph))
+                    _lk.append(float((_LP[_m] - _lpn).mean()))
+                    _lcl.append(float(((_rt - 1).abs() > _eps).float().mean()))
+                    _np_ += 1
+            _ppo = {"n": len(_A), "actor": float(np.mean(_la)),
+                    "critic": float(np.mean(_lc)), "H": float(np.mean(_lh)),
+                    "kl": float(np.mean(_lk)), "clip": float(np.mean(_lcl)),
+                    "ferme": float((_A == FERMER).float().mean())}
+            print(f"  {_col('phase', _C.GREY)}  PPO sortie  "
+                  f"{_ppo['n']:,} transitions  "
+                  f"ActorL {_ppo['actor']:+.4f}  CriticL {_ppo['critic']:.4f}  "
+                  f"H {_ppo['H']:.3f}/{np.log(N_ACTIONS_SORTIE):.3f}  "
+                  f"KL {_ppo['kl']:+.4f}  clip {100*_ppo['clip']:.0f}%  "
+                  f"ferme {100*_ppo['ferme']:.1f}%")
+        else:
+            print(f"  {_col('phase', _C.GREY)}  PPO sortie  "
+                  f"{len(_tr)} transitions — trop peu pour une mise a jour")
+
         # SANS CETTE LIGNE ON LIRAIT `ActorL 0.0000 CriticL 0.0000` et on
-        # chercherait une panne. Ce sont des zeros VOULUS : la mise a jour
-        # PPO a ete SUPPRIMEE, pas desactivee. Les transitions restent
-        # collectees pour calibrer la barre d'entree.
-        print(f"  {_col('phase', _C.GREY)}  PAS DE PPO — "
+        # chercherait une panne. Ce sont des zeros VOULUS pour l'acteur
+        # d'ENTREE, qui reste gele. La sortie, elle, apprend — voir la
+        # ligne `PPO sortie` juste au-dessus.
+        print(f"  {_col('phase', _C.GREY)}  entree : PAS DE PPO — "
               f"{_n_transitions} transitions collectees, gardees pour la "
               f"calibration de la barre. Le tronc n'apprend que par la tete "
               f"de rang. ActorL/CriticL/KL/gnorm sont nuls par construction.")
@@ -8831,14 +9269,48 @@ def run_training_on_split(
                 # compteur, un seuil trop bas ferait de la tete un
                 # ornement silencieux — l'etat exact ou `tete_cloture` a
                 # vecu pendant des jours.
-                _part_p = float(np.mean(_rp < float(
-                    getattr(cfg, "seuil_profit", 0.0))))
+                # LE COMPTEUR SUIT LA REGLE REELLE, sinon il mesure
+                # autre chose que ce que l'environnement joue : la regle
+                # est relative au latent ET exige un gain.
+                _lat_p = _pin[:, 0].cpu().numpy()
+                _part_p = float(np.mean(
+                    (_rp < float(getattr(cfg, "coupe_profit", 0.0)) * _lat_p)
+                    & (_lat_p > 0.0)))
+                # LE GARDE D'ARMEMENT LIT CETTE VALEUR. Elle est posee sur
+                # la politique elle-meme pour que `demande_profit` la
+                # trouve sans qu'on ait a la faire passer par six appels.
+                policy._rho_profit = (float(_rho_p) if np.isfinite(_rho_p)
+                                      else 0.0)
+                # L'ECHELLE, ET ELLE EST AUSSI IMPORTANTE QUE L'ORDRE.
+                #
+                # `rho` mesure l'ORDRE, pas la MAGNITUDE. Le run du
+                # 2026-09-22 le montre net : la tete atteint rho +0.150 —
+                # exactement la valeur visee hors ligne — en predisant
+                # `reste median 3.57 ATR` la ou la cible en vaut 13. Un
+                # facteur QUATRE d'erreur d'echelle, avec un classement
+                # parfaitement correct.
+                #
+                # ET LA REGLE EST SENSIBLE A L'ECHELLE D'UN COTE. Elle
+                # compare `reste_predit` a `coupe x latent` : le latent est
+                # une grandeur reelle, la prediction non. Resultat, une
+                # regle calibree pour mordre sur 0.4 % des trades en
+                # declenchait 46.9 %.
+                #
+                # ON REDRESSE PAR LE RAPPORT DES MEDIANES. La mediane est
+                # robuste aux queues — et cette cible en a de tres longues.
+                # Le facteur est borne : une tete degeneree ne doit pas
+                # pouvoir fabriquer un redressement de mille.
+                _med_y = float(np.median(_yp_))
+                _ech = _med_y / max(_med_p, 1e-6)
+                policy._echelle_profit = float(np.clip(_ech, 0.1, 10.0))
             print(f"  {_col('phase', _C.GREY)}  profit   "
                   f"perte {_prof_perte:.4f}  "
                   f"rho {_rho_p:+.3f} (etat seul faisait +0.15)  "
-                  f"reste median {_med_p:.2f} ATR  "
-                  f"fermerait {100*_part_p:.1f}% (seuil "
-                  f"{getattr(cfg, 'seuil_profit', 0.0):.2f})")
+                  f"reste median {_med_p:.2f} ATR (cible {float(np.median(_yp_)):.2f}, "
+                  f"echelle x{getattr(policy, '_echelle_profit', 1.0):.2f})  "
+                  f"fermerait {100*_part_p:.1f}% "
+                  f"(coupe {getattr(cfg, 'coupe_profit', 0.0):.2f} x latent, "
+                  f"armee {'OUI' if _rho_p >= float(getattr(cfg, 'rho_profit_min', 0.0)) else 'NON'})")
         # `AuxL` RAPPORTE LA PASSE SUPERVISEE quand la grille existe. Il
         # reportait la perte auxiliaire calculee DANS la boucle PPO ; ce n'est
         # plus la qu'elle s'entraine, et laisser l'ancien compteur afficherait
@@ -9113,16 +9585,14 @@ def run_training_on_split(
                 _vp = [k for k in v_active
                        if k not in deciding and val_envs[k].n_positions > 0]
                 if _vp:
-                    _vf = demande_cloture(
+                    # `explore=False` : on veut la DECISION, pas son
+                    # bruit. Echantillonner en validation ferait juger une
+                    # politique qui n'est pas celle qu'on deploierait.
+                    _va, _, _ = decide_sortie(
                         policy, [v_states[k] for k in _vp], device,
-                        N_BASE_FEATURES,
-                    getattr(cfg, 'coupe_risque', 0.0),
-                    getattr(cfg, 'marge_sortie', 1.0))
-                    _vfp = demande_profit(
-                        policy, [v_states[k] for k in _vp], device,
-                        N_BASE_FEATURES, getattr(cfg, 'seuil_profit', 0.0))
+                        N_BASE_FEATURES, explore=False)
                     for _bi, _k in enumerate(_vp):
-                        if bool(_vf[_bi]) or bool(_vfp[_bi]):
+                        if int(_va[_bi]) == FERMER:
                             v_actions[_k] = 3
 
                 if deciding:
@@ -9957,9 +10427,15 @@ def run_training_on_split(
             f"Sortino {metric:>+6.3f}  "
             f"{_col(f'Sortino30 {s30:>+6.3f}', s30_col)}  "
             f"AvgW {_money(avg_win_train, width=8)}  AvgL {_money(avg_loss_train, width=8)}  "
+            # LA TENUE MAXIMALE Y EST DEPUIS LE RETRAIT DU PLAFOND. Sans
+            # horloge, rien n'empeche structurellement une position de
+            # courir jusqu'a la fin de l'episode ; ce chiffre est le seul
+            # endroit ou ca se verrait. Le fold 1 a deja vecu un trade
+            # tenu 5 759 barres sans que rien ne le signale.
             f"tenue[G {_med(val_tenues_g):.0f}/{_moy(val_tenues_g):.0f} "
             f"P {_med(val_tenues_p):.0f}/{_moy(val_tenues_p):.0f} "
-            f"x{(_moy(val_tenues_g) / max(_moy(val_tenues_p), 1e-9)):.1f}]  "
+            f"x{(_moy(val_tenues_g) / max(_moy(val_tenues_p), 1e-9)):.1f} "
+            f"max {max(_max(val_tenues_g), _max(val_tenues_p)):.0f}]  "
             f"ActorL {np.mean(epoch_actor_loss):>+7.4f}  "
             f"AuxL {np.mean(epoch_aux_loss) if epoch_aux_loss else float(chr(110)+chr(97)+chr(110)):>7.4f}  "
             f"CriticL {np.mean(epoch_critic_loss):>7.4f}  "
@@ -10471,16 +10947,11 @@ def run_training_on_split(
             _tp = [k for k in t_active
                    if k not in deciding and test_envs[k].n_positions > 0]
             if _tp:
-                _tf = demande_cloture(
+                _ta, _, _ = decide_sortie(
                     policy, [t_states[k] for k in _tp], device,
-                    N_BASE_FEATURES,
-                    getattr(cfg, 'coupe_risque', 0.0),
-                    getattr(cfg, 'marge_sortie', 1.0))
-                _tfp = demande_profit(
-                    policy, [t_states[k] for k in _tp], device,
-                    N_BASE_FEATURES, getattr(cfg, 'seuil_profit', 0.0))
+                    N_BASE_FEATURES, explore=False)
                 for _bi, _k in enumerate(_tp):
-                    if bool(_tf[_bi]) or bool(_tfp[_bi]):
+                    if int(_ta[_bi]) == FERMER:
                         t_actions[_k] = 3
 
             if deciding:
@@ -11081,17 +11552,22 @@ if __name__ == "__main__":
         # l'instrument, la friction et le titre bilateral. Un bandeau se
         # lit en diagonale : c'est precisement la qu'une affirmation
         # perimee survit le plus longtemps.
-        _sp_ = float(getattr(cfg_long, "seuil_profit", 0.0))
-        _prof_txt = (f"`tete_profit` quand il reste moins de {_sp_:.2f} ATR "
-                     f"a prendre" if _sp_ > 0.0
-                     else "`tete_profit` DESACTIVEE (seuil_profit nul)")
+        _sp_ = float(getattr(cfg_long, "coupe_profit", 0.0))
+        _prof_txt = (f"`tete_profit` quand il reste moins de {_sp_:.2f} x le "
+                     f"gain deja acquis (et seulement si elle a appris : rho "
+                     f">= {getattr(cfg_long, 'rho_profit_min', 0.0):.2f})"
+                     if _sp_ > 0.0
+                     else "`tete_profit` DESACTIVEE (coupe_profit nul)")
         print(f"SORTIE    AUCUN stop fixe, AUCUN objectif fixe, AUCUN "
               f"trailing — DEUX portes : `tete_cloture` quand la perte "
               f"depasse {getattr(cfg_long, 'coupe_risque', 0.0):.2f} x le "
               f"risque predit, et {_prof_txt}")
-        print(f"          plafond de detention "
-              f"{getattr(cfg_long, 'tenue_max_cloture', _h)} minutes — il ne "
-              f"ferme plus QUE ce que les deux tetes ont laisse courir")
+        _pl_ = plafond_detention(cfg_long)
+        print("          AUCUN plafond de detention — une position vit tant "
+              "que les deux tetes la laissent vivre"
+              if _pl_ <= 0 else
+              f"          plafond de detention {_pl_} minutes "
+              f"(`max_holding_bars` pose a la main)")
         # LE BANDEAU DIT LE COUT REELLEMENT FACTURE, pas une constante.
         #
         # Il affichait `cout_aller_retour`, la constante de repli, alors

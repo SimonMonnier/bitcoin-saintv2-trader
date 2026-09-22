@@ -483,7 +483,14 @@ def echantillon_cloture(df: pd.DataFrame, n: int, horizon: int = HORIZON_DEFAUT,
     # l'environnement fige `entry_atr` a l'ouverture.
     atr = np.maximum(df["atr_14"].to_numpy(np.float64), 1e-9)
     latent_atr = sens * (p_ici - p_entree) / atr[entree]
-    tenue_norm = np.minimum(tenue / 30.0, 3.0)
+    # L'ECHELLE VIENT DE `saint_core`, elle n'est plus recopiee ici. Le
+    # 30.0 en dur a survecu au passage du plafond de 30 a 480 minutes : la
+    # fabrique fournissait des ages satures a 90 barres pendant que
+    # l'environnement en montrait jusqu'a 480. La tete apprenait sur une
+    # distribution et decidait sur une autre — la faute que ce fichier
+    # documente le plus souvent.
+    from saint_core import SCALPING_MAX_HOLDING as _SMH
+    tenue_norm = np.minimum(tenue / max(float(_SMH), 1.0), 3.0)
 
     # LA CIBLE EST LE RISQUE, PLUS LE SIGNE. Voir `cible_risque` pour la
     # mesure qui l'a impose : le signe du mouvement est une piece de

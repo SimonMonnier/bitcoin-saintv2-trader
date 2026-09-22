@@ -163,7 +163,7 @@ RE_SOMMET = re.compile(r"sommet\s+(" + NB + r")R/(" + NB + r")R")
 # sortie n'a aucune prise de profit — elle ne sait que couper les pertes.
 RE_TENUE = re.compile(
     r"tenue\[G (" + NB + r")/(" + NB + r") P (" + NB + r")/(" + NB + r") "
-    r"x(" + NB + r")\]")
+    r"x(" + NB + r") max (" + NB + r")\]")
 
 # LE CRITERE DE SELECTION DEPUIS LE 2026-09-20, et la raison du changement.
 #
@@ -520,14 +520,17 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     # la regle de sortie n'a pas de prise de profit, elle ne sait que
     # couper les pertes.
     if tenue is not None:
-        _mg, _yg, _mp, _yp, _rap = tenue
+        _mg, _yg, _mp, _yp, _rap, _mx = tenue
         _ct = (C.VERT if _rap >= 3.0 else
                (C.ROUGE if _rap < 1.0 else C.GRIS))
-        _fin = ("   les gagnants vont TOUS au plafond — aucune prise de profit"
+        # SANS PLAFOND, LE SIGNAL A GUETTER A CHANGE. Ce n'est plus
+        # « tous les gagnants sortent au meme instant » mais « une
+        # position ne sort jamais ».
+        _fin = ("   les gagnants sortent TOUS au meme instant — regle figee"
                 if (_mg > 0 and abs(_mg - _yg) < 1.0) else "")
         L.append(f"  tenue          gagnant {_mg:.0f} min (mediane) / "
                  f"{_yg:.0f} (moyenne)   perdant {_mp:.0f} / {_yp:.0f}   "
-                 f"{_ct}x{_rap:.1f}{C.FIN}{_fin}")
+                 f"{_ct}x{_rap:.1f}{C.FIN}   max {_mx:.0f} min{_fin}")
 
     if sommet is not None:
         g_top, g_hasard = sommet

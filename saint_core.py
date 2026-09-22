@@ -57,7 +57,46 @@ CLIP_SIGMA = 5.0
 # resolus en 60 barres. A 120 la feature valait ~0.06 pour un trade typique et
 # ne portait quasiment aucune information. A 30 elle vaut ~0.23 et sature
 # au-dela de 90 barres, ce qui ne concerne qu'environ 1 % des trades.
-SCALPING_MAX_HOLDING = 30
+# L'ECHELLE DE LA COLONNE D'AGE. UNE SEULE SOURCE, ET ELLE EN AVAIT TROIS.
+#
+# `bars_held_norm = min(bars_in_position / SCALPING_MAX_HOLDING, 3.0)`, donc
+# la colonne SATURE a trois fois cette valeur. Au-dela, toutes les positions
+# portent exactement le meme nombre et les tetes ne les distinguent plus.
+#
+# ELLE VALAIT 30, ET C'ETAIT JUSTE — quand le plafond de detention valait
+# 30 minutes et que 98.2 % des trades se resolvaient en 60 barres. Le
+# plafond a ete retire le 2026-09-22 et la detention se compte desormais en
+# heures : une colonne qui sature a une heure et demie ne distingue plus
+# rien.
+#
+# CE QUE LA SATURATION COUTAIT, mesure le 2026-09-22 sur la cible de
+# `tete_profit`, memes occasions, seule l'echelle d'age changeant :
+#
+#     age / 1440 (sans saturation)   IC +0.1523   sature 16.7 %
+#     min(age/30, 3.0)   ANCIEN      IC +0.1325   sature 66.7 %
+#     min(age/480, 3.0)  RETENU      IC +0.1523   sature 16.7 %
+#     sans age du tout               IC +0.0994
+#
+# DEUX TIERS DES ECHANTILLONS SATURAIENT. L'age vaut environ 0.05 d'IC a
+# lui seul ; en faire disparaitre l'essentiel en revenait a le retirer a
+# moitie.
+#
+# TROIS FICHIERS ECRIVAIENT CETTE VALEUR : ici, `PPOConfig` pour
+# l'environnement, et `cibles_m1` en dur dans la fabrique d'echantillons.
+# Le commentaire de `PPOConfig` en connaissait deux et avertissait deja que
+# « les changer separement decale l'observation entre les deux ». Les deux
+# autres la LISENT desormais ici.
+# TROISIEME VALEUR EN UN JOUR, ET ELLE SUIT LA GEOMETRIE. 30 quand le
+# plafond valait 30, 480 quand il valait 480, 60 maintenant que le scalping
+# est retabli. La colonne sature a trois fois cette valeur, soit 180 barres
+# — exactement `tenue_max_cloture`.
+#
+# LA LAISSER A 480 AURAIT ETE PIRE QUE DE NE RIEN FAIRE : avec des trades
+# de quelques minutes, `min(age/480, 3.0)` reste colle a zero et la colonne
+# ne distingue plus rien. Le defaut serait l'inverse de celui de ce matin —
+# saturation totale d'un cote, ecrasement total de l'autre — et tout aussi
+# muet. C'est `test_cloture_branchee` qui l'a attrape.
+SCALPING_MAX_HOLDING = 60
 
 
 # ============================================================
@@ -853,6 +892,13 @@ PLAFOND_RISQUE_EQUITE = 0.20
 IDX_PROFIT_POS = (1, 2)      # latent en ATR d'entree, age normalise
 COLS_PROFIT_MARCHE = ("creux_rang", "flux_rang")
 N_PROFIT_FEATURES = len(IDX_PROFIT_POS) + len(COLS_PROFIT_MARCHE)
+
+# DEUX ACTIONS DE SORTIE, DANS CET ORDRE EXACT : tenir, puis fermer.
+# L'ordre est lu par `decide_sortie` et par la boucle de collecte ; une
+# inversion ne leverait aucune erreur, elle ferait seulement fermer quand
+# il faut tenir.
+TENIR, FERMER = 0, 1
+N_ACTIONS_SORTIE = 2
 
 # OU LIRE LES DEUX COLONNES DE LA TETE DE PROFIT, dans le bloc de features.
 #
@@ -1959,6 +2005,65 @@ class SAINTPolicySingleHead(nn.Module):
             nn.Linear(32, 32), nn.GELU())
         self.tete_profit = nn.Linear(32, 1)
 
+        # ============================================================
+        # L'ACTEUR DE SORTIE — LA SORTIE REDEVIENT UNE DECISION APPRISE
+        # ============================================================
+        #
+        # POURQUOI IL EXISTE, ET C'EST UNE HISTOIRE DE MODE D'ECHEC REPETE.
+        # Le 2026-09-22, la sortie a ete confiee a DEUX tetes supervisees :
+        # `tete_cloture` predit le risque, `tete_profit` ce qu'il reste a
+        # prendre, et une REGLE ECRITE A LA MAIN transformait chaque
+        # prediction en decision. Les deux tetes ont bien appris —
+        # `rho +0.355` et `+0.272`, au-dessus de la mesure hors ligne. La
+        # regle, elle, a echoue quatre fois de suite :
+        #
+        #     seuil 1.00 ATR absolu       tenue[G 3/15 P 52/88 x0.2]
+        #     + condition latent > 0      x0.5, toujours inverse
+        #     seuil relatif 0.25 x latent `fermerait 0.0 %` sur 51/53 epochs
+        #     redressement d'echelle      74 % des GAGNANTS soldes par la
+        #                                 fin d'episode, aucune tete
+        #
+        # Chaque correction etait juste et n'a jamais suffi, parce que le
+        # defaut n'etait pas dans la calibration : il etait dans l'idee
+        # meme de seuiller une amplitude predite. PPO SUPPRIME LA REGLE —
+        # la politique sort la decision, pas un nombre qu'il faut ensuite
+        # comparer a quelque chose.
+        #
+        # ET RIEN NE S'Y OPPOSE. Le journal du depot est explicite sur la
+        # suppression de PPO en 2026-09-21 : « toute conclusion tiree d'un
+        # ecart de validation inferieur a 0.2 R par trade est du bruit, y
+        # compris les "PPO degrade la validation" accumules depuis exec24.
+        # Ces runs n'ont pas montre que PPO nuit ; ils n'ont rien montre. »
+        #
+        # LA SORTIE EST UN BIEN MEILLEUR PROBLEME DE RL QUE L'ENTREE, et
+        # c'est quantitatif :
+        #
+        #     decision d'ENTREE   ~55 occasions independantes par fenetre
+        #     decision de SORTIE  une par barre de chaque trade
+        #
+        # Le plancher de bruit qui a tue toutes les mesures PPO passees
+        # vient de la RARETE des occasions d'entree. La sortie n'a pas ce
+        # probleme, et sa consequence se realise dans le trade meme, donc
+        # l'attribution de credit est courte.
+        #
+        # IL LIT LES QUATRE COLONNES DE `tete_profit`, et rien d'autre :
+        # latent, age, creux_rang, flux_rang. La mesure qui l'impose est
+        # la meme — nourrie des 274 colonnes de marche, la meme cible
+        # tombe sous son plancher de bruit avec UN arbre.
+        #
+        # DEUX ACTIONS : tenir, fermer. Pas quatre — il ne decide jamais
+        # d'entrer, et lui laisser des actions impossibles diluerait son
+        # gradient sur des cas qu'il ne voit pas.
+        self.mlp_sortie = nn.Sequential(
+            nn.Linear(N_PROFIT_FEATURES, 64), nn.GELU(),
+            nn.Linear(64, 64), nn.GELU())
+        self.acteur_sortie = nn.Linear(64, N_ACTIONS_SORTIE)
+        # LE CRITIQUE PARTAGE LE TRONC DE L'ACTEUR. Sur quatre colonnes
+        # d'entree, deux corps separes apprendraient deux fois la meme
+        # representation ; et c'est la valeur de l'ETAT qu'il estime, pas
+        # celle d'une action.
+        self.critique_sortie = nn.Linear(64, 1)
+
         self._init_poids()
 
     def _init_poids(self):
@@ -2153,6 +2258,23 @@ class SAINTPolicySingleHead(nn.Module):
             h = self.memoire(h)
         return self.tete_cloture(self.mlp_cloture(self.norm(h)))
 
+    def sortie(self, p: torch.Tensor):
+        """Tenir ou fermer ? Rend (logits, valeur) sur (B, 4) colonnes.
+
+        MEME ENTREE QUE `profit`, et c'est voulu : les deux organes
+        repondent a la meme question sur le meme etat, l'un en predisant
+        une amplitude, l'autre en decidant. Voir `entree_profit` dans
+        `training.py`, qui est le SEUL endroit qui sache extraire ces
+        quatre colonnes.
+
+        L'ACTEUR REND DES LOGITS, PAS UNE PROBABILITE. PPO a besoin du
+        log-rapport entre l'ancienne et la nouvelle politique ; le
+        calculer depuis une probabilite deja normalisee perd en precision
+        sur les queues, la ou le rapport compte le plus.
+        """
+        h = self.mlp_sortie(p)
+        return self.acteur_sortie(h), self.critique_sortie(h).squeeze(-1)
+
     def profit(self, p: torch.Tensor) -> torch.Tensor:
         """Ce qu'il reste a prendre sur la position ouverte. (B, 1).
 
@@ -2304,6 +2426,65 @@ class PatchTSTPolicy(nn.Module):
             nn.Linear(N_PROFIT_FEATURES, 32), nn.GELU(),
             nn.Linear(32, 32), nn.GELU())
         self.tete_profit = nn.Linear(32, 1)
+
+        # ============================================================
+        # L'ACTEUR DE SORTIE — LA SORTIE REDEVIENT UNE DECISION APPRISE
+        # ============================================================
+        #
+        # POURQUOI IL EXISTE, ET C'EST UNE HISTOIRE DE MODE D'ECHEC REPETE.
+        # Le 2026-09-22, la sortie a ete confiee a DEUX tetes supervisees :
+        # `tete_cloture` predit le risque, `tete_profit` ce qu'il reste a
+        # prendre, et une REGLE ECRITE A LA MAIN transformait chaque
+        # prediction en decision. Les deux tetes ont bien appris —
+        # `rho +0.355` et `+0.272`, au-dessus de la mesure hors ligne. La
+        # regle, elle, a echoue quatre fois de suite :
+        #
+        #     seuil 1.00 ATR absolu       tenue[G 3/15 P 52/88 x0.2]
+        #     + condition latent > 0      x0.5, toujours inverse
+        #     seuil relatif 0.25 x latent `fermerait 0.0 %` sur 51/53 epochs
+        #     redressement d'echelle      74 % des GAGNANTS soldes par la
+        #                                 fin d'episode, aucune tete
+        #
+        # Chaque correction etait juste et n'a jamais suffi, parce que le
+        # defaut n'etait pas dans la calibration : il etait dans l'idee
+        # meme de seuiller une amplitude predite. PPO SUPPRIME LA REGLE —
+        # la politique sort la decision, pas un nombre qu'il faut ensuite
+        # comparer a quelque chose.
+        #
+        # ET RIEN NE S'Y OPPOSE. Le journal du depot est explicite sur la
+        # suppression de PPO en 2026-09-21 : « toute conclusion tiree d'un
+        # ecart de validation inferieur a 0.2 R par trade est du bruit, y
+        # compris les "PPO degrade la validation" accumules depuis exec24.
+        # Ces runs n'ont pas montre que PPO nuit ; ils n'ont rien montre. »
+        #
+        # LA SORTIE EST UN BIEN MEILLEUR PROBLEME DE RL QUE L'ENTREE, et
+        # c'est quantitatif :
+        #
+        #     decision d'ENTREE   ~55 occasions independantes par fenetre
+        #     decision de SORTIE  une par barre de chaque trade
+        #
+        # Le plancher de bruit qui a tue toutes les mesures PPO passees
+        # vient de la RARETE des occasions d'entree. La sortie n'a pas ce
+        # probleme, et sa consequence se realise dans le trade meme, donc
+        # l'attribution de credit est courte.
+        #
+        # IL LIT LES QUATRE COLONNES DE `tete_profit`, et rien d'autre :
+        # latent, age, creux_rang, flux_rang. La mesure qui l'impose est
+        # la meme — nourrie des 274 colonnes de marche, la meme cible
+        # tombe sous son plancher de bruit avec UN arbre.
+        #
+        # DEUX ACTIONS : tenir, fermer. Pas quatre — il ne decide jamais
+        # d'entrer, et lui laisser des actions impossibles diluerait son
+        # gradient sur des cas qu'il ne voit pas.
+        self.mlp_sortie = nn.Sequential(
+            nn.Linear(N_PROFIT_FEATURES, 64), nn.GELU(),
+            nn.Linear(64, 64), nn.GELU())
+        self.acteur_sortie = nn.Linear(64, N_ACTIONS_SORTIE)
+        # LE CRITIQUE PARTAGE LE TRONC DE L'ACTEUR. Sur quatre colonnes
+        # d'entree, deux corps separes apprendraient deux fois la meme
+        # representation ; et c'est la valeur de l'ETAT qu'il estime, pas
+        # celle d'une action.
+        self.critique_sortie = nn.Linear(64, 1)
 
         # MEME INTERFACE QUE SAINT. L'entrainement interroge `policy.memoire`
         # et appelle `rafraichit_banque()` a chaque epoch : sans ces deux
