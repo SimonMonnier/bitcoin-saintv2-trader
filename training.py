@@ -1183,6 +1183,17 @@ class PPOConfig:
     #
     # 2 ATR : les vrais perdants restent chers en une dizaine de minutes,
     # sans fenetre de temps, et le bruit d'une minute ne fait plus fermer.
+    #
+    # REMESURE A 15 MINUTES, quand l'horizon y est passe (meme echantillon) :
+    #
+    #     marge   coupees   quand (mediane)   gagnants a 15 min coupes avant
+    #     1.0 ATR   62 %        4 min               30 %
+    #     1.5 ATR   51 %        5 min               18 %
+    #     2.0 ATR   41 %        6 min               10 %
+    #     3.0 ATR   26 %        8 min                3 %
+    #
+    # 2 ATR est garde : coupure deux fois plus rapide qu'a 60 minutes, et
+    # quatre fois moins de gagnants tues.
     marge_zombie_atr: float = 2.0
     # LA DERIVE DU MARCHE EST RETIREE DE LA RECOMPENSE.
     #
@@ -1284,7 +1295,25 @@ class PPOConfig:
     # ON L'ASSUME, PARCE QUE L'ALTERNATIVE ETAIT DE CHANGER DE PRODUIT sans
     # le decider. Un avantage plus mince sur la geometrie voulue vaut mieux
     # qu'un avantage plus gros sur une strategie que personne n'a demandee.
-    horizon_cloture: int = 60
+    #
+    # 15 MINUTES — choix du proprietaire, 2026-09-25 : du vrai scalping.
+    #
+    # A 60, couper les pertes vite et predire le mouvement d'une heure se
+    # contredisaient. Le BTC en minute s'ecarte de 7 a 8 ATR en une heure :
+    # une coupure a 2 ATR sous le point mort tuait 41 % des trades qui
+    # auraient fini gagnants a 60 minutes. A 15, la meme coupure n'en tue
+    # plus que 10 % — mesure sur le train du fold 1, voir `marge_zombie_atr`.
+    #
+    # CE QUE CA COUTE, et il faudra le lire dans la veille : l'aller-retour
+    # (4.18 bps median) ne raccourcit pas avec le trade. Il pese environ
+    # deux fois plus lourd sur un mouvement de 15 minutes que sur un de 60.
+    # Les entrees au hasard gagnent 44.7 % du temps a 15 minutes, contre
+    # 47.8 % a 60.
+    #
+    # CE QUI SUIT L'HORIZON : `SCALPING_MAX_HOLDING` (saint_core), qui
+    # normalise l'age, et `tenue_max_cloture` ci-dessous, trois fois
+    # l'horizon — la ou la colonne d'age sature.
+    horizon_cloture: int = 15
     # La tenue maximale tiree dans l'echantillon. Au-dela, la position est
     # plus vieille que tout ce que la tete verra.
     #
@@ -1303,7 +1332,9 @@ class PPOConfig:
     # au-dela de 480 barres. Si l'echantillon s'arretait la, les deux tetes
     # decideraient sur des ages qu'elles n'ont jamais vus — exactement ce
     # que `echantillon_cloture` existe pour empecher.
-    tenue_max_cloture: int = 180
+    # 180 -> 45 LE 2026-09-25, avec l'horizon : trois fois l'horizon, la ou
+    # la colonne d'age `min(age / SCALPING_MAX_HOLDING, 3)` sature.
+    tenue_max_cloture: int = 45
     # LA REGLE DE SORTIE :  fermer si  latent < -(marge + k x risque)
     #
     # Tout est en ATR D'ENTREE — `latent_atr` est la colonne 1 de l'etat,

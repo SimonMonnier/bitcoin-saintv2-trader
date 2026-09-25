@@ -96,7 +96,11 @@ CLIP_SIGMA = 5.0
 # ne distingue plus rien. Le defaut serait l'inverse de celui de ce matin —
 # saturation totale d'un cote, ecrasement total de l'autre — et tout aussi
 # muet. C'est `test_cloture_branchee` qui l'a attrape.
-SCALPING_MAX_HOLDING = 60
+#
+# 15 DEPUIS LE 2026-09-25, avec `horizon_cloture` : la colonne d'age sature
+# a 45 barres, exactement `tenue_max_cloture`. A 60, un trade de quinze
+# minutes n'aurait jamais depasse 0.25 sur une colonne qui va jusqu'a 3.
+SCALPING_MAX_HOLDING = 15
 
 
 # ============================================================

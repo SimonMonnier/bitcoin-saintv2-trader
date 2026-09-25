@@ -387,6 +387,20 @@ verifie("recalcule a neuf, il donne les memes departs",
         (_ref is None and _e4.low_vol_starts is None)
         or np.array_equal(_ref, _e4.low_vol_starts))
 
+print("\n9e. L'AGE, LA TENUE ET L'HORIZON RESTENT ALIGNES")
+# Trois reglages qui n'ont de sens qu'ensemble. L'horizon est passe de 60 a
+# 15 le 2026-09-25 ; si l'un des trois ne suit pas, la colonne d'age sature
+# trop tot ou reste ecrasee, sans qu'aucune erreur ne se leve.
+from saint_core import SCALPING_MAX_HOLDING as _SMH
+_c9 = T.PPOConfig()
+verifie("l'age se normalise sur l'horizon",
+        _SMH == int(_c9.horizon_cloture) == int(_c9.scalping_max_holding),
+        "SCALPING_MAX_HOLDING %d, horizon %d" % (_SMH, _c9.horizon_cloture))
+verifie("la tenue rejouee va jusqu'a la saturation de l'age",
+        int(_c9.tenue_max_cloture) == 3 * _SMH,
+        "tenue_max_cloture %d = 3 x %d" % (_c9.tenue_max_cloture, _SMH))
+verifie("l'horizon est celui du scalping choisi", int(_c9.horizon_cloture) == 15)
+
 print("\n9. LE COTE SE DECLARE A UN SEUL ENDROIT")
 # ============================================================
 # Le 2026-09-25 la configuration disait "both" et le run est parti en LONG
