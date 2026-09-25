@@ -1,0 +1,18 @@
+cache 979,236 barres, coupe a 685,464 : le TEST n'est pas lu
+train [0, 538,579)   calibration [538,579, 589,988)   validation [589,988, 685,464)
+barres sans spread reel (repli sur la constante) : 0.00 %
+274 features, chargees en 3 s
+
+  horizon   IC ach   IC ven plancher    hasard    sommet    ecart  gagnant
+  ------------------------------------------------------------------------
+  5 min    +0.0250  +0.0083   0.0265     -4.78     -4.27    +0.51    37.2%   (1/3 arbres, 23,868 occasions de validation)
+  10 min   +0.0204  +0.0316   0.0194     -4.78     -7.40    -2.62    44.5%   (28/26 arbres, 23,866 occasions de validation)
+  15 min   +0.0143  +0.0252   0.0330     -4.78     -5.39    -0.61    48.4%   (17/1 arbres, 23,865 occasions de validation)
+  30 min   +0.0089  +0.0367   0.0309     -4.78     -5.18    -0.39    47.4%   (7/17 arbres, 23,861 occasions de validation)
+  60 min   -0.0088  +0.0316   0.0329     -4.78     -3.93    +0.86    51.0%   (2/11 arbres, 23,854 occasions de validation)
+  120 min  +0.0528  +0.0542   0.0534     -4.78     -5.20    -0.41    52.9%   (15/2 arbres, 23,839 occasions de validation)
+  240 min  +0.0640  +0.0847   0.0976     -4.78     -7.59    -2.81    50.2%   (7/7 arbres, 23,809 occasions de validation)
+
+62 s au total
+
+Lecture : un IC au-dessus du plancher dit qu'il y a de l'information ; un sommet POSITIF dit qu'elle paie le spread.
