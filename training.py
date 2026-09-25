@@ -2151,6 +2151,28 @@ class PPOConfig:
     # epoch devient constant, quelle que soit la geometrie, et aucun
     # changement futur ne le refera deriver.
     cible_decisions: int = 4000
+    #
+    # CETTE CIBLE COMPTAIT LES MAUVAISES CHOSES, ET LE RUN L'A MONTRE —
+    # 2026-09-25.
+    #
+    # Une « transition versee » est toute decision prise a plat, ATTENTES
+    # COMPRISES. Tant qu'un trade durait des heures, l'agent etait rarement
+    # a plat et les deux comptes se ressemblaient. Des que la sortie a ferme
+    # a la premiere minute, l'agent a ete a plat presque tout le temps : un
+    # seul episode fournissait ~3 800 « decisions », et le regulateur a
+    # conclu qu'un episode suffisait. Episodes joues : 7, 4, 2, 1, 1. Trades
+    # d'entrainement : 8 028, 4 023, 2 428, 1 416, 1 014 — et vers 200 a la
+    # selectivite de regime, pendant que la validation en jouait 4 400.
+    #
+    # LE REGULATEUR VISE DONC DES TRADES. C'est ce dont l'apprentissage se
+    # nourrit : chaque trade ouvert est une trajectoire pour le modele de
+    # sortie. `cible_decisions` ne dimensionne plus que l'estimation de
+    # depart, avant toute mesure.
+    #
+    # 5 000, un peu plus que la validation (~4 400) : l'entrainement ne doit
+    # pas voir moins de marche que la mesure qui le juge. Le budget de temps
+    # ci-dessous reste la borne finale.
+    cible_trades: int = 5_000
 
     # LE BUDGET DE TEMPS DE LA COLLECTE, EN SECONDES — et il prime sur la
     # cible de decisions.
@@ -2412,7 +2434,26 @@ class PPOConfig:
     # quand il tire — parce qu'une collecte tronquee biaise l'echantillon vers
     # le DEBUT des episodes, et qu'un biais silencieux serait pire que le
     # crash qu'il evite.
-    plafond_collecte: int = 20_000
+    #
+    # 20 000 -> 400 000 LE 2026-09-25, et c'est `garde_attentes` qui le
+    # permet. La soupape comptait des DECISIONS parce que chacune stockait
+    # son etat. Desormais seule une attente sur vingt en stocke un : 400 000
+    # decisions pesent ~20 000 attentes plus les trades, soit ~0.1 Go —
+    # moins que les 20 000 d'avant a plein. Elle reste une soupape : elle ne
+    # doit mordre que si l'agent cesse d'entrer.
+    plafond_collecte: int = 400_000
+
+    # LA PART DES ATTENTES DONT ON GARDE L'ETAT. Une decision qui n'ouvre
+    # rien stockait son observation entiere, ~5 Ko ; elles font 95 % des
+    # decisions a la selectivite de regime. Leur SEUL lecteur, la mise a
+    # jour PPO des entrees, a ete supprime le 2026-09-21 : le lot est
+    # ramene a `max_decisions_per_epoch` puis n'est plus lu. Viser plus de
+    # trades en stockant toutes les attentes aurait demande ~0.5 Go sur une
+    # machine qui n'en a plus que 0.46 de libre — la mort memoire d'exec61.
+    #
+    # UN TIRAGE UNIFORME, donc la composition de ce qui reste ne change pas.
+    # Les decisions qui OUVRENT sont toutes gardees.
+    garde_attentes: float = 0.05
     # Nombre de passes PPO sur les données collectées.
     # Testé à 8 pour tenter de débloquer le KL (0.0004 contre un target de
     # 0.03) : sans effet sur le KL, resté à 0.0000, et le critique a divergé
@@ -7353,7 +7394,7 @@ def run_training_on_split(
     # encore de mesure, et c'est justement celle qu'on regarde le plus.
     _dec_par_ep = max(cfg.episode_length / max(cfg.atr_sl_mult * 1.7, 1.0), 1.0)
     n_episodes_courant = [max(1, min(cfg.episodes_per_epoch,
-                                     int(round(cfg.cible_decisions / _dec_par_ep))))]
+                                     int(round(cfg.cible_trades / _dec_par_ep))))]
 
     # MESURE EXHAUSTIVE, pas échantillonnée. Voir departs_disjoints : la
     # validation, la calibration et le test couvrent désormais leur fenêtre
@@ -8175,9 +8216,13 @@ def run_training_on_split(
         #                      sur ce qui peut encore casser, SANS etre
         #                      renomme. Un champ qui mesure autre chose que
         #                      son nom est pire qu'un champ absent.
-        sampling_audit = {"decisions": 0, "forced_actions": 0,
+        # `ouvertures` : les trades REELLEMENT ouverts par la collecte.
+        # C'est lui que le regulateur d'episodes vise — voir `cible_trades`.
+        sampling_audit = {"decisions": 0, "ouvertures": 0,
+                          "forced_actions": 0,
                           "remapped_actions": 0, "cote_interdit": 0.0,
                           "episodes_joues": len(envs)}
+        _p_attente = float(getattr(cfg, "garde_attentes", 1.0))
 
         def _verse(k: int, p: Dict, done_flag: bool) -> None:
             """Verse une décision terminée au buffer de l'env k."""
@@ -8660,6 +8705,11 @@ def run_training_on_split(
                 # ferait apprendre leur resultat.
                 nouveau = en_attente.pop(k, None)
                 j_ouvert = int(info.get("slot_ouvert", -1))
+                if nouveau is not None and j_ouvert >= 0:
+                    sampling_audit["ouvertures"] += 1
+                # UNE ATTENTE SUR VINGT GARDE SON ETAT. Voir `garde_attentes`.
+                _garde = (nouveau is not None and j_ouvert < 0
+                          and np.random.rand() < _p_attente)
                 if nouveau is not None:
                     nouveau["dt"] = 1
                     if j_ouvert >= 0 and rs is not None:
@@ -8676,7 +8726,7 @@ def run_training_on_split(
                     last_reason[k] = info.get("done_reason")
                     for slot in list(pending[k]):
                         _cloture(k, slot, True)
-                    if nouveau is not None and j_ouvert < 0:
+                    if _garde:
                         _verse(k, nouveau, True)
                 else:
                     # Les emplacements fermes a cette barre terminent leur
@@ -8685,7 +8735,7 @@ def run_training_on_split(
                     # ni le drapeau, et evite de relire `infos`.
                     for slot in info.get("slots_fermes", []):
                         _cloture(k, int(slot), False)
-                    if nouveau is not None and j_ouvert < 0:
+                    if _garde:
                         _verse(k, nouveau, False)
                     still_active.append(k)
 
@@ -8994,9 +9044,14 @@ def run_training_on_split(
         # soit 2 776 par episode. Viser `cible_decisions / 2776` aurait ramene
         # le budget a UN episode par epoch — une seule fenetre de marche par
         # gradient. Le compteur mesurait la consultation, pas l'apprentissage.
-        _transitions = max(_n_transitions, 1)
-        _par_ep = max(_transitions / _joues, 1e-9)
-        _vise = int(round(cfg.cible_decisions / _par_ep))
+        #
+        # ET DESORMAIS ON COMPTE LES TRADES. Les transitions versees
+        # comprenaient les attentes : un agent presque toujours a plat en
+        # versait ~3 800 par episode, et le regulateur est descendu a UN
+        # episode par epoch. Voir `cible_trades`.
+        _ouv = max(int(sampling_audit.get("ouvertures", 0)), 1)
+        _par_ep = max(_ouv / _joues, 1e-9)
+        _vise = int(round(cfg.cible_trades / _par_ep))
         _vise = max(1, min(_vise, cfg.episodes_per_epoch))
         _avant = n_episodes_courant[0]
         _lisse = max(1, (_avant + _vise) // 2)

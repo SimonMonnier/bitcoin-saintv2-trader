@@ -351,6 +351,23 @@ for _act, _nom in ((0, "long"), (1, "short")):
     verifie("%s : remis a zero a la fermeture" % _nom,
             _e.n_positions == 0 and _e.cout_entree_atr == 0.0)
 
+print("\n9c. LA COLLECTE VISE DES TRADES, PAS DES CONSULTATIONS")
+# Le 2026-09-25 le regulateur comptait les attentes : episodes joues 7, 4,
+# 2, 1, 1, et ~1 000 trades d'entrainement pour 4 400 en validation.
+verifie("le regulateur divise la cible de TRADES par les ouvertures",
+        "_vise = int(round(cfg.cible_trades / _par_ep))" in src
+        and '_ouv = max(int(sampling_audit.get("ouvertures", 0)), 1)' in src)
+verifie("les ouvertures sont comptees a l'ouverture",
+        'sampling_audit["ouvertures"] += 1' in src)
+verifie("l'entrainement vise au moins la validation",
+        T.PPOConfig().cible_trades >= 4_400, str(T.PPOConfig().cible_trades))
+verifie("les attentes ne stockent plus toutes leur etat",
+        0.0 < T.PPOConfig().garde_attentes < 1.0
+        and src.count("if _garde:") == 2,
+        "%.0f %% gardees" % (100 * T.PPOConfig().garde_attentes))
+verifie("les ouvertures, elles, sont toutes gardees",
+        "_garde = (nouveau is not None and j_ouvert < 0" in src)
+
 print("\n9. LE COTE SE DECLARE A UN SEUL ENDROIT")
 # ============================================================
 # Le 2026-09-25 la configuration disait "both" et le run est parti en LONG
