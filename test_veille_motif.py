@@ -119,16 +119,20 @@ def main() -> int:
                 f"net={m_net.groups() if m_net else 'NON'}")
 
     print("\nUN CRITERE NON MESURABLE NE REND PAS LA VEILLE MUETTE")
-    print("  Sans grille de classement, `net` vaut nan et la f-string ecrit")
-    print("  `+nan%`. Le motif `net` ne doit alors PAS mordre — la ligne")
-    print("  s'affiche sans le bloc du critere — mais le motif META, lui,")
+    print("  Sans trade de validation, `net` vaut nan. Depuis le 2026-09-26")
+    print("  le motif `net` le LIT, et la veille ecrit « aucun trade de")
+    print("  validation » au lieu de taire la ligne. Le motif META, lui,")
     print("  doit continuer de mordre, sinon toute l'epoch disparait.")
     _n = float("nan")
     ligne = base.replace("  Sortino ",
                          "  " + _champs_net(_n, _n, _n, _n, _n) + "Sortino ",
                          1)
     verifie("META mord encore", V.RE_META.search(ligne) is not None)
-    verifie("net ne mord pas", V.RE_NET.search(ligne) is None)
+    _mn = V.RE_NET.search(ligne)
+    verifie("net se lit NON MESURABLE",
+            _mn is not None
+            and all(x.lstrip("+-") == "nan" for x in _mn.groups()),
+            str(_mn.groups() if _mn else "NON"))
     verifie("sommet mord encore", V.RE_SOMMET.search(ligne) is not None)
 
     print("\nUN INDICATEUR QU'ON CESSE DE MESURER S'ECRIT `nan`")

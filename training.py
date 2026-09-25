@@ -2864,7 +2864,23 @@ class PPOConfig:
     # 10.2 encadre 11.6 par en dessous, du cote qui a marche. C'est un ancrage
     # herite, pas une mesure : la capacite ne se tranche pas sur une sonde
     # supervisee, il faut un run.
-    saint_mlp_dim: int = 4
+    #
+    # 4 -> 32 LE 2026-09-26, avec le PPO complet — accord du proprietaire.
+    #
+    # Le calcul ci-dessus comptait des parametres par OCCASION D'ENTREE
+    # independante, pour une tete de CLASSEMENT. Deux choses ont change :
+    # PPO apprend desormais sur des dizaines de milliers de decisions par
+    # epoch, et chaque tete doit dire, a partir des 2 232 valeurs du tronc,
+    # « ICI j'ouvre, LA j'attends ».
+    #
+    # A 4, ELLE N'Y ARRIVAIT PAS. Premiere epoch du PPO complet en argmax :
+    # 92 160 decisions a plat en validation, 92 160 attentes. La politique
+    # ne distinguait presque pas les situations — entropie 1.087 pour un
+    # maximum de 1.099 — et c'est un reglage GLOBAL de chaque tete qui
+    # decidait, le meme a chaque minute : tout vendre au premier run, tout
+    # attendre au suivant. Quatre nombres pour resumer 279 colonnes, c'est
+    # la premiere chose a lever.
+    saint_mlp_dim: int = 32
     # LECTURE PAR COLONNES plutot que par jeton CLS. exec19 a montre le
     # goulot : en lecture CLS, la tete recevait SEIZE nombres pour resumer 107
     # colonnes, contre 428 chez PatchTST. L'etendue des convictions plafonnait
@@ -4368,7 +4384,7 @@ def _tire(logits, explore: bool, generateur=None):
 
 
 def decide_entree(policy, etats, masques, device, explore: bool = True,
-                  generateur=None):
+                  generateur=None, diag=None):
     """Acheter, vendre ou attendre ? Rend (actions, logprobs, valeurs).
 
     On ECHANTILLONNE a l'entrainement — PPO a besoin que l'action jouee
@@ -4380,6 +4396,10 @@ def decide_entree(policy, etats, masques, device, explore: bool = True,
     with torch.no_grad():
         logits, valeur = policy.entree(x)
         logits = logits.masked_fill(~m, -1e9)
+        # LE DIAGNOSTIC LIT LES LOGITS TELS QU'ILS ONT DECIDE. Voir la ligne
+        # `marge entree` de la validation.
+        if diag is not None:
+            diag.append(logits.float().cpu().numpy())
         dist = torch.distributions.Categorical(logits=logits)
         a = _tire(logits, explore, generateur)
         lp = dist.log_prob(a)
@@ -10076,6 +10096,8 @@ def run_training_on_split(
         _explore_v = bool(getattr(cfg, "evaluation_stochastique", True))
         _gen_v = torch.Generator(device=device)
         _gen_v.manual_seed(int(cfg.val_seed) + 2)
+        # LES LOGITS D'ENTREE DE LA VALIDATION, pour la ligne `marge entree`.
+        _diag_v: List[np.ndarray] = []
         v_states = []
         v_infos = []
         for e, d in zip(val_envs, departs_val):
@@ -10149,7 +10171,7 @@ def run_training_on_split(
                         [val_envs[k] for k in deciding])
                     _va_e, _, _ = decide_entree(
                         policy, [v_states[k] for k in deciding], _m3, device,
-                        explore=_explore_v, generateur=_gen_v)
+                        explore=_explore_v, generateur=_gen_v, diag=_diag_v)
                     _portillons["occasions"] += len(deciding)
                     _portillons["capacite"] += int(_sans.sum())
                     for bi, k in enumerate(deciding):
@@ -10882,6 +10904,32 @@ def run_training_on_split(
         # fenetre ; on prend celle de l'environnement 0, comme la
         # validation prend `val_decisions[0]`. Un flux vaut l'autre :
         # ils voient le meme nombre d'occasions.
+        # A QUELLE DISTANCE LA POLITIQUE EST-ELLE D'OUVRIR ? — 2026-09-26.
+        #
+        # Zero trade en validation ne dit pas si la politique en est LOIN ou
+        # juste au seuil. La marge d'ouverture le dit, minute par minute :
+        # le meilleur logit d'ouverture moins celui d'attendre. Positive,
+        # l'argmax ouvre. Si son maximum monte d'epoch en epoch, des
+        # situations s'approchent du seuil ; s'il descend, la politique
+        # s'installe dans l'attente. L'ecart entre achat et vente dit
+        # quel cote elle prefere, et si cette preference DEPEND de la
+        # situation — une part collee a 0 ou 100 % dit que non.
+        if _valide and _diag_v:
+            _lgv = np.concatenate(_diag_v, axis=0)
+            _okd = (_lgv[:, ACHETER] > -1e8) & (_lgv[:, VENDRE] > -1e8)
+            if _okd.any():
+                _lg = _lgv[_okd]
+                _marge = np.maximum(_lg[:, ACHETER], _lg[:, VENDRE]) - _lg[:, ATTENDRE]
+                _q = np.percentile(_marge, [0, 50, 99, 100])
+                print(f"  {_col('phase', _C.GREY)}  marge entree  "
+                      f"(ouvrir - attendre, {int(_okd.sum()):,} minutes a plat)  "
+                      f"min {_q[0]:+.4f}  mediane {_q[1]:+.4f}  "
+                      f"p99 {_q[2]:+.4f}  max {_q[3]:+.4f}  ->  ouvrirait "
+                      f"{100*float(np.mean(_marge > 0)):.1f}%  |  achat "
+                      f"prefere a la vente {100*float(np.mean(_lg[:, ACHETER] > _lg[:, VENDRE])):.1f}%  "
+                      f"(ecart achat-vente de {float(np.min(_lg[:, ACHETER] - _lg[:, VENDRE])):+.4f} "
+                      f"a {float(np.max(_lg[:, ACHETER] - _lg[:, VENDRE])):+.4f})")
+
         # LE CRITERE JUGE LES TRADES JOUES EN VALIDATION — PPO complet,
         # 2026-09-25.
         #

@@ -152,7 +152,10 @@ RE_META = re.compile(
 # unites de risque, les occasions que le checkpoint mettrait en position, et
 # ce que rapporte une occasion au hasard. Lu par un motif separe pour la
 # meme raison que rho — ne pas decaler les indices de `analyse`.
-RE_SOMMET = re.compile(r"sommet\s+(" + NB + r")R/(" + NB + r")R")
+# `\s*` APRES LA BARRE : un `nan` s'ecrit `  +nan` sur six colonnes, et
+# depuis le PPO complet le sommet vaut `nan` a chaque epoch. Sans cela le
+# motif ne mordait plus.
+RE_SOMMET = re.compile(r"sommet\s+(" + NB + r")R/\s*(" + NB + r")R")
 
 # LA TENUE PAR ISSUE : mediane/moyenne des gagnants, puis des perdants.
 #
@@ -204,8 +207,12 @@ RE_TENUE = re.compile(
 #
 # MOTIF SEPARE, comme rho et sommet : l'inclure dans RE_META decalerait les
 # indices que `analyse` lit par position, en silence.
+# LA BAISSE ACCEPTE `nan` AUSSI, depuis le 2026-09-26 : une validation
+# sans aucun trade n'a pas de score, et le motif ne mordait plus — la ligne
+# du critere disparaissait de la veille exactement quand elle devait dire
+# « rien a juger ».
 RE_NET = re.compile(
-    r"net\s+(" + NB + r")R\s+\(gain\s+(" + NB + r")R baisse\s+([\d.]+)R\)")
+    r"net\s+(" + NB + r")R\s+\(gain\s+(" + NB + r")R baisse\s+(" + NB + r")R\)")
 
 # Combien de scores sont venus de la table groupee, et combien ont du
 # repasser par un forward. Le second doit rester petit : il compte les
@@ -658,6 +665,10 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
     # qui monte : c'est l'abstention qui paie. `net` qui monte avec `bud` qui
     # monte : c'est le levier, et le creux dira bientot ce qu'il coute. Sans
     # ces deux nombres, les deux histoires sont indiscernables.
+    if net is not None and not math.isfinite(net[0]):
+        L.append(f"  critere net  {C.ROUGE}aucun trade de validation{C.FIN} : "
+                 f"rien a juger, rien a sauvegarder")
+        net = None
     if net is not None:
         v_net, v_gain, v_creux = net
         cn = C.VERT if v_net > 0 else (C.ROUGE if v_net < 0 else C.GRIS)

@@ -79,7 +79,7 @@ verifie("le rollout EXPLORE",
 # du proprietaire, 2026-09-25. Le tirage a graine fixe reste disponible
 # par `evaluation_stochastique`, mais il n'est pas la regle.
 verifie("validation et test jouent l'action la plus probable",
-        src.count("generateur=_gen_v)") == 2
+        src.count("generateur=_gen_v") == 2
         and src.count("generateur=_gen_t)") == 2
         and not T.PPOConfig().evaluation_stochastique,
         "entree ET sortie, validation ET test")
@@ -566,6 +566,20 @@ verifie("et masquent par `masque_entree`",
         src.count("masque_entree(") == 4, "1 definition + 3 appels")
 verifie("le classement ne tourne plus",
         T.PPOConfig().pas_rang_par_epoch == 0 and not T.PPOConfig().diag_rang)
+
+print("\n11. DES TETES QUI PEUVENT DISTINGUER LES SITUATIONS")
+# A 4 nombres par tete, la politique decidait par un reglage global : la
+# meme action a chaque minute de validation.
+verifie("les tetes lisent le tronc sur 32 nombres",
+        T.PPOConfig().saint_mlp_dim >= 32, str(T.PPOConfig().saint_mlp_dim))
+_d11 = []
+T.decide_entree(_p10, [np.random.randn(4, OBS_N_FEATURES).astype(np.float32)
+                       for _ in range(5)],
+                np.ones((5, 3), bool), "cpu", explore=False, diag=_d11)
+verifie("la decision d'entree rend ses logits au diagnostic",
+        len(_d11) == 1 and _d11[0].shape == (5, 3))
+verifie("la validation les recueille",
+        "generateur=_gen_v, diag=_diag_v)" in src and "marge entree" in src)
 
 print("\n9. LE COTE SE DECLARE A UN SEUL ENDROIT")
 # ============================================================

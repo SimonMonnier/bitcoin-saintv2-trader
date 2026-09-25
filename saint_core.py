@@ -2158,13 +2158,14 @@ class SAINTPolicySingleHead(nn.Module):
         # plus un rendement a horizon fixe, elles sortent des LOGITS de
         # politique appris par PPO sur ce que les trades rapportent.
         #
-        # LE LECTEUR DE SORTIE EST ETROIT A L'ENTREE — 16 — parce que la
-        # lecture « colonnes » fait 2 232 valeurs : un lecteur de 64 en
-        # couterait 143 000 par tete, cinq fois le tronc.
+        # LE LECTEUR DE SORTIE A LA LARGEUR DES AUTRES TETES — `mlp_dim` —
+        # a son entree. Il valait 16 en dur ; les tetes d'ouverture sont
+        # passees a 32 le 2026-09-26, et les quatre tetes lisent le tronc a
+        # la meme largeur.
         def _lecture_sortie():
             return nn.Sequential(
-                nn.Linear(dim_lecture + N_SORTIE_FEATURES, 16), nn.GELU(),
-                nn.Linear(16, 64), nn.GELU())
+                nn.Linear(dim_lecture + N_SORTIE_FEATURES, mlp_dim), nn.GELU(),
+                nn.Linear(mlp_dim, 64), nn.GELU())
         self.lecteur_gain = _lecture_sortie()
         self.lecteur_perte = _lecture_sortie()
 
