@@ -11690,14 +11690,19 @@ if __name__ == "__main__":
     cfg_base = PPOConfig()
 
     # =======================================================
-    # PIPELINE LONG-ONLY : un modèle spécialisé qui décide BUY ou HOLD.
+    # LE PIPELINE. Le cote vient de `PPOConfig.side`, et de nulle part
+    # ailleurs.
     # =======================================================
-    # side="long": BUY ou HOLD à plat ; les ventes restent interdites.
+    # `cfg_long` GARDE SON NOM par habitude : il porte le cote que la
+    # configuration declare, "both" depuis le 2026-09-25.
     cfg_long = PPOConfig(**cfg_base.__dict__)
-    # La repetition est volontaire — voir le commentaire de `PPOConfig.side`
-    # : un reglage duplique finit par diverger, alors il est repete a
-    # l'IDENTIQUE plutot que regle a deux endroits.
-    cfg_long.side = "long"
+    # CETTE LIGNE REPETAIT `cfg_long.side = "long"`, « a l'identique ».
+    # Le 2026-09-25 la configuration est passee a "both" pour ouvrir les
+    # shorts, et le run est reparti... en LONG seul : `[LONG_wf1]`, « vente
+    # INTERDIT », zero short sur 3 600 trades. La repetition devait etre
+    # une redondance visible ; elle etait un second reglage, qui gagnait.
+    # C'est la panne que le commentaire de `PPOConfig.side` decrit, a
+    # l'envers. On LIT la configuration, on ne la recopie pas.
 
     # LE TITRE ETAIT EN DUR, et il annoncait « BILATERAL » pendant que la
     # configuration disait `side = "long"`. Troisieme fois de la journee

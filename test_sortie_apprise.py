@@ -323,6 +323,19 @@ verifie("l'equilibre exact va a la tete de perte",
         _g(pol.acteur_sortie_perte) > 0.0 and _g(pol.acteur_sortie_gain) == 0.0)
 pol.zero_grad(set_to_none=True)
 
+# ============================================================
+print("\n9. LE COTE SE DECLARE A UN SEUL ENDROIT")
+# ============================================================
+# Le 2026-09-25 la configuration disait "both" et le run est parti en LONG
+# seul : le bloc __main__ redeclarait `cfg_long.side = "long"`.
+_main = src[src.index('if __name__ == "__main__":'):]
+_actives = [l for l in _main.split("\n")
+            if ".side = " in l and not l.strip().startswith("#")]
+verifie("le bloc __main__ ne redeclare pas le cote",
+        not _actives, "; ".join(l.strip() for l in _actives))
+verifie("la configuration ouvre les deux cotes",
+        T.PPOConfig().side == "both", T.PPOConfig().side)
+
 print("\n%d/%d OK" % (_ok, _ok + _ko))
 if _ko:
     print("\nLA SORTIE EST REDEVENUE UN SEUIL. Quatre calibrations ont deja")
