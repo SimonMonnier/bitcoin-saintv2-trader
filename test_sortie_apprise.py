@@ -616,8 +616,10 @@ def _attente_apres(pen):
 _sans, _avec = _attente_apres(0.0), _attente_apres(0.3)
 verifie("sans penalite, l'attente monte", _sans > 0.34, "%.3f" % _sans)
 verifie("avec penalite, elle baisse", _avec < 0.33, "%.3f" % _avec)
-verifie("la collecte mesure l'action la plus probable",
-        "explore=True, diag=_diag_r)" in src)
+verifie("la penalite se regle sur la politique APRES sa mise a jour",
+        '_taux_arg = float(_st_e["taux_argmax"])' in src
+        and 'st["taux_argmax"]' in src,
+        "sur la collecte, elle lisait la politique d'avant : 81 % contre 1.6 %")
 verifie("la penalite s'ajuste vers la cible d'ouverture",
         "penalite_attente=penalite_attente)" in src
         and 0 < T.PPOConfig().cible_ouverture < 1)

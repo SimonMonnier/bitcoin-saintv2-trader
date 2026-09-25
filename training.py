@@ -1251,7 +1251,10 @@ class PPOConfig:
     # diminuee dans la mise a jour ; le PnL, les trades et le critere de
     # sauvegarde restent ceux du marche.
     cible_ouverture: float = 0.05
-    pas_penalite_attente: float = 0.1
+    # 0.3 : sous la cible, la penalite gagne ~0.015 par epoch et atteint en
+    # deux ou trois epochs l'ordre de grandeur d'un trade rate (0.064 sur
+    # ~2 minutes, soit ~0.03 par minute). A 0.1, il en fallait six.
+    pas_penalite_attente: float = 0.3
     penalite_attente_max: float = 0.1
     pas_profit_par_epoch: int = 0
     # L'HORIZON SUR LEQUEL ELLE JUGE — ET IL FIXE AUSSI CELUI DE L'ENTREE.
@@ -4552,12 +4555,17 @@ def maj_ppo_entree(policy, ep_buf, optims, cfg, device,
     st = _boucle_ppo(avant, A, LP, RET, ADV, optims, groupes, noms, cfg,
                      float(getattr(cfg, "entropie_entree", 0.01)), device)
     with torch.no_grad():
-        hs = []
+        hs, ouv = [], []
         for d in range(0, len(A), 2048):
             mm = torch.arange(d, min(d + 2048, len(A)), device=device)
-            hs.append(torch.distributions.Categorical(
-                logits=avant(mm)[0]).entropy())
+            lg_ = avant(mm)[0]
+            hs.append(torch.distributions.Categorical(logits=lg_).entropy())
+            # OU L'ACTION LA PLUS PROBABLE OUVRIRAIT, sous la politique qui
+            # SORT de la mise a jour : c'est elle que la penalite d'attente
+            # doit regler. Voir `cible_ouverture`.
+            ouv.append(lg_.argmax(-1) != ATTENDRE)
         st["H"] = float(torch.cat(hs).mean())
+        st["taux_argmax"] = float(torch.cat(ouv).float().mean())
     st["n"], st["n_total"] = len(A), n_total
     st["parts"] = [float((A == a).float().mean()) for a in range(N_ACTIONS_ENTREE)]
     return st
@@ -9466,11 +9474,15 @@ def run_training_on_split(
         # collecte ou l'action la plus probable OUVRIRAIT. Elle ne se lit
         # pas sur les actions tirees : elles ouvrent encore une fois sur
         # deux quand l'argmax n'ouvre plus jamais.
-        if _diag_r:
-            _lgr = np.concatenate(_diag_r, axis=0)
-            _taux_arg = float(np.mean(
-                np.maximum(_lgr[:, ACHETER], _lgr[:, VENDRE])
-                > _lgr[:, ATTENDRE]))
+        #
+        # ET ELLE SE LIT APRES LA MISE A JOUR. La premiere version lisait les
+        # logits de la COLLECTE, donc ceux de la politique d'avant : a
+        # l'epoch 1, la politique initiale « ouvrait » sur 81.3 % des minutes
+        # et la penalite restait a zero, pendant que la politique mise a jour
+        # n'ouvrait plus que sur 1.6 %. Un regulateur en retard d'une epoch
+        # sur ce qu'il regle.
+        if _st_e is not None and "taux_argmax" in _st_e:
+            _taux_arg = float(_st_e["taux_argmax"])
             _avant_pen = penalite_attente
             penalite_attente = float(np.clip(
                 penalite_attente
