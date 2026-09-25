@@ -550,7 +550,10 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
                  f"{_yg:.0f} (moyenne)   perdant {_mp:.0f} / {_yp:.0f}   "
                  f"{_ct}x{_rap:.1f}{C.FIN}   max {_mx:.0f} min{_fin}")
 
-    if sommet is not None:
+    # SANS CLASSEMENT — PPO complet, 2026-09-25 — le sommet n'est plus
+    # mesure et vaut `nan` : on ne l'affiche pas plutot que d'ecrire une
+    # ligne de `nan` qu'on chercherait a interpreter.
+    if sommet is not None and all(math.isfinite(v) for v in sommet):
         g_top, g_hasard = sommet
         ecart = g_top - g_hasard
         cs = (C.VERT if ecart > 0.05 else
@@ -663,7 +666,7 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
         _rap = (v_gain / v_creux) if v_creux > 1e-9 else float("inf")
         _lr = ("aucune perte" if not math.isfinite(_rap)
                else f"{_rap:.2f}x la baisse")
-        L.append(f"  critere net  {cn}{v_net:+6.3f} R{C.FIN} par occasion  "
+        L.append(f"  critere net  {cn}{v_net:+6.3f} R{C.FIN} par trade  "
                  f"= gain {v_gain:+.3f} R - baisse {v_creux:.3f} R  ({_lr})"
                  f"   [C'EST LUI QUI DECIDE LA SAUVEGARDE]")
         # CE QU'IL DOIT BATTRE, et ce qu'il lui manque. Sans le seuil, on

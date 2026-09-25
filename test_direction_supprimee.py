@@ -65,8 +65,9 @@ for _f in ("training.py", "kairos_live.py"):
 
 
 # ============================================================
-print("\n2. LE ROLLOUT ET LE DEPLOIEMENT APPELLENT LA MEME FONCTION")
-print("   `decide_avec_barres` est la source unique de la regle d'entree.")
+print("\n2. LE ROLLOUT, LA VALIDATION ET LE TEST APPELLENT LA MEME FONCTION")
+print("   `decide_entree` est la source unique de la regle d'entree depuis")
+print("   le PPO complet (2026-09-25) ; c'etait `decide_avec_barres`.")
 print("   Une seconde ecriture aurait diverge sans que rien ne le signale ;")
 print("   c'est deja arrive dans ce depot.")
 # ============================================================
@@ -74,9 +75,9 @@ _arbre = ast.parse(io.open("training.py", encoding="utf-8").read())
 _appels = [n for n in ast.walk(_arbre)
            if isinstance(n, ast.Call)
            and isinstance(n.func, ast.Name)
-           and n.func.id == "decide_avec_barres"]
-verifie("training.py appelle `decide_avec_barres` au rollout",
-        len(_appels) >= 1, f"{len(_appels)} appel(s)")
+           and n.func.id == "decide_entree"]
+verifie("training.py decide par `decide_entree` a la collecte, en "
+        "validation et au test", len(_appels) == 3, f"{len(_appels)} appel(s)")
 
 # La tete de direction n'est plus liee a une variable dans training.py : les
 # deux `policy.sorties(...)` qui restent jettent leur premiere sortie.

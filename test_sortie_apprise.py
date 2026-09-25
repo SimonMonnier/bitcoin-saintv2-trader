@@ -75,8 +75,9 @@ verifie("le rollout EXPLORE",
 # l'occurrence du COMMENTAIRE qui explique le choix, et le test echouait
 # sur du texte au lieu de code.
 verifie("validation et test prennent l'argmax",
-        src.count("explore=False)") == 2,
-        "on juge la decision, pas son bruit")
+        src.count("explore=False)") == 4,
+        "entree ET sortie, validation ET test : on juge la decision, "
+        "pas son bruit")
 
 # LES DEUX ANCIENNES REGLES NE DECIDENT PLUS RIEN. Les garder en
 # parallele a ete explicitement refuse : deux organes qui repondent a la
@@ -240,29 +241,36 @@ verifie("l'echantillon couvre plus que l'horizon",
         "tenue_max %d > horizon %d" % (c1.tenue_max_cloture, c1.horizon_cloture))
 
 # ============================================================
-print("\n6. PPO N'ENTRAINE QUE LA SORTIE")
+print("\n6. QUATRE TETES, CHACUNE SON OPTIMISEUR")
 # ============================================================
-verifie("le modele de sortie a SON optimiseur",
-        "optimizer_sortie = optim.Adam(\n        policy.params_sortie()" in src,
-        "separe de `optimizer_rang`, qui porte le tronc et les entrees")
+# LE 2026-09-25, LE PROPRIETAIRE : une tete pour l'achat, une pour la
+# vente, une pour la coupure des pertes, une pour la coupure des gains,
+# CHACUNE AVEC SON OPTIMISEUR, toutes en PPO, toutes sur toutes les
+# features.
+verifie("les optimiseurs sont crees par groupe",
+        src.count("optims_ppo = optimiseurs_ppo(policy, cfg)") == 1,
+        "un par tete, plus le tronc et le critique d'entree")
 verifie("il est cree une fois par fold, pas a chaque epoch",
         "_optim_s = optim.Adam(" not in src,
         "reconstruit a chaque epoch, il jetait l'etat Adam")
-_ids_s = {id(q) for q in pol.params_sortie()}
-_ent = list(pol.tete_achat.parameters()) + list(pol.tete_vente.parameters())
-verifie("il ne porte AUCUN poids des tetes d'ouverture",
-        not any(id(q) in _ids_s for q in _ent),
-        "ouvrir et fermer sont deux metiers")
-verifie("l'acteur d'ENTREE reste gele",
-        "g[actor 0.00e+00" not in src or "actor.parameters()" not in
-        src.split("PPO SUR LA SORTIE")[-1].split("print(f\"  {_col('phase'")[0],
-        "seuls trois modules recoivent un gradient ici")
+_gr = pol.groupes_ppo()
+verifie("quatre tetes, chacune son groupe",
+        all(k in _gr for k in ("achat", "vente", "gain", "perte")),
+        ", ".join(sorted(_gr)))
+_vus = {}
+_dup = [k for k, v in _gr.items() for q in v
+        if _vus.setdefault(id(q), k) != k]
+verifie("aucun poids n'appartient a deux optimiseurs", not _dup, str(_dup))
+verifie("l'entree est entrainee par PPO",
+        "maj_ppo_entree(policy, ep_buf, optims_ppo, cfg, device)" in src)
+verifie("la sortie aussi",
+        "maj_ppo_sortie(policy, sortie_buf, optims_ppo, cfg, device)" in src)
 verifie("l'avantage est normalise PAR TETE",
         "_ADV[_mq] = (_x - _x.mean()) / (_x.std() + 1e-8)" in src,
         "ensemble, les pertes gonflees par le loyer zombie fixeraient "
         "l'echelle et les gains deviendraient du bruit")
 verifie("la derniere transition est terminale",
-        '_b[-1]["done"] = True' in src,
+        'b[-1]["done"] = True' in src,
         "l'episode s'arrete et l'environnement solde : bootstrapper "
         "au-dela espererait une suite qui n'existe pas")
 verifie("`lambda_gae` est lu au bon nom",
@@ -272,14 +280,16 @@ verifie("`lambda_gae` est lu au bon nom",
 # ============================================================
 print("\n7. LE JOURNAL MONTRE CE QUE LA POLITIQUE FAIT")
 # ============================================================
-for _m, _q in (("PPO sortie", "la ligne dediee"),
-               ("PPO sortie {_cote}", "une ligne PAR TETE"),
+for _m, _q in (("PPO entree", "la ligne de l'entree"),
+               ("achat {_pa_:.1f}%", "la repartition des entrees"),
+               ("PPO sortie", "la ligne de la sortie"),
+               ("PPO sortie {_cote}", "une ligne PAR TETE de sortie"),
                ("ferme {100*_ferme", "le taux de fermeture de chaque tete"),
-               ("KL {np.mean(_lk)", "la divergence"),
-               ("clip {100*np.mean(_lcl)", "la part ecretee")):
+               ("KL {_st_s['kl']", "la divergence"),
+               ("clip {100*_st_s['clip']", "la part ecretee")):
     verifie("le journal porte %s" % _q, _m in src)
 verifie("il dit aussi quand le lot est trop petit",
-        "trop peu pour une mise a jour" in src,
+        src.count("trop peu de") >= 2,
         "un PPO muet ressemble a un PPO qui marche")
 
 # ============================================================
@@ -362,8 +372,10 @@ verifie("les ouvertures sont comptees a l'ouverture",
         'sampling_audit["ouvertures"] += 1' in src)
 verifie("l'entrainement vise au moins la validation",
         T.PPOConfig().cible_trades >= 4_400, str(T.PPOConfig().cible_trades))
-verifie("les attentes ne stockent plus toutes leur etat",
-        0.0 < T.PPOConfig().garde_attentes < 1.0
+# 1.0 DEPUIS LE PPO COMPLET : les attentes sont des actions de la
+# politique d'entree, et l'avantage se calcule sur la suite complete.
+verifie("toutes les attentes sont gardees",
+        T.PPOConfig().garde_attentes == 1.0
         and src.count("if _garde:") == 2,
         "%.0f %% gardees" % (100 * T.PPOConfig().garde_attentes))
 verifie("les ouvertures, elles, sont toutes gardees",
@@ -400,6 +412,123 @@ verifie("la tenue rejouee va jusqu'a la saturation de l'age",
         int(_c9.tenue_max_cloture) == 3 * _SMH,
         "tenue_max_cloture %d = 3 x %d" % (_c9.tenue_max_cloture, _SMH))
 verifie("l'horizon est celui du scalping choisi", int(_c9.horizon_cloture) == 15)
+
+print("\n10. PPO COMPLET : QUATRE TETES SUR TOUTES LES FEATURES")
+# ============================================================
+from saint_core import ACHETER, VENDRE, ATTENDRE, N_ACTIONS_ENTREE
+torch.manual_seed(1)
+np.random.seed(1)
+_p10 = SAINTPolicySingleHead(n_features=OBS_N_FEATURES, d_model=8,
+                             num_blocks=2, heads=1, n_freq=16, mlp_dim=4,
+                             lecture="colonnes", max_len=4,
+                             n_actions=N_ACTIONS)
+_x10 = torch.randn(6, 4, OBS_N_FEATURES)
+_lg10, _v10 = _p10.entree(_x10)
+verifie("l'entree rend trois logits et une valeur",
+        tuple(_lg10.shape) == (6, N_ACTIONS_ENTREE) and tuple(_v10.shape) == (6,))
+verifie("le logit d'ATTENDRE est fixe a zero",
+        bool((_lg10[:, ATTENDRE] == 0).all()),
+        "chaque tete dit combien elle prefere ouvrir a attendre")
+verifie("la politique d'entree part presque uniforme",
+        float(_lg10[:, :2].abs().max()) < 0.1,
+        "acteurs initialises a gain 0.01")
+
+# L'achat n'entraine jamais la vente, et reciproquement.
+_p10.zero_grad(set_to_none=True)
+_p10.entree(_x10)[0][:, ACHETER].sum().backward()
+verifie("un gradient d'ACHAT ne touche pas la tete de vente",
+        _g(_p10.tete_achat) > 0 and _g(_p10.tete_vente) == 0
+        and _g(_p10.mlp_vente) == 0)
+verifie("il remonte dans le tronc", _g(_p10.embed) > 0,
+        "la tete lit toutes les features")
+_p10.zero_grad(set_to_none=True)
+
+# La sortie lit le tronc, donc toutes les features.
+_ps = torch.randn(6, N_SORTIE_FEATURES)
+_ps[:3, 0] = 2.0
+_ps[3:, 0] = -2.0
+_lgs, _vs = _p10.sortie_complete(_x10, _ps)
+(_lgs[:3].sum() + _vs[:3].sum()).backward()
+verifie("une decision en GAIN entraine la tete de gain",
+        _g(_p10.lecteur_gain) > 0 and _g(_p10.acteur_sortie_gain) > 0)
+verifie("jamais la tete de perte",
+        _g(_p10.lecteur_perte) == 0 and _g(_p10.acteur_sortie_perte) == 0)
+verifie("ni les tetes d'ouverture",
+        _g(_p10.tete_achat) == 0 and _g(_p10.tete_vente) == 0)
+verifie("la sortie lit le tronc : toutes les features",
+        _g(_p10.embed) > 0, "elle ne lisait que cinq colonnes")
+_p10.zero_grad(set_to_none=True)
+
+# Les deux mises a jour, sur des tampons factices : chacune ne fait bouger
+# que les groupes qu'elle doit faire bouger.
+_c10 = T.PPOConfig()
+_c10.batch_size = 64
+_c10.max_transitions_ppo = 0
+_o10 = T.optimiseurs_ppo(_p10, _c10)
+_g10 = _p10.groupes_ppo()
+
+
+def _photo():
+    return {k: [q.detach().clone() for q in v] for k, v in _g10.items()}
+
+
+def _bouge(a, b):
+    return {k for k in a
+            if any(float((x - y).abs().max()) > 0 for x, y in zip(a[k], b[k]))}
+
+
+_n = 300
+_eb = []
+for _ in range(2):
+    _ac = np.random.randint(0, 3, _n)
+    _eb.append({
+        "states": [np.random.randn(4, OBS_N_FEATURES).astype(np.float32)
+                   for _ in range(_n)],
+        "masques": [np.ones(3, bool) for _ in range(_n)],
+        "actions": list(_ac),
+        "rewards": list(np.random.randn(_n) * (_ac != 2)),
+        "dts": list(np.where(_ac != 2, 5, 1)),
+        "dones": [False] * (_n - 1) + [True],
+        "lps": [float(np.log(1 / 3))] * _n, "vals": [0.0] * _n,
+        "barres": [0] * _n, "positions": [0] * _n})
+_a = _photo()
+_st10 = T.maj_ppo_entree(_p10, _eb, _o10, _c10, "cpu")
+verifie("la mise a jour d'ENTREE fait bouger achat, vente, tronc, critique",
+        _bouge(_a, _photo()) == {"achat", "vente", "tronc", "valeur_entree"},
+        str(sorted(_bouge(_a, _photo()))))
+_sb = []
+for _ in range(2):
+    _sb.append([{"o": np.random.randn(4, OBS_N_FEATURES).astype(np.float32),
+                 "p": np.random.randn(N_SORTIE_FEATURES).astype(np.float32),
+                 "a": int(np.random.randint(0, 2)), "lp": float(np.log(0.5)),
+                 "v": 0.0, "r": float(np.random.randn()),
+                 "done": bool(np.random.rand() < 0.1)} for _ in range(200)])
+_a = _photo()
+T.maj_ppo_sortie(_p10, _sb, _o10, _c10, "cpu")
+verifie("la mise a jour de SORTIE fait bouger gain, perte, tronc",
+        _bouge(_a, _photo()) == {"gain", "perte", "tronc"},
+        str(sorted(_bouge(_a, _photo()))))
+
+# Le masque est respecte, et le solde decide AVANT le tirage.
+_ae, _, _ = T.decide_entree(_p10, [np.random.randn(4, OBS_N_FEATURES)
+                                   .astype(np.float32) for _ in range(50)],
+                            np.array([[True, False, True]] * 50), "cpu")
+verifie("une action masquee n'est jamais tiree", bool((_ae != VENDRE).all()))
+
+# L'avantage semi-MDP, calcule a la main.
+_adv, _ret = T.avantages_semi_mdp([1.0, 0.0, 2.0], [3, 1, 2], [0.5, 0.2, 0.1],
+                                  [False, False, True], 0.9, 0.95)
+verifie("l'avantage actualise chaque decision par sa duree",
+        np.allclose(_adv, [1.6947, 1.5145, 1.9], atol=1e-4),
+        str(np.round(_adv, 4)))
+
+# UNE REGLE, TROIS LECTEURS.
+verifie("collecte, validation et test decident par `decide_entree`",
+        src.count("decide_entree(") == 4, "1 definition + 3 appels")
+verifie("et masquent par `masque_entree`",
+        src.count("masque_entree(") == 4, "1 definition + 3 appels")
+verifie("le classement ne tourne plus",
+        T.PPOConfig().pas_rang_par_epoch == 0 and not T.PPOConfig().diag_rang)
 
 print("\n9. LE COTE SE DECLARE A UN SEUL ENDROIT")
 # ============================================================

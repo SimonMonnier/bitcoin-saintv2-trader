@@ -146,6 +146,11 @@ from saint_core import (
     TENIR,
     FERMER,
     N_ACTIONS_SORTIE,
+    # LES TROIS ACTIONS D'ENTREE DE PPO, dans l'ordre de l'environnement.
+    ACHETER,
+    VENDRE,
+    ATTENDRE,
+    N_ACTIONS_ENTREE,
     # LES TROIS CONSTANTES DE LA TETE DE PROFIT. Elles sont importees
     # plutot que recopiees : `entree_profit` s'en sert pour extraire les
     # quatre colonnes, et un indice recopie ici finirait par diverger de
@@ -985,7 +990,11 @@ class PPOConfig:
     # la grille reviendrait a diviser son entrainement par 6.6 EN MEME TEMPS
     # qu'on change sa distribution. On ne saurait plus lequel des deux agit.
     # Seule la DONNEE change, pas la quantite.
-    pas_rang_par_epoch: int = 240
+    #
+    # 0 DEPUIS LE 2026-09-25 : LE CLASSEMENT EST ABANDONNE, choix du
+    # proprietaire. Les tetes d'achat et de vente ne regressent plus un
+    # rendement a horizon fixe ; elles sont des politiques apprises par PPO.
+    pas_rang_par_epoch: int = 0
 
     # LA TETE DE CLOTURE A SA PROPRE PASSE, ET SON PROPRE ECHANTILLON.
     #
@@ -1214,6 +1223,11 @@ class PPOConfig:
     # sur 0.693 en quatre epochs — la politique est devenue deterministe
     # avant que le critique n'ait fini de se caler.
     entropie_sortie: float = 0.02
+    # LE BONUS D'ENTROPIE DE LA POLITIQUE D'ENTREE. Sans lui, trois actions
+    # dont deux coutent le spread s'effondrent vite sur ATTENDRE : c'est la
+    # reponse la plus sure tant que rien n'est appris, et c'est celle qui
+    # empeche d'apprendre quoi que ce soit.
+    entropie_entree: float = 0.01
     pas_profit_par_epoch: int = 0
     # L'HORIZON SUR LEQUEL ELLE JUGE — ET IL FIXE AUSSI CELUI DE L'ENTREE.
     #
@@ -1715,7 +1729,11 @@ class PPOConfig:
     # ------------------------------------------------------------------
     validation_tous_les: int = 1
 
-    diag_rang: bool = True
+    #
+    # FALSE DEPUIS LE PPO COMPLET, 2026-09-25. La grille jugeait un
+    # CLASSEMENT — le sommet du tri contre le hasard — et il n'y a plus de
+    # classement. Le critere juge desormais les trades joues en validation.
+    diag_rang: bool = False
     diag_rang_pas: int = 12    # une decision suivie toutes les heures
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -2490,7 +2508,11 @@ class PPOConfig:
     # decisions pesent ~20 000 attentes plus les trades, soit ~0.1 Go —
     # moins que les 20 000 d'avant a plein. Elle reste une soupape : elle ne
     # doit mordre que si l'agent cesse d'entrer.
-    plafond_collecte: int = 400_000
+    #
+    # 400 000 -> 50 000 LE 2026-09-25, avec le PPO complet : chaque decision
+    # garde de nouveau son etat (~5 Ko), donc 50 000 pesent ~0.25 Go — ce
+    # que la machine peut encore donner pendant l'entrainement.
+    plafond_collecte: int = 50_000
 
     # LA PART DES ATTENTES DONT ON GARDE L'ETAT. Une decision qui n'ouvre
     # rien stockait son observation entiere, ~5 Ko ; elles font 95 % des
@@ -2502,7 +2524,13 @@ class PPOConfig:
     #
     # UN TIRAGE UNIFORME, donc la composition de ce qui reste ne change pas.
     # Les decisions qui OUVRENT sont toutes gardees.
-    garde_attentes: float = 0.05
+    #
+    # 1.0 DEPUIS LE PASSAGE AU PPO COMPLET, 2026-09-25. Les attentes sont
+    # redevenues des ACTIONS de la politique d'entree : PPO en a besoin, et
+    # l'avantage se calcule sur la suite COMPLETE des decisions de chaque
+    # episode. En jeter dix-neuf sur vingt casserait cette suite. La memoire
+    # est tenue par `plafond_collecte`, ramene en consequence.
+    garde_attentes: float = 1.0
     # Nombre de passes PPO sur les données collectées.
     # Testé à 8 pour tenter de débloquer le KL (0.0004 contre un target de
     # 0.03) : sans effet sur le KL, resté à 0.0000, et le critique a divergé
@@ -4262,6 +4290,260 @@ def rendements_sortie_ppo(policy, data, idx, cfg, device):
     return ach / _sig, ven / _sig, np.stack([t_a, t_v], axis=1)
 
 
+def optimiseurs_ppo(policy, cfg):
+    """UN OPTIMISEUR PAR GROUPE de `policy.groupes_ppo()`.
+
+    Choix du proprietaire, 2026-09-25 : une tete pour l'achat, une pour la
+    vente, une pour la coupure des gains, une pour la coupure des pertes,
+    CHACUNE AVEC SON OPTIMISEUR. S'y ajoutent le tronc, partage et nourri
+    par les quatre, et le critique de l'etat plat. Les groupes sont
+    disjoints : aucun optimiseur ne touche les poids d'un autre.
+    """
+    return {nom: optim.Adam(ps, lr=float(cfg.lr), eps=1e-8)
+            for nom, ps in policy.groupes_ppo().items()}
+
+
+def masque_entree(masque_plat, envs_):
+    """Les actions d'entree permises, pour chaque environnement qui decide.
+
+    Rend (masque (B, 3) bool, sans_place (B,) bool).
+
+    LE COTE vient du masque plat (`cotes_permises`, et le veto eventuel).
+    LE SOLDE vient ensuite : une ouverture qu'il refuserait est masquee
+    AVANT le tirage. L'action enregistree est alors celle qui est jouee, et
+    sa probabilite celle de la loi qui l'a tiree — c'est ce qui garde le
+    rapport de PPO exact. ATTENDRE est toujours permis.
+
+    UNE ECRITURE, TROIS LECTEURS : collecte, validation, test.
+    """
+    m = np.asarray(masque_plat, dtype=bool)[:, :N_ACTIONS_ENTREE].copy()
+    m[:, ATTENDRE] = True
+    sans = np.zeros(len(envs_), dtype=bool)
+    for i, e in enumerate(envs_):
+        _px = float(e.data.close[min(e.idx, e.data.length - 1)])
+        if e.places_ouvrables(_px) <= 0:
+            m[i, ACHETER] = False
+            m[i, VENDRE] = False
+            sans[i] = True
+    return m, sans
+
+
+def decide_entree(policy, etats, masques, device, explore: bool = True):
+    """Acheter, vendre ou attendre ? Rend (actions, logprobs, valeurs).
+
+    On ECHANTILLONNE a l'entrainement — PPO a besoin que l'action jouee
+    vienne de la loi qu'il met a jour — et on prend l'argmax en validation
+    et au test, comme pour la sortie.
+    """
+    x = torch.as_tensor(np.asarray(etats, dtype=np.float32), device=device)
+    m = torch.as_tensor(np.asarray(masques, dtype=bool), device=device)
+    with torch.no_grad():
+        logits, valeur = policy.entree(x)
+        logits = logits.masked_fill(~m, -1e9)
+        dist = torch.distributions.Categorical(logits=logits)
+        a = dist.sample() if explore else logits.argmax(-1)
+        lp = dist.log_prob(a)
+    return (a.cpu().numpy().astype(np.int64),
+            lp.cpu().numpy().astype(np.float32),
+            valeur.cpu().numpy().astype(np.float32))
+
+
+def avantages_semi_mdp(r, dt, v, fin, gamma: float, lam: float):
+    """GAE sur une suite de decisions qui durent chacune `dt` barres.
+
+    Une decision d'entree couvre toute la vie du trade qu'elle ouvre — ou
+    une seule barre si elle attend. Sa recompense `r` est deja la somme
+    actualisee de ce que le trade a rapporte ; le suivant s'actualise donc
+    de `gamma ** dt`, et la trace de `(gamma ** dt) * lam`.
+
+    La derniere decision de la suite n'a pas de suivante : sa valeur de
+    depart est prise a zero, comme a la fin d'un episode.
+    """
+    r = np.asarray(r, np.float64)
+    dt = np.maximum(np.asarray(dt, np.float64), 1.0)
+    v = np.asarray(v, np.float64)
+    fin = np.asarray(fin, bool)
+    n = len(r)
+    adv = np.zeros(n)
+    a = 0.0
+    for t in range(n - 1, -1, -1):
+        suite = 0.0 if (fin[t] or t == n - 1) else 1.0
+        vn = v[t + 1] if t + 1 < n else 0.0
+        g = gamma ** dt[t]
+        d = r[t] + g * vn * suite - v[t]
+        a = d + g * lam * suite * a
+        adv[t] = a
+    return adv, adv + v
+
+
+def _boucle_ppo(avant, A, LP, RET, ADV, optims, groupes, noms, cfg,
+                coef_h, device):
+    """Les passes PPO communes aux deux mises a jour.
+
+    UN PAS PAR OPTIMISEUR ET PAR LOT, chacun sur ses poids et son propre
+    ecretage de gradient : une tete qui recoit un gradient fort ne reduit
+    pas le pas des autres.
+    """
+    eps = float(getattr(cfg, "clip_eps", 0.2))
+    cv = float(getattr(cfg, "value_coef", 0.5))
+    n = len(A)
+    nlot = max(1, n // max(1, int(cfg.batch_size)))
+    st = {"actor": [], "critic": [], "kl": [], "clip": []}
+    for _ in range(int(getattr(cfg, "passes_ppo", 4))):
+        perm = torch.randperm(n, device=device)
+        for i in range(nlot):
+            m = perm[i::nlot]
+            lg, vv = avant(m)
+            dist = torch.distributions.Categorical(logits=lg)
+            lpn = dist.log_prob(A[m])
+            rt = torch.exp(lpn - LP[m])
+            pa = -torch.min(rt * ADV[m],
+                            torch.clamp(rt, 1 - eps, 1 + eps) * ADV[m]).mean()
+            pc = torch.nn.functional.mse_loss(vv, RET[m])
+            perte = pa + cv * pc - coef_h * dist.entropy().mean()
+            for nom in noms:
+                optims[nom].zero_grad(set_to_none=True)
+            perte.backward()
+            for nom in noms:
+                torch.nn.utils.clip_grad_norm_(groupes[nom],
+                                               float(cfg.max_grad_norm))
+                optims[nom].step()
+            st["actor"].append(float(pa))
+            st["critic"].append(float(pc))
+            st["kl"].append(float((LP[m] - lpn).mean()))
+            st["clip"].append(float(((rt - 1).abs() > eps).float().mean()))
+    return {k: float(np.mean(v)) if v else float("nan") for k, v in st.items()}
+
+
+def _sous_lot(n, cfg):
+    """Les indices gardes pour la mise a jour, APRES le calcul de l'avantage."""
+    idx = np.arange(n)
+    n_max = int(getattr(cfg, "max_transitions_ppo", 0) or 0)
+    if 0 < n_max < n:
+        idx = np.sort(np.random.choice(idx, n_max, replace=False))
+    return idx
+
+
+def maj_ppo_entree(policy, ep_buf, optims, cfg, device):
+    """La mise a jour PPO des tetes d'ACHAT et de VENTE, et du tronc.
+
+    Rend un dict de diagnostics, ou None s'il y a trop peu de decisions.
+    """
+    gam, lam = float(getattr(cfg, "gamma", 0.99)), float(cfg.lambda_gae)
+    O, M, A, LP, RET, ADV = [], [], [], [], [], []
+    for b in ep_buf:
+        if not b["actions"]:
+            continue
+        adv, ret = avantages_semi_mdp(b["rewards"], b["dts"], b["vals"],
+                                      b["dones"], gam, lam)
+        O.extend(b["states"]); M.extend(b["masques"]); A.extend(b["actions"])
+        LP.extend(b["lps"]); ADV.extend(adv); RET.extend(ret)
+    n_total = len(A)
+    if n_total < 256:
+        return None
+    idx = _sous_lot(n_total, cfg)
+    O = torch.as_tensor(np.stack([O[i] for i in idx]).astype(np.float32),
+                        device=device)
+    M = torch.as_tensor(np.stack([M[i] for i in idx]).astype(bool),
+                        device=device)
+    A = torch.as_tensor(np.asarray(A, np.int64)[idx], device=device)
+    LP = torch.as_tensor(np.asarray(LP, np.float32)[idx], device=device)
+    RET = torch.as_tensor(np.asarray(RET, np.float32)[idx], device=device)
+    ADV = torch.as_tensor(np.asarray(ADV, np.float32)[idx], device=device)
+    ADV = (ADV - ADV.mean()) / (ADV.std() + 1e-8)
+    groupes = policy.groupes_ppo()
+    noms = ("tronc", "achat", "vente", "valeur_entree")
+
+    def avant(m):
+        lg, vv = policy.entree(O[m])
+        return lg.masked_fill(~M[m], -1e9), vv
+
+    st = _boucle_ppo(avant, A, LP, RET, ADV, optims, groupes, noms, cfg,
+                     float(getattr(cfg, "entropie_entree", 0.01)), device)
+    with torch.no_grad():
+        hs = []
+        for d in range(0, len(A), 2048):
+            mm = torch.arange(d, min(d + 2048, len(A)), device=device)
+            hs.append(torch.distributions.Categorical(
+                logits=avant(mm)[0]).entropy())
+        st["H"] = float(torch.cat(hs).mean())
+    st["n"], st["n_total"] = len(A), n_total
+    st["parts"] = [float((A == a).float().mean()) for a in range(N_ACTIONS_ENTREE)]
+    return st
+
+
+def maj_ppo_sortie(policy, sortie_buf, optims, cfg, device):
+    """La mise a jour PPO des tetes de COUPURE DES GAINS et DES PERTES.
+
+    Une decision par barre de chaque position. L'avantage se calcule sur la
+    trajectoire entiere de la position — elle peut passer de la perte au
+    gain et revenir — puis chaque decision entraine la tete du cote ou elle
+    a ete prise.
+    """
+    gam, lam = float(getattr(cfg, "gamma", 0.99)), float(cfg.lambda_gae)
+    O, P, A, LP, RET, ADV = [], [], [], [], [], []
+    for b in sortie_buf:
+        if not b:
+            continue
+        b[-1]["done"] = True
+        n = len(b)
+        av = [0.0] * n
+        adv = 0.0
+        for t in range(n - 1, -1, -1):
+            nt = 0.0 if b[t]["done"] else 1.0
+            vn = b[t + 1]["v"] if (t + 1 < n) else 0.0
+            d = b[t]["r"] + gam * vn * nt - b[t]["v"]
+            adv = d + gam * lam * nt * adv
+            av[t] = adv
+        for t in range(n):
+            O.append(b[t]["o"]); P.append(b[t]["p"]); A.append(b[t]["a"])
+            LP.append(b[t]["lp"]); ADV.append(av[t])
+            RET.append(av[t] + b[t]["v"])
+    n_total = len(A)
+    if n_total < 256:
+        return None
+    idx = _sous_lot(n_total, cfg)
+    O = torch.as_tensor(np.stack([O[i] for i in idx]).astype(np.float32),
+                        device=device)
+    _P = torch.as_tensor(np.asarray(P, np.float32)[idx], device=device)
+    A = torch.as_tensor(np.asarray(A, np.int64)[idx], device=device)
+    LP = torch.as_tensor(np.asarray(LP, np.float32)[idx], device=device)
+    RET = torch.as_tensor(np.asarray(RET, np.float32)[idx], device=device)
+    _ADV = torch.as_tensor(np.asarray(ADV, np.float32)[idx], device=device)
+    _en_gain = _P[:, 0] > 0.0
+    # L'AVANTAGE EST NORMALISE PAR TETE : ensemble, celui des pertes —
+    # gonfle par le loyer zombie — fixerait l'echelle, et celui des gains
+    # deviendrait du bruit.
+    for _mq in (_en_gain, ~_en_gain):
+        if int(_mq.sum()) > 1:
+            _x = _ADV[_mq]
+            _ADV[_mq] = (_x - _x.mean()) / (_x.std() + 1e-8)
+    groupes = policy.groupes_ppo()
+    noms = ("tronc", "gain", "perte")
+
+    def avant(m):
+        return policy.sortie_complete(O[m], _P[m])
+
+    st = _boucle_ppo(avant, A, LP, RET, _ADV, optims, groupes, noms, cfg,
+                     float(getattr(cfg, "entropie_sortie", 0.02)), device)
+    with torch.no_grad():
+        hs = []
+        for d in range(0, len(A), 2048):
+            mm = torch.arange(d, min(d + 2048, len(A)), device=device)
+            hs.append(torch.distributions.Categorical(
+                logits=avant(mm)[0]).entropy())
+        h = torch.cat(hs)
+    st["n"], st["n_total"] = len(A), n_total
+    st["tetes"] = {}
+    for nom, mq in (("GAIN ", _en_gain), ("PERTE", ~_en_gain)):
+        k = int(mq.sum())
+        st["tetes"][nom] = (
+            k,
+            float(h[mq].mean()) if k else float("nan"),
+            float((A[mq] == FERMER).float().mean()) if k else float("nan"))
+    return st
+
+
 def decide_sortie(policy, etats, device, n_base: int, explore: bool = True):
     """Tenir ou fermer ? Rend (actions, logprobs, valeurs), un par etat.
 
@@ -4286,9 +4568,12 @@ def decide_sortie(policy, etats, device, n_base: int, explore: bool = True):
     politiques mises a jour ». En validation et en test on veut la
     decision, pas son bruit.
     """
+    # LA TETE LIT TOUTES LES FEATURES : l'observation entiere par le tronc,
+    # plus les cinq colonnes de position. Voir `sortie_complete`.
     p = torch.from_numpy(entree_sortie(etats, n_base)).to(device)
+    x = torch.as_tensor(np.asarray(etats, dtype=np.float32), device=device)
     with torch.no_grad():
-        logits, valeur = policy.sortie(p)
+        logits, valeur = policy.sortie_complete(x, p)
         dist = torch.distributions.Categorical(logits=logits)
         a = dist.sample() if explore else logits.argmax(-1)
         lp = dist.log_prob(a)
@@ -6152,6 +6437,9 @@ UNE SEULE SOURCE pour les trois boucles — rollout, validation, test.
             "entry_price": float(self._p_entree[slot]),
             "exit_price": float(exit_price),
             "pnl": float(realized),
+            # EN UNITES DE RISQUE DE CE TRADE : c'est ce que le critere de
+            # sauvegarde juge depuis le passage au PPO complet.
+            "r": float(realized / max(float(self._p_risque[slot]), 1e-8)),
             "hit_sl": bool(hit_sl),
             "hit_tp": bool(hit_tp),
             "hit_temps": bool(hit_temps),
@@ -7810,8 +8098,10 @@ def run_training_on_split(
     # IL VIT TOUT LE FOLD. La version precedente reconstruisait
     # l'optimiseur a chaque epoch : l'etat Adam — les moments qui lissent
     # le pas — etait jete toutes les quelques minutes.
-    optimizer_sortie = optim.Adam(
-        policy.params_sortie(), lr=float(cfg.lr), eps=1e-8)
+    # UN OPTIMISEUR PAR TETE, PLUS LE TRONC ET LE CRITIQUE D'ENTREE — voir
+    # `optimiseurs_ppo`. Crees une fois par fold : l'etat Adam survit d'une
+    # epoch a l'autre.
+    optims_ppo = optimiseurs_ppo(policy, cfg)
 
     optimizer_rang = optim.Adam(
         policy.parameters(),
@@ -7999,6 +8289,9 @@ def run_training_on_split(
     # Derniere validation COMPLETE, reprise telle quelle les epochs ou elle
     # est sautee. Voir `validation_tous_les`.
     _val_prec = None
+    # LE RENDEMENT EN R DE CHAQUE TRADE DE LA DERNIERE VALIDATION MESUREE,
+    # repris aux epochs ou elle est sautee. Voir le critere PPO.
+    _val_r_prec: List[float] = []
     _val_epoch = 0
 
     # Somme courante des poids des dernieres epochs, et son compteur.
@@ -8095,7 +8388,7 @@ def run_training_on_split(
         ep_buf = [
             {"states": [], "masques": [], "barres": [], "actions": [],
              "rewards": [], "dones": [], "positions": [],
-             "dts": []}
+             "dts": [], "lps": [], "vals": []}
             for _ in range(n_envs)
         ]
         last_reason = [None] * n_envs
@@ -8324,6 +8617,10 @@ def run_training_on_split(
             buf["rewards"].append(p["R"])
             buf["dones"].append(done_flag)
             buf["dts"].append(max(p["dt"], 1))
+            # CE QUE PPO RELIRA : la probabilite de l'action sous la loi
+            # qui l'a tiree, et la valeur que le critique donnait a l'etat.
+            buf["lps"].append(float(p.get("lp", 0.0)))
+            buf["vals"].append(float(p.get("v", 0.0)))
 
         def _cloture(k: int, slot: int, done_flag: bool) -> None:
             p = pending[k].pop(slot, None)
@@ -8414,6 +8711,9 @@ def run_training_on_split(
                                 - (_loyer_eff + _sens_k * _derive) * _dt)
                         _ferme = int(_sa[_bi]) == FERMER
                         sortie_buf[_k].append({
+                            # L'OBSERVATION ENTIERE : la tete de sortie lit
+                            # le tronc, donc toutes les features.
+                            "o": _ep[_bi],
                             "p": _pin[_bi].copy(), "a": int(_sa[_bi]),
                             "lp": float(_slp[_bi]), "v": float(_sv[_bi]),
                             # A la fermeture il ne reste rien a accumuler :
@@ -8426,24 +8726,13 @@ def run_training_on_split(
                             actions_env[_k] = 3
 
             if deciding:
-                batch_np = np.stack([states[k] for k in deciding], axis=0)
-                s_tensor = torch.as_tensor(batch_np, dtype=torch.float32, device=device)
-                # UN SEUL MASQUE, ET CE N'EST PLUS PARCE QU'ILS SONT PLATS.
-                # Le commentaire disait « tous ces envs sont flat » : c'etait
-                # vrai a une position, faux sous concurrence — un
-                # environnement qui garde une place libre peut en tenir
-                # vingt. Le masque reste celui de l'etat PLAT parce que c'est
-                # `peut_entrer()` qui autorise l'ouverture, pas la position
-                # nette. Prendre `build_mask_from_pos_scalar(position)`
-                # interdirait d'ouvrir des qu'une position est ouverte, et
-                # supprimerait l'essaim sans que rien ne le signale.
-                # LE TROISIEME VOTANT ENTRE ICI. TabM n'a pas de gradient et
-                # ses scores dependent de la BARRE, pas seulement de
-                # l'observation : il ne peut donc pas etre un membre du
-                # melange differentiable. Il oppose un veto — il ne propose
-                # rien, il interdit — ce qui est exactement la regle que decrit
-                # `evalue_ensemble` : un signal n'est pas pris si autre chose
-                # le contredit.
+                # ---- L'ENTREE EST UNE DECISION PPO — 2026-09-25 ----
+                #
+                # Plus de classement, plus de barre de selectivite, plus de
+                # quantile : `tete_achat` et `tete_vente` sortent les logits
+                # d'ACHETER et de VENDRE, celui d'ATTENDRE vaut zero, et
+                # l'action est TIREE de cette loi. PPO l'entraine sur ce que
+                # le trade ouvert a rapporte, sortie comprise.
                 masks_np = np.repeat(MASK_FLAT[None, :], len(deciding), axis=0)
                 if votant is not None:
                     for bi, k in enumerate(deciding):
@@ -8452,293 +8741,26 @@ def run_training_on_split(
                             masks_np[bi, 0] = False
                         if not pv:
                             masks_np[bi, 1] = False
-                masks_b = torch.from_numpy(masks_np).to(device)
-
-                with torch.no_grad():
-                    # UN SEUL PASSAGE DANS LE TRONC pour toutes les tetes.
-                    # Profil du 2026-09-19 : le passage avant pese 95 % de la
-                    # collecte. La cause n'etait pas le calcul — 46 000
-                    # parametres — mais le NOMBRE de traversees : direction,
-                    # budget et rendement etaient demandes separement, soit
-                    # deux a trois encodages par lot, doubles par l'ensemble.
-                    # `sorties` les rend en un passage, terme pour terme
-                    # identiques aux appels separes.
-                    _rend_b = policy.sorties(
-                        s_tensor)
-
-                    # ============================================================
-                    # LA DIRECTION EST SUPPRIMEE. LA TETE DE RANG DECIDE SEULE.
-                    #
-                    # CE QU'IL Y AVAIT AVANT. Le rollout tirait l'action des
-                    # logits de l'ACTEUR, pendant que la validation, le test et
-                    # le live remplacent ces probabilites par la sortie de la
-                    # TETE DE RANG. On entrainait donc sur une regle d'entree et
-                    # on deployait sur une autre. C'est la classe de defaut
-                    # exacte qui a deja coute plusieurs runs ici : une
-                    # validation qui jouait une autre strategie, un run
-                    # long-only qui vendait. La tete qui decidait au
-                    # deploiement n'etait meme pas celle qu'on entrainait a
-                    # decider.
-                    #
-                    # POURQUOI C'EST LA TETE DE RANG QUI RESTE. PPO optimise le
-                    # rendement de ses ACTIONS ; rien dans son objectif ne
-                    # recompense un bon ORDRE de ses probabilites, et c'est
-                    # pourtant tout ce dont la selectivite se sert — une barre
-                    # a 5 % ne lit qu'un rang. Mesure sur exec40, 23 epochs :
-                    # comparee a sa propre politique GELEE, la politique
-                    # entrainee rend +0.27 point pour une reference de bruit a
-                    # +0.7 ; l'acteur n'apportait rien a l'entree. La tete de
-                    # rang, elle, tient `sommet` a +1.24 R au-dessus du hasard
-                    # sur dix-huit epochs, et c'est une perte de RANG qui
-                    # l'entraine — l'objectif et l'usage coincident enfin.
-                    #
-                    # CE QUI RESTE A PPO : le budget de risque, et lui seul.
-                    # C'est ce qui a fait tomber le creux de 90 % a 23-50 %.
-                    #
-                    # LA SIGMOIDE est la MEME transformation qu'en validation.
-                    # Un rang ne depend pas de l'echelle : la monotonie suffit
-                    # pour qu'un quantile designe les memes occasions.
-                    #
-                    # LE COTE INTERDIT RESTE INTERDIT. Le masque des logits
-                    # portait cette regle ; en cessant de lire les logits on la
-                    # perdrait, et un run long-only revendrait — c'est
-                    # litteralement le bug documente dans `decide_avec_barres`.
-                    # On la reporte donc sur le SCORE, et la decision passe de
-                    # toute facon par `decide_avec_barres`, qui la porte aussi.
-                    # ============================================================
-                    # UN COTE INTERDIT VAUT -1, PAS 0.
-                    #
-                    # A l'epoch 1 la barre vaut 0 — la distribution des scores
-                    # est encore plate, on laisse tout passer pour disposer
-                    # d'une mesure de reference. Un cote interdit mis a 0.0
-                    # aurait alors franchi cette barre (0.0 >= 0.0) et un run
-                    # long-only aurait vendu des la premiere epoch. -1 est hors
-                    # de l'image de la sigmoide : aucune barre de [0, 1] ne peut
-                    # le laisser passer.
-                    #
-                    # `masks_b` PORTE AUSSI LE VETO DE TabM, pas seulement le
-                    # cote : le troisieme votant l'ecrit dans `masks_np` juste
-                    # au-dessus. Il agissait par les logits, qu'on ne lit plus ;
-                    # il agit maintenant sur le score, donc il continue
-                    # d'interdire exactement les memes entrees.
-                    _cotes_b = masks_b[:, :2]
-                    _sc_b = torch.where(
-                        _cotes_b,
-                        torch.sigmoid(_rend_b.float().clamp(-30.0, 30.0)),
-                        torch.full_like(_rend_b.float(), -1.0))
-                    # LA VALEUR DU CRITIC N'EST PLUS EMPAQUETEE. Elle
-                    # voyageait jusqu'a `en_attente["value"]`, puis
-                    # `buf["values"]`, puis plus rien : le GAE qui la lisait
-                    # est parti avec PPO. On ne transfere plus une colonne
-                    # du GPU vers le CPU a chaque barre pour l'y jeter.
-                    packed = _sc_b.cpu().numpy()
-
-                probs_np = packed[:, :2]
-
+                _m3, _sans = masque_entree(masks_np, [envs[k] for k in deciding])
+                _ea, _elp, _ev = decide_entree(
+                    policy, [states[k] for k in deciding], _m3, device,
+                    explore=True)
+                # `remapped_actions` COMPTE DESORMAIS LES DECISIONS OU LE
+                # SOLDE INTERDISAIT D'OUVRIR — masquees avant le tirage.
+                sampling_audit["remapped_actions"] += int(_sans.sum())
                 for bi, k in enumerate(deciding):
-                    # ---- CURRICULUM D'OUVERTURE FORCÉE ----
-                    a = None
-                    if np.random.rand() < force_prob:
-                        sampling_audit["forced_actions"] += 1
-                        if cfg.side == "long":
-                            a = 0
-                        elif cfg.side == "short":
-                            a = 1
-                        else:
-                            # Équilibré : biaiser vers SELL sur un sous-jacent
-                            # passé de 25k$ à 89k$ revenait à nourrir le modèle
-                            # d'exemples perdants.
-                            a = random.choice([0, 1])
-
-                    # Conviction de trade sur cet état, quelle que soit l'action
-                    # finalement prise : c'est la distribution de ces valeurs qui
-                    # calibre le seuil, elle doit donc être collectée sur TOUS
-                    # les états flat, y compris ceux ouverts de force.
-                    # LES OCCASIONS OU RIEN N'EST OUVRABLE NE CALIBRENT
-                    # RIEN. Les deux cotes y valent -1 (cote interdit, ou veto
-                    # du troisieme votant) : les verser dans le quantile
-                    # reviendrait a compter comme « peu convaincantes » des
-                    # occasions ou le modele n'a jamais eu son mot a dire, et
-                    # la barre descendrait d'autant.
-                    _pmax = float(max(probs_np[bi, 0], probs_np[bi, 1]))
-                    if _pmax >= 0.0:
-                        pbs_epoch.append(_pmax)
-                    # L'AMORCE DE L'EPOCH SUIVANTE, par cote. Elle donne au
-                    # rang glissant un historique des le premier pas au lieu
-                    # de le faire attendre cinquante observations.
-                    for _c in (0, 1):
-                        _v = float(probs_np[bi, _c])
-                        if _v >= 0.0:
-                            pbs_rollout[_c].append(_v)
-
-                    # LE BUDGET SE CHOISIT AVANT LA DIRECTION, et cet ordre
-                    # est le coeur du mecanisme.
-                    #
-                    # `deciding` interroge desormais la capacite AU PLAFOND :
-                    # l'environnement est consulte des qu'une position serait
-                    # possible a un budget quelconque. C'est le budget choisi
-                    # ici qui ouvre ou refuse l'entree — au lieu qu'un choix
-                    # passe la lui interdise pendant les ~1 140 barres de vie
-                    # d'une position.
-                    #
-                    # LA BARRE DU ROLLOUT VIENT DE SON RANG GLISSANT, et
-                    # non plus d'un niveau herite. C'est une correction.
-                    #
-                    # LE DEFAUT, TROUVE LE 2026-09-21. Le bloc de
-                    # commentaire plus haut explique longuement que le
-                    # rollout devait decider par rang glissant « COMME LE
-                    # DEPLOIEMENT ». `train_decisions` etait bien construit
-                    # et alimente par `observe()` — mais la decision lisait
-                    # `(conf_thr, conf_thr)`, le NIVEAU herite de l'epoch
-                    # precedente, c'est-a-dire exactement le defaut que la
-                    # correction annoncait supprimer. La barre calculee
-                    # n'etait jamais consultee.
-                    #
-                    # PREMIERE CONSEQUENCE : UNE SEULE BARRE POUR DEUX
-                    # TETES. `tete_achat` et `tete_vente` sont deux couches
-                    # lineaires distinctes ; rien n'oblige leurs scores a
-                    # vivre sur la meme echelle. Un decalage de 0.6 sur la
-                    # sigmoide suffit a ce qu'une barre commune ne laisse
-                    # passer que des achats :
-                    #
-                    #     barre commune   achats 7.7 %   ventes 2.3 %
-                    #     deux barres     achats 2.5 %   ventes 2.5 %
-                    #
-                    # Mesure au journal : `ENV [B 24.2 % S 0.0 %]` au
-                    # rollout pendant que la validation faisait 2 142 longs
-                    # et 1 743 courts. Le modele apprenait sa barre sur un
-                    # rollout quasi long-only et se faisait mesurer sur une
-                    # validation bilaterale.
-                    #
-                    # SECONDE CONSEQUENCE : L'OSCILLATION. Un niveau herite
-                    # ne suit pas la distribution courante. Sur ce meme
-                    # run : barre 0.000 a l'epoch 1, puis 0.945 a l'epoch 2
-                    # — tout ferme, `ENV [B 0.0 % S 0.0 % H 100 %]` — puis
-                    # 0.504 a l'epoch 3. C'est mot pour mot ce que la
-                    # docstring de `SeuilRang` decrit comme sa raison
-                    # d'etre : « le nombre de trades s'est effondre de
-                    # 1 461 a 20 ».
-                    #
-                    # `thresholds` REND UNE BARRE PAR COTE, chacune au
-                    # quantile `1 - fraction_per_side` de SA propre
-                    # fenetre. Les deux echelles peuvent differer sans
-                    # consequence, et la barre suit la distribution au lieu
-                    # de la subir.
-                    #
-                    # L'ORDRE COMPTE : on LIT les barres avant d'observer
-                    # cette occasion, sans quoi elle serait jugee par un
-                    # quantile qui la contient deja. C'est la faute que
-                    # `EntryDecisionPolicy.decide` evite en faisant les deux
-                    # dans le bon ordre ; ici les deux etapes sont
-                    # separees parce que `_rk_b` sert aussi au journal.
-                    _rk_b = train_decisions[k].ranks
-                    _a_pre = decide_avec_barres(
-                        float(probs_np[bi, 0]), float(probs_np[bi, 1]),
-                        train_decisions[k].thresholds, cfg.side)
-                    for _c in (0, 1):
-                        _rk_b[_c].observe(float(probs_np[bi, _c]))
-                    # LA CAPACITE, QUI NE DEPEND PLUS QUE DU SOLDE.
-                    _place = envs[k].places_ouvrables(
-                        float(envs[k].data.close[
-                            min(envs[k].idx, envs[k].data.length - 1)]))
-
-                    if a is None:
-                        # LA MEME FONCTION QU'AU DEPLOIEMENT, pas une copie.
-                        # `decide_avec_barres` est la source unique de la regle
-                        # d'entree : validation, test, live et desormais
-                        # rollout. Une seconde ecriture aurait diverge sans que
-                        # rien ne le signale — c'est deja arrive ici.
-                        # LA BARRE FIGEE, ET C'EST UNE MESURE QUI LA REND.
-                        #
-                        # Le rang glissant a ete essaye ici — meme objet qu'en
-                        # validation — pour que la barre cesse de deriver. Il
-                        # tient le taux d'entree par construction, l'etendue
-                        # ne s'effondre plus et la soupape n'a jamais tire.
-                        # Mais il DEGRADE la selection, et c'etait le sujet :
-                        #
-                        #   au-dessus du hasard   ep1      ep2      ep3   moy
-                        #   barre figee         +0.490   +0.851   +0.525  +0.622
-                        #   rang glissant       +0.057   +0.584   -0.562  +0.026
-                        #
-                        #   rhoAux, rang glissant  +0.041  -0.028  -0.110
-                        #
-                        # 2.4 sigma sur la difference des moyennes, et la
-                        # degradation est coherente sur les trois epochs et les
-                        # trois indicateurs. A l'epoch 3 la tete retient des
-                        # occasions a +0.007 R quand le hasard en donne +0.569 :
-                        # elle choisit activement les mauvaises.
-                        #
-                        # POURQUOI, PROBABLEMENT. La regle d'entree du rollout
-                        # change les etats COLLECTES, donc ce que PPO fait au
-                        # tronc PARTAGE, donc les sorties de la tete de rang —
-                        # qui s'entraine pourtant sur une grille independante
-                        # de la politique. Le couplage passe par le tronc, pas
-                        # par ses donnees. C'est une hypothese ; la degradation,
-                        # elle, est mesuree.
-                        #
-                        # LA PANNE QUE LE RANG CORRIGEAIT EST COUVERTE AILLEURS :
-                        # `plafond_collecte` empeche desormais la mort memoire
-                        # quand la barre derive et que l'agent cesse d'entrer.
-                        # On garde le garde-fou, on rend la barre qui marche.
-                        # DEJA CALCULEE quelques lignes plus haut pour en
-                        # deduire la taille : la refaire produirait deux
-                        # appels a la meme regle sur les memes entrees, et
-                        # c'est par la que deux regles finissent par diverger.
-                        a = _a_pre
-                        if a == 2:
-                            sampling_audit["remapped_actions"] += 1
-                    # LE SOLDE PEUT LUI REFUSER L'ENTREE. On remappe alors
-                    # sur « attendre », exactement comme pour une conviction
-                    # insuffisante : l'action ENREGISTREE doit etre celle qui
-                    # a ete JOUEE.
-                    if a != 2 and _place <= 0:
-                        sampling_audit["remapped_actions"] += 1
-                        a = 2
-
+                    a = int(_ea[bi])
                     sampling_audit["decisions"] += 1
                     entrees_epoch[a] += 1
-                    # L'AUDIT CHANGE D'OBJET AVEC LA POLITIQUE.
-                    #
-                    # Il verifiait que la log-probabilite stockee correspondait
-                    # bien a la loi qui avait tire l'action — un controle du
-                    # ratio d'importance. La direction n'est plus tiree d'une
-                    # loi : elle est une fonction DETERMINISTE du score. Le
-                    # seul tirage restant est le budget, et sa log-probabilite
-                    # est stockee telle quelle, donc l'erreur y serait nulle
-                    # par construction et ne mesurerait plus rien.
-                    #
-                    # On mesure a la place ce qui peut reellement casser : le
-                    # COTE INTERDIT. Il etait porte par le masque des logits,
-                    # qu'on ne lit plus ; s'il passe, c'est exactement le bug
-                    # documente dans `decide_avec_barres` — un run long-only
-                    # qui vend — et la veille doit le voir des la premiere
-                    # epoch.
-                    if a != 2 and not cotes_permises(cfg.side)[a]:
+                    if a != ATTENDRE and not cotes_permises(cfg.side)[a]:
                         sampling_audit["cote_interdit"] = 1.0
-
-                    # LA LOG-VRAISEMBLANCE EST CELLE DU BUDGET SEUL.
-                    #
-                    # C'est ce qui rend le ratio de PPO EXACT au lieu d'a peu
-                    # pres. Y laisser un terme de direction supposerait que
-                    # l'action a ete tiree des logits de l'acteur ; elle ne
-                    # l'est plus, donc ce terme corrigerait un ecart qui
-                    # n'existe pas. La politique de PPO est maintenant
-                    # exactement pi(budget | etat), et rien d'autre.
-                    # LA LOG-VRAISEMBLANCE A ETE RETIREE LE 2026-09-21.
-                    #
-                    # Elle valait 0.0 depuis la suppression de PPO — il n'y
-                    # a plus de loi dont tirer une probabilite — et elle
-                    # voyageait quand meme jusqu'a un tenseur `oldlog` dont
-                    # le seul lecteur restant etait une assertion de
-                    # longueur, que `actions` fournit deja.
                     en_attente[k] = {
                         "state": states[k],
-                        "masque": masks_np[bi].copy(),
-                        # L'indice de barre : la tete auxiliaire a besoin de
-                        # l'etiquette de CETTE occasion, et elle se calcule sur
-                        # le dataframe, pas sur l'observation normalisee.
+                        "masque": _m3[bi].copy(),
                         "barre": envs[k].idx - 1,
                         "action": a,
+                        "lp": float(_elp[bi]),
+                        "v": float(_ev[bi]),
                         "R": 0.0,
                         "dt": 0,
                     }
@@ -9289,131 +9311,51 @@ def run_training_on_split(
 
 
         _chrono["maj PPO"] = time.time() - _t_phase; _t_phase = time.time()
-        # ============================================================
-        # PPO SUR LA SORTIE — ET SEULEMENT SUR LA SORTIE
-        # ============================================================
+        # ==============================================================
+        # PPO COMPLET — LES QUATRE TETES APPRENNENT ICI (2026-09-25)
+        # ==============================================================
         #
-        # L'ENTREE N'EST PAS ENTRAINEE PAR PPO, et ce n'est pas un oubli.
-        # Le journal du depot chiffre pourquoi : « toute conclusion tiree
-        # d'un ecart de validation inferieur a 0.2 R par trade est du
-        # bruit, y compris les "PPO degrade la validation" accumules
-        # depuis exec24. Ces runs n'ont pas montre que PPO nuit ; ils
-        # n'ont rien montre. » Le plancher venait de la RARETE des
-        # occasions d'entree — une cinquantaine par fenetre. La SORTIE en
-        # offre une par barre de chaque trade, et sa consequence se
-        # realise dans le trade meme : l'attribution de credit est courte
-        # et les donnees abondantes.
+        # D'abord l'ENTREE — achat et vente, sur les decisions prises a
+        # plat —, puis la SORTIE — coupure des gains et des pertes, sur les
+        # decisions prises en position. Chaque tete avance par SON
+        # optimiseur ; le tronc, lu par les quatre, avance par le sien a
+        # chacune des deux mises a jour.
         #
-        # L'ACTEUR D'ENTREE RESTE GELE. `actor` et `critic` ne sont
-        # toujours pas calcules ; seuls `mlp_sortie`, `acteur_sortie` et
-        # `critique_sortie` recoivent un gradient ici.
-        _tr = [t for k in range(n_envs) for t in sortie_buf[k]]
-        if len(_tr) >= 256:
-            policy.train()
-            _gam = float(getattr(cfg, "gamma", 0.99))
-            _lam = float(cfg.lambda_gae)
-            # L'AVANTAGE SE CALCULE SUR LA TRAJECTOIRE ENTIERE. Une position
-            # peut passer de la perte au gain et revenir : sa trajectoire
-            # traverse les deux tetes, et le GAE est une propriete de la
-            # trajectoire, pas de la tete.
-            _P, _A, _LP, _RET, _ADV = [], [], [], [], []
-            for _k in range(n_envs):
-                _b = sortie_buf[_k]
-                if not _b:
-                    continue
-                _b[-1]["done"] = True
-                _adv, _n = 0.0, len(_b)
-                _av = [0.0] * _n
-                for _t in range(_n - 1, -1, -1):
-                    _nt = 0.0 if _b[_t]["done"] else 1.0
-                    _vn = _b[_t + 1]["v"] if (_t + 1 < _n) else 0.0
-                    _d = _b[_t]["r"] + _gam * _vn * _nt - _b[_t]["v"]
-                    _adv = _d + _gam * _lam * _nt * _adv
-                    _av[_t] = _adv
-                for _t in range(_n):
-                    _P.append(_b[_t]["p"]); _A.append(_b[_t]["a"])
-                    _LP.append(_b[_t]["lp"]); _ADV.append(_av[_t])
-                    _RET.append(_av[_t] + _b[_t]["v"])
-            _P = torch.tensor(np.asarray(_P, np.float32), device=device)
-            _A = torch.tensor(np.asarray(_A, np.int64), device=device)
-            _LP = torch.tensor(np.asarray(_LP, np.float32), device=device)
-            _RET = torch.tensor(np.asarray(_RET, np.float32), device=device)
-            _ADV = torch.tensor(np.asarray(_ADV, np.float32), device=device)
-            # LE ROUTAGE EST CELUI DE `policy.sortie` : le signe du latent au
-            # moment de la decision.
-            _en_gain = _P[:, 0] > 0.0
-            # L'AVANTAGE EST NORMALISE PAR TETE, dans la meme mise a jour.
-            # Ensemble, celui des pertes — gonfle par le loyer zombie —
-            # aurait fixe l'echelle, et celui des gains serait devenu du
-            # bruit. Un seul modele, une seule perte, mais chaque tete voit
-            # son avantage a sa propre echelle.
-            for _mq in (_en_gain, ~_en_gain):
-                if int(_mq.sum()) > 1:
-                    _x = _ADV[_mq]
-                    _ADV[_mq] = (_x - _x.mean()) / (_x.std() + 1e-8)
-            _eps = float(getattr(cfg, "clip_eps", 0.2))
-            _ce = float(getattr(cfg, "entropie_sortie",
-                                getattr(cfg, "entropy_coef", 0.01)))
-            _cv = float(getattr(cfg, "value_coef", 0.5))
-            _params = policy.params_sortie()
-            _nlot = max(1, len(_A) // max(1, int(cfg.batch_size)))
-            _la, _lc, _lk, _lcl = [], [], [], []
-            _hg, _hp = [], []
-            for _ in range(4):
-                _perm = torch.randperm(len(_A), device=device)
-                for _i in range(_nlot):
-                    _m = _perm[_i::_nlot]
-                    _lg, _vv = policy.sortie(_P[_m])
-                    _dist = torch.distributions.Categorical(logits=_lg)
-                    _lpn = _dist.log_prob(_A[_m])
-                    _rt = torch.exp(_lpn - _LP[_m])
-                    _o1 = _rt * _ADV[_m]
-                    _o2 = torch.clamp(_rt, 1 - _eps, 1 + _eps) * _ADV[_m]
-                    _pa = -torch.min(_o1, _o2).mean()
-                    _pc = torch.nn.functional.mse_loss(_vv, _RET[_m])
-                    _ent = _dist.entropy()
-                    _ph = _ent.mean()
-                    _perte = _pa + _cv * _pc - _ce * _ph
-                    optimizer_sortie.zero_grad(set_to_none=True)
-                    _perte.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        _params, float(cfg.max_grad_norm))
-                    optimizer_sortie.step()
-                    _la.append(float(_pa)); _lc.append(float(_pc))
-                    _lk.append(float((_LP[_m] - _lpn).mean()))
-                    _lcl.append(float(((_rt - 1).abs() > _eps).float().mean()))
-                    # L'ENTROPIE PAR TETE, parce que c'est elle qui dira si
-                    # l'une des deux s'effondre pendant que l'autre explore.
-                    _g = _en_gain[_m]
-                    if bool(_g.any()):
-                        _hg.append(float(_ent[_g].mean()))
-                    if bool((~_g).any()):
-                        _hp.append(float(_ent[~_g].mean()))
-            _hmax = np.log(N_ACTIONS_SORTIE)
-            _nf = lambda q: float(q.float().mean()) if bool(q.any()) else float("nan")
+        # EN MODE EVAL : le tronc a du dropout, et le rapport de PPO n'est
+        # exact que si l'ancienne et la nouvelle politique sont la meme
+        # fonction. `eval()` ne coupe pas le gradient.
+        policy.eval()
+        _st_e = maj_ppo_entree(policy, ep_buf, optims_ppo, cfg, device)
+        if _st_e is not None:
+            epoch_actor_loss.append(_st_e["actor"])
+            epoch_critic_loss.append(_st_e["critic"])
+            epoch_kl.append(_st_e["kl"])
+            clipfrac_hist.append(_st_e["clip"])
+            _pa_, _pv_, _ph_ = (100 * x for x in _st_e["parts"])
+            print(f"  {_col('phase', _C.GREY)}  PPO entree  "
+                  f"{_st_e['n']:,} decisions (sur {_st_e['n_total']:,})  "
+                  f"ActorL {_st_e['actor']:+.4f}  CriticL {_st_e['critic']:.4f}  "
+                  f"KL {_st_e['kl']:+.4f}  clip {100*_st_e['clip']:.0f}%  "
+                  f"H {_st_e['H']:.3f}/{np.log(N_ACTIONS_ENTREE):.3f}  "
+                  f"achat {_pa_:.1f}%  vente {_pv_:.1f}%  attendre {_ph_:.1f}%")
+        else:
+            print(f"  {_col('phase', _C.GREY)}  PPO entree  trop peu de "
+                  f"decisions pour une mise a jour")
+        _st_s = maj_ppo_sortie(policy, sortie_buf, optims_ppo, cfg, device)
+        if _st_s is not None:
             print(f"  {_col('phase', _C.GREY)}  PPO sortie  "
-                  f"{len(_A):,} transitions  "
-                  f"ActorL {np.mean(_la):+.4f}  CriticL {np.mean(_lc):.4f}  "
-                  f"KL {np.mean(_lk):+.4f}  clip {100*np.mean(_lcl):.0f}%")
-            for _cote, _mq, _hh in (("GAIN ", _en_gain, _hg),
-                                    ("PERTE", ~_en_gain, _hp)):
-                _ferme = _nf(_A[_mq] == FERMER)
+                  f"{_st_s['n']:,} transitions (sur {_st_s['n_total']:,})  "
+                  f"ActorL {_st_s['actor']:+.4f}  CriticL {_st_s['critic']:.4f}  "
+                  f"KL {_st_s['kl']:+.4f}  clip {100*_st_s['clip']:.0f}%")
+            for _cote, (_nd, _hh, _ferme) in _st_s["tetes"].items():
                 print(f"  {_col('phase', _C.GREY)}  PPO sortie {_cote}  "
-                      f"{int(_mq.sum()):,} decisions  "
-                      f"H {np.mean(_hh) if _hh else float('nan'):.3f}/{_hmax:.3f}  "
+                      f"{_nd:,} decisions  "
+                      f"H {_hh:.3f}/{np.log(N_ACTIONS_SORTIE):.3f}  "
                       f"ferme {100*_ferme:.1f}%")
         else:
-            print(f"  {_col('phase', _C.GREY)}  PPO sortie  "
-                  f"{len(_tr)} transitions — trop peu pour une mise a jour")
-
-        # SANS CETTE LIGNE ON LIRAIT `ActorL 0.0000 CriticL 0.0000` et on
-        # chercherait une panne. Ce sont des zeros VOULUS pour l'acteur
-        # d'ENTREE, qui reste gele. La sortie, elle, apprend — voir la
-        # ligne `PPO sortie` juste au-dessus.
-        print(f"  {_col('phase', _C.GREY)}  entree : PAS DE PPO — "
-              f"{_n_transitions} transitions collectees, gardees pour la "
-              f"calibration de la barre. Le tronc n'apprend que par la tete "
-              f"de rang. ActorL/CriticL/KL/gnorm sont nuls par construction.")
+            print(f"  {_col('phase', _C.GREY)}  PPO sortie  trop peu de "
+                  f"transitions pour une mise a jour")
+        _chrono["maj PPO"] = time.time() - _t_phase; _t_phase = time.time()
 
         # LA PASSE SUPERVISEE TOURNE APRES PPO, ET NON AVANT.
         #
@@ -10115,85 +10057,22 @@ def run_training_on_split(
                             v_actions[_k] = 3
 
                 if deciding:
-                    vb = np.stack([v_states[k] for k in deciding], axis=0)
-                    st = torch.as_tensor(vb, dtype=torch.float32, device=device)
-                    masks_b = torch.from_numpy(
-                        np.repeat(MASK_FLAT[None, :], len(deciding), axis=0)
-                    ).to(device)
-
-                    # UN SEUL PASSAGE DANS LE TRONC pour toutes les tetes.
-                    # Profil du 2026-09-19 : le passage avant pese 95 % de la
-                    # collecte. La cause n'etait pas le calcul — 46 000
-                    # parametres — mais le NOMBRE de traversees : direction,
-                    # budget et rendement etaient demandes separement, soit
-                    # deux a trois encodages par lot, doubles par l'ensemble.
-                    # `sorties` les rend en un passage, terme pour terme
-                    # identiques aux appels separes.
-                    _rend_v = policy.sorties(st)
-
-                    # LE SCORE DE TRI VIENT DE LA TETE AUXILIAIRE. Les deux
-                    # sorties predisent le rendement net d'un achat et d'une
-                    # vente ; on les passe par une sigmoide pour qu'elles
-                    # vivent dans [0, 1] comme les probabilites, puisque la
-                    # barre calibree et `EntryDecisionPolicy` raisonnent sur
-                    # des rangs. La monotonie suffit : un rang ne depend pas
-                    # de l'echelle.
-                    # PLUS DE BASCULE : LA TETE DE RANG EST LA SEULE SOURCE.
-                    # `tri_par_tete_aux` permettait de rebrancher les logits de
-                    # l'acteur sur la decision. La direction supprimee, ce drapeau
-                    # n'aurait plus offert qu'un moyen de rejouer le defaut qu'on
-                    # vient de corriger — un `False` quelque part, et le rollout et
-                    # le deploiement rejoueraient deux strategies differentes.
-                    _aux = _rend_v.float().cpu().numpy()
-                    probs_np = 1.0 / (1.0 + np.exp(-np.clip(_aux, -30, 30)))
-
+                    # LA MEME POLITIQUE QU'A L'ENTRAINEMENT, en argmax.
+                    # `barre` compte desormais les attentes que la politique
+                    # a CHOISIES, `capacite` celles que le solde imposait.
+                    _m3, _sans = masque_entree(
+                        np.repeat(MASK_FLAT[None, :], len(deciding), axis=0),
+                        [val_envs[k] for k in deciding])
+                    _va_e, _, _ = decide_entree(
+                        policy, [v_states[k] for k in deciding], _m3, device,
+                        explore=False)
                     _portillons["occasions"] += len(deciding)
+                    _portillons["capacite"] += int(_sans.sum())
                     for bi, k in enumerate(deciding):
-                        # On retient le MEILLEUR CÔTÉ, puis on exige seulement
-                        # que sa conviction franchisse la barre calibrée.
-                        #
-                        # L'ancienne règle passait par argmax sur les 3 actions,
-                        # donc exigeait implicitement p(BUY) > p(HOLD). Mesuré :
-                        # la policy converge vers p ≈ (0.31, 0.31, 0.38), HOLD
-                        # est l'argmax partout, et la validation renvoyait 0
-                        # trade même avec un seuil nul. Ce n'est pas ce qu'on
-                        # veut mesurer : une stratégie qui ne trade que 5 % du
-                        # temps a forcément p(HOLD) majoritaire en moyenne.
-                        # MEME SOURCE QUE LA CALIBRATION, forcement : la
-                        # barre et la valeur jugee doivent sortir du meme
-                        # calcul, sinon le quantile ne veut rien dire.
-                        pb, ps = float(probs_np[bi, 0]), float(probs_np[bi, 1])
-                        # Chaque côté est jugé sur SA barre. Si les deux passent,
-                        # on retient le plus net par rapport à la sienne, pas le
-                        # plus probable dans l'absolu.
-                        # Les niveaux courants sont lus AVANT d'enregistrer :
-                        # une occasion ne doit pas participer au quantile qui
-                        # la juge.
-                        a = val_decisions[k].decide(pb, ps)
-                        # LEQUEL DES DEUX PORTILLONS FERME ?
-                        #
-                        # Le nombre de trades de validation est tombe de
-                        # 300-450 a 94-173 et rien ne disait POURQUOI. Deux
-                        # regles peuvent refuser une entree — la BARRE de
-                        # selectivite (le score ne la franchit pas) et la
-                        # CAPACITE (le budget choisi n'ouvre rien) — et le
-                        # journal ne comptait ni l'une ni l'autre. Cinq
-                        # explications ont ete proposees sans ce compteur,
-                        # toutes fausses. Trois lignes le reglent.
-                        if a == 2:
+                        a = int(_va_e[bi])
+                        if a == ATTENDRE:
                             _portillons["barre"] += 1
-                        # LA CAPACITE EST CONSULTEE ICI AUSSI. `deciding`
-                        # l'interroge deja, mais entre les deux le solde a pu
-                        # bouger : sans ce controle la validation ouvrirait
-                        # une position que le rollout aurait refusee, et
-                        # mesurerait une autre strategie.
-                        _ve = val_envs[k]
-                        if a != 2 and _ve.places_ouvrables(
-                                float(_ve.data.close[
-                                    min(_ve.idx, _ve.data.length - 1)])) <= 0:
-                            a = 2
-                            _portillons["capacite"] += 1
-                        elif a != 2:
+                        else:
                             _portillons["entrees"] += 1
                         v_actions[k] = a
 
@@ -10919,6 +10798,24 @@ def run_training_on_split(
         # fenetre ; on prend celle de l'environnement 0, comme la
         # validation prend `val_decisions[0]`. Un flux vaut l'autre :
         # ils voient le meme nombre d'occasions.
+        # LE CRITERE JUGE LES TRADES JOUES EN VALIDATION — PPO complet,
+        # 2026-09-25.
+        #
+        # Il jugeait un CLASSEMENT : les 5 % d'occasions preferees d'une
+        # grille, contre le hasard. Il n'y a plus de classement ; la
+        # strategie est ce que la politique JOUE. Le score net se calcule
+        # donc sur les trades de validation, en R de chacun — gain moyen
+        # moins taille typique des pertes, la meme formule
+        # (`score_retenue`). Le portillon du hasard n'a plus d'objet : il
+        # comparait un tri a un tirage.
+        if _rang_idx is None:
+            if _valide:
+                _val_r_prec = [float(tm.get("r", 0.0))
+                               for ve in val_envs for tm in ve.trades_meta]
+            if _val_r_prec:
+                _gain_net, _creux_grille, _score_net = score_retenue(
+                    np.asarray(_val_r_prec, dtype=np.float64))
+
         _thr_roll = train_decisions[0].thresholds
         _ligne_meta = (
             f"{tag} {epoch_str}  "
@@ -11339,7 +11236,10 @@ def run_training_on_split(
         # silence le jour ou `rhoAux` manque.
         _score_rang = _rho_aux
         _retenu, _pourquoi = retient_checkpoint(
-            gain_top=_gain_top, score_rang=_score_rang,
+            # SANS CLASSEMENT, le « sommet » est le gain moyen par trade :
+            # le portillon du hasard est saute (`gain_tous` vaut nan).
+            gain_top=(_gain_top if _rang_idx is not None else _gain_net),
+            score_rang=_score_rang,
             gain_tous=_gain_tous,
             score_retenue=_score_net, creux=_creux_grille,
             marge_hasard=_marge_hasard,
@@ -11525,43 +11425,15 @@ def run_training_on_split(
                         t_actions[_k] = 3
 
             if deciding:
-                tb = np.stack([t_states[k] for k in deciding], axis=0)
-                st = torch.as_tensor(tb, dtype=torch.float32, device=device)
-                masks_b = torch.from_numpy(
-                    np.repeat(MASK_FLAT[None, :], len(deciding), axis=0)
-                ).to(device)
-
-                # UN SEUL PASSAGE DANS LE TRONC, comme en validation.
-                _rend_t = policy.sorties(st)
-                # MEME SCORE DE TRI QU'EN VALIDATION. Mesurer le test avec un
-                # autre tri que celui qui a servi a calibrer les barres
-                # mesurerait une strategie que personne ne deploierait.
-                # PLUS DE BASCULE : LA TETE DE RANG EST LA SEULE SOURCE.
-                # `tri_par_tete_aux` permettait de rebrancher les logits de
-                # l'acteur sur la decision. La direction supprimee, ce drapeau
-                # n'aurait plus offert qu'un moyen de rejouer le defaut qu'on
-                # vient de corriger — un `False` quelque part, et le rollout et
-                # le deploiement rejoueraient deux strategies differentes.
-                _a = _rend_t.float().cpu().numpy()
-                probs_np = 1.0 / (1.0 + np.exp(-np.clip(_a, -30, 30)))
+                # LA MEME POLITIQUE QU'EN VALIDATION, en argmax.
+                _m3, _ = masque_entree(
+                    np.repeat(MASK_FLAT[None, :], len(deciding), axis=0),
+                    [test_envs[k] for k in deciding])
+                _ta_e, _, _ = decide_entree(
+                    policy, [t_states[k] for k in deciding], _m3, device,
+                    explore=False)
                 for bi, k in enumerate(deciding):
-                    # MÊME règle qu'en validation et qu'en production : meilleur
-                    # côté, puis barre calibrée. Utiliser ici le seuil absolu
-                    # historique ferait mesurer le TEST sur une autre politique
-                    # que celle qu'on déploierait.
-                    # MÊME règle qu'en validation : une barre par côté, toutes
-                    # deux calibrées sur la VALIDATION et jamais sur le test —
-                    # les recalibrer ici reviendrait à régler un paramètre sur
-                    # les données censées mesurer la généralisation.
-                    pb, ps = float(probs_np[bi, 0]), float(probs_np[bi, 1])
-                    a = test_decisions[k].decide(pb, ps)
-                    # MEME REGLE QU'EN ROLLOUT ET QU'EN VALIDATION.
-                    _te = test_envs[k]
-                    if a != 2 and _te.places_ouvrables(
-                            float(_te.data.close[
-                                min(_te.idx, _te.data.length - 1)])) <= 0:
-                        a = 2
-                    t_actions[k] = a
+                    t_actions[k] = int(_ta_e[bi])
 
             still = []
             for k in t_active:

@@ -54,8 +54,12 @@ def verifie(nom, cond, detail=""):
 print("\n1. LE ROLLOUT LIT LA BARRE DE SON RANG GLISSANT")
 # ============================================================
 src = io.open("training.py", encoding="utf-8").read()
-verifie("il decide sur `train_decisions[k].thresholds`",
-        "train_decisions[k].thresholds, cfg.side" in src)
+# DEPUIS LE PPO COMPLET (2026-09-25) IL N'Y A PLUS DE BARRE : la regle
+# commune est `decide_entree`, lue par la collecte, la validation et le
+# test. L'intention de ce test — UNE regle — est gardee.
+verifie("il decide par la meme regle que la validation",
+        src.count("decide_entree(") == 4 and src.count("masque_entree(") == 4,
+        "`decide_entree` et `masque_entree`, trois appels chacune")
 verifie("il ne decide plus sur `(conf_thr, conf_thr)`",
         "(conf_thr, conf_thr), cfg.side" not in src,
         "le niveau herite ne commande plus")

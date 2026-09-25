@@ -926,6 +926,13 @@ COL_SENS_SORTIE = N_PROFIT_FEATURES     # le sens est la DERNIERE colonne
 # inversion ne leverait aucune erreur, elle ferait seulement fermer quand
 # il faut tenir.
 TENIR, FERMER = 0, 1
+
+# LES TROIS ACTIONS D'ENTREE, dans l'ordre des actions de l'environnement :
+# 0 acheter, 1 vendre, 2 attendre. Le logit d'ATTENDRE est fixe a zero ; les
+# tetes d'achat et de vente disent chacune combien elles preferent ouvrir a
+# attendre. Voir `SAINTPolicySingleHead.entree`.
+ACHETER, VENDRE, ATTENDRE = 0, 1, 2
+N_ACTIONS_ENTREE = 3
 N_ACTIONS_SORTIE = 2
 
 # OU LIRE LES DEUX COLONNES DE LA TETE DE PROFIT, dans le bloc de features.
@@ -2130,6 +2137,37 @@ class SAINTPolicySingleHead(nn.Module):
         self.acteur_sortie_perte = nn.Linear(64, N_ACTIONS_SORTIE)
         self.critique_sortie_perte = nn.Linear(64, 1)
 
+        # ============================================================
+        # QUATRE TETES PPO SUR LE TRONC — demande du proprietaire, 2026-09-25
+        # ============================================================
+        #
+        #   tete_achat    ouvre un LONG             `entree`
+        #   tete_vente    ouvre un SHORT            `entree`
+        #   tete de gain  ferme une position en GAIN    `sortie_complete`
+        #   tete de perte ferme une position en PERTE   `sortie_complete`
+        #
+        # TOUTES LISENT LE TRONC, donc TOUTES LES FEATURES. Les deux tetes de
+        # sortie ne lisaient que cinq colonnes (latent, age, creux, flux,
+        # sens) ; elles lisent desormais la representation SAINT complete,
+        # plus ces cinq colonnes, concatenees.
+        #
+        # CHACUNE A SON OPTIMISEUR : voir `groupes_ppo`. Le tronc est
+        # partage et a le sien, nourri par les quatre.
+        #
+        # PLUS DE CLASSEMENT : les tetes d'achat et de vente ne regressent
+        # plus un rendement a horizon fixe, elles sortent des LOGITS de
+        # politique appris par PPO sur ce que les trades rapportent.
+        #
+        # LE LECTEUR DE SORTIE EST ETROIT A L'ENTREE — 16 — parce que la
+        # lecture « colonnes » fait 2 232 valeurs : un lecteur de 64 en
+        # couterait 143 000 par tete, cinq fois le tronc.
+        def _lecture_sortie():
+            return nn.Sequential(
+                nn.Linear(dim_lecture + N_SORTIE_FEATURES, 16), nn.GELU(),
+                nn.Linear(16, 64), nn.GELU())
+        self.lecteur_gain = _lecture_sortie()
+        self.lecteur_perte = _lecture_sortie()
+
         self._init_poids()
 
     def _init_poids(self):
@@ -2152,6 +2190,17 @@ class SAINTPolicySingleHead(nn.Module):
         nn.init.zeros_(self.actor.bias)
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
         nn.init.zeros_(self.critic.bias)
+        # LES QUATRE ACTEURS PPO PARTENT PRESQUE UNIFORMES, pour la meme
+        # raison que `actor` : un acteur a gain racine de 2 sortirait des
+        # logits deja marques, et le premier pas corrigerait un a priori
+        # arbitraire. Les critiques restent a gain 1.
+        for _m in (self.tete_achat, self.tete_vente,
+                   self.acteur_sortie_gain, self.acteur_sortie_perte):
+            nn.init.orthogonal_(_m.weight, gain=0.01)
+            nn.init.zeros_(_m.bias)
+        for _m in (self.critique_sortie_gain, self.critique_sortie_perte):
+            nn.init.orthogonal_(_m.weight, gain=1.0)
+            nn.init.zeros_(_m.bias)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Tronc : (B, T, F) -> lecture a deux vues (B, 2*d_model).
@@ -2353,6 +2402,86 @@ class SAINTPolicySingleHead(nn.Module):
                              self.critique_sortie_gain(h).squeeze(-1),
                              self.critique_sortie_perte(h).squeeze(-1))
         return logits, valeur
+
+    def _lecture_tronc(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.encode(x)
+        if self.memoire is not None:
+            h = self.memoire(h)
+        return self.norm(h)
+
+    def entree(self, x: torch.Tensor):
+        """Ouvrir un long, un short, ou attendre ? (logits (B, 3), valeur (B,)).
+
+        DEUX TETES, UNE PAR COTE. `tete_achat` rend le logit d'ACHETER,
+        `tete_vente` celui de VENDRE, chacune par son propre lecteur du
+        tronc. Le logit d'ATTENDRE est fixe a zero : chaque tete dit
+        seulement combien elle prefere ouvrir a ne rien faire, et le
+        gradient d'une decision d'achat ne touche jamais la tete de vente.
+
+        LA VALEUR de l'etat plat vient de `critic` sur son lecteur `mlp` —
+        les deux etaient morts depuis la suppression de PPO, et reprennent
+        exactement leur role d'origine.
+        """
+        zn = self._lecture_tronc(x)
+        la = self.tete_achat(self.mlp_achat(zn))
+        lv = self.tete_vente(self.mlp_vente(zn))
+        logits = torch.cat([la, lv, torch.zeros_like(la)], dim=-1)
+        valeur = self.critic(self.mlp(zn)).squeeze(-1)
+        return logits, valeur
+
+    def sortie_complete(self, x: torch.Tensor, p: torch.Tensor):
+        """Tenir ou fermer, en lisant TOUTES les features. (logits (B, 2), valeur (B,)).
+
+        `x` est l'observation complete, `p` les cinq colonnes de position
+        (`entree_sortie` dans `training.py`) : latent, age, creux, flux,
+        sens. Le tronc lit la premiere ; les deux sont concatenees pour la
+        tete, qui voit donc le marche entier ET l'etat de sa position.
+
+        LE ROUTAGE EST CELUI DE `sortie` : le signe du latent. Une decision
+        en gain entraine la tete de gain, une decision en perte — equilibre
+        exact compris — la tete de perte, et jamais l'inverse.
+        """
+        z = torch.cat([self._lecture_tronc(x), p], dim=-1)
+        en_gain = p[:, 0] > 0.0
+        hg = self.lecteur_gain(z)
+        hp = self.lecteur_perte(z)
+        logits = torch.where(en_gain.unsqueeze(-1),
+                             self.acteur_sortie_gain(hg),
+                             self.acteur_sortie_perte(hp))
+        valeur = torch.where(en_gain,
+                             self.critique_sortie_gain(hg).squeeze(-1),
+                             self.critique_sortie_perte(hp).squeeze(-1))
+        return logits, valeur
+
+    def groupes_ppo(self):
+        """Les poids de chaque optimiseur, DISJOINTS. dict nom -> liste.
+
+            achat          lecteur + tete d'achat
+            vente          lecteur + tete de vente
+            gain           lecteur + acteur + critique de la coupure des gains
+            perte          lecteur + acteur + critique de la coupure des pertes
+            valeur_entree  lecteur + critique de l'etat plat
+            tronc          plongement, blocs d'attention, normalisation
+
+        Le tronc est PARTAGE : les quatre tetes le lisent, leurs pertes y
+        remontent, et c'est son optimiseur a lui qui l'avance.
+        """
+        def _p(*mods):
+            return [q for m in mods for q in m.parameters()]
+        g = {
+            "achat": _p(self.mlp_achat, self.tete_achat),
+            "vente": _p(self.mlp_vente, self.tete_vente),
+            "gain": _p(self.lecteur_gain, self.acteur_sortie_gain,
+                       self.critique_sortie_gain),
+            "perte": _p(self.lecteur_perte, self.acteur_sortie_perte,
+                        self.critique_sortie_perte),
+            "valeur_entree": _p(self.mlp, self.critic),
+            "tronc": _p(self.embed, self.col_emb, *self.blocks, self.norm)
+                     + [self.cls],
+        }
+        if self.memoire is not None:
+            g["tronc"] += list(self.memoire.parameters())
+        return g
 
     def params_sortie(self):
         """Tous les poids du MODELE DE SORTIE, et rien d'autre.
