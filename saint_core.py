@@ -893,6 +893,30 @@ IDX_PROFIT_POS = (1, 2)      # latent en ATR d'entree, age normalise
 COLS_PROFIT_MARCHE = ("creux_rang", "flux_rang")
 N_PROFIT_FEATURES = len(IDX_PROFIT_POS) + len(COLS_PROFIT_MARCHE)
 
+# LE MODELE DE SORTIE LIT UNE COLONNE DE PLUS : LE SENS DE LA POSITION.
+#
+# TANT QUE SEULS LES LONGS OUVRAIENT, le sens etait une constante et le
+# modele de sortie n'en avait pas besoin. Avec les shorts, le meme etat de
+# marche ne veut plus dire la meme chose selon le cote tenu. `creux_rang`
+# bas, c'est un prix tombe sous sa moyenne : pour un long, la situation
+# qui l'a mis en perte ; pour un short, celle qui l'a mis en gain — et
+# qui s'epuise peut-etre. `flux_rang` compte le volume AGRESSIF A
+# L'ACHAT : il pousse dans le sens du long et contre le short.
+#
+# ON NE PEUT PAS SIMPLEMENT RETOURNER CES COLONNES POUR UN SHORT. Le rang
+# du creux se retournerait, celui du flux non : son miroir serait le
+# volume agressif a la VENTE, que l'etat ne porte pas. Le sens est donc
+# donne tel quel, et le modele apprend lui-meme ce qu'il change.
+#
+# IL VIENT DU BLOC POSITION, colonne 0 — `float(self.position)`, +1 ou
+# -1 — deja dans l'observation. Aucune colonne nouvelle a fabriquer.
+#
+# `tete_profit` GARDE SES QUATRE COLONNES : c'est un autre organe, et sa
+# mesure (IC +0.1523) a ete faite sans le sens.
+IDX_SENS_POS = 0
+N_SORTIE_FEATURES = N_PROFIT_FEATURES + 1
+COL_SENS_SORTIE = N_PROFIT_FEATURES     # le sens est la DERNIERE colonne
+
 # DEUX ACTIONS DE SORTIE, DANS CET ORDRE EXACT : tenir, puis fermer.
 # L'ordre est lu par `decide_sortie` et par la boucle de collecte ; une
 # inversion ne leverait aucune erreur, elle ferait seulement fermer quand
@@ -2046,16 +2070,18 @@ class SAINTPolicySingleHead(nn.Module):
         # probleme, et sa consequence se realise dans le trade meme, donc
         # l'attribution de credit est courte.
         #
-        # IL LIT LES QUATRE COLONNES DE `tete_profit`, et rien d'autre :
-        # latent, age, creux_rang, flux_rang. La mesure qui l'impose est
-        # la meme — nourrie des 274 colonnes de marche, la meme cible
-        # tombe sous son plancher de bruit avec UN arbre.
+        # IL LIT LES QUATRE COLONNES DE `tete_profit`, PLUS LE SENS :
+        # latent, age, creux_rang, flux_rang, sens. La mesure qui impose
+        # de ne pas lui donner le marche est la meme — nourrie des 274
+        # colonnes de marche, la meme cible tombe sous son plancher de
+        # bruit avec UN arbre. Le sens, lui, est la depuis que les shorts
+        # ouvrent : voir `N_SORTIE_FEATURES`.
         #
         # DEUX ACTIONS : tenir, fermer. Pas quatre — il ne decide jamais
         # d'entrer, et lui laisser des actions impossibles diluerait son
         # gradient sur des cas qu'il ne voit pas.
         self.mlp_sortie = nn.Sequential(
-            nn.Linear(N_PROFIT_FEATURES, 64), nn.GELU(),
+            nn.Linear(N_SORTIE_FEATURES, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU())
         self.acteur_sortie = nn.Linear(64, N_ACTIONS_SORTIE)
         # LE CRITIQUE PARTAGE LE TRONC DE L'ACTEUR. Sur quatre colonnes
@@ -2295,13 +2321,11 @@ class SAINTPolicySingleHead(nn.Module):
         return self.tete_cloture(self.mlp_cloture(self.norm(h)))
 
     def sortie(self, p: torch.Tensor):
-        """Tenir ou fermer ? Rend (logits, valeur) sur (B, 4) colonnes.
+        """Tenir ou fermer ? Rend (logits, valeur) sur (B, 5) colonnes.
 
-        MEME ENTREE QUE `profit`, et c'est voulu : les deux organes
-        repondent a la meme question sur le meme etat, l'un en predisant
-        une amplitude, l'autre en decidant. Voir `entree_profit` dans
-        `training.py`, qui est le SEUL endroit qui sache extraire ces
-        quatre colonnes.
+        LES QUATRE COLONNES DE `profit`, PLUS LE SENS DE LA POSITION. Voir
+        `entree_sortie` dans `training.py`, le SEUL endroit qui sache les
+        extraire, et `N_SORTIE_FEATURES` pour la raison du sens.
 
         L'ACTEUR REND DES LOGITS, PAS UNE PROBABILITE. PPO a besoin du
         log-rapport entre l'ancienne et la nouvelle politique ; le
@@ -2531,16 +2555,18 @@ class PatchTSTPolicy(nn.Module):
         # probleme, et sa consequence se realise dans le trade meme, donc
         # l'attribution de credit est courte.
         #
-        # IL LIT LES QUATRE COLONNES DE `tete_profit`, et rien d'autre :
-        # latent, age, creux_rang, flux_rang. La mesure qui l'impose est
-        # la meme — nourrie des 274 colonnes de marche, la meme cible
-        # tombe sous son plancher de bruit avec UN arbre.
+        # IL LIT LES QUATRE COLONNES DE `tete_profit`, PLUS LE SENS :
+        # latent, age, creux_rang, flux_rang, sens. La mesure qui impose
+        # de ne pas lui donner le marche est la meme — nourrie des 274
+        # colonnes de marche, la meme cible tombe sous son plancher de
+        # bruit avec UN arbre. Le sens, lui, est la depuis que les shorts
+        # ouvrent : voir `N_SORTIE_FEATURES`.
         #
         # DEUX ACTIONS : tenir, fermer. Pas quatre — il ne decide jamais
         # d'entrer, et lui laisser des actions impossibles diluerait son
         # gradient sur des cas qu'il ne voit pas.
         self.mlp_sortie = nn.Sequential(
-            nn.Linear(N_PROFIT_FEATURES, 64), nn.GELU(),
+            nn.Linear(N_SORTIE_FEATURES, 64), nn.GELU(),
             nn.Linear(64, 64), nn.GELU())
         self.acteur_sortie = nn.Linear(64, N_ACTIONS_SORTIE)
         # LE CRITIQUE PARTAGE LE TRONC DE L'ACTEUR. Sur quatre colonnes

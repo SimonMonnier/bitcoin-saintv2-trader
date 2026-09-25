@@ -125,6 +125,25 @@ verifie("des tenues variees, pas figees",
         len(np.unique(tt)) > 1,
         "mediane %.0f, de %d a %d" % (np.median(tt), tt.min(), tt.max()))
 
+print("\n4b. LA SORTIE REJOUEE CONNAIT LE SENS DE LA POSITION")
+# Une politique qui ne ferme QUE les shorts. Si le sens n'arrivait pas a
+# la politique, les deux cotes auraient la meme tenue.
+
+
+class _FermeShorts:
+    def sortie(self, x):
+        a = (x[:, -1] < 0).long()
+        lg = torch.full((x.shape[0], 2), -5.0)
+        lg[torch.arange(x.shape[0]), a] = 5.0
+        return lg, torch.zeros(x.shape[0])
+
+
+_, _, t3 = T.rendements_sortie_ppo(_FermeShorts(), data, idx, cfg, "cpu")
+verifie("deux tenues, une par sens", t3.shape == (len(idx), 2))
+verifie("le long tient jusqu'a la borne",
+        bool((t3[:, 0] == cfg.tenue_max_cloture).all()))
+verifie("le short ferme des la premiere barre", bool((t3[:, 1] == 1).all()))
+
 print("\n5. LES QUATRE ENDROITS LISENT LA MEME CADENCE")
 src = open("training.py", encoding="utf-8").read()
 verifie("rollout, validation et test appellent `cadence_sortie`",

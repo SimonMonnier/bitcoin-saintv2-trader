@@ -153,6 +153,10 @@ from saint_core import (
     IDX_PROFIT_POS,
     IDX_PROFIT_MARCHE,
     N_PROFIT_FEATURES,
+    # LE SENS DE LA POSITION, que le modele de sortie lit en plus.
+    IDX_SENS_POS,
+    N_SORTIE_FEATURES,
+    COL_SENS_SORTIE,
     N_ACTIONS,
     MASK_VALUE,
     NORM_STATS_PATH,
@@ -3698,7 +3702,26 @@ class PPOConfig:
     # ET JOUER LES DEUX COTES COUTE. Une tete sans avantage entre quand
     # meme, paie l'aller-retour — 4.36 bps mesures — et occupe la seule
     # position disponible pendant que le creux suivant passe.
-    side: str = "long"
+    #
+    # LES DEUX COTES A NOUVEAU — une decision du proprietaire, 2026-09-25.
+    #
+    # La mesure ci-dessus tient toujours, et elle est a 120-480 minutes :
+    # vendre le sommet n'y rapportait rien. Mais le run est passe au
+    # scalping — horizon 60 barres, tenue jugee par une sortie apprise — et
+    # a cet horizon la mesure du 2026-09-21 trouvait deux queues de meme
+    # taille (achat p99 +1.92 sigma, vente +1.94). C'est la validation, et
+    # elle seule, qui dira laquelle des deux a raison ici.
+    #
+    # CHAQUE COTE A SA TETE : `tete_achat` ouvre les longs, `tete_vente` les
+    # shorts, chacune avec son propre lecteur du tronc (`mlp_achat`,
+    # `mlp_vente`). En `long`, le masque de `cotes_permises` annulait tout
+    # gradient de la seconde ; en `both`, elle apprend.
+    #
+    # CE QUE CE CHANGEMENT A DEMANDE AILLEURS, et qui aurait ete faux sans :
+    #   - le modele de sortie lit le SENS (`entree_sortie`) ;
+    #   - la derive se retire dans le sens de la position ;
+    #   - le critere rejoue la sortie avec le sens, et rend les deux tenues.
+    side: str = "both"
 
     # Préfixe pour nommer les fichiers de modèle
     model_prefix: str = "saintv2_btc_m1_flux01"
@@ -3981,6 +4004,29 @@ def entree_profit(x, n_base: int):
     ], axis=1).astype(_np.float32)
 
 
+def entree_sortie(x, n_base: int):
+    """Les CINQ colonnes que le modele de sortie lit, dans CET ordre exact.
+
+        0-3  celles de `entree_profit` : latent, age, creux_rang, flux_rang
+        4    sens     +1 long, -1 short                  bloc position 0
+
+    LE SENS EST LA DEPUIS QUE LES SHORTS OUVRENT, le 2026-09-25. Voir
+    `N_SORTIE_FEATURES` dans `saint_core` : le meme etat de marche ne dit
+    pas la meme chose selon le cote tenu, et le flux ne se retourne pas.
+
+    UNE SEULE ECRITURE, trois lecteurs : la decision (`decide_sortie`), le
+    tampon PPO de la collecte, et — par la meme convention, vectorisee —
+    `rendements_sortie_ppo`.
+    """
+    import numpy as _np
+    a = _np.asarray(x, dtype=_np.float32)
+    if a.ndim == 2:
+        a = a[None, ...]
+    return _np.concatenate(
+        [entree_profit(a, n_base), a[:, -1, n_base + IDX_SENS_POS][:, None]],
+        axis=1).astype(_np.float32)
+
+
 def cadence_sortie(en_pos, frais, depuis, pas: int):
     """QUI decide de sortir a cette barre. Une seule ecriture, quatre lecteurs.
 
@@ -4103,6 +4149,8 @@ def rendements_sortie_ppo(policy, data, idx, cfg, device):
                 np.full(len(r), min(t / smh, 3.0)),
                 feats[jj - 1, im[0]],
                 feats[jj - 1, im[1]],
+                # LE SENS, dans la colonne ou `entree_sortie` le met.
+                np.full(len(r), sens),
             ], axis=1).astype(np.float32)
             with torch.no_grad():
                 lg, _ = policy.sortie(torch.from_numpy(x).to(device))
@@ -4119,7 +4167,9 @@ def rendements_sortie_ppo(policy, data, idx, cfg, device):
     _px = c[ip]
     _sig = atr[ip] / np.maximum(_px, 1e-9) * 1e4 * np.sqrt(float(h))
     _sig = np.where(np.isfinite(_sig) & (_sig > 1e-6), _sig, np.nan)
-    return ach / _sig, ven / _sig, t_a
+    # LES DEUX TENUES, une colonne par sens : depuis que les shorts ouvrent,
+    # celle de l'achat seul ne decrivait plus que la moitie des positions.
+    return ach / _sig, ven / _sig, np.stack([t_a, t_v], axis=1)
 
 
 def decide_sortie(policy, etats, device, n_base: int, explore: bool = True):
@@ -4146,7 +4196,7 @@ def decide_sortie(policy, etats, device, n_base: int, explore: bool = True):
     politiques mises a jour ». En validation et en test on veut la
     decision, pas son bruit.
     """
-    p = torch.from_numpy(entree_profit(etats, n_base)).to(device)
+    p = torch.from_numpy(entree_sortie(etats, n_base)).to(device)
     with torch.no_grad():
         logits, valeur = policy.sortie(p)
         dist = torch.distributions.Categorical(logits=logits)
@@ -8156,7 +8206,7 @@ def run_training_on_split(
                     _ep = [states[k] for k in _a_decider]
                     _sa, _slp, _sv = decide_sortie(
                         policy, _ep, device, N_BASE_FEATURES, explore=True)
-                    _pin = entree_profit(_ep, N_BASE_FEATURES)
+                    _pin = entree_sortie(_ep, N_BASE_FEATURES)
                     for _bi, _k in enumerate(_a_decider):
                         _lat = float(_pin[_bi, 0])
                         # LA RECOMPENSE DE LA DECISION PRECEDENTE se solde
@@ -8172,9 +8222,19 @@ def run_training_on_split(
                             _loyer_eff = (
                                 _loyer * _loyer_z_mult if _lat < 0.0
                                 else _loyer)
+                            # LA DERIVE SE RETIRE DANS LE SENS DE LA
+                            # POSITION. Elle est la pour que le long ne
+                            # soit pas paye a tenir un BTC qui monte. Le
+                            # short, lui, PAIE deja cette derive dans son
+                            # latent : la lui retirer encore la compterait
+                            # deux fois, et le pousserait a fermer tout
+                            # short pour une raison qui n'a rien a voir
+                            # avec son timing. Signee, elle neutralise le
+                            # beta des deux cotes.
+                            _sens_k = float(_pin[_bi, COL_SENS_SORTIE])
                             sortie_buf[_k][-1]["r"] = (
                                 _lat - float(lat_prec[_k])
-                                - (_loyer_eff + _derive) * _dt)
+                                - (_loyer_eff + _sens_k * _derive) * _dt)
                         _ferme = int(_sa[_bi]) == FERMER
                         sortie_buf[_k].append({
                             "p": _pin[_bi].copy(), "a": int(_sa[_bi]),
@@ -10402,6 +10462,9 @@ def run_training_on_split(
                 policy, val_data, _rang_idx, cfg, device)
             _rang_ra = np.nan_to_num(_rang_ra, nan=0.0)
             _rang_rv = np.nan_to_num(_rang_rv, nan=0.0)
+            # LA TENUE DU SENS QUE LE TRI CHOISIT pour chaque occasion.
+            _rang_tenue = np.where(_sens_sel > 0.0,
+                                   _rang_tenue[:, 0], _rang_tenue[:, 1])
             print(f"  {_col('phase', _C.GREY)}  critere  sortie PPO rejouee sur "
                   f"{len(_rang_idx):,} occasions — tenue mediane "
                   f"{float(np.median(_rang_tenue)):.0f} barres, "

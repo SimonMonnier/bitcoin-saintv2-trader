@@ -39,6 +39,9 @@ from saint_core import (
     N_ACTIONS_SORTIE,
     N_BASE_FEATURES,
     N_PROFIT_FEATURES,
+    N_SORTIE_FEATURES,
+    COL_SENS_SORTIE,
+    IDX_SENS_POS,
     OBS_N_FEATURES,
     SAINTPolicySingleHead,
     TENIR,
@@ -111,12 +114,23 @@ verifie("un log-vraisemblance par action", lp.shape == (11,) and np.isfinite(lp)
 verifie("une valeur par etat", v.shape == (11,) and np.isfinite(v).all())
 verifie("les actions sont dans {TENIR, FERMER}",
         bool(np.isin(a, [TENIR, FERMER]).all()))
-verifie("elle passe par `entree_profit`",
-        "entree_profit(etats, n_base)" in src,
-        "le SEUL endroit qui sache extraire les quatre colonnes")
+verifie("elle passe par `entree_sortie`",
+        "entree_sortie(etats, n_base)" in src,
+        "le SEUL endroit qui sache extraire ses colonnes")
 p4 = T.entree_profit(x, N_BASE_FEATURES)
-verifie("quatre colonnes, pas une de plus",
+verifie("la tete de profit garde ses quatre colonnes",
         p4.shape == (11, N_PROFIT_FEATURES) and N_PROFIT_FEATURES == 4)
+# LE SENS : les shorts ouvrent depuis le 2026-09-25, et un meme etat de
+# marche ne dit pas la meme chose selon le cote tenu.
+p5 = T.entree_sortie(x, N_BASE_FEATURES)
+verifie("la sortie lit cinq colonnes : les quatre, plus le sens",
+        p5.shape == (11, N_SORTIE_FEATURES) and N_SORTIE_FEATURES == 5
+        and np.array_equal(p5[:, :4], p4))
+verifie("le sens est celui du bloc position",
+        np.array_equal(p5[:, COL_SENS_SORTIE],
+                       x[:, -1, N_BASE_FEATURES + IDX_SENS_POS]))
+verifie("le tampon PPO lit la meme extraction",
+        "_pin = entree_sortie(_ep, N_BASE_FEATURES)" in src)
 
 # L'ARGMAX EST DETERMINISTE, L'ECHANTILLONNAGE NE L'EST PAS.
 a1, _, _ = T.decide_sortie(pol, x, "cpu", N_BASE_FEATURES, explore=False)
@@ -178,7 +192,7 @@ verifie("du cote des PERTES, le loyer zombie rend le signal visible",
 # deux sessions : le loyer zombie ci-dessous. Le test gardait une ecriture,
 # pas une propriete ; c'est la propriete qui compte.
 verifie("la duree entre decisions entre dans la recompense",
-        "+ _derive) * _dt" in src,
+        "+ _sens_k * _derive) * _dt" in src,
         "sans quoi une decision couvrant 15 barres n'en paierait qu'une")
 
 # LE LOYER ZOMBIE. Le loyer est multiplie quand la position PERD, et
@@ -276,7 +290,7 @@ for _nom in ("acteur_sortie_gain", "critique_sortie_gain",
              "acteur_sortie_perte", "critique_sortie_perte"):
     verifie("la tete `%s` existe" % _nom, hasattr(pol, _nom))
 
-_x = torch.randn(8, N_PROFIT_FEATURES)
+_x = torch.randn(8, N_SORTIE_FEATURES)
 _x[:4, 0] = 2.0          # en gain
 _x[4:, 0] = -2.0         # en perte
 pol.zero_grad(set_to_none=True)
@@ -301,7 +315,7 @@ verifie("ni les tetes d'ouverture",
 
 # L'EQUILIBRE EXACT VA A LA TETE DE PERTE : aucun gain a proteger, et le
 # spread deja paye.
-_z = torch.zeros(2, N_PROFIT_FEATURES)
+_z = torch.zeros(2, N_SORTIE_FEATURES)
 pol.zero_grad(set_to_none=True)
 _lz, _ = pol.sortie(_z)
 _lz.sum().backward()
