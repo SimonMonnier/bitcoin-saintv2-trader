@@ -3681,7 +3681,13 @@ class PPOConfig:
     # FIXE, le meme a chaque epoch : deux epochs se comparent sur les memes
     # aleas, et le generateur global de l'entrainement n'est pas touche.
     # Quand la politique deviendra confiante, tirage et argmax convergent.
-    evaluation_stochastique: bool = True
+    #
+    # FALSE — L'ACTION LA PLUS PROBABLE, decision du proprietaire le meme
+    # soir : pas de hasard en live, donc pas de hasard en validation ni au
+    # test, qui doivent juger la regle qu'on deploierait. On laisse la
+    # politique apprendre a se decider, longs et shorts. Le tirage reste
+    # disponible ici, mais il n'est plus la regle.
+    evaluation_stochastique: bool = False
     # PPO requiert les probabilites de la politique qui a tire les actions.
     # L'ancien curriculum forcait BUY/SELL ou remappait en HOLD sans corriger
     # logprob. Conserve uniquement pour reproduire les anciens diagnostics.

@@ -74,13 +74,14 @@ verifie("le rollout EXPLORE",
 # LE MOTIF PORTE LA PARENTHESE FERMANTE : sans elle il comptait aussi
 # l'occurrence du COMMENTAIRE qui explique le choix, et le test echouait
 # sur du texte au lieu de code.
-# DEPUIS LE 2026-09-25 LA VALIDATION ET LE TEST TIRENT LA POLITIQUE,
-# graine fixe : en argmax une politique indecise se jouait comme une regle
-# absolue — 46 046 shorts d'une minute, zero long.
-verifie("validation et test tirent la politique, graine fixe",
+# LA VALIDATION ET LE TEST JOUENT L'ACTION LA PLUS PROBABLE : pas de
+# hasard en live, donc pas de hasard dans ce qui juge le modele — decision
+# du proprietaire, 2026-09-25. Le tirage a graine fixe reste disponible
+# par `evaluation_stochastique`, mais il n'est pas la regle.
+verifie("validation et test jouent l'action la plus probable",
         src.count("generateur=_gen_v)") == 2
         and src.count("generateur=_gen_t)") == 2
-        and T.PPOConfig().evaluation_stochastique,
+        and not T.PPOConfig().evaluation_stochastique,
         "entree ET sortie, validation ET test")
 
 
