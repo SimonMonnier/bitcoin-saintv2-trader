@@ -1131,7 +1131,23 @@ class PPOConfig:
     # perte avant une heure, ce qui contredit le scalping. A 15 elle garde
     # une granularite de quart d'heure et gagne un facteur quatre sur le
     # rapport signal/bruit.
-    pas_decision_sortie: int = 15
+    #
+    # UNE DECISION A CHAQUE BARRE — un choix du proprietaire, 2026-09-25.
+    #
+    # Cette valeur etait passee a 15 pour rendre le loyer visible dans le
+    # gradient : a une barre il etait 98 fois plus petit que le bruit. Le
+    # contexte a change sur un point qui compte : le LOYER ZOMBIE multiplie
+    # le loyer par 15 sur les positions en perte. Du cote des pertes le
+    # rapport signal/bruit passe donc de 1 % a 15 %, et c'est la tete de
+    # PERTE — distincte depuis le meme jour — qui recoit ce signal.
+    #
+    # Du cote des GAINS le loyer reste invisible a une barre : la tete de
+    # gain apprend surtout du rebond lui-meme. C'est voulu — on ne veut pas
+    # la pousser a fermer un gagnant.
+    #
+    # LA MEME CADENCE PARTOUT, et c'est `cadence_sortie` qui la porte :
+    # rollout, validation, test et critere de sauvegarde.
+    pas_decision_sortie: int = 1
     loyer_temps_atr: float = 0.0066
     # LOYER RENFORCE SUR LES POSITIONS EN PERTE (zombies).
     #
@@ -7579,6 +7595,18 @@ def run_training_on_split(
     # mesure qui l'impose. Il porte les MEMES parametres — le tronc doit
     # apprendre des deux objectifs — mais son propre etat Adam et son propre
     # pas.
+    # LE MODELE DE SORTIE A SON OPTIMISEUR, SEPARE DE CELUI DES ENTREES.
+    #
+    # `optimizer_rang` porte le tronc et les tetes d'ouverture ; celui-ci
+    # ne porte que `policy.params_sortie()` — le corps de sortie et ses
+    # deux tetes. Aucun des deux ne touche les poids de l'autre.
+    #
+    # IL VIT TOUT LE FOLD. La version precedente reconstruisait
+    # l'optimiseur a chaque epoch : l'etat Adam — les moments qui lissent
+    # le pas — etait jete toutes les quelques minutes.
+    optimizer_sortie = optim.Adam(
+        policy.params_sortie(), lr=float(cfg.lr), eps=1e-8)
+
     optimizer_rang = optim.Adam(
         policy.parameters(),
         lr=float(getattr(cfg, "lr_rang", cfg.lr)), eps=1e-8)
@@ -9032,33 +9060,20 @@ def run_training_on_split(
         # L'ACTEUR D'ENTREE RESTE GELE. `actor` et `critic` ne sont
         # toujours pas calcules ; seuls `mlp_sortie`, `acteur_sortie` et
         # `critique_sortie` recoivent un gradient ici.
-        _ppo = {"n": 0, "actor": float("nan"), "critic": float("nan"),
-                "H": float("nan"), "kl": float("nan"), "clip": 0.0,
-                "ferme": float("nan")}
         _tr = [t for k in range(n_envs) for t in sortie_buf[k]]
         if len(_tr) >= 256:
             policy.train()
-            _optim_s = optim.Adam(
-                list(policy.mlp_sortie.parameters())
-                + list(policy.acteur_sortie.parameters())
-                + list(policy.critique_sortie.parameters()),
-                lr=float(cfg.lr), eps=1e-8)
             _gam = float(getattr(cfg, "gamma", 0.99))
-            # LE NOM EXACT EST `lambda_gae`, et `gae_lambda` n'existe pas
-            # dans cette configuration. Un `getattr` avec defaut aurait
-            # silencieusement pris 0.95 meme si le reglage valait autre
-            # chose — un repli muet de plus, exactement ce que ce depot
-            # paie le plus souvent.
             _lam = float(cfg.lambda_gae)
+            # L'AVANTAGE SE CALCULE SUR LA TRAJECTOIRE ENTIERE. Une position
+            # peut passer de la perte au gain et revenir : sa trajectoire
+            # traverse les deux tetes, et le GAE est une propriete de la
+            # trajectoire, pas de la tete.
             _P, _A, _LP, _RET, _ADV = [], [], [], [], []
             for _k in range(n_envs):
                 _b = sortie_buf[_k]
                 if not _b:
                     continue
-                # LA DERNIERE TRANSITION EST TERMINALE MEME SI LA
-                # POLITIQUE N'A PAS FERME : l'episode s'arrete et
-                # l'environnement solde. Bootstrapper au-dela ferait
-                # esperer une suite qui n'existe pas.
                 _b[-1]["done"] = True
                 _adv, _n = 0.0, len(_b)
                 _av = [0.0] * _n
@@ -9077,22 +9092,26 @@ def run_training_on_split(
             _LP = torch.tensor(np.asarray(_LP, np.float32), device=device)
             _RET = torch.tensor(np.asarray(_RET, np.float32), device=device)
             _ADV = torch.tensor(np.asarray(_ADV, np.float32), device=device)
-            # L'AVANTAGE EST CENTRE REDUIT SUR LE LOT. Sans cela son
-            # echelle suit le loyer du temps, et le meme `clip_eps`
-            # mordrait differemment selon un reglage qui n'a rien a voir.
-            _ADV = (_ADV - _ADV.mean()) / (_ADV.std() + 1e-8)
+            # LE ROUTAGE EST CELUI DE `policy.sortie` : le signe du latent au
+            # moment de la decision.
+            _en_gain = _P[:, 0] > 0.0
+            # L'AVANTAGE EST NORMALISE PAR TETE, dans la meme mise a jour.
+            # Ensemble, celui des pertes — gonfle par le loyer zombie —
+            # aurait fixe l'echelle, et celui des gains serait devenu du
+            # bruit. Un seul modele, une seule perte, mais chaque tete voit
+            # son avantage a sa propre echelle.
+            for _mq in (_en_gain, ~_en_gain):
+                if int(_mq.sum()) > 1:
+                    _x = _ADV[_mq]
+                    _ADV[_mq] = (_x - _x.mean()) / (_x.std() + 1e-8)
             _eps = float(getattr(cfg, "clip_eps", 0.2))
-            # SON PROPRE POIDS, plus celui de l'acteur d'entree. Voir
-            # `entropie_sortie` : a 0.003 l'entropie est tombee a 0.192 sur
-            # 0.693 en quatre epochs.
             _ce = float(getattr(cfg, "entropie_sortie",
                                 getattr(cfg, "entropy_coef", 0.01)))
             _cv = float(getattr(cfg, "value_coef", 0.5))
+            _params = policy.params_sortie()
             _nlot = max(1, len(_A) // max(1, int(cfg.batch_size)))
-            _la, _lc, _lh, _lk, _lcl, _np_ = [], [], [], [], [], 0
-            # QUATRE PASSES SUR LE MEME LOT. La configuration n'expose
-            # pas ce reglage — PPO ayant ete supprime, il avait disparu —
-            # et on le pose ici plutot que de le lire d'un champ absent.
+            _la, _lc, _lk, _lcl = [], [], [], []
+            _hg, _hp = [], []
             for _ in range(4):
                 _perm = torch.randperm(len(_A), device=device)
                 for _i in range(_nlot):
@@ -9105,31 +9124,37 @@ def run_training_on_split(
                     _o2 = torch.clamp(_rt, 1 - _eps, 1 + _eps) * _ADV[_m]
                     _pa = -torch.min(_o1, _o2).mean()
                     _pc = torch.nn.functional.mse_loss(_vv, _RET[_m])
-                    _ph = _dist.entropy().mean()
+                    _ent = _dist.entropy()
+                    _ph = _ent.mean()
                     _perte = _pa + _cv * _pc - _ce * _ph
-                    _optim_s.zero_grad(set_to_none=True)
+                    optimizer_sortie.zero_grad(set_to_none=True)
                     _perte.backward()
                     torch.nn.utils.clip_grad_norm_(
-                        list(policy.mlp_sortie.parameters())
-                        + list(policy.acteur_sortie.parameters())
-                        + list(policy.critique_sortie.parameters()),
-                        float(cfg.max_grad_norm))
-                    _optim_s.step()
+                        _params, float(cfg.max_grad_norm))
+                    optimizer_sortie.step()
                     _la.append(float(_pa)); _lc.append(float(_pc))
-                    _lh.append(float(_ph))
                     _lk.append(float((_LP[_m] - _lpn).mean()))
                     _lcl.append(float(((_rt - 1).abs() > _eps).float().mean()))
-                    _np_ += 1
-            _ppo = {"n": len(_A), "actor": float(np.mean(_la)),
-                    "critic": float(np.mean(_lc)), "H": float(np.mean(_lh)),
-                    "kl": float(np.mean(_lk)), "clip": float(np.mean(_lcl)),
-                    "ferme": float((_A == FERMER).float().mean())}
+                    # L'ENTROPIE PAR TETE, parce que c'est elle qui dira si
+                    # l'une des deux s'effondre pendant que l'autre explore.
+                    _g = _en_gain[_m]
+                    if bool(_g.any()):
+                        _hg.append(float(_ent[_g].mean()))
+                    if bool((~_g).any()):
+                        _hp.append(float(_ent[~_g].mean()))
+            _hmax = np.log(N_ACTIONS_SORTIE)
+            _nf = lambda q: float(q.float().mean()) if bool(q.any()) else float("nan")
             print(f"  {_col('phase', _C.GREY)}  PPO sortie  "
-                  f"{_ppo['n']:,} transitions  "
-                  f"ActorL {_ppo['actor']:+.4f}  CriticL {_ppo['critic']:.4f}  "
-                  f"H {_ppo['H']:.3f}/{np.log(N_ACTIONS_SORTIE):.3f}  "
-                  f"KL {_ppo['kl']:+.4f}  clip {100*_ppo['clip']:.0f}%  "
-                  f"ferme {100*_ppo['ferme']:.1f}%")
+                  f"{len(_A):,} transitions  "
+                  f"ActorL {np.mean(_la):+.4f}  CriticL {np.mean(_lc):.4f}  "
+                  f"KL {np.mean(_lk):+.4f}  clip {100*np.mean(_lcl):.0f}%")
+            for _cote, _mq, _hh in (("GAIN ", _en_gain, _hg),
+                                    ("PERTE", ~_en_gain, _hp)):
+                _ferme = _nf(_A[_mq] == FERMER)
+                print(f"  {_col('phase', _C.GREY)}  PPO sortie {_cote}  "
+                      f"{int(_mq.sum()):,} decisions  "
+                      f"H {np.mean(_hh) if _hh else float('nan'):.3f}/{_hmax:.3f}  "
+                      f"ferme {100*_ferme:.1f}%")
         else:
             print(f"  {_col('phase', _C.GREY)}  PPO sortie  "
                   f"{len(_tr)} transitions — trop peu pour une mise a jour")

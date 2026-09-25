@@ -145,7 +145,7 @@ verifie("la recompense telescope",
         "la somme d'un trade vaut le net realise moins le loyer")
 
 # ============================================================
-print("\n4b. LA DECISION EST SEMI-MDP, ET C'EST CE QUI REND LE LOYER VISIBLE")
+print("\n4b. UNE DECISION A CHAQUE BARRE, PARTOUT")
 # ============================================================
 # LE PROBLEME ETAIT LA FREQUENCE, PAS LE TARIF. Mesure du 2026-09-22 :
 # |delta latent| vaut 0.650 ATR par barre en moyenne, le loyer 0.0066 —
@@ -153,19 +153,25 @@ print("\n4b. LA DECISION EST SEMI-MDP, ET C'EST CE QUI REND LE LOYER VISIBLE")
 # l'entropie est tombee de 0.572 a 0.192 pendant que le taux de fermeture
 # passait de 40 % a 10.9 %.
 #
-# En decidant tous les K barres, le cout croit en K et le bruit en RACINE
-# de K : le rapport s'ameliore en racine de K.
+# LA CADENCE EST REPASSEE A UNE BARRE, et c'est un choix du proprietaire
+# du 2026-09-25. Elle avait ete portee a 15 pour rendre le loyer visible ;
+# le LOYER ZOMBIE — loyer multiplie sur les positions en perte — rend le
+# signal visible du cote des pertes sans espacer les decisions. Ce test
+# gardait l'ancienne valeur ; il garde maintenant la nouvelle, et surtout
+# qu'elle soit LA MEME PARTOUT.
 _K = int(c.pas_decision_sortie)
-verifie("la sortie ne decide plus a chaque barre",
-        _K > 1, "une decision tous les %d barres" % _K)
-verifie("mais assez souvent pour couper vite",
-        _K <= 30, "%d barres — au-dela le scalping perd son sens" % _K)
+verifie("la sortie decide a chaque barre",
+        _K == 1, "pas_decision_sortie = %d" % _K)
+verifie("la meme cadence au rollout, en validation et au test",
+        src.count("cadence_sortie(") == 4,
+        "une seule regle, `cadence_sortie`, lue aux trois boucles")
 _bruit = 0.650
-_r1 = c.loyer_temps_atr / _bruit
-_rK = (c.loyer_temps_atr + c.derive_atr_barre) * _K / (_bruit * np.sqrt(_K))
-verifie("le rapport signal/bruit du loyer a gagne un facteur",
-        _rK > 3 * _r1,
-        "%.1f %% par decision contre %.1f %% par barre" % (100 * _rK, 100 * _r1))
+_zomb = float(getattr(c, "loyer_zombie_mult", 1.0))
+_rp = c.loyer_temps_atr * _zomb / _bruit
+verifie("du cote des PERTES, le loyer zombie rend le signal visible",
+        _rp > 0.10,
+        "%.1f %% du bruit d'une barre, contre %.1f %% sans lui"
+        % (100 * _rp, 100 * c.loyer_temps_atr / _bruit))
 # LE MOTIF NE NOMME PLUS LE LOYER, SEULEMENT SA MULTIPLICATION PAR LA
 # DUREE. Il exigeait `(_loyer + _derive) * _dt` et a casse le 2026-09-25
 # quand le loyer est devenu `_loyer_eff` — un changement VOULU, fait entre
@@ -219,17 +225,25 @@ verifie("l'echantillon couvre plus que l'horizon",
 # ============================================================
 print("\n6. PPO N'ENTRAINE QUE LA SORTIE")
 # ============================================================
-verifie("l'optimiseur ne porte que les poids de sortie",
-        "policy.mlp_sortie.parameters()" in src
-        and "policy.acteur_sortie.parameters()" in src
-        and "policy.critique_sortie.parameters()" in src)
+verifie("le modele de sortie a SON optimiseur",
+        "optimizer_sortie = optim.Adam(\n        policy.params_sortie()" in src,
+        "separe de `optimizer_rang`, qui porte le tronc et les entrees")
+verifie("il est cree une fois par fold, pas a chaque epoch",
+        "_optim_s = optim.Adam(" not in src,
+        "reconstruit a chaque epoch, il jetait l'etat Adam")
+_ids_s = {id(q) for q in pol.params_sortie()}
+_ent = list(pol.tete_achat.parameters()) + list(pol.tete_vente.parameters())
+verifie("il ne porte AUCUN poids des tetes d'ouverture",
+        not any(id(q) in _ids_s for q in _ent),
+        "ouvrir et fermer sont deux metiers")
 verifie("l'acteur d'ENTREE reste gele",
         "g[actor 0.00e+00" not in src or "actor.parameters()" not in
         src.split("PPO SUR LA SORTIE")[-1].split("print(f\"  {_col('phase'")[0],
         "seuls trois modules recoivent un gradient ici")
-verifie("l'avantage est centre reduit",
-        "_ADV = (_ADV - _ADV.mean())" in src,
-        "sinon `clip_eps` mordrait selon le loyer, qui n'a rien a voir")
+verifie("l'avantage est normalise PAR TETE",
+        "_ADV[_mq] = (_x - _x.mean()) / (_x.std() + 1e-8)" in src,
+        "ensemble, les pertes gonflees par le loyer zombie fixeraient "
+        "l'echelle et les gains deviendraient du bruit")
 verifie("la derniere transition est terminale",
         '_b[-1]["done"] = True' in src,
         "l'episode s'arrete et l'environnement solde : bootstrapper "
@@ -242,13 +256,58 @@ verifie("`lambda_gae` est lu au bon nom",
 print("\n7. LE JOURNAL MONTRE CE QUE LA POLITIQUE FAIT")
 # ============================================================
 for _m, _q in (("PPO sortie", "la ligne dediee"),
-               ("ferme {100*_ppo['ferme']", "le taux de fermeture"),
-               ("KL {_ppo['kl']", "la divergence"),
-               ("clip {100*_ppo['clip']", "la part ecretee")):
+               ("PPO sortie {_cote}", "une ligne PAR TETE"),
+               ("ferme {100*_ferme", "le taux de fermeture de chaque tete"),
+               ("KL {np.mean(_lk)", "la divergence"),
+               ("clip {100*np.mean(_lcl)", "la part ecretee")):
     verifie("le journal porte %s" % _q, _m in src)
 verifie("il dit aussi quand le lot est trop petit",
         "trop peu pour une mise a jour" in src,
         "un PPO muet ressemble a un PPO qui marche")
+
+# ============================================================
+print("\n8. UN MODELE DE SORTIE, DEUX TETES, SEPARE DES ENTREES")
+# ============================================================
+# CE QUE LE PROPRIETAIRE A DEMANDE, le 2026-09-25 : une tete pour fermer
+# les GAINS, une pour fermer les PERTES, sur le MEME modele PPO, et ce
+# modele distinct des tetes d'ouverture. La tete unique d'avant devait
+# donner les deux reponses avec les memes poids de sortie.
+for _nom in ("acteur_sortie_gain", "critique_sortie_gain",
+             "acteur_sortie_perte", "critique_sortie_perte"):
+    verifie("la tete `%s` existe" % _nom, hasattr(pol, _nom))
+
+_x = torch.randn(8, N_PROFIT_FEATURES)
+_x[:4, 0] = 2.0          # en gain
+_x[4:, 0] = -2.0         # en perte
+pol.zero_grad(set_to_none=True)
+_lg, _v = pol.sortie(_x)
+(_lg[:4].sum() + _v[:4].sum()).backward()
+
+
+def _g(mod):
+    return sum(float(q.grad.abs().sum()) for q in mod.parameters()
+               if q.grad is not None)
+
+
+verifie("une decision EN GAIN entraine la tete de gain",
+        _g(pol.acteur_sortie_gain) > 0.0)
+verifie("et le corps partage",
+        _g(pol.mlp_sortie) > 0.0, "une seule representation de la situation")
+verifie("mais JAMAIS la tete de perte",
+        _g(pol.acteur_sortie_perte) == 0.0
+        and _g(pol.critique_sortie_perte) == 0.0)
+verifie("ni les tetes d'ouverture",
+        _g(pol.tete_achat) == 0.0 and _g(pol.tete_vente) == 0.0)
+
+# L'EQUILIBRE EXACT VA A LA TETE DE PERTE : aucun gain a proteger, et le
+# spread deja paye.
+_z = torch.zeros(2, N_PROFIT_FEATURES)
+pol.zero_grad(set_to_none=True)
+_lz, _ = pol.sortie(_z)
+_lz.sum().backward()
+verifie("l'equilibre exact va a la tete de perte",
+        _g(pol.acteur_sortie_perte) > 0.0 and _g(pol.acteur_sortie_gain) == 0.0)
+pol.zero_grad(set_to_none=True)
 
 print("\n%d/%d OK" % (_ok, _ok + _ko))
 if _ko:

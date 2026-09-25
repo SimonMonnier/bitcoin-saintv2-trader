@@ -2063,6 +2063,42 @@ class SAINTPolicySingleHead(nn.Module):
         # representation ; et c'est la valeur de l'ETAT qu'il estime, pas
         # celle d'une action.
         self.critique_sortie = nn.Linear(64, 1)
+        # ============================================================
+        # LE MODELE DE SORTIE : UN CORPS, DEUX TETES
+        # ============================================================
+        #
+        # UN SEUL MODELE PPO pour la sortie, et il est SEPARE DES TETES
+        # D'OUVERTURE. Les tetes d'achat et de vente vivent sur le tronc
+        # SAINT et apprennent par la tete de rang ; le modele de sortie ne
+        # lit pas le tronc, n'a pas le meme optimiseur, et ne recoit aucun
+        # gradient des entrees. C'est la frontiere qui compte : ouvrir et
+        # fermer sont deux metiers, et l'un ne doit pas deformer l'autre.
+        #
+        # SUR CE MODELE, DEUX TETES : une pour fermer les GAINS, une pour
+        # fermer les PERTES. Fermer un gain et fermer une perte ne sont pas
+        # la meme decision — sur un gain on se demande s'il reste quelque
+        # chose a prendre, sur une perte si elle va se reprendre ou
+        # s'aggraver. Une tete unique devait donner les deux reponses avec
+        # les memes poids de sortie.
+        #
+        # LE CORPS EST PARTAGE, ET C'EST VOULU. Les deux tetes lisent la
+        # meme situation — latent, age, creux, flux — et une seule
+        # representation de cette situation suffit. Ce qui differe, c'est ce
+        # qu'on en DECIDE : chaque tete a son acteur et son critique.
+        #
+        # `mlp_sortie` EST CE CORPS. Il existait deja : les points de
+        # reprise anterieurs y chargent donc leurs poids, qui servent de
+        # depart. `acteur_sortie` et `critique_sortie`, eux, ne decident
+        # plus rien et restent pour le chargement — meme convention que
+        # `actor` et `critic`.
+        #
+        # LE ROUTAGE EST LE SIGNE DU LATENT au moment de la decision. Voir
+        # `sortie`. Le loyer zombie, qui multiplie le loyer du temps sur les
+        # positions en perte, alimente donc uniquement la tete de PERTE.
+        self.acteur_sortie_gain = nn.Linear(64, N_ACTIONS_SORTIE)
+        self.critique_sortie_gain = nn.Linear(64, 1)
+        self.acteur_sortie_perte = nn.Linear(64, N_ACTIONS_SORTIE)
+        self.critique_sortie_perte = nn.Linear(64, 1)
 
         self._init_poids()
 
@@ -2272,8 +2308,35 @@ class SAINTPolicySingleHead(nn.Module):
         calculer depuis une probabilite deja normalisee perd en precision
         sur les queues, la ou le rapport compte le plus.
         """
+        # LE ROUTAGE PAR LE SIGNE DU LATENT. Le corps est calcule une fois ;
+        # les deux tetes lisent sa sortie, et `torch.where` choisit ligne a
+        # ligne. Le gradient d'une decision en perte remonte donc dans la
+        # tete de PERTE et dans le corps partage — jamais dans la tete de
+        # gain.
+        #
+        # L'EQUILIBRE EXACT VA A LA TETE DE PERTE. Un latent nul ne porte
+        # aucun gain a proteger ; il porte en revanche le spread deja paye.
         h = self.mlp_sortie(p)
-        return self.acteur_sortie(h), self.critique_sortie(h).squeeze(-1)
+        en_gain = p[:, 0] > 0.0
+        logits = torch.where(en_gain.unsqueeze(-1),
+                             self.acteur_sortie_gain(h),
+                             self.acteur_sortie_perte(h))
+        valeur = torch.where(en_gain,
+                             self.critique_sortie_gain(h).squeeze(-1),
+                             self.critique_sortie_perte(h).squeeze(-1))
+        return logits, valeur
+
+    def params_sortie(self):
+        """Tous les poids du MODELE DE SORTIE, et rien d'autre.
+
+        Le corps partage et les deux tetes. Ni le tronc, ni les tetes
+        d'ouverture : un seul optimiseur les porte, et il n'en touche
+        aucun autre.
+        """
+        mods = (self.mlp_sortie,
+                self.acteur_sortie_gain, self.critique_sortie_gain,
+                self.acteur_sortie_perte, self.critique_sortie_perte)
+        return [q for m in mods for q in m.parameters()]
 
     def profit(self, p: torch.Tensor) -> torch.Tensor:
         """Ce qu'il reste a prendre sur la position ouverte. (B, 1).
