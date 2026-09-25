@@ -1166,6 +1166,24 @@ class PPOConfig:
     # chaque barre → l'avantage de FERMER devient fort → la tete apprend
     # a sortir tot. Aucun stop au temps, purement un signal d'apprentissage.
     loyer_zombie_mult: float = 15.0
+    # LE ZOMBIE COMMENCE A 2 ATR SOUS LE POINT MORT — choix du proprietaire,
+    # 2026-09-25, sur mesure.
+    #
+    # Au point mort meme, une minute de bruit suffisait a declencher le
+    # loyer x15 : la sortie fermait tout a la premiere barre, six epochs sur
+    # six. Mais le BTC en minute s'ecarte de 7 a 8 ATR en une heure, et
+    # couper vite coupe aussi les futurs gagnants. Mesure sur le train du
+    # fold 1, entrees au hasard, deux sens (a 1 point pres) :
+    #
+    #     marge   coupees   quand (mediane)   gagnants a 60 min coupes avant
+    #     0.5 ATR   87 %        3 min               74 %
+    #     1.0 ATR   81 %        6 min               62 %
+    #     2.0 ATR   68 %       11 min               41 %
+    #     3.0 ATR   56 %       17 min               26 %
+    #
+    # 2 ATR : les vrais perdants restent chers en une dizaine de minutes,
+    # sans fenetre de temps, et le bruit d'une minute ne fait plus fermer.
+    marge_zombie_atr: float = 2.0
     # LA DERIVE DU MARCHE EST RETIREE DE LA RECOMPENSE.
     #
     # Sans cela, tenir une position longue dans un BTC qui monte rapporte
@@ -7473,6 +7491,11 @@ def run_training_on_split(
     # filtrer les occasions valides.
     _rang_idx = _rang_reel = None
     _rang_ra = _rang_rv = None
+    # LES MEMES OCCASIONS TENUES `horizon_cloture` BARRES, gardees pour le
+    # fold : `_rang_ra` est ecrase a chaque epoch par la sortie PPO. Elles
+    # ne decident de rien — voir `_g60_top`.
+    _rang_ra60 = _rang_rv60 = None
+    _g60_top = _g60_tous = float("nan")
     if getattr(cfg, "diag_rang", True):
         _pas = max(int(getattr(cfg, "diag_rang_pas", 12)), 1)
         _i = np.arange(cfg.lookback,
@@ -7562,6 +7585,8 @@ def run_training_on_split(
                 # du modele, plus bas.
                 _rang_ra = _ra[_ok]
                 _rang_rv = _rv[_ok]
+                _rang_ra60 = np.nan_to_num(_rang_ra.copy(), nan=0.0)
+                _rang_rv60 = np.nan_to_num(_rang_rv.copy(), nan=0.0)
                 _ca_d, _cv_d = cotes_permises(cfg.side)
                 print(f"  • Classement : {len(_rang_idx):,} decisions de "
                       f"validation suivies (une toutes les {_pas} barres), "
@@ -8085,6 +8110,7 @@ def run_training_on_split(
         _loyer = float(getattr(cfg, "loyer_temps_atr", 0.0))
         _derive = float(getattr(cfg, "derive_atr_barre", 0.0))
         _loyer_z_mult = float(getattr(cfg, "loyer_zombie_mult", 15.0))
+        _marge_z = float(getattr(cfg, "marge_zombie_atr", 0.0))
         _pas_s = max(1, int(getattr(cfg, "pas_decision_sortie", 1)))
 
         # Sélectivité visée cette epoch, et seuil absolu qui la réalise.
@@ -8336,9 +8362,11 @@ def run_training_on_split(
                             # rendait pas le spread, deja paye ; cela le
                             # figeait. Est zombie desormais la position que
                             # le MARCHE a mise en perte, au-dela du ticket.
+                            # ET 2 ATR PLUS BAS : voir `marge_zombie_atr`.
                             _mort = -float(envs[_k].cout_entree_atr)
                             _loyer_eff = (
-                                _loyer * _loyer_z_mult if _lat < _mort
+                                _loyer * _loyer_z_mult
+                                if _lat < _mort - _marge_z
                                 else _loyer)
                             # LA DERIVE SE RETIRE DANS LE SENS DE LA
                             # POSITION. Elle est la pour que le long ne
@@ -10636,6 +10664,20 @@ def run_training_on_split(
                 # depend d'une taille de mise.
                 _gain_top = float(np.mean(_rang_gain[_top]))
             _gain_tous = float(np.mean(_rang_gain))
+            # LE SOMMET DES ENTREES SEULES, SORTIE FIXE A L'HORIZON DE LA
+            # CIBLE. Un DIAGNOSTIC, il ne decide rien : la sauvegarde juge la
+            # strategie jouee, sortie PPO comprise.
+            #
+            # POURQUOI IL EXISTE. Six epochs sur six, la sortie a ferme a la
+            # premiere minute ; le sommet ci-dessus mesurait donc le spread
+            # plus une minute de bruit, et ne pouvait pas dire si les
+            # entrees — entrainees a 60 minutes — valent quelque chose.
+            # Celui-ci le dit : les MEMES occasions, le MEME tri, le MEME
+            # sens, tenues jusqu'a l'horizon.
+            if _rang_ra60 is not None and len(_rang_ra60) == len(_sens_sel):
+                _g60 = np.where(_sens_sel > 0.0, _rang_ra60, _rang_rv60)
+                _g60_top = float(np.mean(_g60[_top]))
+                _g60_tous = float(np.mean(_g60))
 
             # ============================================================
             # L'INCERTITUDE DU SOMMET, ET ELLE EST GRANDE.
@@ -10858,6 +10900,8 @@ def run_training_on_split(
             f"rhoAux {_rho_aux:>+6.4f}  "
             + ("" if _valide else f"[val ep{_val_epoch}] ") +
             f"sommet {_gain_top:>+6.3f}R/{_gain_tous:>+6.3f}R  "
+            f"horizon {int(getattr(cfg, 'horizon_cloture', 60))}m "
+            f"{_g60_top:>+6.3f}R/{_g60_tous:>+6.3f}R  "
             # LE CRITERE DE RETENUE, ET CE QUI LE COMPOSE.
             #
             # `net` est ce qui choisit le checkpoint depuis le 2026-09-20 :

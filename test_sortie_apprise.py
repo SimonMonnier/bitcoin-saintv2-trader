@@ -204,7 +204,8 @@ verifie("le loyer zombie existe",
         float(getattr(c, "loyer_zombie_mult", 1.0)) > 1.0,
         "x%.1f sur les positions en perte" % getattr(c, "loyer_zombie_mult", 1.0))
 verifie("il ne s'applique que SOUS LE POINT MORT",
-        "_loyer * _loyer_z_mult if _lat < _mort" in src
+        "if _lat < _mort - _marge_z" in src
+        and T.PPOConfig().marge_zombie_atr == 2.0
         and "_mort = -float(envs[_k].cout_entree_atr)" in src,
         "le spread seul ne fait pas un zombie : 66 % des positions en "
         "auraient ete a leur premiere decision")

@@ -81,7 +81,10 @@ verifie("un SIXIEME champ dans ENV ne casse plus le motif",
 # La veille montrait le `sommet du tri` en l'annoncant comme « ce qui
 # selectionne le checkpoint », et ne montrait ni le score net — celui qui
 # decide — ni ce qu'il devait battre.
-l0 = lignes[0]
+# UNE LIGNE SANS LE CHAMP, quelle que soit la version du run qui a ecrit le
+# journal : les runs depuis le 2026-09-25 l'ecrivent, et la reconstruction
+# ci-dessous doit etre testee sur une ligne qui ne l'a pas.
+l0 = V.RE_BATTRE.sub("", lignes[0])
 _j = V.RE_NET.search(l0).end()
 avec = l0[:_j] + "  a_battre +0.123R" + l0[_j:]
 verifie("le champ `a_battre` ne decale AUCUN indice META",
@@ -126,6 +129,21 @@ _ess = [l for l in io.open("veille_fenetre.ps1", encoding="utf-8").read()
 verifie("la vue essentielle montre le score net, son seuil, son evolution",
         len(_ess) == 1 and all(k in _ess[0] for k in
                                ("critere net", "sauvegarde ", "evolution ")))
+
+# LE SOMMET A HORIZON FIXE — ajoute le 2026-09-25, diagnostic.
+_js = V.RE_SOMMET.search(l0).end()
+avec_h = l0[:_js] + "  horizon 60m -0.012R/-0.031R" + l0[_js:]
+verifie("le champ `horizon` ne decale AUCUN indice META",
+        V.RE_META.search(avec_h) is not None
+        and V.RE_META.search(avec_h).groups() == V.RE_META.search(l0).groups())
+verifie("ni le sommet",
+        V.RE_SOMMET.search(avec_h).groups() == V.RE_SOMMET.search(l0).groups())
+_mh = V.RE_HORIZON.search(avec_h)
+verifie("et il se lit",
+        _mh is not None and _mh.groups() == ("60", "-0.012", "-0.031"))
+verifie("un `nan` se lit aussi",
+        V.RE_HORIZON.search("horizon 60m   +nan R/  +nan R".replace(" R", "R"))
+        is not None)
 
 print("\n%d/%d OK" % (_ok, _ok + _ko))
 raise SystemExit(1 if _ko else 0)

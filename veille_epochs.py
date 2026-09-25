@@ -170,6 +170,12 @@ RE_SOMMET = re.compile(r"sommet\s+(" + NB + r")R/(" + NB + r")R")
 # score net de la derniere ligne NEW BEST. C'est exactement la regle de
 # `retient_checkpoint`, et c'est exact tant que le journal est lu depuis
 # son debut — ce que la veille fait toujours.
+# LE SOMMET DES ENTREES SEULES, SORTIE FIXE A L'HORIZON DE LA CIBLE.
+# Diagnostic : il dit si les entrees valent quelque chose quand on leur
+# laisse leur horizon. Motif separe, comme tout champ ajoute.
+# `\s*` apres la barre : un `nan` s'ecrit `  +nan` sur six colonnes.
+RE_HORIZON = re.compile(r"horizon\s+(\d+)m\s+(" + NB + r")R/\s*(" + NB + r")R")
+
 RE_BATTRE = re.compile(r"a_battre\s+(" + NB + r")R")
 
 RE_TENUE = re.compile(
@@ -383,7 +389,7 @@ def _point_mort(avg_w, avg_l):
 def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
             ent_prec=None, rho=None, cote="both", herite=False,
             sommet=None, reprise=None, net=None, tenue=None,
-            a_battre=None, historique=None):
+            a_battre=None, historique=None, horizon=None):
     """Rend (lignes colorees, lignes brutes, gain par trade, ecart, gele)."""
     ep = int(v[1])
     pnl, trades, wr, pf, dd = (float(v[2]), int(v[3]), float(v[4]),
@@ -558,6 +564,21 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
                  # le checkpoint, c'est `net` qui decide » — et le libelle
                  # n'avait jamais suivi. On regardait le mauvais chiffre.
                  f"   [portillon : necessaire, ne suffit pas]")
+
+    # LES ENTREES SEULES, tenues jusqu'a l'horizon de leur cible. Il ne
+    # decide rien ; il dit si le tri vaut quelque chose quand la sortie ne
+    # ferme pas tout a la premiere minute.
+    if horizon is not None:
+        _h, h_top, h_has = horizon
+        if math.isfinite(h_top) and math.isfinite(h_has):
+            eh = h_top - h_has
+            ch = (C.VERT if eh > 0.05 else
+                  (C.ROUGE if eh < -0.05 else C.GRIS))
+            L.append(f"  sommet {_h} min  {ch}{h_top:+.3f} R{C.FIN} par "
+                     f"occasion  contre {h_has:+.3f} au hasard  "
+                     f"-> {ch}{eh:+.3f} R{C.FIN} de mieux"
+                     f"   [diagnostic : les entrees seules, sortie fixe "
+                     f"a {_h} min — ne decide rien]")
 
     if reference is not None:
         n_ref, moy_ref = reference
@@ -819,6 +840,7 @@ class Veilleur:
         self.cotes = {}         # par fold : long / short / both, lu du tag
         self.herites = set()    # folds dont les poids viennent du precedent
         self.sommets = {}       # par (fold, epoch) : (gain du sommet, au hasard)
+        self.horizons = {}      # idem, sortie fixe a l'horizon : (h, top, hasard)
         self.tenues = {}        # (med G, moy G, med P, moy P, rapport)
         self.a_battre = {}      # par (fold, epoch) : seuil de sauvegarde
         self.records = {}       # par fold : score net du dernier retenu
@@ -838,7 +860,8 @@ class Veilleur:
         for d in (self.vals, self.metas, self.trains, self.rhos, self.cotes,
                   self.precedent, self.geles, self.cumul, self.entropie,
                   self.sommets, self.reprises, self.nets, self.tenues,
-                  self.a_battre, self.records, self.hist_nets):
+                  self.a_battre, self.records, self.hist_nets,
+                  self.horizons):
             d.clear()
         self._fold_lu = None
         self.herites.clear()
@@ -981,6 +1004,11 @@ class Veilleur:
                 if mt:
                     self.tenues[(mm.group(1), int(mm.group(2)))] = tuple(
                         float(x) for x in mt.groups())
+                mh = RE_HORIZON.search(ligne)
+                if mh:
+                    self.horizons[(mm.group(1), int(mm.group(2)))] = (
+                        int(mh.group(1)), float(mh.group(2)),
+                        float(mh.group(3)))
                 ms = RE_SOMMET.search(ligne)
                 if ms:
                     self.sommets[(mm.group(1), int(mm.group(2)))] = (
@@ -1027,7 +1055,8 @@ class Veilleur:
                 self.cotes.get(fold, "both"), fold in self.herites,
                 self.sommets.get(cle), self.reprises.get(cle),
                 self.nets.get(cle), self.tenues.get(cle),
-                self.a_battre.get(cle), list(self.hist_nets.get(fold, [])))
+                self.a_battre.get(cle), list(self.hist_nets.get(fold, [])),
+                self.horizons.get(cle))
             # L'HISTORIQUE NE GARDE QUE LES MESURES REELLES : une epoch
             # `[val epN]` reaffiche le score d'une autre, le compter deux fois
             # dessinerait un plateau qui n'existe pas.

@@ -109,6 +109,8 @@ Write-Host ''
 #   sommet du tri   le PORTILLON : il doit battre le hasard + la marge.
 #                   Necessaire, pas suffisant. La veille l'annoncait comme
 #                   "ce qui selectionne le checkpoint" : c'etait faux.
+#   sommet 60 min   diagnostic : les entrees seules, sortie fixe a
+#                   l'horizon de leur cible. Ne decide rien.
 #   critere net     LE CRITERE DE SAUVEGARDE : gain - baisse.
 #   sauvegarde      ce qu'il doit battre, et ce qu'il lui manque.
 #   evolution       ses dernieres valeurs dans le fold.
@@ -128,10 +130,10 @@ Write-Host ''
 # entre deux. Une epoch dure cinq minutes ; la fenetre restait donc muette
 # cinq minutes d'affilee, ce qui est indistinguable d'une fenetre cassee.
 # Une veille qui ne dit pas « je travaille » ne sert a rien.
-$essentiel = '^(EPOCH |  (PnL|train |sens |tenue |sommet du tri|critere net|sauvegarde |evolution )|  phase  PPO sortie|\[COLLECTE\]|SORTIE |CIBLE |          (une seule|AUCUN plafond|SHORT)|  (non )?retenu|  garde |  . NEW BEST|  . REFUSE|    a battu|=== |--- Fold |Traceback|.*Error)'
+$essentiel = '^(EPOCH |  (PnL|train |sens |tenue |sommet du tri|sommet \d+ min|critere net|sauvegarde |evolution )|  phase  PPO sortie|\[COLLECTE\]|SORTIE |CIBLE |          (une seule|AUCUN plafond|SHORT)|  (non )?retenu|  garde |  . NEW BEST|  . REFUSE|    a battu|=== |--- Fold |Traceback|.*Error)'
 
 # LE DETAIL : tout le reste — diagnostics, phases du reseau, cadence.
-$detaille = '^(EPOCH |  (PnL|point mort|classement|sommet du tri|vs |sens |actions |entrees |critere net|sauvegarde |evolution |dimension|train |tenue |phase |cadence |\. |temps :)|\[COLLECTE\]|          SHORT|  (non )?retenu|  garde |  . NEW BEST|=== |--- Fold |Traceback|.*Error)'
+$detaille = '^(EPOCH |  (PnL|point mort|classement|sommet du tri|sommet \d+ min|vs |sens |actions |entrees |critere net|sauvegarde |evolution |dimension|train |tenue |phase |cadence |\. |temps :)|\[COLLECTE\]|          SHORT|  (non )?retenu|  garde |  . NEW BEST|=== |--- Fold |Traceback|.*Error)'
 
 $garde = if ($Detail) { $detaille } else { $essentiel }
 $ansi = [regex]"$([char]27)\[[0-9;]*m"
