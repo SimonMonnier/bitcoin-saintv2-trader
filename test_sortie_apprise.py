@@ -286,7 +286,7 @@ _dup = [k for k, v in _gr.items() for q in v
         if _vus.setdefault(id(q), k) != k]
 verifie("aucun poids n'appartient a deux optimiseurs", not _dup, str(_dup))
 verifie("l'entree est entrainee par PPO",
-        "maj_ppo_entree(policy, ep_buf, optims_ppo, cfg, device)" in src)
+        "maj_ppo_entree(policy, ep_buf, optims_ppo, cfg, device," in src)
 verifie("la sortie aussi",
         "maj_ppo_sortie(policy, sortie_buf, optims_ppo, cfg, device)" in src)
 verifie("l'avantage est normalise PAR TETE",
@@ -580,6 +580,47 @@ verifie("la decision d'entree rend ses logits au diagnostic",
         len(_d11) == 1 and _d11[0].shape == (5, 3))
 verifie("la validation les recueille",
         "generateur=_gen_v, diag=_diag_v)" in src and "marge entree" in src)
+
+print("\n12. LA PENALITE D'ATTENTE")
+# Cas connu : acheter et vendre coutent -0.06, attendre 0. Sans penalite,
+# PPO fait monter l'attente — c'est la bonne reponse a ces recompenses.
+# Avec une penalite superieure au cout d'un trade, il doit la faire BAISSER.
+def _attente_apres(pen):
+    torch.manual_seed(3)
+    np.random.seed(3)
+    _p = SAINTPolicySingleHead(n_features=OBS_N_FEATURES, d_model=8,
+                               num_blocks=1, heads=1, n_freq=4, mlp_dim=8,
+                               lecture="colonnes", max_len=4,
+                               n_actions=N_ACTIONS)
+    _c = T.PPOConfig()
+    _c.batch_size = 64
+    _c.max_transitions_ppo = 0
+    _o = T.optimiseurs_ppo(_p, _c)
+    _X = [np.random.randn(4, OBS_N_FEATURES).astype(np.float32)
+          for _ in range(320)]
+    _m = np.ones((320, 3), bool)
+    for _ in range(3):
+        _a, _lp, _v = T.decide_entree(_p, _X, _m, "cpu", explore=True)
+        _r = np.where(_a == ATTENDRE, 0.0, -0.06)
+        T.maj_ppo_entree(_p, [{
+            "states": _X, "masques": list(_m), "actions": list(_a),
+            "rewards": list(_r), "dts": list(np.where(_a == ATTENDRE, 1, 5)),
+            "dones": [True] * len(_a), "lps": list(_lp), "vals": list(_v),
+            "barres": [0] * len(_a), "positions": [0] * len(_a)}],
+            _o, _c, "cpu", penalite_attente=pen)
+    with torch.no_grad():
+        return float(torch.softmax(_p.entree(torch.as_tensor(np.stack(_X)))[0],
+                                   -1)[:, ATTENDRE].mean())
+
+
+_sans, _avec = _attente_apres(0.0), _attente_apres(0.3)
+verifie("sans penalite, l'attente monte", _sans > 0.34, "%.3f" % _sans)
+verifie("avec penalite, elle baisse", _avec < 0.33, "%.3f" % _avec)
+verifie("la collecte mesure l'action la plus probable",
+        "explore=True, diag=_diag_r)" in src)
+verifie("la penalite s'ajuste vers la cible d'ouverture",
+        "penalite_attente=penalite_attente)" in src
+        and 0 < T.PPOConfig().cible_ouverture < 1)
 
 print("\n9. LE COTE SE DECLARE A UN SEUL ENDROIT")
 # ============================================================

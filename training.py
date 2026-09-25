@@ -1228,6 +1228,31 @@ class PPOConfig:
     # reponse la plus sure tant que rien n'est appris, et c'est celle qui
     # empeche d'apprendre quoi que ce soit.
     entropie_entree: float = 0.01
+
+    # LA PENALITE D'ATTENTE — demande du proprietaire, 2026-09-26.
+    #
+    # CE QUI L'IMPOSE. Chaque trade coute en moyenne le spread (-0.064 de
+    # recompense, mesure sous une politique au hasard, achat et vente
+    # identiques), attendre ne coute rien : PPO apprend donc a attendre, et
+    # c'est la reponse CORRECTE a ces recompenses — verifie sur un cas
+    # connu, l'attente passe de 33 % a 54 % en quatre mises a jour. En
+    # validation, l'action la plus probable devient « attendre » partout :
+    # zero trade a l'epoch 3.
+    #
+    # UNE PENALITE QUI S'AJUSTE SEULE, PAS UN COUT FIXE. Un cout fixe trop
+    # fort ferait trader a perte partout ; trop faible, il ne changerait
+    # rien — et on ne connait pas le bon niveau d'avance. On vise une
+    # ACTIVITE : que l'action la plus probable ouvre sur `cible_ouverture`
+    # des minutes a plat, mesure sur les etats de la collecte. En dessous,
+    # la penalite de chaque attente monte de `pas_penalite_attente` x
+    # l'ecart ; au-dessus, elle redescend, jusqu'a zero.
+    #
+    # ELLE NE TOUCHE QUE CE QUE PPO APPREND. La recompense des attentes est
+    # diminuee dans la mise a jour ; le PnL, les trades et le critere de
+    # sauvegarde restent ceux du marche.
+    cible_ouverture: float = 0.05
+    pas_penalite_attente: float = 0.1
+    penalite_attente_max: float = 0.1
     pas_profit_par_epoch: int = 0
     # L'HORIZON SUR LEQUEL ELLE JUGE — ET IL FIXE AUSSI CELUI DE L'ENTREE.
     #
@@ -4484,7 +4509,8 @@ def _sous_lot(n, cfg):
     return idx
 
 
-def maj_ppo_entree(policy, ep_buf, optims, cfg, device):
+def maj_ppo_entree(policy, ep_buf, optims, cfg, device,
+                   penalite_attente: float = 0.0):
     """La mise a jour PPO des tetes d'ACHAT et de VENTE, et du tronc.
 
     Rend un dict de diagnostics, ou None s'il y a trop peu de decisions.
@@ -4494,7 +4520,12 @@ def maj_ppo_entree(policy, ep_buf, optims, cfg, device):
     for b in ep_buf:
         if not b["actions"]:
             continue
-        adv, ret = avantages_semi_mdp(b["rewards"], b["dts"], b["vals"],
+        # CHAQUE ATTENTE PAIE LA PENALITE du moment. Voir
+        # `cible_ouverture`.
+        _r = (np.asarray(b["rewards"], np.float64)
+              - float(penalite_attente)
+              * (np.asarray(b["actions"]) == ATTENDRE))
+        adv, ret = avantages_semi_mdp(_r, b["dts"], b["vals"],
                                       b["dones"], gam, lam)
         O.extend(b["states"]); M.extend(b["masques"]); A.extend(b["actions"])
         LP.extend(b["lps"]); ADV.extend(adv); RET.extend(ret)
@@ -8200,6 +8231,9 @@ def run_training_on_split(
     # `optimiseurs_ppo`. Crees une fois par fold : l'etat Adam survit d'une
     # epoch a l'autre.
     optims_ppo = optimiseurs_ppo(policy, cfg)
+    # LA PENALITE D'ATTENTE du fold, ajustee a chaque epoch. Voir
+    # `cible_ouverture`.
+    penalite_attente = 0.0
 
     optimizer_rang = optim.Adam(
         policy.parameters(),
@@ -8698,6 +8732,9 @@ def run_training_on_split(
         #                      son nom est pire qu'un champ absent.
         # `ouvertures` : les trades REELLEMENT ouverts par la collecte.
         # C'est lui que le regulateur d'episodes vise — voir `cible_trades`.
+        # LES LOGITS D'ENTREE DE LA COLLECTE : ils disent ou l'action la
+        # plus probable ouvrirait, ce que la penalite d'attente regle.
+        _diag_r: List[np.ndarray] = []
         sampling_audit = {"decisions": 0, "ouvertures": 0,
                           "forced_actions": 0,
                           "remapped_actions": 0, "cote_interdit": 0.0,
@@ -8842,7 +8879,7 @@ def run_training_on_split(
                 _m3, _sans = masque_entree(masks_np, [envs[k] for k in deciding])
                 _ea, _elp, _ev = decide_entree(
                     policy, [states[k] for k in deciding], _m3, device,
-                    explore=True)
+                    explore=True, diag=_diag_r)
                 # `remapped_actions` COMPTE DESORMAIS LES DECISIONS OU LE
                 # SOLDE INTERDISAIT D'OUVRIR — masquees avant le tirage.
                 sampling_audit["remapped_actions"] += int(_sans.sum())
@@ -9423,7 +9460,28 @@ def run_training_on_split(
         # exact que si l'ancienne et la nouvelle politique sont la meme
         # fonction. `eval()` ne coupe pas le gradient.
         policy.eval()
-        _st_e = maj_ppo_entree(policy, ep_buf, optims_ppo, cfg, device)
+        _st_e = maj_ppo_entree(policy, ep_buf, optims_ppo, cfg, device,
+                               penalite_attente=penalite_attente)
+        # L'AJUSTEMENT DE LA PENALITE, sur la part des minutes a plat de la
+        # collecte ou l'action la plus probable OUVRIRAIT. Elle ne se lit
+        # pas sur les actions tirees : elles ouvrent encore une fois sur
+        # deux quand l'argmax n'ouvre plus jamais.
+        if _diag_r:
+            _lgr = np.concatenate(_diag_r, axis=0)
+            _taux_arg = float(np.mean(
+                np.maximum(_lgr[:, ACHETER], _lgr[:, VENDRE])
+                > _lgr[:, ATTENDRE]))
+            _avant_pen = penalite_attente
+            penalite_attente = float(np.clip(
+                penalite_attente
+                + float(getattr(cfg, "pas_penalite_attente", 0.1))
+                * (float(getattr(cfg, "cible_ouverture", 0.05)) - _taux_arg),
+                0.0, float(getattr(cfg, "penalite_attente_max", 0.1))))
+            print(f"  {_col('phase', _C.GREY)}  penalite attente  "
+                  f"{_avant_pen:.4f} cette epoch -> {penalite_attente:.4f}  "
+                  f"(l'action la plus probable ouvrirait sur "
+                  f"{100*_taux_arg:.1f}% des minutes a plat, cible "
+                  f"{100*float(getattr(cfg, 'cible_ouverture', 0.05)):.0f}%)")
         if _st_e is not None:
             epoch_actor_loss.append(_st_e["actor"])
             epoch_critic_loss.append(_st_e["critic"])
