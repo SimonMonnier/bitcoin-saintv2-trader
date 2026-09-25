@@ -3664,6 +3664,24 @@ class PPOConfig:
     val_seed: int = 20260914
     legacy_flat_validation: bool = False
     evaluate_test: bool = True
+    # LA VALIDATION ET LE TEST TIRENT LES ACTIONS DE LA POLITIQUE —
+    # choix du proprietaire, 2026-09-25, au vu des deux premieres epochs du
+    # PPO complet.
+    #
+    # En argmax, une politique encore indecise — un tiers par action a
+    # l'entree, 50/50 a la sortie — se jouait comme une regle absolue : la
+    # vente legerement devant, la validation vendait a CHAQUE minute a
+    # plat ; la fermeture legerement devant, elle fermait a la minute
+    # suivante. 46 046 shorts d'une minute, zero long, pendant que la
+    # politique entrainee achetait 28 % du temps. La strategie jugee
+    # n'etait pas celle que PPO apprend.
+    #
+    # EN TIRANT, la validation mesure exactement ce que PPO optimise :
+    # l'esperance sous la politique. Le tirage suit un GENERATEUR A GRAINE
+    # FIXE, le meme a chaque epoch : deux epochs se comparent sur les memes
+    # aleas, et le generateur global de l'entrainement n'est pas touche.
+    # Quand la politique deviendra confiante, tirage et argmax convergent.
+    evaluation_stochastique: bool = True
     # PPO requiert les probabilites de la politique qui a tire les actions.
     # L'ancien curriculum forcait BUY/SELL ou remappait en HOLD sans corriger
     # logprob. Conserve uniquement pour reproduire les anciens diagnostics.
@@ -4328,7 +4346,23 @@ def masque_entree(masque_plat, envs_):
     return m, sans
 
 
-def decide_entree(policy, etats, masques, device, explore: bool = True):
+def _tire(logits, explore: bool, generateur=None):
+    """L'action : tiree de la loi, ou son argmax si `explore` est faux.
+
+    AVEC `generateur`, LE TIRAGE EST REPRODUCTIBLE : la validation et le
+    test en passent un a graine fixe, pour que deux epochs se jugent sur
+    les memes aleas sans toucher au generateur global de l'entrainement.
+    """
+    if not explore:
+        return logits.argmax(-1)
+    if generateur is None:
+        return torch.distributions.Categorical(logits=logits).sample()
+    probs = torch.softmax(logits.float(), dim=-1)
+    return torch.multinomial(probs, 1, generator=generateur).squeeze(-1)
+
+
+def decide_entree(policy, etats, masques, device, explore: bool = True,
+                  generateur=None):
     """Acheter, vendre ou attendre ? Rend (actions, logprobs, valeurs).
 
     On ECHANTILLONNE a l'entrainement — PPO a besoin que l'action jouee
@@ -4341,7 +4375,7 @@ def decide_entree(policy, etats, masques, device, explore: bool = True):
         logits, valeur = policy.entree(x)
         logits = logits.masked_fill(~m, -1e9)
         dist = torch.distributions.Categorical(logits=logits)
-        a = dist.sample() if explore else logits.argmax(-1)
+        a = _tire(logits, explore, generateur)
         lp = dist.log_prob(a)
     return (a.cpu().numpy().astype(np.int64),
             lp.cpu().numpy().astype(np.float32),
@@ -4544,7 +4578,8 @@ def maj_ppo_sortie(policy, sortie_buf, optims, cfg, device):
     return st
 
 
-def decide_sortie(policy, etats, device, n_base: int, explore: bool = True):
+def decide_sortie(policy, etats, device, n_base: int, explore: bool = True,
+                  generateur=None):
     """Tenir ou fermer ? Rend (actions, logprobs, valeurs), un par etat.
 
     ELLE REMPLACE DEUX REGLES ECRITES A LA MAIN, et c'est tout son objet.
@@ -4575,7 +4610,7 @@ def decide_sortie(policy, etats, device, n_base: int, explore: bool = True):
     with torch.no_grad():
         logits, valeur = policy.sortie_complete(x, p)
         dist = torch.distributions.Categorical(logits=logits)
-        a = dist.sample() if explore else logits.argmax(-1)
+        a = _tire(logits, explore, generateur)
         lp = dist.log_prob(a)
     return (a.cpu().numpy().astype(np.int64),
             lp.cpu().numpy().astype(np.float32),
@@ -9993,6 +10028,11 @@ def run_training_on_split(
         # validation la plus recente, jamais des zeros qu'on lirait comme un
         # effondrement.
         np.random.seed(cfg.val_seed + 1)
+        # LE TIRAGE DE LA VALIDATION : meme graine a chaque epoch. Voir
+        # `evaluation_stochastique`.
+        _explore_v = bool(getattr(cfg, "evaluation_stochastique", True))
+        _gen_v = torch.Generator(device=device)
+        _gen_v.manual_seed(int(cfg.val_seed) + 2)
         v_states = []
         v_infos = []
         for e, d in zip(val_envs, departs_val):
@@ -10045,19 +10085,20 @@ def run_training_on_split(
                         v_frais[_k] = True
                 _vd, _ = cadence_sortie(_vp, v_frais, v_depuis, _pas_v)
                 if _vd:
-                    # `explore=False` : on veut la DECISION, pas son
-                    # bruit. Echantillonner en validation ferait juger une
-                    # politique qui n'est pas celle qu'on deploierait.
+                    # LA POLITIQUE EST TIREE, graine fixe : voir
+                    # `evaluation_stochastique`.
                     _va, _, _ = decide_sortie(
                         policy, [v_states[k] for k in _vd], device,
-                        N_BASE_FEATURES, explore=False)
+                        N_BASE_FEATURES, explore=_explore_v,
+                        generateur=_gen_v)
                     for _bi, _k in enumerate(_vd):
                         v_frais[_k] = False
                         if int(_va[_bi]) == FERMER:
                             v_actions[_k] = 3
 
                 if deciding:
-                    # LA MEME POLITIQUE QU'A L'ENTRAINEMENT, en argmax.
+                    # LA MEME POLITIQUE QU'A L'ENTRAINEMENT, tiree avec
+                    # une graine fixe — voir `evaluation_stochastique`.
                     # `barre` compte desormais les attentes que la politique
                     # a CHOISIES, `capacite` celles que le solde imposait.
                     _m3, _sans = masque_entree(
@@ -10065,7 +10106,7 @@ def run_training_on_split(
                         [val_envs[k] for k in deciding])
                     _va_e, _, _ = decide_entree(
                         policy, [v_states[k] for k in deciding], _m3, device,
-                        explore=False)
+                        explore=_explore_v, generateur=_gen_v)
                     _portillons["occasions"] += len(deciding)
                     _portillons["capacite"] += int(_sans.sum())
                     for bi, k in enumerate(deciding):
@@ -11393,6 +11434,10 @@ def run_training_on_split(
         t_states.append(s0)
         t_infos.append(i0)
     t_active = list(range(n_test))
+    # LE TEST TIRE COMME LA VALIDATION, sur sa propre graine fixe.
+    _explore_t = bool(getattr(cfg, "evaluation_stochastique", True))
+    _gen_t = torch.Generator(device=device)
+    _gen_t.manual_seed(int(cfg.val_seed) + 3)
     t_frais = np.ones(max(n_test, 1), dtype=bool)
     t_depuis = np.zeros(max(n_test, 1), dtype=np.int64)
     _pas_t = max(1, int(getattr(cfg, "pas_decision_sortie", 1)))
@@ -11418,20 +11463,20 @@ def run_training_on_split(
             if _td:
                 _ta, _, _ = decide_sortie(
                     policy, [t_states[k] for k in _td], device,
-                    N_BASE_FEATURES, explore=False)
+                    N_BASE_FEATURES, explore=_explore_t, generateur=_gen_t)
                 for _bi, _k in enumerate(_td):
                     t_frais[_k] = False
                     if int(_ta[_bi]) == FERMER:
                         t_actions[_k] = 3
 
             if deciding:
-                # LA MEME POLITIQUE QU'EN VALIDATION, en argmax.
+                # LA MEME POLITIQUE QU'EN VALIDATION, tiree pareil.
                 _m3, _ = masque_entree(
                     np.repeat(MASK_FLAT[None, :], len(deciding), axis=0),
                     [test_envs[k] for k in deciding])
                 _ta_e, _, _ = decide_entree(
                     policy, [t_states[k] for k in deciding], _m3, device,
-                    explore=False)
+                    explore=_explore_t, generateur=_gen_t)
                 for bi, k in enumerate(deciding):
                     t_actions[k] = int(_ta_e[bi])
 

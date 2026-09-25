@@ -74,10 +74,15 @@ verifie("le rollout EXPLORE",
 # LE MOTIF PORTE LA PARENTHESE FERMANTE : sans elle il comptait aussi
 # l'occurrence du COMMENTAIRE qui explique le choix, et le test echouait
 # sur du texte au lieu de code.
-verifie("validation et test prennent l'argmax",
-        src.count("explore=False)") == 4,
-        "entree ET sortie, validation ET test : on juge la decision, "
-        "pas son bruit")
+# DEPUIS LE 2026-09-25 LA VALIDATION ET LE TEST TIRENT LA POLITIQUE,
+# graine fixe : en argmax une politique indecise se jouait comme une regle
+# absolue — 46 046 shorts d'une minute, zero long.
+verifie("validation et test tirent la politique, graine fixe",
+        src.count("generateur=_gen_v)") == 2
+        and src.count("generateur=_gen_t)") == 2
+        and T.PPOConfig().evaluation_stochastique,
+        "entree ET sortie, validation ET test")
+
 
 # LES DEUX ANCIENNES REGLES NE DECIDENT PLUS RIEN. Les garder en
 # parallele a ete explicitement refuse : deux organes qui repondent a la
@@ -138,6 +143,24 @@ a1, _, _ = T.decide_sortie(pol, x, "cpu", N_BASE_FEATURES, explore=False)
 a2, _, _ = T.decide_sortie(pol, x, "cpu", N_BASE_FEATURES, explore=False)
 verifie("sans exploration, la decision est reproductible",
         bool((a1 == a2).all()))
+_xg = np.random.randn(64, 4, OBS_N_FEATURES).astype(np.float32)
+_g1 = torch.Generator().manual_seed(7)
+_g2 = torch.Generator().manual_seed(7)
+_t1, _, _ = T.decide_sortie(pol, _xg, "cpu", N_BASE_FEATURES,
+                            explore=True, generateur=_g1)
+_t2, _, _ = T.decide_sortie(pol, _xg, "cpu", N_BASE_FEATURES,
+                            explore=True, generateur=_g2)
+verifie("a graine egale, le tirage est identique", bool((_t1 == _t2).all()),
+        "deux epochs se jugent sur les memes aleas")
+_m64 = np.ones((64, 3), bool)
+_e1, _, _ = T.decide_entree(pol, _xg, _m64, "cpu", explore=True,
+                            generateur=torch.Generator().manual_seed(7))
+_e2, _, _ = T.decide_entree(pol, _xg, _m64, "cpu", explore=True,
+                            generateur=torch.Generator().manual_seed(7))
+verifie("pour l'entree aussi", bool((_e1 == _e2).all()))
+verifie("et il ne se reduit pas a l'argmax",
+        len(set(_e1.tolist())) > 1,
+        "une politique presque uniforme tire les trois actions")
 
 # ============================================================
 print("\n4. LE LOYER DU TEMPS EST CE QUI FAIT LE SCALPING")
