@@ -166,9 +166,26 @@ _rK = (c.loyer_temps_atr + c.derive_atr_barre) * _K / (_bruit * np.sqrt(_K))
 verifie("le rapport signal/bruit du loyer a gagne un facteur",
         _rK > 3 * _r1,
         "%.1f %% par decision contre %.1f %% par barre" % (100 * _rK, 100 * _r1))
+# LE MOTIF NE NOMME PLUS LE LOYER, SEULEMENT SA MULTIPLICATION PAR LA
+# DUREE. Il exigeait `(_loyer + _derive) * _dt` et a casse le 2026-09-25
+# quand le loyer est devenu `_loyer_eff` — un changement VOULU, fait entre
+# deux sessions : le loyer zombie ci-dessous. Le test gardait une ecriture,
+# pas une propriete ; c'est la propriete qui compte.
 verifie("la duree entre decisions entre dans la recompense",
-        "(_loyer + _derive) * _dt" in src,
+        "+ _derive) * _dt" in src,
         "sans quoi une decision couvrant 15 barres n'en paierait qu'une")
+
+# LE LOYER ZOMBIE. Le loyer est multiplie quand la position PERD, et
+# seulement alors : la politique apprend a couper les perdants qui
+# trainent sans qu'on touche aux gagnants, et sans horloge. C'est la
+# reponse a l'effondrement du 2026-09-22 — la politique avait appris a ne
+# jamais fermer, parce que rien ne rendait la perte qui dure couteuse.
+verifie("le loyer zombie existe",
+        float(getattr(c, "loyer_zombie_mult", 1.0)) > 1.0,
+        "x%.1f sur les positions en perte" % getattr(c, "loyer_zombie_mult", 1.0))
+verifie("il ne s'applique qu'en PERTE",
+        "_loyer * _loyer_z_mult if _lat < 0.0" in src,
+        "un gagnant paie le loyer normal — on ne veut pas le faire fermer")
 
 # LA DERIVE EST RETIREE. Sans cela, tenir une position longue dans un BTC
 # qui monte rapporte en moyenne, et la politique apprend a ne jamais

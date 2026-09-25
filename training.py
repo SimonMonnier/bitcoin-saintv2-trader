@@ -3965,6 +3965,147 @@ def entree_profit(x, n_base: int):
     ], axis=1).astype(_np.float32)
 
 
+def cadence_sortie(en_pos, frais, depuis, pas: int):
+    """QUI decide de sortir a cette barre. Une seule ecriture, quatre lecteurs.
+
+    POURQUOI CETTE FONCTION EXISTE. Le 2026-09-25, trois boucles ne
+    consultaient pas la politique de sortie au meme rythme :
+
+        rollout      tous les 15 barres    (la politique APPREND a ce rythme)
+        validation   A CHAQUE BARRE
+        test         A CHAQUE BARRE
+
+    En `argmax`, une politique interrogee chaque barre ferme a la premiere
+    ou elle penche vers FERMER — quinze fois plus d'occasions de le faire
+    que ce qu'elle a appris. La validation jouait donc une autre strategie
+    que l'entrainement, et c'est elle qui decide du checkpoint. Le critere
+    de sauvegarde, lui, ne jouait meme pas de sortie du tout.
+
+    LA REGLE : une position FRAICHE decide tout de suite ; ensuite une
+    decision tous les `pas` barres exactement. `depuis` compte les barres
+    ecoulees depuis la derniere decision, par position.
+
+    L'ANCIENNE CADENCE ETAIT DE 16, PAS DE 15. Le test precedait
+    l'increment : apres une decision a la barre 1, la suivante tombait a
+    la barre 17. Et le loyer facturait 15 barres sur un intervalle de 16.
+    On incremente desormais AVANT de tester : decisions aux barres 1, 16,
+    31, et `ecoule` vaut exactement l'intervalle facture.
+
+    Rend (decideurs, ecoule), ou `ecoule[k]` est le nombre de barres
+    couvertes par la decision precedente de k — celui que le loyer doit
+    facturer.
+    """
+    for k in en_pos:
+        depuis[k] += 1
+    dec = [k for k in en_pos if bool(frais[k]) or depuis[k] >= pas]
+    ecoule = {k: int(depuis[k]) for k in dec}
+    for k in dec:
+        depuis[k] = 0
+    return dec, ecoule
+
+
+def rendements_sortie_ppo(policy, data, idx, cfg, device):
+    """Ce que rapporte chaque occasion SOUS LA SORTIE QUE LE MODELE JOUE.
+
+    CE QUI ETAIT FAUX, ET CA DECIDAIT DU DEPLOIEMENT. `sommet` et
+    `score_retenue` lisaient `rendements_du_systeme`, qui rend le
+    rendement d'une position tenue EXACTEMENT `horizon_cloture` barres.
+    Depuis que la sortie est une politique PPO, aucun trade ne se joue
+    ainsi : le critere de sauvegarde jugeait une strategie que personne ne
+    jouait, et la politique de sortie n'y entrait nulle part. Elle aurait
+    pu apprendre des sorties parfaites sans que le checkpoint le voie.
+
+    ON DEROULE LA POLITIQUE le long de chaque chemin de prix de la grille,
+    en `argmax`, a la cadence de `cadence_sortie` — la meme qu'au rollout,
+    en validation et au test. La politique change a chaque epoch, donc ce
+    calcul aussi : il est refait a chaque epoch, plus une fois par fold.
+
+    UNE SEULE CHOSE CHANGE PAR RAPPORT A L'ANCIEN CRITERE : la barre de
+    sortie. Le prix d'entree, le cout et l'echelle sont ceux de
+    `rendements_du_systeme`, a l'identique — sinon deux choses auraient
+    bouge a la fois et on ne saurait pas laquelle agit.
+
+    L'ENTREE DE LA POLITIQUE, ELLE, SUIT LA CONVENTION DE L'ENVIRONNEMENT :
+    execution a l'OUVERTURE avec le spread paye, ATR de la barre d'entree.
+    `cibles_m1.echantillon_cloture` a mesure qu'une convention differente
+    decale le latent de 0.61 ATR — assez pour changer la decision.
+
+    LA DETENTION EST BORNEE PAR `tenue_max_cloture`, et par la fin des
+    donnees : une position encore ouverte la est soldee, comme
+    l'environnement le fait en fin d'episode.
+    """
+    import cibles_m1 as _CM
+    import instruments as _IN
+    df = data.df
+    feats = data.features
+    c = df["close"].to_numpy(np.float64)
+    o = df["open"].to_numpy(np.float64) if "open" in df.columns else c
+    atr = np.maximum(df["atr_14"].to_numpy(np.float64), 1e-9)
+    if "spread_bar" in df.columns:
+        spb = df["spread_bar"].to_numpy(np.float64)
+        spb = np.where(np.isfinite(spb) & (spb > 0), spb,
+                       float(np.nanmedian(spb[spb > 0])))
+    else:
+        spb = np.full(len(c), float(_IN.spread_espere(cfg.symbol)))
+    n = len(c)
+    h = int(getattr(cfg, "horizon_cloture", 30))
+    T = int(getattr(cfg, "tenue_max_cloture", h))
+    pas = max(1, int(getattr(cfg, "pas_decision_sortie", 1)))
+    smh = float(max(SCALPING_MAX_HOLDING, 1))
+    gl = float(_IN.INSTRUMENTS[cfg.symbol]["entry_slippage_bps"]) / 2.0
+    im = IDX_PROFIT_MARCHE
+    idx = np.asarray(idx, dtype=np.int64)
+    m = len(idx)
+    ip = np.maximum(idx - 1, 0)
+
+    def _un_cote(sens):
+        p_ent = o[idx] * (1.0 + sens * (spb[ip] + gl) / 1e4)
+        a_ent = atr[idx]
+        t_sortie = np.full(m, T, dtype=np.int64)
+        ouvert = np.ones(m, dtype=bool)
+        frais = np.ones(m, dtype=bool)
+        depuis = np.zeros(m, dtype=np.int64)
+        for t in range(1, T + 1):
+            j = idx + t
+            bout = ouvert & (j >= n - 1)
+            if bout.any():
+                t_sortie[bout] = np.maximum(n - 2 - idx[bout], 1)
+                ouvert[bout] = False
+            if not ouvert.any():
+                break
+            # LA MEME REGLE QUE `cadence_sortie`, vectorisee.
+            depuis[ouvert] += 1
+            dec = ouvert & (frais | (depuis >= pas))
+            depuis[dec] = 0
+            frais[dec] = False
+            if not dec.any():
+                continue
+            r = np.flatnonzero(dec)
+            jj = j[r]
+            x = np.stack([
+                sens * (c[jj] - p_ent[r]) / a_ent[r],
+                np.full(len(r), min(t / smh, 3.0)),
+                feats[jj - 1, im[0]],
+                feats[jj - 1, im[1]],
+            ], axis=1).astype(np.float32)
+            with torch.no_grad():
+                lg, _ = policy.sortie(torch.from_numpy(x).to(device))
+            ferme = r[(lg.argmax(-1) == FERMER).cpu().numpy()]
+            t_sortie[ferme] = t
+            ouvert[ferme] = False
+        je = np.minimum(idx + t_sortie, n - 1)
+        mv = (c[je] - c[idx]) / c[idx] * 1e4
+        return sens * mv - _CM.cout_par_barre(df, idx, cfg.symbol), t_sortie
+
+    ach, t_a = _un_cote(+1.0)
+    ven, t_v = _un_cote(-1.0)
+    # L'ECHELLE EST CELLE DE `rendements_du_systeme`, A L'IDENTIQUE.
+    _px = c[ip]
+    _sig = atr[ip] / np.maximum(_px, 1e-9) * 1e4 * np.sqrt(float(h))
+    _sig = np.where(np.isfinite(_sig) & (_sig > 1e-6), _sig, np.nan)
+    return ach / _sig, ven / _sig, t_a
+
+
 def decide_sortie(policy, etats, device, n_base: int, explore: bool = True):
     """Tenir ou fermer ? Rend (actions, logprobs, valeurs), un par etat.
 
@@ -7154,10 +7295,16 @@ def run_training_on_split(
     # repond. Mesure sur exec32 : rho +0.0696 +/- 0.0238, soit 2.9 ecarts-
     # types, la ou le PnL de validation du meme run ne depassait pas 1.3.
     #
-    # LE COUT EST NUL PAR EPOCH. Le rendement reel ne depend pas du modele :
-    # il se calcule une fois ici, et chaque epoch n'ajoute qu'une passe avant
-    # sur 11 000 observations. Ce qui suit est du diagnostic : rien ne s'en
-    # sert pour selectionner, decider ou arreter.
+    # CE BLOC NE CALCULE PLUS QUE LA GRILLE ET SON FILTRE.
+    #
+    # Il affirmait deux choses devenues fausses. « Le rendement reel ne
+    # depend pas du modele : il se calcule une fois ici » — vrai tant que la
+    # sortie etait un horizon fixe, faux depuis qu'elle est une politique
+    # PPO qui change a chaque epoch. Et « rien ne s'en sert pour
+    # selectionner » — faux aussi : `_rang_gain` alimente `score_retenue`,
+    # qui DECIDE du checkpoint. Les rendements sont donc recalcules a chaque
+    # epoch par `rendements_sortie_ppo` ; ceux d'ici ne servent plus qu'a
+    # filtrer les occasions valides.
     _rang_idx = _rang_reel = None
     _rang_ra = _rang_rv = None
     if getattr(cfg, "diag_rang", True):
@@ -7973,13 +8120,10 @@ def run_training_on_split(
                 # LA SORTIE EST DECIDEE PAR LA POLITIQUE, plus par deux
                 # seuils ecrits a la main. Voir `decide_sortie` pour les
                 # quatre calibrations successives qui ont echoue.
-                # QUI DECIDE A CETTE BARRE. Une position fraiche decide
-                # tout de suite ; ensuite seulement tous les `_pas_s`.
-                _a_decider = [k for k in _en_pos
-                              if (not np.isfinite(lat_prec[k]))
-                              or (depuis_dec[k] >= _pas_s)]
-                for _k in _en_pos:
-                    depuis_dec[_k] += 1
+                # QUI DECIDE A CETTE BARRE — par `cadence_sortie`, la meme
+                # regle qu'en validation, au test et dans le critere.
+                _a_decider, _ecoule = cadence_sortie(
+                    _en_pos, ~np.isfinite(lat_prec), depuis_dec, _pas_s)
                 if _a_decider:
                     _ep = [states[k] for k in _a_decider]
                     _sa, _slp, _sv = decide_sortie(
@@ -7992,7 +8136,7 @@ def run_training_on_split(
                         # depuis elle. Le loyer ET la derive se comptent
                         # PAR BARRE, donc multiplies par cette duree.
                         if sortie_buf[_k] and np.isfinite(lat_prec[_k]):
-                            _dt = float(max(depuis_dec[_k] - 1, 1))
+                            _dt = float(max(_ecoule[_k], 1))
                             # Loyer normal si en gain ; x loyer_zombie_mult
                             # si en perte → la tete apprend a couper les
                             # zombies sans stop au temps et sans toucher
@@ -8013,7 +8157,6 @@ def run_training_on_split(
                             "done": bool(_ferme),
                         })
                         lat_prec[_k] = np.nan if _ferme else _lat
-                        depuis_dec[_k] = 0
                         if _ferme:
                             actions_env[_k] = 3
 
@@ -9644,6 +9787,13 @@ def run_training_on_split(
             v_infos.append(i0)
 
         v_active = list(range(n_val)) if _valide else []
+        # LA CADENCE DE SORTIE, par environnement de validation. Voir
+        # `cadence_sortie` : sans elle la validation interrogeait la
+        # politique a chaque barre, quinze fois plus souvent qu'elle
+        # n'avait appris a l'etre.
+        v_frais = np.ones(max(n_val, 1), dtype=bool)
+        v_depuis = np.zeros(max(n_val, 1), dtype=np.int64)
+        _pas_v = max(1, int(getattr(cfg, "pas_decision_sortie", 1)))
 
         # Même principe qu'au rollout : la policy n'est sollicitée que sur les
         # envs flat. En position l'action est forcée, le forward serait jeté.
@@ -9676,14 +9826,19 @@ def run_training_on_split(
                 # que l'entrainement ne joue pas — ce depot l'a deja paye.
                 _vp = [k for k in v_active
                        if k not in deciding and val_envs[k].n_positions > 0]
-                if _vp:
+                for _k in v_active:
+                    if val_envs[_k].n_positions == 0:
+                        v_frais[_k] = True
+                _vd, _ = cadence_sortie(_vp, v_frais, v_depuis, _pas_v)
+                if _vd:
                     # `explore=False` : on veut la DECISION, pas son
                     # bruit. Echantillonner en validation ferait juger une
                     # politique qui n'est pas celle qu'on deploierait.
                     _va, _, _ = decide_sortie(
-                        policy, [v_states[k] for k in _vp], device,
+                        policy, [v_states[k] for k in _vd], device,
                         N_BASE_FEATURES, explore=False)
-                    for _bi, _k in enumerate(_vp):
+                    for _bi, _k in enumerate(_vd):
+                        v_frais[_k] = False
                         if int(_va[_bi]) == FERMER:
                             v_actions[_k] = 3
 
@@ -10212,6 +10367,21 @@ def run_training_on_split(
                 _sens_sel = np.full(len(_scores_sel), 1.0)
                 _conv_sel = _scores_sel
             # CE QUE LA POSITION ENCAISSE, une fois le sens choisi.
+            # LE RENDEMENT DE CHAQUE OCCASION SOUS LA SORTIE QUE LE MODELE
+            # JOUE A CETTE EPOCH. Voir `rendements_sortie_ppo` : l'ancien
+            # calcul tenait chaque position `horizon_cloture` barres, une
+            # strategie que personne ne joue depuis que la sortie est PPO.
+            # Le « hasard » est la moyenne du MEME tableau, donc les deux
+            # termes de la comparaison changent ensemble.
+            _rang_ra, _rang_rv, _rang_tenue = rendements_sortie_ppo(
+                policy, val_data, _rang_idx, cfg, device)
+            _rang_ra = np.nan_to_num(_rang_ra, nan=0.0)
+            _rang_rv = np.nan_to_num(_rang_rv, nan=0.0)
+            print(f"  {_col('phase', _C.GREY)}  critere  sortie PPO rejouee sur "
+                  f"{len(_rang_idx):,} occasions — tenue mediane "
+                  f"{float(np.median(_rang_tenue)):.0f} barres, "
+                  f"{100*float(np.mean(_rang_tenue < int(getattr(cfg, 'tenue_max_cloture', 0)))):.0f} % "
+                  f"fermees par la politique")
             _rang_gain = np.where(_sens_sel > 0.0, _rang_ra, _rang_rv)
             # LA MEME SELECTIVITE QUE LA VALIDATION APPLIQUE, sans quoi on
             # jugerait un sommet que personne ne trade.
@@ -11023,6 +11193,9 @@ def run_training_on_split(
         t_states.append(s0)
         t_infos.append(i0)
     t_active = list(range(n_test))
+    t_frais = np.ones(max(n_test, 1), dtype=bool)
+    t_depuis = np.zeros(max(n_test, 1), dtype=np.int64)
+    _pas_t = max(1, int(getattr(cfg, "pas_decision_sortie", 1)))
 
     with torch.no_grad():
         while t_active:
@@ -11038,11 +11211,16 @@ def run_training_on_split(
             # depensee pour rien.
             _tp = [k for k in t_active
                    if k not in deciding and test_envs[k].n_positions > 0]
-            if _tp:
+            for _k in t_active:
+                if test_envs[_k].n_positions == 0:
+                    t_frais[_k] = True
+            _td, _ = cadence_sortie(_tp, t_frais, t_depuis, _pas_t)
+            if _td:
                 _ta, _, _ = decide_sortie(
-                    policy, [t_states[k] for k in _tp], device,
+                    policy, [t_states[k] for k in _td], device,
                     N_BASE_FEATURES, explore=False)
-                for _bi, _k in enumerate(_tp):
+                for _bi, _k in enumerate(_td):
+                    t_frais[_k] = False
                     if int(_ta[_bi]) == FERMER:
                         t_actions[_k] = 3
 
