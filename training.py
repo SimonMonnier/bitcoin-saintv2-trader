@@ -6588,8 +6588,35 @@ UNE SEULE SOURCE pour les trois boucles — rollout, validation, test.
         # stop et l'objectif. La sortie change de DECIDEUR, pas de mecanique
         # — donc pas de seconde ecriture de la comptabilite de sortie, qui
         # est l'endroit ou deux chemins finissent toujours par diverger.
+        #
+        # LA CLOTURE PAIE LE PRIX EXECUTABLE — bug trouve le 2026-09-25.
+        #
+        # Elle passait `prix_execution`, l'ouverture BID brute. Correct pour
+        # un long, qui revend au bid ; FAUX pour un short, qui doit racheter
+        # a l'ASK. Le short avait vendu au bid et rachetait au bid : il ne
+        # payait JAMAIS le spread, seulement le glissement d'entree. Mesure
+        # sur les trades d'une barre, ou le marche ne bouge pas en moyenne :
+        #
+        #                  long         short
+        #   validation   -2.66 bps    -0.81 bps
+        #   entrainement -2.11 bps    -0.49 bps
+        #
+        # Un spread d'ecart. C'est ce qui faisait les shorts « meilleurs »
+        # dans tous les runs depuis leur retour : 41-50 % de gagnants contre
+        # 18-30 % pour les longs. Les autres sorties — stop, objectif, fin
+        # d'episode — passaient deja par `execution_quote` ; seule celle que
+        # le modele decide l'oubliait.
+        #
+        # LE SPREAD EST CELUI DU TRADE, `_p_spread` : c'est lui qui valorise
+        # deja la position latente (`_latent_slot`). Sans cela, la recompense
+        # voyait le spread pendant la tenue et le rendait a la cloture —
+        # fermer un short en devenait paye.
         if manual_close:
-            self._close_position(prix_execution, terminal_reason="modele")
+            _a = np.flatnonzero(self._p_sens != 0)
+            _j = int(_a[np.argmin(self._p_idx[_a])])
+            _q = execution_quote(prix_execution, -int(self._p_sens[_j]),
+                                 float(self._p_spread[_j]))
+            self._close_position(_q, terminal_reason="modele", slot=_j)
             n_fermes += 1
 
         # --------- OUVERTURE DIRECTE (pas de confirmation dans l'env) ---------
@@ -6642,7 +6669,17 @@ UNE SEULE SOURCE pour les trois boucles — rollout, validation, test.
                 fallback = ATR_PLANCHER_FRAC * exec_price
                 entry_atr = max(atr_raw, fallback, 1e-8)
                 self._p_atr[j] = entry_atr
-                self._p_cout[j] = abs(exec_price - prix_execution) / entry_atr
+                # LE POINT MORT EST LA PERTE LATENTE D'UNE POSITION DONT LE
+                # MARCHE N'A PAS BOUGE : ce que coute l'aller-retour tel que
+                # `_latent_slot` le valorise. Il valait `|prix paye -
+                # ouverture|`, juste pour un long — qui paie le spread a
+                # l'entree — mais pas pour un short, qui le paie a la SORTIE :
+                # son point mort ne comptait que le glissement (0.010 ATR
+                # contre 0.103 pour le long), alors que son latent inclut deja
+                # le rachat a l'ask. Corrige avec la cloture, 2026-09-25.
+                self._p_cout[j] = max(0.0, -side * (
+                    execution_quote(prix_execution, -side, spread)
+                    - exec_price)) / entry_atr
 
                 sl_dist = self.cfg.atr_sl_mult * entry_atr
                 tp_dist = self.cfg.atr_tp_mult * entry_atr * self.cfg.tp_shrink

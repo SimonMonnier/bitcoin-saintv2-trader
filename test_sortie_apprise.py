@@ -376,12 +376,25 @@ for _act, _nom in ((0, "long"), (1, "short")):
     verifie("%s : point mort nul a plat" % _nom, _e.cout_entree_atr == 0.0)
     _e.step(_act)
     _ci = int(_e.entry_idx)
-    _attendu = abs(_e.entry_price - float(_md.open[_ci])) / _e.entry_atr
-    verifie("%s : point mort = (prix paye - ouverture) / ATR" % _nom,
+    # LE POINT MORT EST LA PERTE LATENTE A MARCHE INCHANGE : le short paie
+    # le spread a la sortie, et son point mort doit le compter.
+    _o = float(_md.open[_ci])
+    _sortie0 = _o * (1.0 + float(_e._p_spread[0]) / 1e4) if _act == 1 else _o
+    _attendu = abs(_sortie0 - _e.entry_price) / _e.entry_atr
+    verifie("%s : point mort = perte latente a marche inchange" % _nom,
             _e.n_positions == 1 and _e.cout_entree_atr > 0.0
             and abs(_e.cout_entree_atr - _attendu) < 1e-9,
             "%.3f ATR" % _e.cout_entree_atr)
+    # LA CLOTURE DU MODELE PAIE LE PRIX EXECUTABLE. Le short rachetait au
+    # BID : il ne payait jamais le spread, et paraissait donc meilleur.
+    _sp = float(_e._p_spread[0])
     _e.step(3)
+    _tm = _e.trades_meta[-1]
+    _bid = float(_md.open[_tm["exit_idx"]])
+    _attendu_sortie = _bid * (1.0 + _sp / 1e4) if _act == 1 else _bid
+    verifie("%s : la cloture du modele paie le prix executable" % _nom,
+            abs(_tm["exit_price"] - _attendu_sortie) < 1e-9 * _bid,
+            "rachat a l'ask" if _act == 1 else "revente au bid")
     verifie("%s : remis a zero a la fermeture" % _nom,
             _e.n_positions == 0 and _e.cout_entree_atr == 0.0)
 
