@@ -75,5 +75,57 @@ verifie("un SIXIEME champ dans ENV ne casse plus le motif",
         mf is not None and mf.groups()[23] == V.RE_META.search(
             lignes[0]).groups()[23])
 
+# ============================================================
+# LE SEUIL DE SAUVEGARDE — ajoute le 2026-09-25.
+# ============================================================
+# La veille montrait le `sommet du tri` en l'annoncant comme « ce qui
+# selectionne le checkpoint », et ne montrait ni le score net — celui qui
+# decide — ni ce qu'il devait battre.
+l0 = lignes[0]
+_j = V.RE_NET.search(l0).end()
+avec = l0[:_j] + "  a_battre +0.123R" + l0[_j:]
+verifie("le champ `a_battre` ne decale AUCUN indice META",
+        V.RE_META.search(avec) is not None
+        and V.RE_META.search(avec).groups() == V.RE_META.search(l0).groups())
+verifie("ni le score net",
+        V.RE_NET.search(avec).groups() == V.RE_NET.search(l0).groups())
+verifie("et il se lit",
+        V.RE_BATTRE.search(avec) is not None
+        and V.RE_BATTRE.search(avec).group(1) == "+0.123")
+
+
+def _a_epoch(l, n):
+    """La meme ligne META, pour une autre epoch."""
+    m = V.RE_META.search(l)
+    return l[:m.start(2)] + "%0*d" % (len(m.group(2)), n) + l[m.end(2):]
+
+
+from test_veille_retenue import ligne_best  # noqa: E402  la f-string du run
+
+_fold = V.RE_META.search(l0).group(1)
+_best = ligne_best(net=0.412, gain=0.687, baisse=0.275,
+                   bat="premier retenu du fold", sommet=0.842, hasard=0.623,
+                   trades=56, fichier="best_wf1.pth")
+# UN SEUL BLOC DE TEXTE : la retenue de l'epoch 1 arrive avec la ligne META
+# de l'epoch 2. Le seuil de l'epoch 1 doit rester celui d'AVANT sa decision.
+_v = V.Veilleur()
+_v.avale("\n".join([_a_epoch(l0, 1), _best, _a_epoch(l0, 2)]) + "\n")
+verifie("journal sans le champ : rien retenu -> il suffit d'etre positif",
+        _v.a_battre.get((_fold, 1)) == 0.0, str(_v.a_battre.get((_fold, 1))))
+verifie("apres une retenue, le seuil devient son score net",
+        _v.a_battre.get((_fold, 2)) == 0.412, str(_v.a_battre.get((_fold, 2))))
+_v.avale(_a_epoch(avec, 3) + "\n")
+verifie("le champ ecrit par le run prime sur la reconstruction",
+        _v.a_battre.get((_fold, 3)) == 0.123, str(_v.a_battre.get((_fold, 3))))
+
+_src = io.open("veille_epochs.py", encoding="utf-8").read()
+verifie("le sommet ne se dit plus « ce qui selectionne le checkpoint »",
+        "f\"   [c'est ce qui selectionne le checkpoint]\"" not in _src)
+_ess = [l for l in io.open("veille_fenetre.ps1", encoding="utf-8").read()
+        .split("\n") if l.startswith("$essentiel")]
+verifie("la vue essentielle montre le score net, son seuil, son evolution",
+        len(_ess) == 1 and all(k in _ess[0] for k in
+                               ("critere net", "sauvegarde ", "evolution ")))
+
 print("\n%d/%d OK" % (_ok, _ok + _ko))
 raise SystemExit(1 if _ko else 0)

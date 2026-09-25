@@ -161,6 +161,17 @@ RE_SOMMET = re.compile(r"sommet\s+(" + NB + r")R/(" + NB + r")R")
 # chiffre. Ce qu'elle montre au plafond de 480 : les gagnants tiennent
 # TOUS jusqu'au bout, mediane ET moyenne egales au plafond. La regle de
 # sortie n'a aucune prise de profit — elle ne sait que couper les pertes.
+# LE SEUIL QUE LE SCORE NET DOIT BATTRE POUR QUE LE MODELE SOIT SAUVE.
+# Motif SEPARE, comme ce fichier l'exige pour tout champ ajoute : c'est la
+# seule facon de ne pas decaler les indices que `analyse` lit par position.
+#
+# UN JOURNAL ANTERIEUR AU 2026-09-25 NE L'ECRIT PAS. La veille le reconstruit
+# alors elle-meme : zero tant que rien n'est retenu dans le fold, puis le
+# score net de la derniere ligne NEW BEST. C'est exactement la regle de
+# `retient_checkpoint`, et c'est exact tant que le journal est lu depuis
+# son debut — ce que la veille fait toujours.
+RE_BATTRE = re.compile(r"a_battre\s+(" + NB + r")R")
+
 RE_TENUE = re.compile(
     r"tenue\[G (" + NB + r")/(" + NB + r") P (" + NB + r")/(" + NB + r") "
     r"x(" + NB + r") max (" + NB + r")\]")
@@ -371,7 +382,8 @@ def _point_mort(avg_w, avg_l):
 
 def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
             ent_prec=None, rho=None, cote="both", herite=False,
-            sommet=None, reprise=None, net=None, tenue=None):
+            sommet=None, reprise=None, net=None, tenue=None,
+            a_battre=None, historique=None):
     """Rend (lignes colorees, lignes brutes, gain par trade, ecart, gele)."""
     ep = int(v[1])
     pnl, trades, wr, pf, dd = (float(v[2]), int(v[3]), float(v[4]),
@@ -540,7 +552,12 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
         L.append(f"  sommet du tri  {cs}{g_top:+.3f} R{C.FIN} par occasion  "
                  f"contre {g_hasard:+.3f} au hasard  "
                  f"-> {cs}{ecart:+.3f} R{C.FIN} de mieux"
-                 f"   [c'est ce qui selectionne le checkpoint]")
+                 # CE LIBELLE DISAIT « c'est ce qui selectionne le
+                 # checkpoint ». Le commentaire trente lignes plus haut dit
+                 # le contraire depuis le 2026-09-20 — « il ne choisit plus
+                 # le checkpoint, c'est `net` qui decide » — et le libelle
+                 # n'avait jamais suivi. On regardait le mauvais chiffre.
+                 f"   [portillon : necessaire, ne suffit pas]")
 
     if reference is not None:
         n_ref, moy_ref = reference
@@ -626,7 +643,32 @@ def analyse(v, m, tr, precedent, reference, cumul, moyenne=False,
         _lr = ("aucune perte" if not math.isfinite(_rap)
                else f"{_rap:.2f}x la baisse")
         L.append(f"  critere net  {cn}{v_net:+6.3f} R{C.FIN} par occasion  "
-                 f"= gain {v_gain:+.3f} R - baisse {v_creux:.3f} R  ({_lr})")
+                 f"= gain {v_gain:+.3f} R - baisse {v_creux:.3f} R  ({_lr})"
+                 f"   [C'EST LUI QUI DECIDE LA SAUVEGARDE]")
+        # CE QU'IL DOIT BATTRE, et ce qu'il lui manque. Sans le seuil, on
+        # voyait le score bouger sans savoir s'il s'approchait de quoi que ce
+        # soit.
+        if a_battre is not None:
+            _manque = a_battre - v_net
+            if _manque < 0:
+                _etat = f"{C.VERT}{C.GRAS}FRANCHI de {-_manque:.3f} R{C.FIN}"
+            else:
+                _etat = f"{C.ROUGE}il manque {_manque:.3f} R{C.FIN}"
+            _quoi = ("le record du fold" if a_battre > 0
+                     else "rien de retenu dans ce fold : il suffit d'etre "
+                          "positif")
+            L.append(f"  sauvegarde   si net > {a_battre:+.3f} R "
+                     f"({_quoi})  ->  {_etat}")
+        # SON EVOLUTION : les dernieres mesures du fold, puis celle-ci.
+        if historique:
+            _prec = "  ".join(f"{x:+.3f}" for x in historique[-6:])
+            _plus = "... " if len(historique) > 6 else ""
+            _d = v_net - historique[-1]
+            _cd = C.VERT if _d > 0 else (C.ROUGE if _d < 0 else C.GRIS)
+            L.append(f"  evolution    {_plus}{_prec}  ->  {cn}{v_net:+.3f}"
+                     f"{C.FIN}   ({_cd}{_d:+.3f}{C.FIN} sur l'epoch "
+                     f"precedente, meilleur du fold "
+                     f"{max(historique + [v_net]):+.3f})")
         # LA LIGNE `dimension` A ETE RETIREE LE 2026-09-21, avec le budget.
         # Elle disait la mise moyenne et la part d'abstention ; les deux
         # valaient 60 % et 0 % a chaque epoch — deux constantes affichees
@@ -778,6 +820,10 @@ class Veilleur:
         self.herites = set()    # folds dont les poids viennent du precedent
         self.sommets = {}       # par (fold, epoch) : (gain du sommet, au hasard)
         self.tenues = {}        # (med G, moy G, med P, moy P, rapport)
+        self.a_battre = {}      # par (fold, epoch) : seuil de sauvegarde
+        self.records = {}       # par fold : score net du dernier retenu
+        self.hist_nets = {}     # par fold : score net des epochs mesurees
+        self._fold_lu = None    # fold de la derniere ligne META LUE
         self.reprises = {}      # par (fold, epoch) : epoch dont le PnL est repris
         self.precedent = {}     # par fold : gain par trade de l'epoch d'avant
         self.geles = {}         # par fold : ecarts des epochs a actor gele
@@ -791,8 +837,10 @@ class Veilleur:
         self.vus.clear()
         for d in (self.vals, self.metas, self.trains, self.rhos, self.cotes,
                   self.precedent, self.geles, self.cumul, self.entropie,
-                  self.sommets, self.reprises, self.nets, self.tenues):
+                  self.sommets, self.reprises, self.nets, self.tenues,
+                  self.a_battre, self.records, self.hist_nets):
             d.clear()
+        self._fold_lu = None
         self.herites.clear()
         self.attend_moyenne.clear()
         self.fold_courant = None
@@ -874,6 +922,9 @@ class Veilleur:
                 blocs.append(([f"{C.GRIS}  {ligne.strip()}{C.FIN}"], None))
             elif "NEW BEST" in ligne:
                 blocs.append((self._bloc_retenue(ligne), None))
+                _mb = RE_BEST.search(ligne)
+                if _mb and self._fold_lu is not None:
+                    self.records[self._fold_lu] = float(_mb.group(1))
             mg = RE_GARDE.search(ligne)
             if mg:
                 blocs.append(([f"{C.GRIS}  non retenu — {mg.group(1)}"
@@ -921,6 +972,11 @@ class Veilleur:
                 self.rhos[(mm.group(1), int(mm.group(2)))] = (
                     float(mr.group(1)) if mr else None,
                     float(ma.group(1)) if ma else None)
+                self._fold_lu = mm.group(1)
+                mb = RE_BATTRE.search(ligne)
+                self.a_battre[(mm.group(1), int(mm.group(2)))] = (
+                    float(mb.group(1)) if mb
+                    else max(0.0, self.records.get(mm.group(1), 0.0)))
                 mt = RE_TENUE.search(ligne)
                 if mt:
                     self.tenues[(mm.group(1), int(mm.group(2)))] = tuple(
@@ -970,7 +1026,14 @@ class Veilleur:
                 self.entropie.get(fold), self.rhos.get(cle),
                 self.cotes.get(fold, "both"), fold in self.herites,
                 self.sommets.get(cle), self.reprises.get(cle),
-                self.nets.get(cle), self.tenues.get(cle))
+                self.nets.get(cle), self.tenues.get(cle),
+                self.a_battre.get(cle), list(self.hist_nets.get(fold, [])))
+            # L'HISTORIQUE NE GARDE QUE LES MESURES REELLES : une epoch
+            # `[val epN]` reaffiche le score d'une autre, le compter deux fois
+            # dessinerait un plateau qui n'existe pas.
+            if _reprise is None and cle in self.nets:
+                self.hist_nets.setdefault(fold, []).append(
+                    self.nets[cle][0])
             self.entropie[fold] = float(self.metas[cle][5])
             self.precedent[fold] = par_trade
             if gele:

@@ -10692,6 +10692,15 @@ def run_training_on_split(
             # seul `net` ne permettait pas de separer.
             f"net {_score_net:>+6.3f}R "
             f"(gain {_gain_net:>+6.3f}R baisse {_creux_grille:>5.3f}R)  "
+            # LE SEUIL A BATTRE POUR ETRE SAUVEGARDE, ecrit ici pour que la
+            # veille n'ait pas a le deviner. `retient_checkpoint` exige un
+            # score STRICTEMENT positif — sinon « configuration PERDANTE » —
+            # et STRICTEMENT au-dessus du record du fold. D'ou le max.
+            #
+            # IL N'APPARAISSAIT QUE DANS LE MESSAGE DE REFUS, et seulement
+            # quand le record etait la raison du refus. On voyait le score
+            # epoch apres epoch sans jamais voir ce qu'il lui manquait.
+            f"a_battre {max(0.0, float(best_metric)):+.3f}R  "
             # `bud` ET `abst` ONT QUITTE LE BANDEAU LE 2026-09-21.
             #
             # Ils disaient la mise moyenne sur les occasions retenues et la

@@ -106,7 +106,13 @@ Write-Host ''
 #                   C'est cet ecart qui montre le surapprentissage ; le
 #                   couper revenait a ne montrer qu'une moitie du run.
 #   tenue           gagnants contre perdants — la geometrie du trade
-#   sommet du tri   ce qui SELECTIONNE le checkpoint
+#   sommet du tri   le PORTILLON : il doit battre le hasard + la marge.
+#                   Necessaire, pas suffisant. La veille l'annoncait comme
+#                   "ce qui selectionne le checkpoint" : c'etait faux.
+#   critere net     LE CRITERE DE SAUVEGARDE : gain - baisse.
+#   sauvegarde      ce qu'il doit battre, et ce qu'il lui manque.
+#   evolution       ses dernieres valeurs dans le fold.
+#                   Ces trois lignes n'etaient PAS dans la vue essentielle.
 #   LE SORT DU MODELE, et c'est la raison d'etre du run :
 #     * NEW BEST      il est RETENU et transmis au fold suivant
 #     a battu         ce qu'il a battu pour l'etre
@@ -122,10 +128,10 @@ Write-Host ''
 # entre deux. Une epoch dure cinq minutes ; la fenetre restait donc muette
 # cinq minutes d'affilee, ce qui est indistinguable d'une fenetre cassee.
 # Une veille qui ne dit pas « je travaille » ne sert a rien.
-$essentiel = '^(EPOCH |  (PnL|train |sens |tenue |sommet du tri)|  phase  PPO sortie|\[COLLECTE\]|SORTIE |CIBLE |          (une seule|AUCUN plafond|SHORT)|  (non )?retenu|  garde |  . NEW BEST|  . REFUSE|    a battu|=== |--- Fold |Traceback|.*Error)'
+$essentiel = '^(EPOCH |  (PnL|train |sens |tenue |sommet du tri|critere net|sauvegarde |evolution )|  phase  PPO sortie|\[COLLECTE\]|SORTIE |CIBLE |          (une seule|AUCUN plafond|SHORT)|  (non )?retenu|  garde |  . NEW BEST|  . REFUSE|    a battu|=== |--- Fold |Traceback|.*Error)'
 
 # LE DETAIL : tout le reste — diagnostics, phases du reseau, cadence.
-$detaille = '^(EPOCH |  (PnL|point mort|classement|sommet du tri|vs |sens |actions |entrees |critere net|dimension|train |tenue |phase |cadence |\. |temps :)|\[COLLECTE\]|          SHORT|  (non )?retenu|  garde |  . NEW BEST|=== |--- Fold |Traceback|.*Error)'
+$detaille = '^(EPOCH |  (PnL|point mort|classement|sommet du tri|vs |sens |actions |entrees |critere net|sauvegarde |evolution |dimension|train |tenue |phase |cadence |\. |temps :)|\[COLLECTE\]|          SHORT|  (non )?retenu|  garde |  . NEW BEST|=== |--- Fold |Traceback|.*Error)'
 
 $garde = if ($Detail) { $detaille } else { $essentiel }
 $ansi = [regex]"$([char]27)\[[0-9;]*m"
