@@ -5139,6 +5139,10 @@ class BTCTradingEnvDiscrete(gym.Env):
         self._p_sl = np.zeros(k, dtype=np.float64)
         self._p_tp = np.zeros(k, dtype=np.float64)
         self._p_atr = np.zeros(k, dtype=np.float64)
+        # LE COUT D'ENTREE, EN ATR D'ENTREE : l'ecart entre le prix paye
+        # et l'ouverture de la barre. C'est le latent d'une position dont
+        # le marche n'a pas bouge — son POINT MORT. Voir `cout_entree_atr`.
+        self._p_cout = np.zeros(k, dtype=np.float64)
         self._p_idx = np.full(k, -1, dtype=np.int64)
         self._p_risque = np.zeros(k, dtype=np.float64)
         self._p_spread = np.full(k, float(self.cfg.spread_bps), dtype=np.float64)
@@ -5454,6 +5458,7 @@ class BTCTradingEnvDiscrete(gym.Env):
         self._p_sl = _e(self._p_sl)
         self._p_tp = _e(self._p_tp)
         self._p_atr = _e(self._p_atr)
+        self._p_cout = _e(self._p_cout)
         self._p_idx = _e(self._p_idx, -1)
         self._p_risque = _e(self._p_risque)
         self._p_spread = _e(self._p_spread, float(self.cfg.spread_bps))
@@ -5634,6 +5639,26 @@ UNE SEULE SOURCE pour les trois boucles — rollout, validation, test.
     @property
     def entry_atr(self) -> float:
         return self._agregats()[3]
+
+    @property
+    def cout_entree_atr(self) -> float:
+        """Le POINT MORT de la position, en ATR d'entree : ce que l'entree a
+        coute — spread et glissement — avant que le marche bouge.
+
+        UNE POSITION DONT LE LATENT VAUT `-cout_entree_atr` N'A RIEN PERDU
+        SUR LE MARCHE : elle a paye son ticket. Mesure du 2026-09-25 sur le
+        train du fold 1 : ce cout vaut 0.389 ATR en mediane, et il met 66 %
+        des positions EN PERTE a leur premiere decision, longs comme shorts.
+
+        Moyenne ponderee par la taille, comme `entry_atr` ; a K=1, le cout
+        exact de l'unique position. Zero a plat.
+        """
+        a = self._actifs
+        if not a.any():
+            return 0.0
+        t = self._p_taille[a]
+        st = t.sum()
+        return float((self._p_cout[a] * t).sum() / st) if st > 0 else 0.0
 
     @property
     def entry_idx(self) -> int:
@@ -6032,6 +6057,7 @@ UNE SEULE SOURCE pour les trois boucles — rollout, validation, test.
         self._p_tp[slot] = 0.0
         self._p_idx[slot] = -1
         self._p_atr[slot] = 0.0
+        self._p_cout[slot] = 0.0
         self._p_risque[slot] = 0.0
         self._p_be[slot] = False
         self._p_trail[slot] = False
@@ -6171,6 +6197,7 @@ UNE SEULE SOURCE pour les trois boucles — rollout, validation, test.
                 fallback = ATR_PLANCHER_FRAC * exec_price
                 entry_atr = max(atr_raw, fallback, 1e-8)
                 self._p_atr[j] = entry_atr
+                self._p_cout[j] = abs(exec_price - prix_execution) / entry_atr
 
                 sl_dist = self.cfg.atr_sl_mult * entry_atr
                 tp_dist = self.cfg.atr_tp_mult * entry_atr * self.cfg.tp_shrink
@@ -8219,8 +8246,22 @@ def run_training_on_split(
                             # si en perte → la tete apprend a couper les
                             # zombies sans stop au temps et sans toucher
                             # aux gagnants.
+                            #
+                            # LE ZOMBIE SE COMPTE DEPUIS LE POINT MORT, PLUS
+                            # DEPUIS ZERO — 2026-09-25, accord du proprietaire.
+                            #
+                            # A zero, le cout d'entree (0.389 ATR median)
+                            # mettait 66 % des positions EN PERTE avant que
+                            # le marche ait bouge : loyer x15 des la
+                            # premiere barre, et la politique a appris a
+                            # tout fermer a la premiere minute — tenue
+                            # mediane 1, quatre epochs sur quatre. Fermer ne
+                            # rendait pas le spread, deja paye ; cela le
+                            # figeait. Est zombie desormais la position que
+                            # le MARCHE a mise en perte, au-dela du ticket.
+                            _mort = -float(envs[_k].cout_entree_atr)
                             _loyer_eff = (
-                                _loyer * _loyer_z_mult if _lat < 0.0
+                                _loyer * _loyer_z_mult if _lat < _mort
                                 else _loyer)
                             # LA DERIVE SE RETIRE DANS LE SENS DE LA
                             # POSITION. Elle est la pour que le long ne

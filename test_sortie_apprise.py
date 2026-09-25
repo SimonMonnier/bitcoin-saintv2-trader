@@ -203,9 +203,11 @@ verifie("la duree entre decisions entre dans la recompense",
 verifie("le loyer zombie existe",
         float(getattr(c, "loyer_zombie_mult", 1.0)) > 1.0,
         "x%.1f sur les positions en perte" % getattr(c, "loyer_zombie_mult", 1.0))
-verifie("il ne s'applique qu'en PERTE",
-        "_loyer * _loyer_z_mult if _lat < 0.0" in src,
-        "un gagnant paie le loyer normal — on ne veut pas le faire fermer")
+verifie("il ne s'applique que SOUS LE POINT MORT",
+        "_loyer * _loyer_z_mult if _lat < _mort" in src
+        and "_mort = -float(envs[_k].cout_entree_atr)" in src,
+        "le spread seul ne fait pas un zombie : 66 % des positions en "
+        "auraient ete a leur premiere decision")
 
 # LA DERIVE EST RETIREE. Sans cela, tenir une position longue dans un BTC
 # qui monte rapporte en moyenne, et la politique apprend a ne jamais
@@ -324,6 +326,31 @@ verifie("l'equilibre exact va a la tete de perte",
 pol.zero_grad(set_to_none=True)
 
 # ============================================================
+print("\n9b. LE POINT MORT EST CELUI QUE L'ENVIRONNEMENT A FACTURE")
+# ============================================================
+import pandas as _pd
+from saint_core import FEATURE_COLS as _FC
+_df = _pd.read_pickle("data_cache_BTCUSD_M1.pkl").iloc[:60_000]
+_df = _df.reset_index(drop=True)
+_st = T.compute_and_save_global_norm_stats(_df, _FC, path=None)
+_md = T.MarketData(_df, _FC, _st)
+_cf = T.PPOConfig()
+_cf.episode_length = 5_000
+for _act, _nom in ((0, "long"), (1, "short")):
+    _e = T.BTCTradingEnvDiscrete(_md, _cf)
+    T.reset_au_depart(_e, 20_000)
+    verifie("%s : point mort nul a plat" % _nom, _e.cout_entree_atr == 0.0)
+    _e.step(_act)
+    _ci = int(_e.entry_idx)
+    _attendu = abs(_e.entry_price - float(_md.open[_ci])) / _e.entry_atr
+    verifie("%s : point mort = (prix paye - ouverture) / ATR" % _nom,
+            _e.n_positions == 1 and _e.cout_entree_atr > 0.0
+            and abs(_e.cout_entree_atr - _attendu) < 1e-9,
+            "%.3f ATR" % _e.cout_entree_atr)
+    _e.step(3)
+    verifie("%s : remis a zero a la fermeture" % _nom,
+            _e.n_positions == 0 and _e.cout_entree_atr == 0.0)
+
 print("\n9. LE COTE SE DECLARE A UN SEUL ENDROIT")
 # ============================================================
 # Le 2026-09-25 la configuration disait "both" et le run est parti en LONG
