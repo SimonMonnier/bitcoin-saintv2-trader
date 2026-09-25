@@ -5081,6 +5081,38 @@ class BTCTradingEnvDiscrete(gym.Env):
     # ---------- Curriculum vol ----------
 
     def _init_vol_curriculum(self):
+        """Les departs de faible et de forte volatilite, UNE FOIS par donnees.
+
+        CHAQUE ENVIRONNEMENT LES RECALCULAIT ET LES GARDAIT, alors qu'ils ne
+        dependent que des donnees, de `lookback` et de `episode_length` —
+        les memes pour tous les environnements d'un pool. Mesure du
+        2026-09-25 : 2.6 Mo par environnement, 160 environnements crees
+        d'avance, donc 0.42 Go, sur une machine de 15.7 Go ou l'entrainement
+        en occupait 13.6 et ou une fenetre a cesse de repondre.
+
+        LES TABLEAUX SONT PARTAGES EN LECTURE SEULE : `reset` n'en fait que
+        tirer un indice. Le verrou d'ecriture le garantit — une ecriture
+        leverait une erreur au lieu de modifier les departs de tous.
+        """
+        _cle = (int(self.lookback), int(self.cfg.episode_length))
+        _cache = getattr(self.data, "_departs_vol", None)
+        if _cache is None:
+            _cache = {}
+            try:
+                self.data._departs_vol = _cache
+            except AttributeError:
+                _cache = None
+        if _cache is not None and _cle in _cache:
+            self.low_vol_starts, self.high_vol_starts = _cache[_cle]
+            return
+        self._calcule_departs_vol()
+        for _a in (self.low_vol_starts, self.high_vol_starts):
+            if _a is not None:
+                _a.setflags(write=False)
+        if _cache is not None:
+            _cache[_cle] = (self.low_vol_starts, self.high_vol_starts)
+
+    def _calcule_departs_vol(self):
         close = self.data.close
         ret = np.diff(close) / (close[:-1] + 1e-8)
         vol20 = pd.Series(ret).rolling(20).std().to_numpy()

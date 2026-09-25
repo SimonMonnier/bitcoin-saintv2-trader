@@ -368,6 +368,24 @@ verifie("les attentes ne stockent plus toutes leur etat",
 verifie("les ouvertures, elles, sont toutes gardees",
         "_garde = (nouveau is not None and j_ouvert < 0" in src)
 
+print("\n9d. LES DEPARTS DU CURRICULUM SONT PARTAGES, PAS RECOPIES")
+# 160 environnements recopiaient chacun 2.6 Mo de departs identiques.
+_e1 = T.BTCTradingEnvDiscrete(_md, _cf)
+_e2 = T.BTCTradingEnvDiscrete(_md, _cf)
+if _e1.low_vol_starts is not None:
+    verifie("deux environnements lisent le MEME tableau",
+            _e1.low_vol_starts is _e2.low_vol_starts
+            and _e1.high_vol_starts is _e2.high_vol_starts)
+    verifie("il est en lecture seule",
+            not _e1.low_vol_starts.flags.writeable)
+_e3 = T.BTCTradingEnvDiscrete(_md, _cf)
+_ref = _e3.low_vol_starts
+del _md._departs_vol
+_e4 = T.BTCTradingEnvDiscrete(_md, _cf)
+verifie("recalcule a neuf, il donne les memes departs",
+        (_ref is None and _e4.low_vol_starts is None)
+        or np.array_equal(_ref, _e4.low_vol_starts))
+
 print("\n9. LE COTE SE DECLARE A UN SEUL ENDROIT")
 # ============================================================
 # Le 2026-09-25 la configuration disait "both" et le run est parti en LONG
