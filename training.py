@@ -1133,6 +1133,19 @@ class PPOConfig:
     # rapport signal/bruit.
     pas_decision_sortie: int = 15
     loyer_temps_atr: float = 0.0066
+    # LOYER RENFORCE SUR LES POSITIONS EN PERTE (zombies).
+    #
+    # Mesure du 2026-09-22 sur trades_long_wf2 : 333 positions tenues
+    # 2000+ barres, perte mediane -23 $, cout total -7772 $. Le loyer
+    # ordinaire (0.0066 ATR/barre) est 98x plus petit que le bruit du
+    # latent : la tete de sortie ne "sent" pas que rester en perte est
+    # cher, donc elle n'apprend pas a couper.
+    #
+    # Quand latent < 0, on multiplie le loyer. Les gagnants gardent le
+    # loyer faible → pas de pression a fermer. Les perdants paient cher
+    # chaque barre → l'avantage de FERMER devient fort → la tete apprend
+    # a sortir tot. Aucun stop au temps, purement un signal d'apprentissage.
+    loyer_zombie_mult: float = 15.0
     # LA DERIVE DU MARCHE EST RETIREE DE LA RECOMPENSE.
     #
     # Sans cela, tenir une position longue dans un BTC qui monte rapporte
@@ -7746,6 +7759,7 @@ def run_training_on_split(
         depuis_dec = np.zeros(n_envs, dtype=np.int64)
         _loyer = float(getattr(cfg, "loyer_temps_atr", 0.0))
         _derive = float(getattr(cfg, "derive_atr_barre", 0.0))
+        _loyer_z_mult = float(getattr(cfg, "loyer_zombie_mult", 15.0))
         _pas_s = max(1, int(getattr(cfg, "pas_decision_sortie", 1)))
 
         # Sélectivité visée cette epoch, et seuil absolu qui la réalise.
@@ -7979,9 +7993,16 @@ def run_training_on_split(
                         # PAR BARRE, donc multiplies par cette duree.
                         if sortie_buf[_k] and np.isfinite(lat_prec[_k]):
                             _dt = float(max(depuis_dec[_k] - 1, 1))
+                            # Loyer normal si en gain ; x loyer_zombie_mult
+                            # si en perte → la tete apprend a couper les
+                            # zombies sans stop au temps et sans toucher
+                            # aux gagnants.
+                            _loyer_eff = (
+                                _loyer * _loyer_z_mult if _lat < 0.0
+                                else _loyer)
                             sortie_buf[_k][-1]["r"] = (
                                 _lat - float(lat_prec[_k])
-                                - (_loyer + _derive) * _dt)
+                                - (_loyer_eff + _derive) * _dt)
                         _ferme = int(_sa[_bi]) == FERMER
                         sortie_buf[_k].append({
                             "p": _pin[_bi].copy(), "a": int(_sa[_bi]),
@@ -11746,10 +11767,37 @@ if __name__ == "__main__":
 
     print("\n" + "=" * 70)
     print("  WALK-FORWARD LONG-ONLY TERMINÉ : 3 folds.")
-    print("  Fichiers générés :")
-    print("    best_saintv2_or_exec17_long_wf1_long_wf1.pth")
-    print("    best_saintv2_or_exec17_long_wf2_long_wf2.pth")
-    print("    best_saintv2_or_exec17_long_wf3_long_wf3.pth")
+    # LE BILAN LISAIT UNE LISTE ECRITE EN DUR, et elle mentait.
+    #
+    # Il annoncait `best_saintv2_or_exec17_long_wf1_long_wf1.pth` et ses
+    # deux freres — trois fichiers d'un AUTRE run, sur un autre instrument,
+    # qu'aucun des runs recents n'a produits. Le run du 2026-09-22 s'est
+    # termine sans RETENIR un seul modele — chaque epoch finissait sur
+    # « garde » — et son bilan affirmait pourtant trois sauvegardes.
+    #
+    # Cinquieme phrase de la meme famille en trois jours : apres le nom de
+    # l'instrument, la friction, le titre bilateral et le nombre de portes
+    # de sortie. Un bilan de fin de run est lu une fois, en diagonale, et
+    # c'est la qu'une affirmation fausse coute le plus — on croit avoir un
+    # modele deployable.
+    #
+    # ON LIT DONC LE DISQUE. Ce qui existe est liste ; ce qui manque est
+    # dit en clair.
+    import glob as _glob
+    _pref = cfg_long.model_prefix
+    print("  Modeles RETENUS (sauvegardes sur le critere net) :")
+    _vus = sorted(_glob.glob(f"best_{_pref}*.pth"))
+    if _vus:
+        for _f in _vus:
+            print(f"    {_f}")
+    else:
+        print(f"    AUCUN. Aucune epoch n'a battu le critere de retenue — "
+              f"aucun modele de ce run n'est deployable.")
+    _tem = sorted(_glob.glob(f"bestprofit_{_pref}*.pth"))
+    if _tem:
+        print("  Temoins (meilleur PnL/trade, NE decident PAS du deploiement) :")
+        for _f in _tem:
+            print(f"    {_f}")
     print("=" * 70)
 
     # ---------------------------------------------------------

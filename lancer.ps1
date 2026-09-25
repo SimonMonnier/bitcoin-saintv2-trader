@@ -87,8 +87,33 @@ if ($n -gt 0) { Write-Host "  $n fichier(s) du run precedent deplaces dans journ
 $env:PYTHONUNBUFFERED = '1'
 $env:PYTHONIOENCODING = 'utf-8'
 
-$cmd = "chcp 65001 > `$null; `$env:PYTHONUNBUFFERED='1'; `$env:PYTHONIOENCODING='utf-8'; " +
-       "& '$python' training.py 2>&1 | Tee-Object -FilePath '$journal'"
+# LA SORTIE EST REDIRIGEE, PAS DEDOUBLEE PAR `Tee-Object`.
+#
+# Premiere version : `python ... 2>&1 | Tee-Object -FilePath $journal`,
+# pour voir le texte dans la fenetre ET l'ecrire. Resultat mesure :
+# l'entrainement s'arretait apres six lignes de banniere, journal de
+# 655 octets, aucun processus Python vivant. `Tee-Object` met le flux en
+# tampon et le pipeline meurt avec lui.
+#
+# ON REDIRIGE DONC, comme tout le reste de ce depot le fait. La fenetre de
+# l'entrainement reste ouverte et muette ; c'est la VEILLE qui affiche, et
+# c'est son metier.
+# LA REDIRECTION PASSE PAR `cmd`, ET C'EST LE POINT LE PLUS SUBTIL.
+#
+# `*>` et `>` de PowerShell 5.1 ecrivent en UTF-16 LE, avec un octet
+# nul entre chaque lettre. La veille lit en UTF-8 et n'y voit que du
+# charabia — c'est exactement la panne « la veille ne marche pas » du
+# 2026-09-22. Le `chcp 65001` n'y change rien : il regle la console,
+# pas l'encodage de la redirection PowerShell.
+#
+# `cmd /c` ecrit les OCTETS BRUTS que Python produit. Avec
+# `PYTHONIOENCODING=utf-8`, le journal est donc en UTF-8 et les
+# accents survivent. C'est ce que faisaient les lancements manuels de
+# cette session, qui n'ont jamais eu ce probleme.
+$cmd = "`$env:PYTHONUNBUFFERED='1'; `$env:PYTHONIOENCODING='utf-8'; " +
+       "Write-Host '  entrainement en cours - la lecture se fait dans la veille' -ForegroundColor Green; " +
+       "Write-Host '  NE PAS FERMER cette fenetre' -ForegroundColor Yellow; " +
+       "cmd /c '`"$python`" training.py > `"$journal`" 2>&1'"
 Start-Process powershell -ArgumentList '-NoExit','-ExecutionPolicy','Bypass','-Command',$cmd `
     -WorkingDirectory $PSScriptRoot
 Write-Host '  entrainement lance dans sa fenetre' -ForegroundColor Green

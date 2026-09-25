@@ -93,13 +93,36 @@ Write-Host ''
 
 # L'ESSENTIEL : six lignes par epoch, et rien d'autre.
 #
+#   SORTIE/CIBLE    la geometrie du run, une fois au demarrage
+#   COLLECTE        l'epoch a commence — LE SIGNE DE VIE
+#   PPO sortie      ce que la politique de sortie apprend
 #   EPOCH           le resultat : $/trade, trades, WR, PF
-#   PnL             l'argent, le cumul, le creux
+#   PnL             l'argent, le cumul, le creux — cote VALIDATION
+#   train           le meme cote ENTRAINEMENT, et l'ecart entre les deux
+#   sens / SHORT    LONG et SHORT separes : trades, gagnants, perdants, PnL
+#                   Deux lignes, et elles disent ce qu'aucune moyenne ne
+#                   dit — un cote peut porter tout le resultat pendant que
+#                   l'autre saigne, et le total le cacherait.
+#                   C'est cet ecart qui montre le surapprentissage ; le
+#                   couper revenait a ne montrer qu'une moitie du run.
 #   tenue           gagnants contre perdants — la geometrie du trade
 #   sommet du tri   ce qui SELECTIONNE le checkpoint
-#   garde / retenu  la decision prise
+#   LE SORT DU MODELE, et c'est la raison d'etre du run :
+#     * NEW BEST      il est RETENU et transmis au fold suivant
+#     a battu         ce qu'il a battu pour l'etre
+#     x REFUSE        il avait un MEILLEUR score et il est rejete quand
+#                     meme, sur le portefeuille. C'est le cas le plus
+#                     important a voir — et il n'etait dans AUCUN motif.
+#     non retenu      la raison du rejet
+#     garde           rien de mieux trouve cette epoch
 #   Fold / erreurs  les bornes et les pannes
-$essentiel = '^(EPOCH |  (PnL|tenue |sommet du tri)|  (non )?retenu|  garde |  . NEW BEST|=== |--- Fold |Traceback|.*Error)'
+#
+# LES TROIS PREMIERS SONT DES SIGNES DE VIE, et leur absence a coute une
+# alerte. Premiere version de cette vue : cinq lignes par epoch et RIEN
+# entre deux. Une epoch dure cinq minutes ; la fenetre restait donc muette
+# cinq minutes d'affilee, ce qui est indistinguable d'une fenetre cassee.
+# Une veille qui ne dit pas « je travaille » ne sert a rien.
+$essentiel = '^(EPOCH |  (PnL|train |sens |tenue |sommet du tri)|  phase  PPO sortie|\[COLLECTE\]|SORTIE |CIBLE |          (une seule|AUCUN plafond|SHORT)|  (non )?retenu|  garde |  . NEW BEST|  . REFUSE|    a battu|=== |--- Fold |Traceback|.*Error)'
 
 # LE DETAIL : tout le reste — diagnostics, phases du reseau, cadence.
 $detaille = '^(EPOCH |  (PnL|point mort|classement|sommet du tri|vs |sens |actions |entrees |critere net|dimension|train |tenue |phase |cadence |\. |temps :)|\[COLLECTE\]|          SHORT|  (non )?retenu|  garde |  . NEW BEST|=== |--- Fold |Traceback|.*Error)'
