@@ -622,19 +622,60 @@ FEATURE_COLS_RANGS = [
 ]
 
 # L'INSTRUMENT ENTRAINE — UNE SEULE SOURCE, lue par
-# `training.PPOConfig.symbol`. L'or depuis le 2026-09-26.
-SYMBOLE = "XAUUSD"
+# `training.PPOConfig.symbol`. Le BTC de nouveau depuis le 2026-09-26 au
+# soir : l'or n'a montre AUCUN avantage brut (entrainement sans cout,
+# -0.05 a -0.01 bps par trade en validation), et c'est sur le BTC que le
+# flux d'agression Binance existe.
+SYMBOLE = "BTCUSD"
 
-# LE FLUX BINANCE N'EXISTE QUE SUR LE BTC : un CFD ne publie pas ses
-# transactions. Voir `FEATURE_COLS_FLUX`.
-FEATURE_COLS = (FEATURE_COLS_TF + FEATURE_COLS_SUP
-                + FEATURE_COLS_EXT + FEATURE_COLS_LIQ_TEMPS
-                + FEATURE_COLS_RANGE + FEATURE_COLS_ICHIMOKU
-                + FEATURE_COLS_RANGE_SUP + FEATURE_COLS_ICHIMOKU_SUP
-                + FEATURE_COLS_SUP_LOINTAINES
-                + FEATURE_COLS_MICRO
-                + (FEATURE_COLS_FLUX if SYMBOLE == "BTCUSD" else [])
-                + FEATURE_COLS_RANGS)
+# LE JEU DU SCALPING BTC — 2026-09-26, demande du proprietaire : ce que la
+# recherche a trouve de meilleur, sans l'Ichimoku ni rien de ce qui ne sert
+# a rien. Voir `features_scalping` pour chaque famille et sa source.
+#
+# CE QUI PART, ET POURQUOI :
+#   Ichimoku et range, a toutes les echelles   fonctions de l'OHLC, mesurees
+#                                              sans separation (+0.4 sigma)
+#   rsi_ok, high_vol_regime                    seuils de rsi_14 et vol_rank,
+#                                              deja dans le jeu
+#   tick_ask_part, tick_bid_part,              des mises a jour de cotation,
+#   tick_desequilibre                          pas des transactions : aucun
+#                                              sens
+#   nb_trades, taker_buy_base                  des NIVEAUX qui apprennent
+#                                              l'annee ; leur contenu passe
+#                                              en rapports et en rangs
+#   tick_spread_moy, tick_spread_max           remplaces par leur rapport
+#
+# CE QUI RESTE : le prix en M1, M5 et M15 (dix colonnes par echelle), la
+# tendance longue, l'heure. CE QUI ARRIVE : l'horloge des annonces US et du
+# financement, le cout et le regime rapportes a leur creneau horaire, le
+# flux d'agression signe a trois horizons, l'ecart Binance - courtier, les
+# ancres de prix, et l'interaction creux x flux.
+from features_scalping import (COLONNES_ANCRES as _S_ANCRES,
+                               COLONNES_FLUX as _S_FLUX,
+                               COLONNES_HORLOGE as _S_HORLOGE,
+                               COLONNES_REGIME as _S_REGIME)
+
+_REDONDANTES = ("rsi_ok", "high_vol_regime")
+FEATURE_COLS_PRIX = [c for c in FEATURE_COLS_M1 if c not in _REDONDANTES]
+FEATURE_COLS_PRIX_SUP = [c.replace("_h1", sfx)
+                         for sfx in ECHELLES_SUP for c in FEATURE_COLS_H1
+                         if c.replace("_h1", "") not in _REDONDANTES]
+
+if SYMBOLE == "BTCUSD":
+    FEATURE_COLS = (FEATURE_COLS_PRIX + FEATURE_COLS_PRIX_SUP
+                    + FEATURE_COLS_LIQ_TEMPS + _S_HORLOGE + _S_REGIME
+                    + _S_FLUX + _S_ANCRES
+                    + FEATURE_COLS_RANGS + ["creux_x_flux"])
+else:
+    # L'OR, tel qu'il a tourne jusqu'au 2026-09-26.
+    FEATURE_COLS = (FEATURE_COLS_TF + FEATURE_COLS_SUP
+                    + FEATURE_COLS_EXT + FEATURE_COLS_LIQ_TEMPS
+                    + FEATURE_COLS_RANGE + FEATURE_COLS_ICHIMOKU
+                    + FEATURE_COLS_RANGE_SUP + FEATURE_COLS_ICHIMOKU_SUP
+                    + FEATURE_COLS_SUP_LOINTAINES
+                    + FEATURE_COLS_MICRO
+                    + FEATURE_COLS_RANGS)
+assert len(FEATURE_COLS) == len(set(FEATURE_COLS)), "colonne en double"
 
 N_BASE_FEATURES = len(FEATURE_COLS)
 

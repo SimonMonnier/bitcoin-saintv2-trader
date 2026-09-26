@@ -45,7 +45,20 @@ sur un tiers de l'historique, sans lever la moindre erreur. On le detecte
 donc en correlant les RENDEMENTS, pas les prix : sur douze heures la
 tendance domine et deux series decalees correlent quand meme.
 
-    python prepare_btc_m1.py [n_barres]
+LE 2026-09-26, LE JEU EST REFAIT DE ZERO pour le scalping — M1 avec les
+contextes M5 et M15, sans Ichimoku ni range, et les familles que la
+recherche soutient (`features_scalping`). Deux corrections en chemin :
+
+  L'HEURE DE BINANCE. `decalage_horaire` retenait UN entier mesure sur
+  l'echantillon recent. Or le serveur suit l'heure d'ete americaine :
+  +2 h l'hiver, +3 h l'ete. Tout l'hiver, le flux arrivait avec une heure
+  de retard. `features_scalping.aligne_binance` convertit chaque minute.
+
+  LE BRUT EST GARDE A PART (`BRUT`), comme pour l'or : barres, spread,
+  agregat de ticks. Changer de features ne demande plus MetaTrader 5.
+
+    python prepare_btc_m1.py            depuis le brut (ou l'ancien cache)
+    python prepare_btc_m1.py --mt5 [n]  barres relues dans MetaTrader 5
 """
 from __future__ import annotations
 
@@ -57,6 +70,7 @@ import zipfile
 import numpy as np
 import pandas as pd
 
+import features_scalping as FS
 import prepare_m5
 
 SYMBOLE = "BTCUSD"
@@ -66,6 +80,13 @@ CACHE_TICKS = "cache_ticks_m1_BTCUSD.pkl"
 CACHE_BINANCE = "cache_binance_1m_BTCUSDT.pkl"
 JOUR_M1 = 1440
 N_BARRES = 1_000_000
+# LE BRUT : barres du courtier, spread de chaque barre, agregat de ticks.
+BRUT = "brut_BTCUSD_M1.pkl"
+COLONNES_BRUT = ["time", "open", "high", "low", "close", "volume",
+                 "spread_bar", "tick_n", "tick_spread_moy", "tick_spread_max"]
+# LES CONTEXTES DU SCALPING : M5 et M15, comme l'or M1 — plus de H1 ni de
+# H4. (regle de resample, suffixe, bougies par journee a cette echelle.)
+ECHELLES_BTC_M1 = [("5min", "_m5", 288), ("15min", "_m15", 96)]
 
 COLONNES_TICKS = [
     "spread_bar", "tick_n", "tick_spread_moy", "tick_spread_max",
@@ -299,18 +320,40 @@ def decalage_horaire(mt5_df: pd.DataFrame, bnc: pd.DataFrame) -> int:
     return best
 
 
-def main() -> int:
-    import os
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else N_BARRES
+def brut_depuis_cache() -> pd.DataFrame:
+    """Le brut sans MetaTrader 5 : `BRUT` s'il existe, sinon l'ancien cache.
 
+    L'ancien cache porte deja les barres, le spread et l'agregat de ticks a
+    cote de ses features. On en extrait le brut, et l'ancien cache est
+    RENOMME plutot qu'ecrase : ses colonnes Ichimoku restent relisibles.
+    """
+    import os
+    if os.path.exists(BRUT):
+        b = pd.read_pickle(BRUT)
+        print(f"brut : {len(b):,} barres relues depuis {BRUT}", flush=True)
+        return b
+    ancien = pd.read_pickle(SORTIE)
+    manque = [c for c in COLONNES_BRUT if c not in ancien.columns]
+    if manque:
+        raise RuntimeError(f"{SORTIE} ne porte pas le brut : {manque}")
+    b = ancien[COLONNES_BRUT].copy()
+    del ancien
+    b.to_pickle(BRUT)
+    garde = SORTIE.replace(".pkl", "_ichimoku.pkl")
+    os.replace(SORTIE, garde)
+    print(f"brut : {len(b):,} barres extraites de l'ancien cache -> {BRUT} ; "
+          f"l'ancien cache est garde sous {garde}", flush=True)
+    return b
+
+
+def brut_depuis_mt5(n: int) -> pd.DataFrame:
+    """Le brut relu dans MetaTrader 5, ticks compris."""
+    import os
     m1 = charge_barres_mt5(SYMBOLE, n).sort_values("time").reset_index(drop=True)
     print(f"MT5 : {len(m1):,} barres  {m1['time'].iloc[0]} -> {m1['time'].iloc[-1]}",
           flush=True)
-    print(f"  spread cote : med {m1['spread_bar'].median():.3f} bps  "
-          f"p99 {m1['spread_bar'].quantile(0.99):.3f}", flush=True)
     deb = m1["time"].iloc[0].to_pydatetime()
     fin = m1["time"].iloc[-1].to_pydatetime() + dt.timedelta(minutes=1)
-
     if os.path.exists(CACHE_TICKS):
         tk = pd.read_pickle(CACHE_TICKS)
         print(f"ticks : {len(tk):,} minutes relues du cache", flush=True)
@@ -318,95 +361,88 @@ def main() -> int:
         print("ticks MT5 : agregation par minute", flush=True)
         tk = agrege_ticks(SYMBOLE, deb, fin)
         tk.to_pickle(CACHE_TICKS)
-
-    if os.path.exists(CACHE_BINANCE):
-        bn = pd.read_pickle(CACHE_BINANCE)
-        print(f"Binance : {len(bn):,} minutes relues du cache", flush=True)
-    else:
-        print("Binance : klines 1m mensuelles", flush=True)
-        bn = charge_binance_1m(deb - dt.timedelta(days=35), fin)
-        bn.to_pickle(CACHE_BINANCE)
-
-    print("alignement horaire", flush=True)
-    h = decalage_horaire(m1, bn)
-    bn = bn.copy()
-    bn["time"] = bn["time"] + pd.Timedelta(hours=h)
-
-    # LE FLUX, CALCULE SUR LES COLONNES BINANCE. Memes formules que
-    # `prepare_m5.ajoute_features_flux` — on ne les recopie pas, on les
-    # refait ici sur la grille M1 parce que les fenetres changent.
-    vol = bn["volume"].replace(0, np.nan)
-    bn["taker_ratio"] = (bn["taker_buy_base"] / vol).clip(0, 1)
-    bn["taker_ma5"] = bn["taker_ratio"].rolling(5, min_periods=2).mean()
-    bn["flux_taille_trade"] = (bn["quote_vol"]
-                               / bn["nb_trades"].replace(0, np.nan))
-    bn["flux_intensite"] = (bn["nb_trades"]
-                            .rolling(1440, min_periods=200)
-                            .rank(pct=True))
-
     m1 = m1.merge(tk, on="time", how="left")
-    m1 = m1.merge(bn[["time"] + COLONNES_FLUX], on="time", how="left")
     m1["tick_n"] = m1["tick_n"].fillna(0.0)
     for c in ("tick_spread_moy", "tick_spread_max"):
         m1[c] = m1[c].fillna(m1["spread_bar"])
-    for c in ("tick_ask_part", "tick_bid_part", "tick_desequilibre"):
-        m1[c] = m1[c].fillna(0.0)
-    couvert = float(m1["nb_trades"].notna().mean())
+    b = m1[COLONNES_BRUT].copy()
+    b.to_pickle(BRUT)
+    return b
+
+
+def verifie_alignement(m1: pd.DataFrame) -> None:
+    """Le courtier et Binance doivent bouger ENSEMBLE chaque mois.
+
+    C'est le test qui aurait attrape le decalage fixe : en hiver, avec une
+    heure d'erreur, la correlation des rendements tombait a 0.01. Un mois
+    sous 0.9 arrete la construction.
+    """
+    a = m1.set_index("time")["close"].pct_change()
+    b = m1.set_index("time")["bn_close"].pct_change()
+    ok = a.notna() & b.notna()
+    j = pd.DataFrame({"a": a[ok], "b": b[ok]})
+    par_mois = j.groupby(j.index.to_period("M")).apply(
+        lambda x: float(np.corrcoef(x["a"], x["b"])[0, 1]) if len(x) > 1000
+        else np.nan).dropna()
+    pire = par_mois.idxmin()
+    print(f"  alignement Binance : correlation des rendements par mois "
+          f"min {par_mois.min():+.3f} ({pire})  mediane {par_mois.median():+.3f}"
+          f"  sur {len(par_mois)} mois", flush=True)
+    if par_mois.min() < 0.9:
+        raise RuntimeError(
+            f"le mois {pire} correle a {par_mois.min():+.3f} : Binance et le "
+            f"courtier ne sont pas a la meme heure.")
+
+
+def construit_et_ecrit(m1: pd.DataFrame) -> pd.DataFrame:
+    bn = FS.aligne_binance(pd.read_pickle(CACHE_BINANCE))
+    print(f"Binance : {len(bn):,} minutes, heure serveur "
+          f"{bn['time'].iloc[0]} -> {bn['time'].iloc[-1]}", flush=True)
+    m1 = m1.merge(bn, on="time", how="left")
+    couvert = float(m1["taker_buy_base"].notna().mean())
     print(f"  minutes couvertes par le flux Binance : {100*couvert:.2f} %",
           flush=True)
-    if couvert < 0.90:
-        raise RuntimeError(
-            f"seulement {100*couvert:.1f} % des minutes ont du flux. "
-            f"L'alignement horaire est probablement faux.")
+    if couvert < 0.95:
+        raise RuntimeError(f"seulement {100*couvert:.1f} % des minutes ont "
+                           f"du flux Binance.")
+    verifie_alignement(m1)
 
-    d, _c, _i = prepare_m5.construit(m1, avec_flux=False, jour=JOUR_M1)
-    manquantes = [c for c in COLONNES_TICKS + COLONNES_FLUX
-                  if c not in d.columns]
-    if manquantes:
-        raise RuntimeError(f"colonnes perdues par `construit` : {manquantes}")
-    for c in COLONNES_TICKS + COLONNES_FLUX:
-        d[c] = d[c].astype(np.float32)
-
-    # ------------------------------------------------------------------
-    # LES DEUX RANGS GLISSANTS, et c'est la seule transformation du depot
-    # qui ne regarde PAS une valeur mais une POSITION.
-    #
-    # `close_ema_dev` et le volume agressif sont deja dans le cadre. Le
-    # modele ne s'en est jamais servi parce que leur NIVEAU ne veut rien
-    # dire hors de son epoque : la valeur qui marquait un creux en 2024
-    # n'en marque plus un en 2026. Le meme piege a ete pris en flagrant
-    # delit sur le spread le 2026-09-22 — un seuil au 40e centile calcule
-    # deux ans plus tot n'attrapait PLUS AUCUNE occasion.
-    #
-    # LA FENETRE FERME SUR LA BARRE COURANTE. `rolling` ne voit que le
-    # passe ; il n'y a pas de fuite, et c'est verifiable : la valeur en t
-    # ne change pas quand on ajoute des barres apres t.
-    #
-    # 20 000 BARRES, deux semaines de M1 : assez long pour que le rang
-    # soit stable, assez court pour suivre le regime.
-    _FEN_RANG = 20_000
-    d["creux_rang"] = (d["close_ema_dev"]
-                       .rolling(_FEN_RANG, min_periods=2_000)
-                       .rank(pct=True).astype(np.float32))
-    d["flux_rang"] = (d["taker_buy_base"]
-                      .rolling(_FEN_RANG, min_periods=2_000)
-                      .rank(pct=True).astype(np.float32))
-    print("  rangs glissants : creux_rang et flux_rang (source taker_buy_base)",
-          flush=True)
+    d, _c, _i = prepare_m5.construit(m1, avec_flux=False, jour=JOUR_M1,
+                                     echelles=ECHELLES_BTC_M1,
+                                     avec_structures=False)
+    d = FS.ajoute(d)
 
     from saint_core import FEATURE_COLS as _FC
+    absentes = [c for c in _FC if c not in d.columns]
+    if absentes:
+        raise RuntimeError(f"colonnes de FEATURE_COLS non produites : {absentes}")
     avant = len(d)
     d = d.replace([np.inf, -np.inf], np.nan)
-    d = d.dropna(subset=[x for x in _FC if x in d.columns] + ["atr_14"])
-    d = d.reset_index(drop=True)
-    print(f"  chauffe : {avant:,} -> {len(d):,} lignes "
+    d = d.dropna(subset=list(_FC) + ["atr_14"]).reset_index(drop=True)
+    print(f"  chauffe et trous : {avant:,} -> {len(d):,} lignes "
           f"({100*(1-len(d)/avant):.1f} % perdues)", flush=True)
+    for c in _FC:
+        d[c] = d[c].astype(np.float32)
     d.to_pickle(SORTIE)
-    print(f"\n{SORTIE} : {len(d):,} lignes, {len(d.columns)} colonnes",
-          flush=True)
-    for c in COLONNES_TICKS + COLONNES_FLUX:
-        print("  %-20s med %12.4f   p99 %12.4f"
-              % (c, d[c].median(), d[c].quantile(0.99)), flush=True)
+    print(f"\n{SORTIE} : {len(d):,} lignes, {len(_FC)} features, "
+          f"{d['time'].iloc[0]} -> {d['time'].iloc[-1]}", flush=True)
+    print("  %-20s %12s %12s %12s" % ("feature", "p1", "mediane", "p99"))
+    for c in _FC:
+        q = d[c].quantile([0.01, 0.5, 0.99]).to_numpy()
+        print("  %-20s %12.4f %12.4f %12.4f" % (c, q[0], q[1], q[2]), flush=True)
+    return d
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--mt5":
+        n = int(sys.argv[2]) if len(sys.argv) > 2 else N_BARRES
+        m1 = brut_depuis_mt5(n)
+    else:
+        m1 = brut_depuis_cache()
+    m1 = m1.sort_values("time").reset_index(drop=True)
+    print(f"  spread cote : med {m1['spread_bar'].median():.3f} bps  "
+          f"p99 {m1['spread_bar'].quantile(0.99):.3f}", flush=True)
+    construit_et_ecrit(m1)
     return 0
 
 

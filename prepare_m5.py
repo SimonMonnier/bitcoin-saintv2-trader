@@ -119,7 +119,7 @@ def flux(d, jour=JOUR_M5, semaine=SEMAINE_M5):
     return d
 
 
-def _joint_echelle(m5, regle, sfx, jour_sup):
+def _joint_echelle(m5, regle, sfx, jour_sup, avec_structures=True):
     """Calcule le jeu COMPLET a une echelle superieure et le colle aux lignes M5.
 
     Rend (df, noms des colonnes ajoutees). Les memes 85 colonnes qu'en M5 a
@@ -132,8 +132,12 @@ def _joint_echelle(m5, regle, sfx, jour_sup):
                    "close": "last"})
              .dropna().reset_index())
     sup = indicateurs(sup, jour_sup)
-    sup, cols_rng = ajoute_features_range(sup, suffixe=sfx)
-    sup, cols_ich = ajoute_features_ichimoku(sup, suffixe=sfx)
+    # SANS STRUCTURES : ni range ni Ichimoku. Voir `construit`.
+    if avec_structures:
+        sup, cols_rng = ajoute_features_range(sup, suffixe=sfx)
+        sup, cols_ich = ajoute_features_ichimoku(sup, suffixe=sfx)
+    else:
+        cols_rng, cols_ich = [], []
 
     # Les colonnes de range et d'Ichimoku portent DEJA leur suffixe : les
     # fonctions le posent a la source. Seules les BASES doivent encore le
@@ -156,7 +160,8 @@ def _joint_echelle(m5, regle, sfx, jour_sup):
     return m5.drop(columns=["_c_sup"]), noms + ["close" + sfx + "_dev"]
 
 
-def construit(m5, avec_flux=None, jour=None, echelles=None):
+def construit(m5, avec_flux=None, jour=None, echelles=None,
+              avec_structures=True):
     """Du brut M5 aux colonnes de `saint_core`. Rend (df, colonnes, ichimoku).
 
     `avec_flux` calcule les colonnes de carnet — part acheteuse agressive,
@@ -193,7 +198,7 @@ def construit(m5, avec_flux=None, jour=None, echelles=None):
     cols_sup = []
     for regle, sfx, jour_sup in (ECHELLES_SUP if echelles is None
                                  else echelles):
-        m5, noms = _joint_echelle(m5, regle, sfx, jour_sup)
+        m5, noms = _joint_echelle(m5, regle, sfx, jour_sup, avec_structures)
         cols_sup += noms
 
     # ---------- Le REGIME de tendance, en horizons longs ----------
@@ -234,10 +239,16 @@ def construit(m5, avec_flux=None, jour=None, echelles=None):
     #
     # CAUSALITE : ces trois colonnes ne lisent que du passe. Elles coutent
     # 8 640 barres d'amorcage, soit 1.7 % du jeu, perdues au dropna.
-    for nom, n in (("tend_mom_sem", 2016), ("tend_mom_mois", 8640)):
+    #
+    # LA SEMAINE ET LE MOIS SE COMPTENT EN JOURS, PAS EN BARRES M5 — corrige
+    # le 2026-09-26. Les fenetres valaient 2 016 et 8 640 barres en dur :
+    # une semaine et un mois en M5, mais 34 heures et 6 jours en M1. L'or M1
+    # a tourne avec des colonnes dont le nom mentait (piege 1 de l'en-tete).
+    # En M5, 7 x 288 = 2 016 et 30 x 288 = 8 640 : rien ne change.
+    for nom, n in (("tend_mom_sem", 7 * jour), ("tend_mom_mois", 30 * jour)):
         prec = m5["close"].shift(n)
         m5[nom] = (m5["close"] - prec) / prec.replace(0, np.nan)
-    _ma = m5["close"].rolling(8640).mean()
+    _ma = m5["close"].rolling(30 * jour).mean()
     m5["tend_vs_ma_mois"] = (m5["close"] - _ma) / _ma.replace(0, np.nan)
 
     # ---------- Temps ----------
@@ -245,8 +256,14 @@ def construit(m5, avec_flux=None, jour=None, echelles=None):
     m5["heure_sin"] = np.sin(2 * np.pi * heure / 24.0)
     m5["heure_cos"] = np.cos(2 * np.pi * heure / 24.0)
 
-    m5, cols_rng = ajoute_features_range(m5)
-    m5, cols_ich = ajoute_features_ichimoku(m5)
+    # SANS STRUCTURES — le scalping BTC depuis le 2026-09-26 : ni range ni
+    # Ichimoku, a aucune echelle. Ce sont des fonctions de l'OHLC dont le
+    # depot a mesure qu'elles ne separaient rien. Voir `features_scalping`.
+    if avec_structures:
+        m5, cols_rng = ajoute_features_range(m5)
+        m5, cols_ich = ajoute_features_ichimoku(m5)
+    else:
+        cols_rng, cols_ich = [], []
 
     # Les colonnes de carnet ne sont plus dans l'observation : la liste
     # rendue doit donc s'accorder avec `saint_core.FEATURE_COLS`, que `main`

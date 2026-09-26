@@ -20,12 +20,18 @@ import pandas as pd
 
 import prepare_m5
 import prepare_or_m1 as P
-from saint_core import FEATURE_COLS
+from saint_core import FEATURE_COLS, SYMBOLE
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
+
+# L'OR N'EST PLUS ENTRAINE depuis le 2026-09-26 au soir : son jeu de
+# colonnes n'est plus celui de `FEATURE_COLS`. Voir test_causalite_btc_m1.
+if SYMBOLE != "XAUUSD":
+    print(f"SAUTE : l'instrument entraine est {SYMBOLE}")
+    raise SystemExit(0)
 
 # Assez d'amorce pour `tend_mom_mois` (8 640 barres) et l'Ichimoku M15.
 DEBUT, LONGUEUR = 200_000, 14_000

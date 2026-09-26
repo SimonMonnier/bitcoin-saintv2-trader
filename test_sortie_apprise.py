@@ -582,12 +582,33 @@ verifie("la decision d'entree rend ses logits au diagnostic",
 verifie("la validation les recueille",
         "generateur=_gen_v, diag=_diag_v)" in src and "marge entree" in src)
 
-print("\n12. LE TEST D'AVANTAGE BRUT")
-# L'entrainement se joue sans cout, la validation avec. La penalite
-# d'attente a ete retiree le 2026-09-26.
-verifie("l'entrainement se joue sans cout",
-        T.PPOConfig().entrainement_sans_cout
-        and "_e.sans_cout = True" in src)
+print("\n12. LES COUTS PROGRESSIFS")
+# L'entrainement part sans cout et paie le cout plein apres la rampe ; la
+# validation paie toujours le cout reel. La penalite d'attente a ete
+# retiree le 2026-09-26.
+_rp = T.PPOConfig().rampe_cout_epochs
+verifie("la rampe de cout est active", _rp > 0, str(_rp))
+verifie("epoch 1 sans cout, cout plein a l'epoch rampe + 1",
+        T.part_du_cout(1, _rp) == 0.0 and T.part_du_cout(_rp + 1, _rp) == 1.0
+        and T.part_du_cout(_rp + 30, _rp) == 1.0)
+verifie("la rampe est lineaire",
+        abs(T.part_du_cout(1 + _rp // 2, _rp) - (_rp // 2) / _rp) < 1e-12)
+verifie("sans rampe, cout plein des le depart", T.part_du_cout(1, 0) == 1.0)
+verifie("seuls les environnements d'entrainement suivent la rampe",
+        "for _e in train_envs:\n            _e.frac_cout = _frac_cout" in src)
+verifie("un fold qui herite des poids n'a pas de rampe",
+        "if poids_initiaux is None else 0)" in src)
+_e = T.BTCTradingEnvDiscrete(_md, _cf)
+verifie("un environnement neuf paie le cout plein", _e.frac_cout == 1.0)
+T.reset_au_depart(_e, 20_000)
+_plein = _e._sample_trade_spread_bps()
+_e.frac_cout = 0.5
+_demi = _e._sample_trade_spread_bps()
+verifie("a mi-rampe, la moitie du spread",
+        _plein > 0 and abs(_demi - 0.5 * _plein) < 1e-9 * _plein,
+        "%.4f / %.4f" % (_demi, _plein))
+_e.reset()
+verifie("la part du cout survit a reset", _e.frac_cout == 0.5)
 verifie("la penalite d'attente a disparu",
         "penalite_attente" not in src and "cible_ouverture" not in src)
 verifie("la validation mesure l'avantage brut", "avantage brut" in src)

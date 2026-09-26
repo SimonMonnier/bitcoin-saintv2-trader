@@ -663,7 +663,7 @@ class PPOConfig:
     # ses frais. Le pari est qu'un avantage REEL sur du flux vaut mieux
     # qu'un avantage NUL sur du prix bon marche.
     # LU DANS `saint_core.SYMBOLE`, qui choisit aussi le jeu de features :
-    # les deux ne peuvent pas diverger. L'or depuis le 2026-09-26.
+    # les deux ne peuvent pas diverger. Le BTC depuis le 2026-09-26 au soir.
     symbol: str = SYMBOLE_ENTRAINE
     timeframe: int = mt5.TIMEFRAME_M1
     htf_timeframe: int = mt5.TIMEFRAME_H1
@@ -1240,14 +1240,33 @@ class PPOConfig:
     # validation d'une contrainte d'activite : elle force des trades, elle
     # ne cree pas d'avantage. Son code est dans l'historique git.
     #
-    # LE TEST D'AVANTAGE BRUT LA REMPLACE. L'entrainement se joue SANS
-    # COUT — spread et glissement a zero — pendant que la validation et le
-    # test gardent les couts reels et decident seuls de la sauvegarde. La
-    # validation separe, trade par trade, le mouvement capte du cout paye
-    # (ligne `avantage brut`). Si l'agent, libere du spread, ne trouve pas
-    # un mouvement brut superieur a ~1.6 bps par trade, aucune feature
-    # directionnelle de plus n'a de chance de le rendre rentable.
-    entrainement_sans_cout: bool = True
+    # LES COUTS PROGRESSIFS — 2026-09-26, d'apres la recherche
+    # (`reports/Stratégies de scalping et features PPO.md`, section sur
+    # l'apprentissage par renforcement en haute frequence).
+    #
+    # LE CONSTAT. Un agent qui paie le spread plein des la premiere epoch
+    # apprend d'abord que TOUT trade perd — c'est vrai tant qu'il n'a rien
+    # appris — et se refugie dans l'attente avant d'avoir vu le moindre
+    # mouvement. C'est ce que ce depot a observe run apres run : zero trade
+    # en validation. La litterature appelle le remede un CURRICULUM DE
+    # COUT : apprendre d'abord la direction sans frais, puis introduire le
+    # cout progressivement, pour que la politique apprenne a ne garder que
+    # les mouvements qui le couvrent.
+    #
+    # CE QUI SE FAIT ICI. L'epoch 1 se joue sans cout — spread et
+    # glissement a zero, comme le test d'avantage brut qu'elle generalise.
+    # La part du cout reel monte ensuite lineairement et atteint 100 % a
+    # l'epoch `rampe_cout_epochs + 1`. LA VALIDATION ET LE TEST PAIENT
+    # TOUJOURS LE COUT REEL, et ce sont eux seuls qui decident de la
+    # sauvegarde : aucune epoch a cout reduit ne peut etre retenue pour ce
+    # qu'elle n'a pas paye.
+    #
+    # SEUL LE FOLD QUI PART DE ZERO a la rampe. Un fold qui herite des poids
+    # du precedent les a appris au cout plein ; les renvoyer a cout nul
+    # defairait ce qu'ils savent.
+    #
+    # 0 = cout plein des la premiere epoch.
+    rampe_cout_epochs: int = 10
     pas_profit_par_epoch: int = 0
     # L'HORIZON SUR LEQUEL ELLE JUGE — ET IL FIXE AUSSI CELUI DE L'ENTREE.
     #
@@ -3902,7 +3921,7 @@ class PPOConfig:
     side: str = "both"
 
     # Préfixe pour nommer les fichiers de modèle
-    model_prefix: str = "saintv2_or_m1_ppo01"
+    model_prefix: str = "saintv2_btc_m1_scalp01"
     def __post_init__(self):
         """Les constantes de l'instrument viennent de `instruments.py`.
 
@@ -4502,6 +4521,17 @@ def _sous_lot(n, cfg):
     if 0 < n_max < n:
         idx = np.sort(np.random.choice(idx, n_max, replace=False))
     return idx
+
+
+def part_du_cout(epoch: int, rampe: int) -> float:
+    """La part du cout reel payee a l'entrainement a cette epoch.
+
+    0 a l'epoch 1, puis lineaire jusqu'a 1 a l'epoch `rampe + 1`. Une rampe
+    nulle paie le cout plein des le depart. Voir `rampe_cout_epochs`.
+    """
+    if rampe <= 0:
+        return 1.0
+    return float(min(1.0, max(0.0, (epoch - 1) / rampe)))
 
 
 def maj_ppo_entree(policy, ep_buf, optims, cfg, device):
@@ -5495,17 +5525,26 @@ class BTCTradingEnvDiscrete(gym.Env):
 
         self.risk_scale = 1.0
         self.last_risk_scale = 1.0
-        # SANS COUT : spread et glissement a zero. Vrai pour les seuls
-        # environnements d'ENTRAINEMENT, et seulement si
-        # `entrainement_sans_cout` le demande. La validation et le test
-        # gardent toujours les couts reels.
+        # LA PART DU COUT REEL que paie cet environnement : spread et
+        # glissement multiplies par elle. 1.0 partout, sauf pour les
+        # environnements d'ENTRAINEMENT pendant la rampe — voir
+        # `rampe_cout_epochs`. La validation et le test restent a 1.0.
         #
         # ICI, A LA CREATION, ET SURTOUT PAS DANS `reset`. La premiere
-        # version le posait dans `reset` : chaque debut d'episode effacait
-        # le mode, et l'entrainement aurait paye les couts sans que rien ne
-        # le signale. C'est le test de l'environnement qui l'a vu.
-        self.sans_cout = False
+        # version du mode sans cout le posait dans `reset` : chaque debut
+        # d'episode l'effacait, et l'entrainement aurait paye les couts sans
+        # que rien ne le signale. C'est le test de l'environnement qui l'a vu.
+        self.frac_cout = 1.0
         self.reset()
+
+    # SANS COUT = une part nulle. Garde pour les tests et les diagnostics.
+    @property
+    def sans_cout(self) -> bool:
+        return self.frac_cout <= 0.0
+
+    @sans_cout.setter
+    def sans_cout(self, v: bool) -> None:
+        self.frac_cout = 0.0 if v else 1.0
 
     # ---------- Curriculum vol ----------
 
@@ -6332,8 +6371,9 @@ UNE SEULE SOURCE pour les trois boucles — rollout, validation, test.
     def _apply_micro(self, price: float, side: int, is_entry: bool = True) -> float:
         """Convertit une bougie BID en prix BUY/SELL exécutable."""
         price = execution_quote(price, side, self.current_trade_spread_bps)
-        if is_entry and self.cfg.entry_slippage_bps > 0 and not self.sans_cout:
-            extra = np.random.uniform(0.0, self.cfg.entry_slippage_bps) / 10_000.0
+        if is_entry and self.cfg.entry_slippage_bps > 0 and self.frac_cout > 0:
+            extra = (np.random.uniform(0.0, self.cfg.entry_slippage_bps)
+                     / 10_000.0 * self.frac_cout)
             price *= (1 + side * extra)
         return price
 
@@ -6371,20 +6411,21 @@ UNE SEULE SOURCE pour les trois boucles — rollout, validation, test.
         nulle, et le run paraitrait rentable pour une raison purement
         comptable.
         """
-        # SANS COUT : le test d'avantage brut. Voir `entrainement_sans_cout`.
-        if self.sans_cout:
+        # LA PART DU COUT de cet environnement. Voir `rampe_cout_epochs`.
+        f = float(self.frac_cout)
+        if f <= 0.0:
             return 0.0
         i = min(max(self.idx - 1, 0), len(self.data.spread_bar) - 1)
         reel = float(self.data.spread_bar[i])
         if reel > 0.0:
-            return reel
+            return reel * f
         base = float(self.cfg.spread_bps)
         if base <= 0.0:
             return 0.0
         if np.random.rand() < self.cfg.spread_wide_prob:
-            return float(np.random.uniform(
+            return f * float(np.random.uniform(
                 base * 1.2, base * self.cfg.spread_bps_wide_factor))
-        return float(np.random.uniform(base * 0.98, base * 1.02))
+        return f * float(np.random.uniform(base * 0.98, base * 1.02))
 
     def _compute_dynamic_size(self, price: float) -> float:
         """Taille dictée par le RISQUE, jamais par une constante absolue.
@@ -6917,8 +6958,8 @@ UNE SEULE SOURCE pour les trois boucles — rollout, validation, test.
                 if True:
                     # SL/sortie au marché: slippage adverse. TP: niveau cible,
                     # sans amélioration favorable systématique inventée.
-                    slip_max = (0.0 if self.sans_cout
-                                else self.cfg.slippage_bps / 10_000.0)
+                    slip_max = (self.cfg.slippage_bps / 10_000.0
+                                * float(self.frac_cout))
                     if slip_max > 0 and not h_tp:
                         slip_amount = exit_price * np.random.uniform(0.0, slip_max)
                         # Une sortie au marche (temps ecoule) traverse le
@@ -6997,7 +7038,8 @@ UNE SEULE SOURCE pour les trois boucles — rollout, validation, test.
                 sens = int(self._p_sens[j])
                 exit_price = self._apply_micro(price, -sens, is_entry=False)
                 slip = (np.random.uniform(0.0, self.cfg.slippage_bps) / 10000.0
-                        if self.cfg.slippage_bps > 0 and not self.sans_cout
+                        * float(self.frac_cout)
+                        if self.cfg.slippage_bps > 0 and self.frac_cout > 0
                         else 0.0)
                 exit_price *= 1.0 - sens * slip
                 realized_trade += self._close_position(
@@ -7892,14 +7934,14 @@ def run_training_on_split(
     train_envs = [
         BTCTradingEnvDiscrete(train_data, cfg) for _ in range(cfg.episodes_per_epoch)
     ]
-    # LE TEST D'AVANTAGE BRUT : l'entrainement se joue sans cout, la
-    # validation et le test avec. Voir `entrainement_sans_cout`.
-    if bool(getattr(cfg, "entrainement_sans_cout", False)):
-        for _e in train_envs:
-            _e.sans_cout = True
-        print("  \u2022 ENTRAINEMENT SANS COUT (test d'avantage brut) : spread et "
-              "glissement a zero a l'entrainement ; validation et test aux "
-              "couts reels")
+    # LES COUTS PROGRESSIFS : seul le fold qui part de zero a la rampe.
+    # Voir `rampe_cout_epochs`.
+    _rampe_cout = (int(getattr(cfg, "rampe_cout_epochs", 0))
+                   if poids_initiaux is None else 0)
+    if _rampe_cout > 0:
+        print(f"  \u2022 COUTS PROGRESSIFS : l'entrainement part sans cout et "
+              f"paie le cout reel plein a l'epoch {_rampe_cout + 1} ; "
+              f"validation et test toujours au cout reel")
     # Nombre d'episodes REELLEMENT joues. Il part d'une estimation — la duree
     # mediane d'un trade donne l'ordre de grandeur des decisions par episode —
     # puis se corrige des la premiere epoch avec le compte reel.
@@ -8451,6 +8493,15 @@ def run_training_on_split(
     for epoch in range(1, cfg.epochs + 2):
         cfg.current_epoch = epoch
         epoch_moyenne = (epoch == cfg.epochs + 1)
+        # LA PART DU COUT DE CETTE EPOCH, pour les seuls environnements
+        # d'entrainement. Voir `rampe_cout_epochs`.
+        _frac_cout = part_du_cout(epoch, _rampe_cout)
+        for _e in train_envs:
+            _e.frac_cout = _frac_cout
+        if _rampe_cout > 0 and not epoch_moyenne:
+            print(f"  {_col('phase', _C.GREY)}  cout entrainement  "
+                  f"{100*_frac_cout:.0f}% du cout reel "
+                  f"(rampe de {_rampe_cout} epochs ; validation a 100%)")
         if epoch_moyenne:
             if somme_poids is None:
                 break
@@ -12186,7 +12237,7 @@ if __name__ == "__main__":
     # Reprend exec16 : revision horaire du budget, bonus d'entropie sur les
     # deux tetes, `H` ramenee a la direction seule, budget d'episodes compte
     # sur les transitions versees.
-    cfg_long.model_prefix = "saintv2_or_m1_ppo01"
+    cfg_long.model_prefix = "saintv2_btc_m1_scalp01"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant
