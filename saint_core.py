@@ -651,6 +651,7 @@ SYMBOLE = "BTCUSD"
 # flux d'agression signe a trois horizons, l'ecart Binance - courtier, les
 # ancres de prix, et l'interaction creux x flux.
 from features_scalping import (COLONNES_ANCRES as _S_ANCRES,
+                               COLONNES_COINBASE as _S_COINBASE,
                                COLONNES_FLUX as _S_FLUX,
                                COLONNES_HORLOGE as _S_HORLOGE,
                                COLONNES_REGIME as _S_REGIME)
@@ -664,7 +665,7 @@ FEATURE_COLS_PRIX_SUP = [c.replace("_h1", sfx)
 if SYMBOLE == "BTCUSD":
     FEATURE_COLS = (FEATURE_COLS_PRIX + FEATURE_COLS_PRIX_SUP
                     + FEATURE_COLS_LIQ_TEMPS + _S_HORLOGE + _S_REGIME
-                    + _S_FLUX + _S_ANCRES
+                    + _S_FLUX + _S_COINBASE + _S_ANCRES
                     + FEATURE_COLS_RANGS + ["creux_x_flux"])
 else:
     # L'OR, tel qu'il a tourne jusqu'au 2026-09-26.

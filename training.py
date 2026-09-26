@@ -1231,7 +1231,17 @@ class PPOConfig:
     # dont deux coutent le spread s'effondrent vite sur ATTENDRE : c'est la
     # reponse la plus sure tant que rien n'est appris, et c'est celle qui
     # empeche d'apprendre quoi que ce soit.
-    entropie_entree: float = 0.01
+    #
+    # 0.01 -> 0.005 LE 2026-09-26, POUR UNE ENTREE PLUS SELECTIVE. Apres
+    # 26 epochs du run scalp01, l'entropie d'entree valait encore 0.98 sur
+    # 1.10 : la collecte ouvrait sur plus de la moitie des occasions, au
+    # hasard, pendant que la validation (argmax) n'en ouvrait que 10 %. PPO
+    # apprenait donc surtout d'entrees que la politique jouee ne prend
+    # jamais. La mesure dit que l'avantage ne vit que dans les signaux les
+    # plus forts : le bonus est divise par deux pour laisser la politique
+    # se concentrer. La rampe de cout, qui part de zero, protege les
+    # premieres epochs de l'effondrement sur ATTENDRE.
+    entropie_entree: float = 0.005
 
     # LA PENALITE D'ATTENTE A ETE RETIREE LE 2026-09-26, a la demande du
     # proprietaire, apres un run complet : elle faisait revenir des trades
@@ -1388,6 +1398,30 @@ class PPOConfig:
     # 180 -> 45 LE 2026-09-25, avec l'horizon : trois fois l'horizon, la ou
     # la colonne d'age `min(age / SCALPING_MAX_HOLDING, 3)` sature.
     tenue_max_cloture: int = 45
+    # LA TENUE MINIMALE — 2026-09-26, accord du proprietaire.
+    #
+    # CE QUE LA MESURE A MONTRE. `mesure_sources_btc.py`, train et
+    # validation du fold 1 : un LightGBM sur les 68 colonnes du run capte
+    # +1.2 bps brut par trade a 15 minutes sur les 10 % de signaux les plus
+    # forts, et +3.3 bps sur les 2 % — le niveau du cout. Le PPO, lui, ne
+    # captait que +0.2 bps. La raison etait dans le journal : TOUS les
+    # trades duraient une minute en mediane, gagnants comme perdants. En une
+    # minute il n'y a presque rien a prendre, et le cout (2.6 bps) est paye
+    # en entier. L'information etait la ; les sorties la jetaient.
+    #
+    # LA REGLE. La tete de sortie n'est PAS CONSULTEE avant
+    # `tenue_min_sortie` barres : la position tient. Une seule exception,
+    # la coupure d'urgence — si le latent passe sous le point mort moins
+    # `urgence_sortie_atr` ATR, la tete des pertes peut fermer tout de
+    # suite. Voir `porte_sortie`, la seule ecriture de cette regle, lue au
+    # rollout, en validation et au test par `cadence_sortie`.
+    #
+    # CE QUE L'ENTREE Y GAGNE : son trade dure au moins l'horizon de son
+    # signal, donc sa recompense juge enfin ce qu'elle a vu.
+    tenue_min_sortie: int = 15
+    # 3 ATR sous le point mort : environ 1.2 ecart-type d'un mouvement de
+    # 15 minutes en M1. Une grosse perte, pas un tremblement.
+    urgence_sortie_atr: float = 3.0
     # LA REGLE DE SORTIE :  fermer si  latent < -(marge + k x risque)
     #
     # Tout est en ATR D'ENTREE — `latent_atr` est la colonne 1 de l'etat,
@@ -3921,7 +3955,7 @@ class PPOConfig:
     side: str = "both"
 
     # Préfixe pour nommer les fichiers de modèle
-    model_prefix: str = "saintv2_btc_m1_scalp01"
+    model_prefix: str = "saintv2_btc_m1_scalp02"
     def __post_init__(self):
         """Les constantes de l'instrument viennent de `instruments.py`.
 
@@ -4224,7 +4258,7 @@ def entree_sortie(x, n_base: int):
         axis=1).astype(_np.float32)
 
 
-def cadence_sortie(en_pos, frais, depuis, pas: int):
+def cadence_sortie(en_pos, frais, depuis, pas: int, permis=None):
     """QUI decide de sortir a cette barre. Une seule ecriture, quatre lecteurs.
 
     POURQUOI CETTE FONCTION EXISTE. Le 2026-09-25, trois boucles ne
@@ -4253,14 +4287,41 @@ def cadence_sortie(en_pos, frais, depuis, pas: int):
     Rend (decideurs, ecoule), ou `ecoule[k]` est le nombre de barres
     couvertes par la decision precedente de k — celui que le loyer doit
     facturer.
+
+    `permis[k]` FAUX : la position ne decide pas a cette barre, mais son
+    compteur avance quand meme — le jour ou elle decide, `ecoule` couvre
+    toutes les barres tenues. Voir `porte_sortie`.
     """
     for k in en_pos:
         depuis[k] += 1
-    dec = [k for k in en_pos if bool(frais[k]) or depuis[k] >= pas]
+    dec = [k for k in en_pos
+           if (bool(frais[k]) or depuis[k] >= pas)
+           and (permis is None or bool(permis[k]))]
     ecoule = {k: int(depuis[k]) for k in dec}
     for k in dec:
         depuis[k] = 0
     return dec, ecoule
+
+
+def porte_sortie(env, cfg) -> bool:
+    """La tete de sortie peut-elle etre CONSULTEE pour cette position ?
+
+    Oui des que la position a tenu `tenue_min_sortie` barres. Avant, non —
+    sauf coupure d'urgence : latent sous le point mort moins
+    `urgence_sortie_atr` ATR. Voir `tenue_min_sortie`.
+
+    UNE ECRITURE, TROIS LECTEURS : collecte, validation, test, tous par
+    l'argument `permis` de `cadence_sortie`.
+    """
+    tmin = int(getattr(cfg, "tenue_min_sortie", 0))
+    if tmin <= 0 or env.bars_in_position >= tmin:
+        return True
+    urg = float(getattr(cfg, "urgence_sortie_atr", 0.0))
+    if urg <= 0.0 or env.entry_atr <= 1e-8 or env.entry_price <= 0.0:
+        return False
+    px = float(env.data.close[max(env.idx - 1, 0)])
+    lat = float(env.position) * (px - float(env.entry_price)) / float(env.entry_atr)
+    return lat < -float(env.cout_entree_atr) - urg
 
 
 def rendements_sortie_ppo(policy, data, idx, cfg, device):
@@ -8854,8 +8915,10 @@ def run_training_on_split(
                 # quatre calibrations successives qui ont echoue.
                 # QUI DECIDE A CETTE BARRE — par `cadence_sortie`, la meme
                 # regle qu'en validation, au test et dans le critere.
+                # LA TENUE MINIMALE : voir `porte_sortie`.
                 _a_decider, _ecoule = cadence_sortie(
-                    _en_pos, ~np.isfinite(lat_prec), depuis_dec, _pas_s)
+                    _en_pos, ~np.isfinite(lat_prec), depuis_dec, _pas_s,
+                    permis={k: porte_sortie(envs[k], cfg) for k in _en_pos})
                 if _a_decider:
                     _ep = [states[k] for k in _a_decider]
                     _sa, _slp, _sv = decide_sortie(
@@ -10247,7 +10310,9 @@ def run_training_on_split(
                 for _k in v_active:
                     if val_envs[_k].n_positions == 0:
                         v_frais[_k] = True
-                _vd, _ = cadence_sortie(_vp, v_frais, v_depuis, _pas_v)
+                _vd, _ = cadence_sortie(
+                    _vp, v_frais, v_depuis, _pas_v,
+                    permis={k: porte_sortie(val_envs[k], cfg) for k in _vp})
                 if _vd:
                     # LA POLITIQUE EST TIREE, graine fixe : voir
                     # `evaluation_stochastique`.
@@ -11678,7 +11743,9 @@ def run_training_on_split(
             for _k in t_active:
                 if test_envs[_k].n_positions == 0:
                     t_frais[_k] = True
-            _td, _ = cadence_sortie(_tp, t_frais, t_depuis, _pas_t)
+            _td, _ = cadence_sortie(
+                _tp, t_frais, t_depuis, _pas_t,
+                permis={k: porte_sortie(test_envs[k], cfg) for k in _tp})
             if _td:
                 _ta, _, _ = decide_sortie(
                     policy, [t_states[k] for k in _td], device,
@@ -12237,7 +12304,7 @@ if __name__ == "__main__":
     # Reprend exec16 : revision horaire du budget, bonus d'entropie sur les
     # deux tetes, `H` ramenee a la direction seule, budget d'episodes compte
     # sur les transitions versees.
-    cfg_long.model_prefix = "saintv2_btc_m1_scalp01"
+    cfg_long.model_prefix = "saintv2_btc_m1_scalp02"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant

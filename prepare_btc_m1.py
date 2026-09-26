@@ -78,6 +78,8 @@ SYMBOLE_BINANCE = "BTCUSDT"
 SORTIE = "data_cache_BTCUSD_M1.pkl"
 CACHE_TICKS = "cache_ticks_m1_BTCUSD.pkl"
 CACHE_BINANCE = "cache_binance_1m_BTCUSDT.pkl"
+# COINBASE BTC-USD, bougies 1 min — `telecharge_sources_btc.py` l'ecrit.
+CACHE_COINBASE = "cache_coinbase_1m_BTCUSD.pkl"
 JOUR_M1 = 1440
 N_BARRES = 1_000_000
 # LE BRUT : barres du courtier, spread de chaque barre, agregat de ticks.
@@ -394,11 +396,22 @@ def verifie_alignement(m1: pd.DataFrame) -> None:
             f"courtier ne sont pas a la meme heure.")
 
 
-def construit_et_ecrit(m1: pd.DataFrame) -> pd.DataFrame:
+def joint_sources(m1: pd.DataFrame) -> pd.DataFrame:
+    """Le brut du courtier, plus Binance spot et Coinbase a l'heure du serveur.
+
+    UNE ECRITURE, DEUX LECTEURS : la construction du cache et le test de
+    causalite.
+    """
     bn = FS.aligne_binance(pd.read_pickle(CACHE_BINANCE))
-    print(f"Binance : {len(bn):,} minutes, heure serveur "
-          f"{bn['time'].iloc[0]} -> {bn['time'].iloc[-1]}", flush=True)
+    cb = FS.aligne_coinbase(pd.read_pickle(CACHE_COINBASE))
     m1 = m1.merge(bn, on="time", how="left")
+    return m1.merge(cb, on="time", how="left")
+
+
+def construit_et_ecrit(m1: pd.DataFrame) -> pd.DataFrame:
+    m1 = joint_sources(m1)
+    print(f"  minutes couvertes par Coinbase : "
+          f"{100*m1['cb_close'].notna().mean():.2f} %", flush=True)
     couvert = float(m1["taker_buy_base"].notna().mean())
     print(f"  minutes couvertes par le flux Binance : {100*couvert:.2f} %",
           flush=True)

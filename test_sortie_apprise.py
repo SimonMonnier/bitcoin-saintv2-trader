@@ -626,6 +626,48 @@ for _act, _nom in ((0, "long"), (1, "short")):
             abs(_tm["exit_price"] - float(_md.open[_tm["exit_idx"]]))
             < 1e-9 * _tm["exit_price"])
 
+print("\n13. LA TENUE MINIMALE")
+# La tete de sortie n'est pas consultee avant `tenue_min_sortie` barres,
+# sauf coupure d'urgence. Voir `porte_sortie`.
+_cm = T.PPOConfig()
+verifie("tenue minimale de 15 barres", _cm.tenue_min_sortie == 15)
+verifie("les trois boucles passent par la porte",
+        src.count("permis={k: porte_sortie(") == 3)
+_dep = {0: 0, 1: 0}
+_dec, _ec = T.cadence_sortie([0, 1], {0: True, 1: True}, _dep, 1,
+                             permis={0: False, 1: True})
+verifie("une position non permise ne decide pas", _dec == [1])
+verifie("mais son compteur avance", _dep[0] == 1)
+_dec, _ec = T.cadence_sortie([0], {0: True}, _dep, 1, permis={0: True})
+verifie("quand la porte s'ouvre, l'intervalle couvre toute la tenue",
+        _dec == [0] and _ec[0] == 2)
+for _act, _nom in ((0, "long"), (1, "short")):
+    _e = T.BTCTradingEnvDiscrete(_md, _cm)
+    T.reset_au_depart(_e, 20_000)
+    _e.step(_act)
+    verifie("%s : pas de sortie a la premiere barre" % _nom,
+            _e.bars_in_position < 15 and not T.porte_sortie(_e, _cm))
+    for _ in range(15):
+        _e.step(2)
+    verifie("%s : sortie permise apres 15 barres" % _nom,
+            _e.n_positions > 0 and T.porte_sortie(_e, _cm),
+            "tenue %d" % _e.bars_in_position)
+_e = T.BTCTradingEnvDiscrete(_md, _cm)
+T.reset_au_depart(_e, 20_000)
+_e.step(0)
+_cu = T.PPOConfig()
+_cu.urgence_sortie_atr = 0.0      # coupure d'urgence desactivee
+verifie("urgence desactivee : la porte reste fermee",
+        not T.porte_sortie(_e, _cu))
+_cu.urgence_sortie_atr = 1e-9
+_px = float(_e.data.close[_e.idx - 1])
+_lat = _e.position * (_px - _e.entry_price) / _e.entry_atr
+verifie("urgence : la porte s'ouvre sous le point mort moins la marge",
+        T.porte_sortie(_e, _cu) == (_lat < -_e.cout_entree_atr - 1e-9),
+        "latent %.3f, point mort %.3f" % (_lat, -_e.cout_entree_atr))
+verifie("entree plus selective : bonus d'entropie 0.005",
+        T.PPOConfig().entropie_entree == 0.005)
+
 print("\n9. LE COTE SE DECLARE A UN SEUL ENDROIT")
 # ============================================================
 # Le 2026-09-25 la configuration disait "both" et le run est parti en LONG

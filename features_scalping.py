@@ -108,6 +108,17 @@ COLONNES_ANCRES = [
     "dist_rond",           # distance au millier de dollars, en ranges
 ]
 COLONNES_RANGS = ["creux_rang", "flux_rang", "creux_x_flux"]
+# COINBASE — ajoutee le 2026-09-26 apres `mesure_sources_btc.py` : la seule
+# des sources gratuites mesurees qui apporte quelque chose. Coinbase est en
+# AVANCE d'environ une minute sur le courtier (correlation de rang avec la
+# minute suivante +0.034, t = +12.6, train et validation du fold 1), et le
+# signe tient a 15 et 60 minutes. Les perpetuels, la prime, les positions
+# ouvertes et les ratios longs/shorts n'apportaient rien de stable.
+COLONNES_COINBASE = [
+    "prime_cb_dev_60",     # Coinbase - Binance, contre sa normale de l'heure
+    "prime_cb_chg_15",     # la meme prime, variation sur 15 minutes
+    "cb_ecart_courtier",   # Coinbase - courtier, contre sa normale de l'heure
+]
 
 # Normes de creneau : quart d'heure de la journee, semaine et week-end
 # separes. 300 observations = 20 jours ouvres d'un creneau de 15 minutes.
@@ -145,6 +156,15 @@ def aligne_binance(bn: pd.DataFrame) -> pd.DataFrame:
         "bn_quote_vol": bn["quote_vol"].astype(np.float64),
         "nb_trades": bn["nb_trades"].astype(np.float64),
         "taker_buy_base": bn["taker_buy_base"].astype(np.float64),
+    })
+    return out.drop_duplicates("time").sort_values("time").reset_index(drop=True)
+
+
+def aligne_coinbase(cb: pd.DataFrame) -> pd.DataFrame:
+    """Les bougies Coinbase (UTC) sur l'horloge du serveur."""
+    out = pd.DataFrame({
+        "time": serveur_depuis_utc(pd.to_datetime(cb["time"])),
+        "cb_close": cb["close"].astype(np.float64),
     })
     return out.drop_duplicates("time").sort_values("time").reset_index(drop=True)
 
@@ -224,6 +244,22 @@ def flux(d: pd.DataFrame, creneau: pd.Series) -> pd.DataFrame:
     return d
 
 
+def coinbase(d: pd.DataFrame) -> pd.DataFrame:
+    """La demande americaine, et l'avance de Coinbase sur le courtier.
+
+    COINBASE N'EMET PAS DE BOUGIE SANS TRANSACTION : une minute absente est
+    une minute sans echange, donc au meme prix. Le dernier prix est
+    prolonge, cinq minutes au plus.
+    """
+    cb = d["cb_close"].ffill(limit=5)
+    e = (cb / d["bn_close"] - 1.0) * 1e4
+    d["prime_cb_dev_60"] = e - e.rolling(60, min_periods=30).mean()
+    d["prime_cb_chg_15"] = e - e.shift(15)
+    e = (cb / d["close"] - 1.0) * 1e4
+    d["cb_ecart_courtier"] = e - e.rolling(60, min_periods=30).mean()
+    return d
+
+
 def ancres(d: pd.DataFrame) -> pd.DataFrame:
     utc = utc_depuis_serveur(d["time"])
     jour = utc.dt.floor("D")
@@ -276,10 +312,11 @@ def ajoute(d: pd.DataFrame) -> pd.DataFrame:
     d = horloge(d)
     d = regime(d, cr)
     d = flux(d, cr)
+    d = coinbase(d)
     d = ancres(d)
     d = rangs(d)
     return d
 
 
 TOUTES = (COLONNES_HORLOGE + COLONNES_REGIME + COLONNES_FLUX
-          + COLONNES_ANCRES + COLONNES_RANGS)
+          + COLONNES_COINBASE + COLONNES_ANCRES + COLONNES_RANGS)

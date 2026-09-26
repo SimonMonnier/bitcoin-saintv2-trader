@@ -42,8 +42,7 @@ DEBUT, LONGUEUR = 100_000, 62_000
 POINTS = (50_000, 52_517, 55_003, 57_871, 60_402, 61_999)
 
 brut = pd.read_pickle(P.BRUT).iloc[DEBUT:DEBUT + LONGUEUR].reset_index(drop=True)
-bn = FS.aligne_binance(pd.read_pickle(P.CACHE_BINANCE))
-brut = brut.merge(bn, on="time", how="left")
+brut = P.joint_sources(brut)
 
 
 def features(df):
