@@ -151,6 +151,8 @@ from saint_core import (
     VENDRE,
     ATTENDRE,
     N_ACTIONS_ENTREE,
+    # L'INSTRUMENT, choisi avec le jeu de features.
+    SYMBOLE as SYMBOLE_ENTRAINE,
     # LES TROIS CONSTANTES DE LA TETE DE PROFIT. Elles sont importees
     # plutot que recopiees : `entree_profit` s'en sert pour extraire les
     # quatre colonnes, et un indice recopie ici finirait par diverger de
@@ -660,7 +662,9 @@ class PPOConfig:
     # 0.56 sur l'or). Il faut donc capter deux fois plus pour rentrer dans
     # ses frais. Le pari est qu'un avantage REEL sur du flux vaut mieux
     # qu'un avantage NUL sur du prix bon marche.
-    symbol: str = "BTCUSD"
+    # LU DANS `saint_core.SYMBOLE`, qui choisit aussi le jeu de features :
+    # les deux ne peuvent pas diverger. L'or depuis le 2026-09-26.
+    symbol: str = SYMBOLE_ENTRAINE
     timeframe: int = mt5.TIMEFRAME_M1
     htf_timeframe: int = mt5.TIMEFRAME_H1
     # Fenetre temporelle (UTC). Si date_to est None -> maintenant.
@@ -3910,7 +3914,7 @@ class PPOConfig:
     side: str = "both"
 
     # Préfixe pour nommer les fichiers de modèle
-    model_prefix: str = "saintv2_btc_m1_flux01"
+    model_prefix: str = "saintv2_or_m1_ppo01"
     def __post_init__(self):
         """Les constantes de l'instrument viennent de `instruments.py`.
 
@@ -12179,7 +12183,7 @@ if __name__ == "__main__":
     # Reprend exec16 : revision horaire du budget, bonus d'entropie sur les
     # deux tetes, `H` ramenee a la direction seule, budget d'episodes compte
     # sur les transitions versees.
-    cfg_long.model_prefix = "saintv2_btc_m1_flux01"
+    cfg_long.model_prefix = "saintv2_or_m1_ppo01"
 
     # LE JOURNAL CONSIGNE LA GEOMETRIE, parce que ce depot a deja paye deux
     # fois la meme faute : une regle de sortie changee dans la config pendant

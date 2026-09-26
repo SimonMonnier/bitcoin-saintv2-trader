@@ -35,7 +35,7 @@ if (-not (Test-Path -LiteralPath $python)) {
 }
 
 $journal = Join-Path $PSScriptRoot 'training_btc.log'
-$prefixe = 'saintv2_btc_m1_flux01'
+$prefixe = 'saintv2_or_m1_ppo01'
 
 Write-Host ''
 Write-Host '  KAIROS - lancement' -ForegroundColor Cyan

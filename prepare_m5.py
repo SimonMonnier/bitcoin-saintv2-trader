@@ -156,7 +156,7 @@ def _joint_echelle(m5, regle, sfx, jour_sup):
     return m5.drop(columns=["_c_sup"]), noms + ["close" + sfx + "_dev"]
 
 
-def construit(m5, avec_flux=None, jour=None):
+def construit(m5, avec_flux=None, jour=None, echelles=None):
     """Du brut M5 aux colonnes de `saint_core`. Rend (df, colonnes, ichimoku).
 
     `avec_flux` calcule les colonnes de carnet — part acheteuse agressive,
@@ -186,8 +186,13 @@ def construit(m5, avec_flux=None, jour=None):
     if avec_flux:
         m5 = flux(m5, jour=jour, semaine=jour * 7)
 
+    # `echelles` REMPLACE LES CONTEXTES SUPERIEURS PAR DEFAUT. L'or M1 lit
+    # le M5 et le M15 depuis le 2026-09-26 — H1 et H4 retires, choix du
+    # proprietaire. Le defaut reste H1 + H4 : aucun appelant existant ne
+    # change de comportement.
     cols_sup = []
-    for regle, sfx, jour_sup in ECHELLES_SUP:
+    for regle, sfx, jour_sup in (ECHELLES_SUP if echelles is None
+                                 else echelles):
         m5, noms = _joint_echelle(m5, regle, sfx, jour_sup)
         cols_sup += noms
 

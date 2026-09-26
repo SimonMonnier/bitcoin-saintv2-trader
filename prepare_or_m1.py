@@ -47,6 +47,14 @@ import prepare_m5
 
 SYMBOLE = "XAUUSD"
 SORTIE = "data_cache_XAUUSD_M1.pkl"
+# LE BRUT, garde a part : barres, spread reel, agregat de ticks. Il permet de
+# reconstruire les features sans MetaTrader 5 quand on change de jeu.
+BRUT = "brut_XAUUSD_M1.pkl"
+
+# LES CONTEXTES SUPERIEURS DE L'OR M1 — 2026-09-26, choix du proprietaire :
+# M1, M5 et M15, et plus de H1 ni de H4. (regle de resample, suffixe,
+# bougies par journee a cette echelle.)
+ECHELLES_OR_M1 = [("5min", "_m5", 288), ("15min", "_m15", 96)]
 JOUR_M1 = 1440
 N_BARRES = 900_000
 
@@ -152,7 +160,38 @@ def agrege_ticks(symbole: str, debut: dt.datetime, fin: dt.datetime,
     return out.reset_index()
 
 
+def brut_depuis_cache() -> pd.DataFrame:
+    """Le brut, relu sans MetaTrader 5 : `BRUT` s'il existe, sinon l'ancien cache.
+
+    L'ANCIEN CACHE PORTE DEJA TOUT LE BRUT — barres, spread de chaque barre,
+    agregat de ticks — a cote des features qu'on veut recalculer. On en
+    extrait ces colonnes-la, on les ecrit dans `BRUT`, et l'ancien cache est
+    renomme plutot qu'ecrase : ses features H1/H4 restent disponibles.
+    """
+    import os
+    garder = ["time", "open", "high", "low", "close", "volume"] + COLONNES_TICKS
+    if os.path.exists(BRUT):
+        b = pd.read_pickle(BRUT)
+        print(f"brut : {len(b):,} barres relues depuis {BRUT}", flush=True)
+        return b
+    ancien = pd.read_pickle(SORTIE)
+    manque = [c for c in garder if c not in ancien.columns]
+    if manque:
+        raise RuntimeError(f"{SORTIE} ne porte pas le brut : {manque}")
+    b = ancien[garder].copy()
+    del ancien
+    b.to_pickle(BRUT)
+    os.replace(SORTIE, SORTIE.replace(".pkl", "_h1h4.pkl"))
+    print(f"brut : {len(b):,} barres extraites de l'ancien cache -> {BRUT} ; "
+          f"l'ancien cache est garde sous "
+          f"{SORTIE.replace('.pkl', '_h1h4.pkl')}", flush=True)
+    return b
+
+
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--depuis-cache":
+        m1 = brut_depuis_cache().sort_values("time").reset_index(drop=True)
+        return construit_et_ecrit(m1)
     n = int(sys.argv[1]) if len(sys.argv) > 1 else N_BARRES
     m1 = charge_barres(SYMBOLE, n).sort_values("time").reset_index(drop=True)
     print(f"barres : {len(m1):,} M1  {m1['time'].iloc[0]} -> {m1['time'].iloc[-1]}",
@@ -195,9 +234,16 @@ def main() -> int:
         m1[c] = m1[c].fillna(0.0)
     manquant = float((m1["tick_n"] == 0).mean())
     print(f"  minutes sans tick : {100*manquant:.2f} %", flush=True)
+    m1[["time", "open", "high", "low", "close", "volume"]
+       + COLONNES_TICKS].to_pickle(BRUT)
+    return construit_et_ecrit(m1)
 
+
+def construit_et_ecrit(m1: pd.DataFrame) -> int:
+    """Du brut M1 au cache : features M1, contextes M5 et M15, rangs."""
     # `construit` REND UN TUPLE (df, colonnes, ichimoku), pas un cadre.
-    d, _cols, _ich = prepare_m5.construit(m1, avec_flux=False, jour=JOUR_M1)
+    d, _cols, _ich = prepare_m5.construit(m1, avec_flux=False, jour=JOUR_M1,
+                                          echelles=ECHELLES_OR_M1)
     # `construit` MODIFIE SON ARGUMENT ET LE REND : `d` EST `m1`.
     #
     # Une premiere version faisait `d.merge(m1[...])` pour recoller les
@@ -260,6 +306,12 @@ def main() -> int:
           flush=True)
 
     from saint_core import FEATURE_COLS as _FC
+    # LA LISTE DE SAINT_CORE FAIT FOI : une colonne qu'elle attend et que le
+    # cache ne porte pas ferait lever `MarketData` trois heures plus tard.
+    _absentes = [c for c in _FC if c not in d.columns]
+    if _absentes:
+        raise RuntimeError(f"{len(_absentes)} colonnes de FEATURE_COLS absentes "
+                           f"du cache : {_absentes[:10]}")
     avant = len(d)
     d = d.replace([np.inf, -np.inf], np.nan)
     d = d.dropna(subset=[x for x in _FC if x in d.columns] + ["atr_14"])

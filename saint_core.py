@@ -394,7 +394,11 @@ FEATURE_COLS_TF = FEATURE_COLS_M1                      # calculees sur H1
 #
 # Le M1 reste hors de portee a toute largeur de stop : meme a 8xATR il exige
 # +0.114 R d'avantage, davantage que tout ce que ce depot a mesure.
-TIMEFRAME = "M5"
+#
+# M1 DEPUIS LE 2026-09-26 — l'or en scalping, choix du proprietaire. Ses
+# contextes sont le M5 et le M15 ; le H1 et le H4 sont RETIRES. Voir
+# `prepare_or_m1.ECHELLES_OR_M1`, qui les calcule.
+TIMEFRAME = "M1"
 # LES ECHELLES SUPERIEURES SONT UNE LISTE, de la plus proche a la plus
 # lointaine. En H1 il n'y en avait qu'une, le H4 ; en M5 on lit le H1 ET le H4.
 #
@@ -411,7 +415,8 @@ TIMEFRAME = "M5"
 # lequel ce mouvement s'inscrit. C'est exactement la lecture que prescrivent
 # les documents Ichimoku : trouver le signal sur son unite de temps, le valider
 # en basculant sur les unites superieures.
-ECHELLES_SUP = {"H1": ["_h4"], "M5": ["_h1", "_h4"]}[TIMEFRAME]
+ECHELLES_SUP = {"H1": ["_h4"], "M5": ["_h1", "_h4"],
+                "M1": ["_m5", "_m15"]}[TIMEFRAME]
 SUFFIXE_SUP = ECHELLES_SUP[0]       # le contexte immediat, celui du merge_asof
 FEATURE_COLS_SUP = [c.replace("_h1", SUFFIXE_SUP) for c in FEATURE_COLS_H1]
 
@@ -616,12 +621,19 @@ FEATURE_COLS_RANGS = [
     "flux_rang",    # rang glissant du volume agressif : purge ou erosion
 ]
 
+# L'INSTRUMENT ENTRAINE — UNE SEULE SOURCE, lue par
+# `training.PPOConfig.symbol`. L'or depuis le 2026-09-26.
+SYMBOLE = "XAUUSD"
+
+# LE FLUX BINANCE N'EXISTE QUE SUR LE BTC : un CFD ne publie pas ses
+# transactions. Voir `FEATURE_COLS_FLUX`.
 FEATURE_COLS = (FEATURE_COLS_TF + FEATURE_COLS_SUP
                 + FEATURE_COLS_EXT + FEATURE_COLS_LIQ_TEMPS
                 + FEATURE_COLS_RANGE + FEATURE_COLS_ICHIMOKU
                 + FEATURE_COLS_RANGE_SUP + FEATURE_COLS_ICHIMOKU_SUP
                 + FEATURE_COLS_SUP_LOINTAINES
-                + FEATURE_COLS_MICRO + FEATURE_COLS_FLUX
+                + FEATURE_COLS_MICRO
+                + (FEATURE_COLS_FLUX if SYMBOLE == "BTCUSD" else [])
                 + FEATURE_COLS_RANGS)
 
 N_BASE_FEATURES = len(FEATURE_COLS)

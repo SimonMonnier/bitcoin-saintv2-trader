@@ -46,6 +46,11 @@ import pandas as pd
 # est la source de verite ; la faire choisir ici la dedoublerait.
 import saint_core as S
 
+if S.TIMEFRAME == "M1":
+    # L'ECHELLE M1 A SON PROPRE TEST, sur la chaine de l'or : contextes M5
+    # et M15. Voir test_causalite_or_m1.py.
+    print("TIMEFRAME M1 : voir test_causalite_or_m1.py")
+    raise SystemExit(0)
 if S.TIMEFRAME == "M5":
     from prepare_m5 import construit
     SOURCE = "klines_5m_spot_BTCUSDT.pkl"

@@ -61,7 +61,7 @@ verifie("decisions aux barres 1, 16, 31, 46", quand == [1, 16, 31, 46],
 # ---------------------------------------------------------------- donnees
 cfg = T.PPOConfig()
 cfg.timeframe_entrainement = "M1"
-d = pd.read_pickle("data_cache_BTCUSD_M1.pkl").iloc[:200_000].reset_index(drop=True)
+d = pd.read_pickle("data_cache_%s_M1.pkl" % cfg.symbol).iloc[:200_000].reset_index(drop=True)
 
 
 class _Data:

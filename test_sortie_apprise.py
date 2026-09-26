@@ -365,7 +365,8 @@ print("\n9b. LE POINT MORT EST CELUI QUE L'ENVIRONNEMENT A FACTURE")
 # ============================================================
 import pandas as _pd
 from saint_core import FEATURE_COLS as _FC
-_df = _pd.read_pickle("data_cache_BTCUSD_M1.pkl").iloc[:60_000]
+_df = _pd.read_pickle(
+    "data_cache_%s_M1.pkl" % T.PPOConfig().symbol).iloc[:60_000]
 _df = _df.reset_index(drop=True)
 _st = T.compute_and_save_global_norm_stats(_df, _FC, path=None)
 _md = T.MarketData(_df, _FC, _st)
