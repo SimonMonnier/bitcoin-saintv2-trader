@@ -49,6 +49,19 @@ qu'un tel modele capte +3.3 bps par trade sur ses 2 % de signaux les plus
 forts, hors echantillon. L'expert joue d'abord SEUL la validation : c'est
 la reference que le PPO doit battre.
 
+LE SCORE DE L'EXPERT EST UNE ENTREE DU MODELE DEPUIS LE RUN
+kairos_jeu_btc04. `mesure_expert_val.py` : joue seul sur ses signaux les
+plus forts (rang glissant, sommet 0.5 a 2 %), l'expert gagne en
+validation sur 11 a 12 des 16 barrieres, jusqu'a +4.63 $/jour (PF 1.58).
+Le PPO, lui, glissait vers « ne jamais trader » : il devait reapprendre
+seul, depuis un signal a +0.04 de correlation, ce que l'expert avait deja
+trouve. Il recoit donc ses deux predictions et leur rang glissant
+(`features_expert`) et garde toutes les decisions : quand, quel sens,
+quel objectif, quel stop. AUCUNE FUITE : l'expert n'apprend que sur le
+train du fold 1 ; chaque bloc du train est note par un modele qui ne l'a
+pas appris ; tout le reste par le modele du train entier, comme en direct.
+Les deux modeles de l'expert sont sauvegardes pour le live.
+
 L'EXPERT N'ENSEIGNE QUE L'ENTREE — quand, et dans quel sens. Premier
 lancement, 2026-09-26 : imites, l'objectif et le stop etaient TOUJOURS
 8 ATR et 2 ATR — le coup qui rapporte le plus de R quand on connait
@@ -97,7 +110,7 @@ N_ETAT = 5          # le bloc de position de l'observation porte l'etat du jeu
 
 @dataclass
 class JeuConfig:
-    prefixe: str = "kairos_jeu_btc03"
+    prefixe: str = "kairos_jeu_btc04"
     cache: str = "data_cache_BTCUSD_M1.pkl"
     # --- le modele : celui du run PPO, a l'identique ---
     lookback: int = 4
@@ -159,6 +172,8 @@ class JeuConfig:
     expert_blocs: int = 4
     expert_pas_app: int = 5
     expert_arbres: int = 300
+    # Les colonnes de l'expert ajoutees a l'observation. Voir `features_expert`.
+    n_expert: int = 4
     # --- PPO ---
     lr: float = 5e-4
     gamma: float = 0.9995          # par minute
@@ -190,7 +205,8 @@ class PolitiqueJeu(SAINTPolicySingleHead):
 
     def __init__(self, cfg: JeuConfig):
         super().__init__(
-            n_features=OBS_N_FEATURES, d_model=cfg.d_model,
+            n_features=len(FEATURE_COLS) + cfg.n_expert + N_ETAT,
+            d_model=cfg.d_model,
             num_blocks=cfg.num_blocks, heads=cfg.heads, n_freq=cfg.n_freq,
             mlp_dim=cfg.mlp_dim, lecture="colonnes", dropout=0.05, ff_mult=2,
             max_len=cfg.lookback, n_actions=N_ACTIONS, n_ref=0)
@@ -692,7 +708,29 @@ def expert_realiste(Xn, y, n_tr: int, fin_pred: int, cfg: JeuConfig):
     ms = _modeles(app_tout)
     for s_ in range(2):
         pred[n_tr:fin_pred, s_] = ms[s_].predict(Xn[n_tr:fin_pred])
-    return pred
+    return pred, ms
+
+
+NOMS_EXPERT = ["expert_achat", "expert_vente",
+               "expert_rang_achat", "expert_rang_vente"]
+
+
+def features_expert(pred: np.ndarray, fenetre: int = 10_000) -> np.ndarray:
+    """(N, 4) : les deux predictions de l'expert et leur RANG GLISSANT.
+
+    Le rang compare la minute aux `fenetre` minutes PRECEDENTES (et a
+    elle-meme) : il ne lit que le passe, et il ne depend pas de l'echelle
+    des predictions — celle des blocs croises du train n'est pas celle du
+    modele appris sur tout le train. C'est sur ce rang que l'expert, joue
+    seul, gagnait en validation.
+    """
+    out = np.zeros((len(pred), 4), np.float32)
+    for s_ in range(2):
+        q = pd.Series(pred[:, s_].astype(np.float64))
+        out[:, s_] = q.fillna(0.0).to_numpy()
+        out[:, 2 + s_] = (q.rolling(fenetre, min_periods=min(2_000, fenetre))
+                          .rank(pct=True).fillna(0.5).to_numpy())
+    return out
 
 
 def _ref(cfg: JeuConfig):
@@ -935,8 +973,35 @@ def main() -> int:
     t0 = time.time()
     R0, D0, _ = table_coups(o, h, l, sp, atr, cfg, 0.0)
     R1, D1, S1 = table_coups(o, h, l, sp, atr, cfg, 1.0)
-    print(f"  table des coups : {N:,} minutes x 18 coups, sans cout et au cout "
-          f"reel, {time.time() - t0:.0f} s", flush=True)
+    print(f"  table des coups : {N:,} minutes x {R1[0].size} coups, sans cout et "
+          f"au cout reel, {time.time() - t0:.0f} s", flush=True)
+
+    # L'EXPERT, APPRIS SUR LE TRAIN DU FOLD 1 SEULEMENT. Voir l'en-tete.
+    t_ex = time.time()
+    y_ex = cibles_expert(R1)
+    pred, modeles_expert = expert_realiste(Xn, y_ex, n_tr, N, cfg)
+    for s_, nom in enumerate(("achat", "vente")):
+        modeles_expert[s_].booster_.save_model(f"expert_{cfg.prefixe}_{nom}.txt")
+    FE = features_expert(pred)
+    m_e = FE[:n_tr].astype(np.float64).mean(0)
+    s_e = FE[:n_tr].astype(np.float64).std(0)
+    FEn = np.clip((FE - m_e) / (s_e + 1e-8), -5.0, 5.0).astype(np.float32)
+    Xn = np.concatenate([Xn, FEn[:, :cfg.n_expert]], axis=1)
+    stats = {"mean": np.concatenate([stats["mean"], m_e[:cfg.n_expert].astype(np.float32)]),
+             "std": np.concatenate([stats["std"], s_e[:cfg.n_expert].astype(np.float32)])}
+    noms_entree = list(FEATURE_COLS) + NOMS_EXPERT[:cfg.n_expert]
+    np.savez(f"{cfg.prefixe}_norm.npz", mean=stats["mean"], std=stats["std"],
+             features=np.array(noms_entree))
+    ics = []
+    for s_ in range(2):
+        ok = np.isfinite(y_ex[n_tr:n_tr + n_va, s_])
+        ics.append(pd.Series(pred[n_tr:n_tr + n_va, s_][ok]).corr(
+            pd.Series(y_ex[n_tr:n_tr + n_va, s_][ok]), method="spearman"))
+    print(f"  expert  LightGBM appris sur le train du fold 1, {time.time() - t_ex:.0f} s ; "
+          f"correlation avec le R moyen en validation : achat {ics[0]:+.3f}, "
+          f"vente {ics[1]:+.3f} ; {cfg.n_expert} colonnes ajoutees au modele "
+          f"({len(noms_entree)} en tout), modeles sauvegardes "
+          f"expert_{cfg.prefixe}_*.txt", flush=True)
 
     policy = PolitiqueJeu(cfg).to(device)
     optims = optimiseurs(policy, cfg)
@@ -964,30 +1029,12 @@ def main() -> int:
             print(f"  reprend {precedent}", flush=True)
         depart_zero = precedent is None
         if depart_zero:
-            t_ex = time.time()
-            y_ex = cibles_expert(R1)
-            pred = expert_realiste(Xn, y_ex, a_va, a_te, cfg)
-            ics = []
-            for s_ in range(2):
-                ok = np.isfinite(pred[a_va:a_te, s_]) & np.isfinite(y_ex[a_va:a_te, s_])
-                ics.append(pd.Series(pred[a_va:a_te, s_][ok]).corr(
-                    pd.Series(y_ex[a_va:a_te, s_][ok]), method="spearman"))
-            vmax = np.nanmax(pred[:a_va], axis=1)
-            seuil = max(0.0, float(np.nanquantile(vmax, 1 - 2.0 * cfg.jetons / 1440)))
-            print(f"  expert  realiste : LightGBM appris sur le passe, "
-                  f"{time.time() - t_ex:.0f} s — correlation avec le R moyen "
-                  f"en validation : achat {ics[0]:+.3f}, vente {ics[1]:+.3f}", flush=True)
-            se, ce = joue_expert(j_va, pred, R1, D1, S1, a_te, seuil, cfg)
-            be = bilan(se, ce, c, atr, sp, cfg)
-            print(f"  expert  JOUE SEUL LA VALIDATION (seuil {seuil:+.3f} R) : "
-                  f"{ligne_bilan(be, cfg)}", flush=True)
             pos = coups_expert_predits(j_tr, pred, D1, a_va, cfg)
             ri_, rj_ = _ref(cfg)
             r_pos = [float(R1[q[0], q[1], ri_, rj_]) for q in pos]
             print(f"  expert  ses coups d'entrainement ont rapporte "
                   f"{np.mean(r_pos) if r_pos else float('nan'):+.3f} R en moyenne "
                   f"(predits sans les avoir appris)", flush=True)
-            del pred, y_ex
             imite_expert(policy, optims, pos, j_tr, Xn, a_va, cfg, device, rng)
         best_path = f"best_{cfg.prefixe}{suffixe}.pth"
         record = 0.0
@@ -1026,7 +1073,7 @@ def main() -> int:
                       f"H barrieres {st['Hb']:.3f}/1.099  KL {st['kl']:+.4f}  "
                       f"clip {100 * st['clip']:.0f}%  critique {st['v']:.4f}", flush=True)
             etat = {"modele": policy.state_dict(), "config": asdict(cfg),
-                    "features": list(FEATURE_COLS), "mean": stats["mean"],
+                    "features": noms_entree, "mean": stats["mean"],
                     "std": stats["std"], "epoch": epoch, "fold": fold + 1}
             torch.save(etat, f"last_{cfg.prefixe}{suffixe}.pth")
             if bv["coups"] >= cfg.min_coups_val and bv["score"] > record:

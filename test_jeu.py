@@ -96,7 +96,7 @@ verifie("plancher : le cout ne depasse jamais ~0.2 R au plus petit stop",
 
 print("\n2. LES REGLES DES PARTIES")
 torch.manual_seed(0)
-cfgj = replace(J.JeuConfig(), horizon_max=10, jetons=3, lookback=4)
+cfgj = replace(J.JeuConfig(), horizon_max=10, jetons=3, lookback=4, n_expert=0)
 pol = J.PolitiqueJeu(cfgj)
 g = pol.groupes_jeu()
 verifie("six groupes, dont les quatre tetes", sorted(g) ==
@@ -185,9 +185,21 @@ verifie("son score est la somme de ses coups",
         abs(sx.sum() - sum(c_[5] for c_ in kx)) < 1e-9)
 Xg = np.random.default_rng(3).normal(0, 1, (M, N_BASE_FEATURES)).astype(np.float32)
 cfgx = replace(cfgj, expert_arbres=20, expert_blocs=2, expert_pas_app=3)
-px = J.expert_realiste(Xg, yx, 2000, 2400, cfgx)
+px, _mx = J.expert_realiste(Xg, yx, 2000, 2400, cfgx)
 verifie("l'expert predit le train et la validation, rien au-dela",
         np.isfinite(px[:2400]).all() and np.isnan(px[2400:]).all())
+
+fe = J.features_expert(px, fenetre=500)
+verifie("les colonnes de l'expert n'ont aucun trou", np.isfinite(fe).all())
+px2 = px.copy()
+px2[1500:] = 99.0
+fe2 = J.features_expert(px2, fenetre=500)
+verifie("le rang de l'expert ne lit que le passe",
+        np.array_equal(fe[:1500], fe2[:1500]))
+pj = J.PolitiqueJeu(replace(cfgj, n_expert=4))
+xj = torch.zeros(2, 4, N_BASE_FEATURES + 4 + J.N_ETAT)
+verifie("le modele lit les 71 colonnes, les 4 de l'expert et l'etat",
+        pj.jeu(xj)[0].shape == (2, 3))
 
 print("\n5. UNE MISE A JOUR PPO ET UNE PASSE D'IMITATION")
 pol2 = J.PolitiqueJeu(cfgj)
