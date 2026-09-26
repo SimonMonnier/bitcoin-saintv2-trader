@@ -35,7 +35,9 @@ if (-not (Test-Path -LiteralPath $python)) {
 }
 
 $journal = Join-Path $PSScriptRoot 'training_btc.log'
-$prefixe = 'saintv2_btc_m1_scalp02'
+$prefixe = 'kairos_jeu_btc01'
+# LE JEU DEPUIS LE 2026-09-26 : `jeu_kairos.py` remplace `training.py`.
+$script = 'jeu_kairos.py'
 
 Write-Host ''
 Write-Host '  KAIROS - lancement' -ForegroundColor Cyan
@@ -45,7 +47,8 @@ Write-Host ''
 # Deux entrainements en parallele ecrivent dans le MEME journal et se
 # disputent le GPU. Le second parait lent sans raison.
 $vieux = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-           Where-Object { $_.CommandLine -like '*training.py*' })
+           Where-Object { $_.CommandLine -like '*training.py*' -or
+                          $_.CommandLine -like '*jeu_kairos.py*' })
 if ($vieux.Count -gt 0) {
     foreach ($v in $vieux) {
         Stop-Process -Id $v.ProcessId -Force -ErrorAction SilentlyContinue
@@ -71,7 +74,8 @@ if (Test-Path -LiteralPath $journal) {
 # Elle fait donc echouer toute relance tant qu'on ne l'a pas levee.
 $n = 0
 foreach ($motif in @("run_$prefixe*.json", "best_$prefixe*.pth",
-                     "last_$prefixe*.pth", "bestprofit_$prefixe*.pth")) {
+                     "last_$prefixe*.pth", "bestprofit_$prefixe*.pth",
+                     "test_$prefixe*.json")) {
     foreach ($f in @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter $motif -ErrorAction SilentlyContinue)) {
         Move-Item -LiteralPath $f.FullName -Destination (Join-Path $dossier $f.Name) -Force
         $n++
@@ -113,7 +117,7 @@ $env:PYTHONIOENCODING = 'utf-8'
 $cmd = "`$env:PYTHONUNBUFFERED='1'; `$env:PYTHONIOENCODING='utf-8'; " +
        "Write-Host '  entrainement en cours - la lecture se fait dans la veille' -ForegroundColor Green; " +
        "Write-Host '  NE PAS FERMER cette fenetre' -ForegroundColor Yellow; " +
-       "cmd /c '`"$python`" training.py > `"$journal`" 2>&1'"
+       "cmd /c '`"$python`" $script > `"$journal`" 2>&1'"
 Start-Process powershell -ArgumentList '-NoExit','-ExecutionPolicy','Bypass','-Command',$cmd `
     -WorkingDirectory $PSScriptRoot
 Write-Host '  entrainement lance dans sa fenetre' -ForegroundColor Green
