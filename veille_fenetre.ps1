@@ -130,13 +130,47 @@ Write-Host ''
 # entre deux. Une epoch dure cinq minutes ; la fenetre restait donc muette
 # cinq minutes d'affilee, ce qui est indistinguable d'une fenetre cassee.
 # Une veille qui ne dit pas « je travaille » ne sert a rien.
-$essentiel = '^(EPOCH |  (PnL|train |sens |tenue |sommet du tri|sommet \d+ min|critere net|sauvegarde |evolution )|  phase  (PPO (entree|sortie)|marge entree|avantage brut|cout entrainement)|\[COLLECTE\]|SORTIE |CIBLE |          (une seule|AUCUN plafond|SHORT)|  (non )?retenu|  garde |  . NEW BEST|  . REFUSE|    a battu|  jeu |  expert |  reprend |FIN |=== |--- Fold |Traceback|.*Error)'
+$essentiel = '^(EPOCH |  (PnL|train |sens |tenue |sommet du tri|sommet \d+ min|critere net|sauvegarde |evolution )|  phase  (PPO (entree|sortie)|marge entree|avantage brut|cout entrainement)|\[COLLECTE\]|SORTIE |CIBLE |          (une seule|AUCUN plafond|SHORT)|  (non )?retenu|  garde |  . NEW BEST|  . REFUSE|    a battu|  expert |  reprend |FIN |=== |--- Fold |Traceback|.*Error)'
 
 # LE DETAIL : tout le reste — diagnostics, phases du reseau, cadence.
 $detaille = '^(EPOCH |  (PnL|point mort|classement|sommet du tri|sommet \d+ min|vs |sens |actions |entrees |critere net|sauvegarde |evolution |dimension|train |tenue |phase |cadence |\. |temps :)|\[COLLECTE\]|          SHORT|  (non )?retenu|  garde |  . NEW BEST|  jeu |  expert |  reprend |  (normalisation|table des coups|modele|regles|un R) |TEST |FIN |=== |--- Fold |Traceback|.*Error)'
 
 $garde = if ($Detail) { $detaille } else { $essentiel }
 $ansi = [regex]"$([char]27)\[[0-9;]*m"
+$esc = [char]27
+$inv = [Globalization.CultureInfo]::InvariantCulture
+
+# LE VERDICT DU JEU, EN CLAIR - 2026-09-26, demande du proprietaire : 'je
+# ne comprends rien a ce qu'il faut regarder pour savoir si le modele est
+# rentable'. Les lignes du jeu sont techniques ; la question, elle, est
+# simple. Chaque epoch se resume donc a UNE ligne : rentable ou pas, en
+# dollars par jour, sur les journees de validation que le modele n'a jamais
+# vues. Vert si l'on gagne, rouge si l'on perd. La vue detaillee garde tout.
+function Verdict([string]$nu) {
+    if ($nu -match '^EPOCH (\d+)\s+(.+?)\s+VAL\s+score ([+-][0-9.]+) R/partie \(([+-][0-9.]+)\$\)\s+gagnees (\d+)% perdues \d+% sur (\d+)\s+coups (\d+) \(([0-9.]+)/partie') {
+        # COPIE D'ABORD : un -match reussi plus bas ecraserait $Matches.
+        $m = $Matches.Clone()
+        $dol = [double]::Parse($m[4], $inv)
+        $c = if ($dol -gt 0) { '32' } else { '31' }
+        $mot = if ($dol -gt 0) { 'OUI' } else { 'NON' }
+        $niv = if ($m[2] -match 'EXPERT') { 'apres imitation de l expert' } else { "entrainement a $($m[2] -replace 'cout ', '') du cout reel" }
+        return @('', "EPOCH $($m[1])   ($niv)",
+                 "$esc[1;$($c)m  RENTABLE ?  $mot   $($m[4]) dollars par jour$esc[0m   (validation : $($m[6]) jours jamais vus, $($m[5])% de jours gagnants, $($m[8]) trades par jour)")
+    }
+    if ($nu -match '^EPOCH (\d+)\s+(.+?)\s+VAL\s+parties (\d+)\s+AUCUN COUP JOUE') {
+        return @('', "EPOCH $($Matches[1])",
+                 "$esc[1;33m  RENTABLE ?  NON   aucun trade joue sur les $($Matches[3]) jours de validation$esc[0m")
+    }
+    if ($nu -match '^TEST fold (\d+) \(([^)]*)\)\s+score ([+-][0-9.]+) R/partie \(([+-][0-9.]+)\$\)\s+gagnees (\d+)% perdues \d+% sur (\d+)') {
+        $dol = [double]::Parse($Matches[4], $inv)
+        $c = if ($dol -gt 0) { '32' } else { '31' }
+        return @('', "$esc[1;$($c)m  RESULTAT FINAL du fold $($Matches[1]) sur des jours JAMAIS utilises : $($Matches[4]) dollars par jour ($($Matches[5])% de jours gagnants sur $($Matches[6]))$esc[0m", '')
+    }
+    if ($nu -match '^  sauvegarde  NOUVEAU MEILLEUR : ([+-][0-9.]+) R/partie') {
+        return @("$esc[1;32m  >>> MODELE SAUVEGARDE : le plus rentable jusqu ici en validation$esc[0m")
+    }
+    return $null
+}
 
 $flux = $null
 $lecteur = $null
@@ -205,6 +239,13 @@ while ($true) {
         # le second passe par la mise en forme de PowerShell, qui peut les
         # echapper selon l'hote.
         $nu = $ansi.Replace($ligne, '')
+        $v = Verdict $nu
+        if ($null -ne $v) {
+            foreach ($x in $v) { [Console]::Out.WriteLine($x) }
+            if (-not $Detail) { continue }
+        }
+        # LE REFUS DE SAUVEGARDER EST DEJA DIT PAR LE VERDICT.
+        if (-not $Detail -and $nu -match '^  garde  rien de sauvegarde') { continue }
         if ($nu -match $garde) {
             # UNE LIGNE VIDE AVANT CHAQUE EPOCH. Sans separation les blocs
             # se collent et l'oeil ne retrouve plus ou commence l'epoch
