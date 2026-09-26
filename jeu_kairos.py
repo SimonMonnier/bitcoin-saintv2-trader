@@ -110,7 +110,7 @@ N_ETAT = 5          # le bloc de position de l'observation porte l'etat du jeu
 
 @dataclass
 class JeuConfig:
-    prefixe: str = "kairos_jeu_btc04"
+    prefixe: str = "kairos_jeu_btc05"
     cache: str = "data_cache_BTCUSD_M1.pkl"
     # --- le modele : celui du run PPO, a l'identique ---
     lookback: int = 4
@@ -174,6 +174,22 @@ class JeuConfig:
     expert_arbres: int = 300
     # Les colonnes de l'expert ajoutees a l'observation. Voir `features_expert`.
     n_expert: int = 4
+    # LA PORTE D'ENTREE — 2026-09-26, run kairos_jeu_btc05.
+    #
+    # `analyse_jeu_val.py`, validation du fold 1, trade par trade, sur les
+    # deux modeles du run btc04 (epochs 39 et 40) :
+    #
+    #     rang de l'expert (sens joue)   epoch 39             epoch 40
+    #     les 2 % du sommet              +0.092 R  PF 1.34    +0.116 R  PF 1.45
+    #     de 2 % a 10 %                  +0.012 R  PF 1.04    +0.015 R  PF 1.05
+    #     au-dela de 10 %                -0.034 R  PF 0.88    -0.167 R  PF 0.54
+    #
+    # Pres de la moitie des coups se prenaient au-dela des 10 %, et c'etaient
+    # eux qui perdaient. Un achat n'est donc PERMIS que si le rang de
+    # l'expert a l'achat est au moins `porte_rang_expert`, une vente de meme.
+    # A l'interieur de la porte, le PPO et les quatre tetes decident de tout :
+    # entrer ou non, le sens, l'objectif, le stop. 0 = pas de porte.
+    porte_rang_expert: float = 0.90
     # --- PPO ---
     lr: float = 5e-4
     gamma: float = 0.9995          # par minute
@@ -409,11 +425,25 @@ def observations(Xn: np.ndarray, t: np.ndarray, etat: np.ndarray, L: int):
 _NEG = -1e9
 
 
-def _masque_logits(le: torch.Tensor, peut: torch.Tensor) -> torch.Tensor:
+def _masque_logits(le: torch.Tensor, peut_achat: torch.Tensor,
+                   peut_vente: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """ATTENDRE est toujours permis ; acheter et vendre chacun selon sa porte."""
+    if peut_vente is None:
+        peut_vente = peut_achat
     m = torch.zeros_like(le)
-    m[:, ACHETER] = torch.where(peut, 0.0, _NEG)
-    m[:, VENDRE] = torch.where(peut, 0.0, _NEG)
+    m[:, ACHETER] = torch.where(peut_achat, 0.0, _NEG)
+    m[:, VENDRE] = torch.where(peut_vente, 0.0, _NEG)
     return le + m
+
+
+def portes(peut: np.ndarray, t: np.ndarray, rangs, cfg: JeuConfig):
+    """(achat permis, vente permise) : les regles du jeu, puis la porte de
+    l'expert. `rangs` (N, 2) sont les rangs glissants bruts de
+    `features_expert` ; None = pas de porte."""
+    g = float(getattr(cfg, "porte_rang_expert", 0.0))
+    if rangs is None or g <= 0.0:
+        return peut, peut
+    return peut & (rangs[t, 0] >= g), peut & (rangs[t, 1] >= g)
 
 
 def _choix(logits: torch.Tensor, explore: bool, gen=None) -> torch.Tensor:
@@ -440,7 +470,7 @@ def departs_tires(jours: np.ndarray, rng, marge: int = 240) -> np.ndarray:
 
 def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
          cfg: JeuConfig, device, explore: bool, gen=None,
-         collecte: bool = False):
+         collecte: bool = False, rangs=None):
     """Joue toutes les parties de `jours` EN PARALLELE.
 
     Rend (scores (G,), coups (liste de tuples), transitions par partie ou
@@ -464,11 +494,14 @@ def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
         et = etat_jeu(jet[g], score[g], fin[g] - tt, cfg)
         ob = observations(Xn, tt, et, L)
         peut_np = (jet[g] > 0) & (tt + 1 + H < fin_valide)
+        # LA PORTE DE L'EXPERT, par sens. Voir `porte_rang_expert`.
+        pa_np, pv_np = portes(peut_np, tt, rangs, cfg)
         with torch.no_grad():
             x = torch.from_numpy(ob).to(device)
-            peut = torch.from_numpy(peut_np).to(device)
+            pa_t = torch.from_numpy(pa_np).to(device)
+            pv_t = torch.from_numpy(pv_np).to(device)
             le, v, ltp, lsl = policy.jeu(x)
-            le = _masque_logits(le, peut)
+            le = _masque_logits(le, pa_t, pv_t)
             a = _choix(le, explore, gen)
             sidx = (a == VENDRE).long()
             ar = torch.arange(len(g), device=device)
@@ -501,7 +534,9 @@ def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
         actif[g[fini]] = False
         if collecte:
             for q in range(len(g)):
-                trans[g[q]].append((int(tt[q]), et[q], bool(peut_np[q]),
+                # LES DEUX PORTES, codees : bit 0 achat, bit 1 vente.
+                trans[g[q]].append((int(tt[q]), et[q],
+                                    int(pa_np[q]) + 2 * int(pv_np[q]),
                                     int(a[q]), int(i[q]), int(j[q]),
                                     float(lp_e[q]), float(lp_i[q]),
                                     float(lp_j[q]), float(v[q]), float(r[q]),
@@ -581,7 +616,8 @@ def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng):
             b = perm[d0:d0 + cfg.minibatch]
             x = T(observations(Xn, tt[b], et[b], L))
             le, v, ltp, lsl = policy.jeu(x)
-            le = _masque_logits(le, T(peut[b], torch.bool))
+            le = _masque_logits(le, T((peut[b] & 1) > 0, torch.bool),
+                                T((peut[b] & 2) > 0, torch.bool))
             ab = T(a[b], torch.long)
             wb, Ab = T(w[b]), T(advn[b])
             logp = torch.log_softmax(le, -1)
@@ -983,6 +1019,8 @@ def main() -> int:
     for s_, nom in enumerate(("achat", "vente")):
         modeles_expert[s_].booster_.save_model(f"expert_{cfg.prefixe}_{nom}.txt")
     FE = features_expert(pred)
+    # Les rangs BRUTS, pour la porte d'entree (pas les colonnes normalisees).
+    rangs_ex = FE[:, 2:4].copy()
     m_e = FE[:n_tr].astype(np.float64).mean(0)
     s_e = FE[:n_tr].astype(np.float64).std(0)
     FEn = np.clip((FE - m_e) / (s_e + 1e-8), -5.0, 5.0).astype(np.float32)
@@ -999,7 +1037,9 @@ def main() -> int:
             pd.Series(y_ex[n_tr:n_tr + n_va, s_][ok]), method="spearman"))
     print(f"  expert  LightGBM appris sur le train du fold 1, {time.time() - t_ex:.0f} s ; "
           f"correlation avec le R moyen en validation : achat {ics[0]:+.3f}, "
-          f"vente {ics[1]:+.3f} ; {cfg.n_expert} colonnes ajoutees au modele "
+          f"vente {ics[1]:+.3f} ; {cfg.n_expert} colonnes ajoutees au modele ; "
+          f"porte d'entree : rang de l'expert >= {cfg.porte_rang_expert:g} dans "
+          f"le sens joue "
           f"({len(noms_entree)} en tout), modeles sauvegardes "
           f"expert_{cfg.prefixe}_*.txt", flush=True)
 
@@ -1053,14 +1093,14 @@ def main() -> int:
                                    replace=False)
                 sc, cp, tr = joue(policy, departs_tires(j_tr[choix], rng), Xn,
                                   Rf, Df, S1, a_va, cfg, device, explore=True,
-                                  collecte=True)
+                                  collecte=True, rangs=rangs_ex)
                 b_tr = bilan(sc, cp, c, atr, sp, cfg, frac=frac)
                 st = maj_ppo(policy, optims, avantages(tr, cfg), Xn, cfg, device, rng)
                 del Rf
             gen = torch.Generator(device=device)
             gen.manual_seed(cfg.graine)
             sv, cv, _ = joue(policy, j_va, Xn, R1, D1, S1, a_te, cfg, device,
-                             explore=False, gen=gen)
+                             explore=False, gen=gen, rangs=rangs_ex)
             bv = bilan(sv, cv, c, atr, sp, cfg)
             nom = "EXPERT IMITE" if epoch == 0 else f"cout {100 * frac:.0f}%"
             print(f"\nEPOCH {epoch:03d}  {nom:>12}  VAL  {ligne_bilan(bv, cfg)}  "
@@ -1098,7 +1138,7 @@ def main() -> int:
         gen = torch.Generator(device=device)
         gen.manual_seed(cfg.graine)
         s_t, c_t, _ = joue(policy, j_te, Xn, R1, D1, S1, f_te, cfg, device,
-                           explore=False, gen=gen)
+                           explore=False, gen=gen, rangs=rangs_ex)
         bt = bilan(s_t, c_t, c, atr, sp, cfg)
         print(f"\nTEST fold {fold + 1} ({os.path.basename(src)})  {ligne_bilan(bt, cfg)}",
               flush=True)

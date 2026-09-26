@@ -141,6 +141,23 @@ for gg in range(3):
 verifie("la partie s'arrete quand la vie est perdue", fin_vie,
         " ".join(f"{x:+.2f}" for x in sc3))
 
+cfgp = replace(cfgj, porte_rang_expert=0.9)
+rg = np.zeros((M, 2), np.float32)
+rg[[150, 400, 1100], 0] = 0.95          # trois minutes ou l'achat est permis
+_, cpp, trp = J.joue(pol, jours, Xn, R, D, S, 2800, cfgp, "cpu", explore=False,
+                     collecte=True, rangs=rg)
+verifie("la porte : on n'achete qu'aux minutes ou le rang le permet",
+        sorted(c_[1] for c_ in cpp) == [150, 400, 1100], str([c_[1] for c_ in cpp]))
+verifie("les portes sont gardees pour la mise a jour (bit 0 achat, bit 1 vente)",
+        all(x[2] in (0, 1) for tr_ in trp for x in tr_)
+        and any(x[2] == 1 for tr_ in trp for x in tr_))
+_, cp0, _ = J.joue(pol, jours, Xn, R, D, S, 2800, cfgp, "cpu", explore=False, rangs=None)
+verifie("sans rangs, pas de porte", len(cp0) == 9)
+lg_ = J._masque_logits(torch.zeros(2, 3), torch.tensor([True, False]),
+                       torch.tensor([False, True]))
+verifie("le masque traite l'achat et la vente separement",
+        lg_[0, 0] == 0 and lg_[0, 1] < -1e8 and lg_[1, 0] < -1e8 and lg_[1, 1] == 0)
+
 print("\n3. L'OBSERVATION NE LIT QUE LE PASSE")
 et = J.etat_jeu(np.array([3]), np.array([0.0]), np.array([500]), cfgj)
 a = J.observations(Xn, np.array([500]), et, 4)
