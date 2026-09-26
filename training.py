@@ -1233,33 +1233,21 @@ class PPOConfig:
     # empeche d'apprendre quoi que ce soit.
     entropie_entree: float = 0.01
 
-    # LA PENALITE D'ATTENTE — demande du proprietaire, 2026-09-26.
+    # LA PENALITE D'ATTENTE A ETE RETIREE LE 2026-09-26, a la demande du
+    # proprietaire, apres un run complet : elle faisait revenir des trades
+    # en validation, mais des trades perdants, et la politique repartait
+    # vers l'attente des qu'elle baissait. La litterature ne connait aucune
+    # validation d'une contrainte d'activite : elle force des trades, elle
+    # ne cree pas d'avantage. Son code est dans l'historique git.
     #
-    # CE QUI L'IMPOSE. Chaque trade coute en moyenne le spread (-0.064 de
-    # recompense, mesure sous une politique au hasard, achat et vente
-    # identiques), attendre ne coute rien : PPO apprend donc a attendre, et
-    # c'est la reponse CORRECTE a ces recompenses — verifie sur un cas
-    # connu, l'attente passe de 33 % a 54 % en quatre mises a jour. En
-    # validation, l'action la plus probable devient « attendre » partout :
-    # zero trade a l'epoch 3.
-    #
-    # UNE PENALITE QUI S'AJUSTE SEULE, PAS UN COUT FIXE. Un cout fixe trop
-    # fort ferait trader a perte partout ; trop faible, il ne changerait
-    # rien — et on ne connait pas le bon niveau d'avance. On vise une
-    # ACTIVITE : que l'action la plus probable ouvre sur `cible_ouverture`
-    # des minutes a plat, mesure sur les etats de la collecte. En dessous,
-    # la penalite de chaque attente monte de `pas_penalite_attente` x
-    # l'ecart ; au-dessus, elle redescend, jusqu'a zero.
-    #
-    # ELLE NE TOUCHE QUE CE QUE PPO APPREND. La recompense des attentes est
-    # diminuee dans la mise a jour ; le PnL, les trades et le critere de
-    # sauvegarde restent ceux du marche.
-    cible_ouverture: float = 0.05
-    # 0.3 : sous la cible, la penalite gagne ~0.015 par epoch et atteint en
-    # deux ou trois epochs l'ordre de grandeur d'un trade rate (0.064 sur
-    # ~2 minutes, soit ~0.03 par minute). A 0.1, il en fallait six.
-    pas_penalite_attente: float = 0.3
-    penalite_attente_max: float = 0.1
+    # LE TEST D'AVANTAGE BRUT LA REMPLACE. L'entrainement se joue SANS
+    # COUT — spread et glissement a zero — pendant que la validation et le
+    # test gardent les couts reels et decident seuls de la sauvegarde. La
+    # validation separe, trade par trade, le mouvement capte du cout paye
+    # (ligne `avantage brut`). Si l'agent, libere du spread, ne trouve pas
+    # un mouvement brut superieur a ~1.6 bps par trade, aucune feature
+    # directionnelle de plus n'a de chance de le rendre rentable.
+    entrainement_sans_cout: bool = True
     pas_profit_par_epoch: int = 0
     # L'HORIZON SUR LEQUEL ELLE JUGE — ET IL FIXE AUSSI CELUI DE L'ENTREE.
     #
@@ -4516,8 +4504,7 @@ def _sous_lot(n, cfg):
     return idx
 
 
-def maj_ppo_entree(policy, ep_buf, optims, cfg, device,
-                   penalite_attente: float = 0.0):
+def maj_ppo_entree(policy, ep_buf, optims, cfg, device):
     """La mise a jour PPO des tetes d'ACHAT et de VENTE, et du tronc.
 
     Rend un dict de diagnostics, ou None s'il y a trop peu de decisions.
@@ -4527,12 +4514,7 @@ def maj_ppo_entree(policy, ep_buf, optims, cfg, device,
     for b in ep_buf:
         if not b["actions"]:
             continue
-        # CHAQUE ATTENTE PAIE LA PENALITE du moment. Voir
-        # `cible_ouverture`.
-        _r = (np.asarray(b["rewards"], np.float64)
-              - float(penalite_attente)
-              * (np.asarray(b["actions"]) == ATTENDRE))
-        adv, ret = avantages_semi_mdp(_r, b["dts"], b["vals"],
+        adv, ret = avantages_semi_mdp(b["rewards"], b["dts"], b["vals"],
                                       b["dones"], gam, lam)
         O.extend(b["states"]); M.extend(b["masques"]); A.extend(b["actions"])
         LP.extend(b["lps"]); ADV.extend(adv); RET.extend(ret)
@@ -4565,8 +4547,7 @@ def maj_ppo_entree(policy, ep_buf, optims, cfg, device,
             lg_ = avant(mm)[0]
             hs.append(torch.distributions.Categorical(logits=lg_).entropy())
             # OU L'ACTION LA PLUS PROBABLE OUVRIRAIT, sous la politique qui
-            # SORT de la mise a jour : c'est elle que la penalite d'attente
-            # doit regler. Voir `cible_ouverture`.
+            # SORT de la mise a jour : c'est ce que la validation jouera.
             ouv.append(lg_.argmax(-1) != ATTENDRE)
         st["H"] = float(torch.cat(hs).mean())
         st["taux_argmax"] = float(torch.cat(ouv).float().mean())
@@ -5514,6 +5495,16 @@ class BTCTradingEnvDiscrete(gym.Env):
 
         self.risk_scale = 1.0
         self.last_risk_scale = 1.0
+        # SANS COUT : spread et glissement a zero. Vrai pour les seuls
+        # environnements d'ENTRAINEMENT, et seulement si
+        # `entrainement_sans_cout` le demande. La validation et le test
+        # gardent toujours les couts reels.
+        #
+        # ICI, A LA CREATION, ET SURTOUT PAS DANS `reset`. La premiere
+        # version le posait dans `reset` : chaque debut d'episode effacait
+        # le mode, et l'entrainement aurait paye les couts sans que rien ne
+        # le signale. C'est le test de l'environnement qui l'a vu.
+        self.sans_cout = False
         self.reset()
 
     # ---------- Curriculum vol ----------
@@ -6341,7 +6332,7 @@ UNE SEULE SOURCE pour les trois boucles — rollout, validation, test.
     def _apply_micro(self, price: float, side: int, is_entry: bool = True) -> float:
         """Convertit une bougie BID en prix BUY/SELL exécutable."""
         price = execution_quote(price, side, self.current_trade_spread_bps)
-        if is_entry and self.cfg.entry_slippage_bps > 0:
+        if is_entry and self.cfg.entry_slippage_bps > 0 and not self.sans_cout:
             extra = np.random.uniform(0.0, self.cfg.entry_slippage_bps) / 10_000.0
             price *= (1 + side * extra)
         return price
@@ -6380,6 +6371,9 @@ UNE SEULE SOURCE pour les trois boucles — rollout, validation, test.
         nulle, et le run paraitrait rentable pour une raison purement
         comptable.
         """
+        # SANS COUT : le test d'avantage brut. Voir `entrainement_sans_cout`.
+        if self.sans_cout:
+            return 0.0
         i = min(max(self.idx - 1, 0), len(self.data.spread_bar) - 1)
         reel = float(self.data.spread_bar[i])
         if reel > 0.0:
@@ -6923,7 +6917,8 @@ UNE SEULE SOURCE pour les trois boucles — rollout, validation, test.
                 if True:
                     # SL/sortie au marché: slippage adverse. TP: niveau cible,
                     # sans amélioration favorable systématique inventée.
-                    slip_max = self.cfg.slippage_bps / 10_000.0
+                    slip_max = (0.0 if self.sans_cout
+                                else self.cfg.slippage_bps / 10_000.0)
                     if slip_max > 0 and not h_tp:
                         slip_amount = exit_price * np.random.uniform(0.0, slip_max)
                         # Une sortie au marche (temps ecoule) traverse le
@@ -7002,7 +6997,8 @@ UNE SEULE SOURCE pour les trois boucles — rollout, validation, test.
                 sens = int(self._p_sens[j])
                 exit_price = self._apply_micro(price, -sens, is_entry=False)
                 slip = (np.random.uniform(0.0, self.cfg.slippage_bps) / 10000.0
-                        if self.cfg.slippage_bps > 0 else 0.0)
+                        if self.cfg.slippage_bps > 0 and not self.sans_cout
+                        else 0.0)
                 exit_price *= 1.0 - sens * slip
                 realized_trade += self._close_position(
                     exit_price, terminal_reason=done_reason, slot=j)
@@ -7896,6 +7892,14 @@ def run_training_on_split(
     train_envs = [
         BTCTradingEnvDiscrete(train_data, cfg) for _ in range(cfg.episodes_per_epoch)
     ]
+    # LE TEST D'AVANTAGE BRUT : l'entrainement se joue sans cout, la
+    # validation et le test avec. Voir `entrainement_sans_cout`.
+    if bool(getattr(cfg, "entrainement_sans_cout", False)):
+        for _e in train_envs:
+            _e.sans_cout = True
+        print("  \u2022 ENTRAINEMENT SANS COUT (test d'avantage brut) : spread et "
+              "glissement a zero a l'entrainement ; validation et test aux "
+              "couts reels")
     # Nombre d'episodes REELLEMENT joues. Il part d'une estimation — la duree
     # mediane d'un trade donne l'ordre de grandeur des decisions par episode —
     # puis se corrige des la premiere epoch avec le compte reel.
@@ -8243,9 +8247,6 @@ def run_training_on_split(
     # `optimiseurs_ppo`. Crees une fois par fold : l'etat Adam survit d'une
     # epoch a l'autre.
     optims_ppo = optimiseurs_ppo(policy, cfg)
-    # LA PENALITE D'ATTENTE du fold, ajustee a chaque epoch. Voir
-    # `cible_ouverture`.
-    penalite_attente = 0.0
 
     optimizer_rang = optim.Adam(
         policy.parameters(),
@@ -8744,9 +8745,6 @@ def run_training_on_split(
         #                      son nom est pire qu'un champ absent.
         # `ouvertures` : les trades REELLEMENT ouverts par la collecte.
         # C'est lui que le regulateur d'episodes vise — voir `cible_trades`.
-        # LES LOGITS D'ENTREE DE LA COLLECTE : ils disent ou l'action la
-        # plus probable ouvrirait, ce que la penalite d'attente regle.
-        _diag_r: List[np.ndarray] = []
         sampling_audit = {"decisions": 0, "ouvertures": 0,
                           "forced_actions": 0,
                           "remapped_actions": 0, "cote_interdit": 0.0,
@@ -8891,7 +8889,7 @@ def run_training_on_split(
                 _m3, _sans = masque_entree(masks_np, [envs[k] for k in deciding])
                 _ea, _elp, _ev = decide_entree(
                     policy, [states[k] for k in deciding], _m3, device,
-                    explore=True, diag=_diag_r)
+                    explore=True)
                 # `remapped_actions` COMPTE DESORMAIS LES DECISIONS OU LE
                 # SOLDE INTERDISAIT D'OUVRIR — masquees avant le tirage.
                 sampling_audit["remapped_actions"] += int(_sans.sum())
@@ -9472,32 +9470,7 @@ def run_training_on_split(
         # exact que si l'ancienne et la nouvelle politique sont la meme
         # fonction. `eval()` ne coupe pas le gradient.
         policy.eval()
-        _st_e = maj_ppo_entree(policy, ep_buf, optims_ppo, cfg, device,
-                               penalite_attente=penalite_attente)
-        # L'AJUSTEMENT DE LA PENALITE, sur la part des minutes a plat de la
-        # collecte ou l'action la plus probable OUVRIRAIT. Elle ne se lit
-        # pas sur les actions tirees : elles ouvrent encore une fois sur
-        # deux quand l'argmax n'ouvre plus jamais.
-        #
-        # ET ELLE SE LIT APRES LA MISE A JOUR. La premiere version lisait les
-        # logits de la COLLECTE, donc ceux de la politique d'avant : a
-        # l'epoch 1, la politique initiale « ouvrait » sur 81.3 % des minutes
-        # et la penalite restait a zero, pendant que la politique mise a jour
-        # n'ouvrait plus que sur 1.6 %. Un regulateur en retard d'une epoch
-        # sur ce qu'il regle.
-        if _st_e is not None and "taux_argmax" in _st_e:
-            _taux_arg = float(_st_e["taux_argmax"])
-            _avant_pen = penalite_attente
-            penalite_attente = float(np.clip(
-                penalite_attente
-                + float(getattr(cfg, "pas_penalite_attente", 0.1))
-                * (float(getattr(cfg, "cible_ouverture", 0.05)) - _taux_arg),
-                0.0, float(getattr(cfg, "penalite_attente_max", 0.1))))
-            print(f"  {_col('phase', _C.GREY)}  penalite attente  "
-                  f"{_avant_pen:.4f} cette epoch -> {penalite_attente:.4f}  "
-                  f"(l'action la plus probable ouvrirait sur "
-                  f"{100*_taux_arg:.1f}% des minutes a plat, cible "
-                  f"{100*float(getattr(cfg, 'cible_ouverture', 0.05)):.0f}%)")
+        _st_e = maj_ppo_entree(policy, ep_buf, optims_ppo, cfg, device)
         if _st_e is not None:
             epoch_actor_loss.append(_st_e["actor"])
             epoch_critic_loss.append(_st_e["critic"])
@@ -9509,7 +9482,8 @@ def run_training_on_split(
                   f"ActorL {_st_e['actor']:+.4f}  CriticL {_st_e['critic']:.4f}  "
                   f"KL {_st_e['kl']:+.4f}  clip {100*_st_e['clip']:.0f}%  "
                   f"H {_st_e['H']:.3f}/{np.log(N_ACTIONS_ENTREE):.3f}  "
-                  f"achat {_pa_:.1f}%  vente {_pv_:.1f}%  attendre {_ph_:.1f}%")
+                  f"achat {_pa_:.1f}%  vente {_pv_:.1f}%  attendre {_ph_:.1f}%  "
+                  f"(l'argmax ouvrirait {100*_st_e.get('taux_argmax', float('nan')):.1f}%)")
         else:
             print(f"  {_col('phase', _C.GREY)}  PPO entree  trop peu de "
                   f"decisions pour une mise a jour")
@@ -10978,6 +10952,35 @@ def run_training_on_split(
         # fenetre ; on prend celle de l'environnement 0, comme la
         # validation prend `val_decisions[0]`. Un flux vaut l'autre :
         # ils voient le meme nombre d'occasions.
+        # L'AVANTAGE BRUT, TRADE PAR TRADE — 2026-09-26.
+        #
+        # Le mouvement capte se mesure d'OUVERTURE BID a OUVERTURE BID, dans
+        # le sens du trade : c'est ce que le trade aurait rapporte sans
+        # spread ni glissement. Le net se lit sur les prix d'execution
+        # reels. Leur difference est le cout paye. Un avantage brut qui ne
+        # depasse pas le cout ne deviendra rentable par aucun reglage.
+        if _valide:
+            _brut, _net = [], []
+            for _ve in val_envs:
+                _o = _ve.data.open
+                for _tm in _ve.trades_meta:
+                    _ie, _ix = int(_tm["entry_idx"]), int(_tm["exit_idx"])
+                    if not (0 <= _ie < len(_o) and 0 <= _ix < len(_o)):
+                        continue
+                    _s = float(_tm["side"])
+                    _brut.append(_s * (float(_o[_ix]) / float(_o[_ie]) - 1.0) * 1e4)
+                    _net.append(_s * (float(_tm["exit_price"])
+                                      / float(_tm["entry_price"]) - 1.0) * 1e4)
+            if len(_brut) >= 2:
+                _b, _nn = np.asarray(_brut), np.asarray(_net)
+                _t_b = float(_b.mean() / (_b.std(ddof=1) / np.sqrt(len(_b)) + 1e-12))
+                print(f"  {_col('phase', _C.GREY)}  avantage brut  {len(_b):,} trades "
+                      f"de validation : brut {_b.mean():+.3f} bps/trade "
+                      f"(t = {_t_b:+.1f})  cout {(_b - _nn).mean():.3f} bps  "
+                      f"net {_nn.mean():+.3f} bps  ->  "
+                      + ("le brut COUVRE le cout" if _b.mean() > (_b - _nn).mean()
+                         else "le brut ne couvre PAS le cout"))
+
         # A QUELLE DISTANCE LA POLITIQUE EST-ELLE D'OUVRIR ? — 2026-09-26.
         #
         # Zero trade en validation ne dit pas si la politique en est LOIN ou
