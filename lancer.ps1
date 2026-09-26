@@ -117,7 +117,14 @@ $env:PYTHONIOENCODING = 'utf-8'
 $cmd = "`$env:PYTHONUNBUFFERED='1'; `$env:PYTHONIOENCODING='utf-8'; " +
        "Write-Host '  entrainement en cours - la lecture se fait dans la veille' -ForegroundColor Green; " +
        "Write-Host '  NE PAS FERMER cette fenetre' -ForegroundColor Yellow; " +
-       "cmd /c '`"$python`" $script > `"$journal`" 2>&1'"
+       "cmd /c '$python $script > training_btc.log 2>&1'"
+# SANS GUILLEMETS INTERIEURS, et le journal en chemin RELATIF - 2026-09-26.
+# La version precedente citait l'interpreteur et le journal : PowerShell 5.1
+# a retire ces guillemets en passant la commande a `cmd`, et le chemin du
+# depot, qui contient des espaces, a ete coupe au premier. La sortie est
+# partie dans un fichier `C:\Users\smonn\Desktop\ia\model`, et la veille
+# n'a rien vu. L'interpreteur n'a pas d'espace ; le journal est ecrit dans
+# le repertoire de travail, qui est $PSScriptRoot (voir -WorkingDirectory).
 Start-Process powershell -ArgumentList '-NoExit','-ExecutionPolicy','Bypass','-Command',$cmd `
     -WorkingDirectory $PSScriptRoot
 Write-Host '  entrainement lance dans sa fenetre' -ForegroundColor Green

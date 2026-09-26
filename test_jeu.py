@@ -173,8 +173,21 @@ bouge = {k: any(not torch.equal(a_, b_) for a_, b_ in zip(avant[k], v))
          for k, v in pol2.groupes_jeu().items()}
 verifie("les six groupes ont avance", all(bouge.values()), str(bouge))
 cfgi = replace(cfge, expert_epochs=1, expert_pas_neg=20)
+bar_av = [q.detach().clone() for k in ("gain", "perte")
+          for q in pol2.groupes_jeu()[k]]
+ent_av = [q.detach().clone() for k in ("achat", "vente")
+          for q in pol2.groupes_jeu()[k]]
 J.imite_expert(pol2, opt2, jours, R, D, Xn, 2800, cfgi, "cpu", rng)
-verifie("l'imitation tourne", True)
+bar_ap = [q for k in ("gain", "perte") for q in pol2.groupes_jeu()[k]]
+ent_ap = [q for k in ("achat", "vente") for q in pol2.groupes_jeu()[k]]
+verifie("l'imitation n'enseigne pas les barrieres",
+        all(torch.equal(a_, b_) for a_, b_ in zip(bar_av, bar_ap)))
+verifie("elle enseigne l'entree",
+        any(not torch.equal(a_, b_) for a_, b_ in zip(ent_av, ent_ap)))
+dt_ = J.departs_tires(jours, np.random.default_rng(1))
+verifie("les departs tires restent dans la journee, avant la marge",
+        bool(((dt_[:, 0] >= jours[:, 0]) & (dt_[:, 0] <= jours[:, 1] - 240)).all()
+             and (dt_[:, 1] == jours[:, 1]).all()), str(dt_[:, 0]))
 
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)

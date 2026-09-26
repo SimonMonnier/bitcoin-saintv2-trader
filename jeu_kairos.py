@@ -39,6 +39,14 @@ chevauchement, au plus `expert_k`, chacun rapportant au moins
 `expert_R_min` R net. C'est ce qu'a fait AlphaGo avec des parties humaines
 avant de jouer contre lui-meme. Puis PPO joue, et le jeu seul juge.
 
+L'EXPERT N'ENSEIGNE QUE L'ENTREE — quand, et dans quel sens. Premier
+lancement, 2026-09-26 : imites, l'objectif et le stop etaient TOUJOURS
+8 ATR et 2 ATR — le coup qui rapporte le plus de R quand on connait
+l'avenir. Joue sans le connaitre, ce stop etait touche 80 % du temps, et
+les deux tetes etaient figees (entropie 0.010 sur 1.099) : PPO ne pouvait
+plus rien leur apprendre. Les barrieres partent donc d'un choix uniforme,
+et c'est le jeu seul qui les regle.
+
 CE QUI NE CHANGE PAS : le modele SAINT, les 71 features du BTC, la rampe
 de cout (niveau 1 sans spread), l'action la plus probable en validation et
 au test, la fenetre de test jamais lue pour choisir quoi que ce soit.
@@ -359,6 +367,21 @@ def _choix(logits: torch.Tensor, explore: bool, gen=None) -> torch.Tensor:
     return torch.multinomial(p, 1, generator=gen).squeeze(-1)
 
 
+def departs_tires(jours: np.ndarray, rng, marge: int = 240) -> np.ndarray:
+    """Les memes journees, commencees a une minute TIREE AU HASARD.
+
+    POURQUOI, premier lancement du 2026-09-26 : la politique d'entrainement
+    ouvrait sur 37 % des minutes. Ses six jetons partaient dans la premiere
+    heure, et le reste de la journee n'etait jamais joue — le modele
+    n'apprenait que l'ouverture de la journee. La validation, elle, joue
+    toujours les journees entieres depuis minuit.
+    """
+    j = jours.copy()
+    long_ = np.maximum(j[:, 1] - j[:, 0] - marge, 1)
+    j[:, 0] = j[:, 0] + (rng.random(len(j)) * long_).astype(np.int64)
+    return j
+
+
 def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
          cfg: JeuConfig, device, explore: bool, gen=None,
          collecte: bool = False):
@@ -575,7 +598,11 @@ def coups_expert(jours, R, D, fin_valide: int, cfg: JeuConfig):
 
 
 def imite_expert(policy, optims, jours, R, D, Xn, fin_valide, cfg, device, rng):
-    """L'apprentissage par imitation : entree, objectif et stop de l'expert."""
+    """L'apprentissage par imitation : l'ENTREE de l'expert, et elle seule.
+
+    Les tetes de barrieres n'y apprennent rien : le choix a posteriori de
+    l'expert est biaise vers le coup le plus risque. Voir l'en-tete.
+    """
     pos = coups_expert(jours, R, D, fin_valide, cfg)
     n_j = max(len(jours), 1)
     print(f"  expert  {len(pos):,} coups sur {len(jours)} journees "
@@ -615,10 +642,6 @@ def imite_expert(policy, optims, jours, R, D, Xn, fin_valide, cfg, device, rng):
             pe = (F.cross_entropy(le, ab, reduction="none") * wb).sum() / wb.sum()
             cb = ab != ATTENDRE
             if bool(cb.any()):
-                sidx = (ab[cb] == VENDRE).long()
-                ar = torch.arange(int(cb.sum()), device=device)
-                pe = pe + F.cross_entropy(ltp[cb][ar, sidx], T(ii[b], torch.long)[cb])
-                pe = pe + F.cross_entropy(lsl[cb][ar, sidx], T(jj[b], torch.long)[cb])
                 justes_c += int((le[cb].argmax(-1) == ab[cb]).sum())
                 n_c += int(cb.sum())
             _pas(policy, optims, pe, cfg)
@@ -632,7 +655,8 @@ def imite_expert(policy, optims, jours, R, D, Xn, fin_valide, cfg, device, rng):
 # ======================================================================
 # LE BILAN D'UNE SERIE DE PARTIES
 # ======================================================================
-def bilan(scores, coups, close, atr, sp, cfg: JeuConfig) -> Dict[str, float]:
+def bilan(scores, coups, close, atr, sp, cfg: JeuConfig,
+          frac: float = 1.0) -> Dict[str, float]:
     ksl = np.asarray(cfg.sl_atr)
     n = len(coups)
     b = {"parties": len(scores), "score": float(np.mean(scores)) if len(scores) else 0.0,
@@ -648,8 +672,9 @@ def bilan(scores, coups, close, atr, sp, cfg: JeuConfig) -> Dict[str, float]:
     t, s, i, j = (c[:, k].astype(np.int64) for k in (1, 2, 3, 4))
     r, du, so = c[:, 5], c[:, 6], c[:, 7].astype(np.int64)
     net = r * ksl[j] * atr[t] / close[t] * 1e4
-    cout = (sp[t] + cfg.glissement_entree_bps
-            + np.where(so != 0, cfg.glissement_sortie_bps, 0.0))
+    # LE COUT REELLEMENT PAYE : pendant la rampe, une part seulement.
+    cout = frac * (sp[t] + cfg.glissement_entree_bps
+                   + np.where(so != 0, cfg.glissement_sortie_bps, 0.0))
     g, p = r[r > 0].sum(), -r[r < 0].sum()
     return b | {
         "net": float(net.mean()), "brut": float((net + cout).mean()),
@@ -783,9 +808,10 @@ def main() -> int:
                 Df = D1 if frac >= 0.5 else D0
                 choix = rng.choice(len(j_tr), size=min(cfg.parties_par_epoch, len(j_tr)),
                                    replace=False)
-                sc, cp, tr = joue(policy, j_tr[choix], Xn, Rf, Df, S1, a_va, cfg,
-                                  device, explore=True, collecte=True)
-                b_tr = bilan(sc, cp, c, atr, sp, cfg)
+                sc, cp, tr = joue(policy, departs_tires(j_tr[choix], rng), Xn,
+                                  Rf, Df, S1, a_va, cfg, device, explore=True,
+                                  collecte=True)
+                b_tr = bilan(sc, cp, c, atr, sp, cfg, frac=frac)
                 st = maj_ppo(policy, optims, avantages(tr, cfg), Xn, cfg, device, rng)
                 del Rf
             gen = torch.Generator(device=device)
