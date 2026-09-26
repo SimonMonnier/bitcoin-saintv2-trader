@@ -222,6 +222,13 @@ while ($true) {
         $pos = 0
     }
 
+    # UN JOURNAL VIDE N'A PAS ENCORE DE LECTEUR - 2026-09-26. A chaque
+    # relance, `cmd` cree le journal avant que Python n'y ecrive : sa cle
+    # est vide, egale a la cle de depart, donc aucun lecteur n'est ouvert.
+    # Lire quand meme levait ' Impossible d'appeler une methode dans une
+    # expression Null ' a chaque tour, tant que le fichier restait vide.
+    if ($null -eq $lecteur) { Start-Sleep -Milliseconds 400; continue }
+
     $rien = $true
     while ($null -ne ($ligne = $lecteur.ReadLine())) {
         $rien = $false
