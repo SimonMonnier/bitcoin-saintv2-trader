@@ -87,7 +87,7 @@ N_ETAT = 5          # le bloc de position de l'observation porte l'etat du jeu
 
 @dataclass
 class JeuConfig:
-    prefixe: str = "kairos_jeu_btc01"
+    prefixe: str = "kairos_jeu_btc02"
     cache: str = "data_cache_BTCUSD_M1.pkl"
     # --- le modele : celui du run PPO, a l'identique ---
     lookback: int = 4
@@ -104,6 +104,19 @@ class JeuConfig:
     # quelques heures.
     tp_atr: Tuple[float, ...] = (2.0, 4.0, 8.0)
     sl_atr: Tuple[float, ...] = (2.0, 4.0, 8.0)
+    # LE PLANCHER DE VOLATILITE DES BARRIERES — 2026-09-26, run
+    # kairos_jeu_btc01. L'ATR M1 du BTC tombe a 2 bps dans les 10 % de
+    # minutes les plus calmes, pour 3.5 bps de cout par coup. Un stop de
+    # 2 ATR y faisait 4 bps : le cout mangeait 0.81 R de chaque coup AVANT
+    # que le marche bouge (0.29 R en mediane). Chaque coup risquant la meme
+    # somme, ces coups-la faisaient perdre les journees alors que le net
+    # par coup, en bps, etait deja proche de zero.
+    #
+    # L'ATR qui place l'objectif et le stop ne descend donc jamais sous
+    # `atr_min_bps` : a 8 bps, le stop fait au moins 16 bps et le cout ne
+    # depasse jamais ~0.2 R. En marche agite, rien ne change ; en marche
+    # calme, le coup est plus petit au lieu d'etre mange par le spread.
+    atr_min_bps: float = 8.0
     horizon_max: int = 120
     # Glissements ESPERES (la moitie des bornes de `training.PPOConfig`) :
     # entree toujours, sortie au stop et au temps, jamais a l'objectif.
@@ -232,6 +245,12 @@ def _pas(policy, optims, perte, cfg):
 # ======================================================================
 # LES COUPS — chaque coup possible, a chaque minute, resolu d'avance
 # ======================================================================
+def atr_effectif(atr, prix, cfg: JeuConfig) -> np.ndarray:
+    """L'ATR qui place les barrieres : jamais sous `atr_min_bps`."""
+    return np.maximum(np.asarray(atr, np.float64),
+                      float(cfg.atr_min_bps) * 1e-4 * np.asarray(prix, np.float64))
+
+
 def table_coups(o, h, l, sp, atr, cfg: JeuConfig, frac: float):
     """Le resultat de CHAQUE coup possible a CHAQUE minute.
 
@@ -733,6 +752,8 @@ def main() -> int:
     print(f"  regles : {cfg.jetons} coups par partie, fin de partie a "
           f"-{cfg.vie_R:g} R, coup = sens + objectif {cfg.tp_atr} ATR + stop "
           f"{cfg.sl_atr} ATR, temps limite {cfg.horizon_max} min")
+    print(f"  barrieres placees sur l'ATR M1, jamais sous {cfg.atr_min_bps:g} bps "
+          f"(stop minimum {min(cfg.sl_atr) * cfg.atr_min_bps:g} bps)")
     print(f"  un R = {cfg.risque_dollars:.0f}$ ({cfg.risque_pct:g}% de "
           f"{cfg.capital:.0f}$)  |  quatre tetes : achat, vente, gain (objectif), "
           f"perte (stop), chacune son optimiseur  |  {device}", flush=True)
@@ -743,7 +764,9 @@ def main() -> int:
     d = d[cols].reset_index(drop=True)
     N = len(d)
     o, h, l, c = (d[k].to_numpy(np.float64) for k in ("open", "high", "low", "close"))
-    atr = d["atr_14"].to_numpy(np.float64)
+    # L'ATR DES BARRIERES, plancher compris : la table, l'expert et le
+    # bilan lisent tous le meme. Voir `atr_min_bps`.
+    atr = atr_effectif(d["atr_14"].to_numpy(np.float64), c, cfg)
     sp = d["spread_bar"].to_numpy(np.float64)
     n_tr, n_va, n_te = (int(N * x) for x in (cfg.part_train, cfg.part_val, cfg.part_test))
     pas_wf = n_te

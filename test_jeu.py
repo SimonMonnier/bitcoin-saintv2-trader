@@ -86,6 +86,14 @@ verifie("aucun coup ne lit au-dela des donnees",
         np.isnan(R1[N - 1 - cfg0.horizon_max:]).all()
         and np.isfinite(R1[:N - 1 - cfg0.horizon_max]).all())
 
+_cp = J.JeuConfig()
+_ae = J.atr_effectif(np.array([0.0002, 0.02]), np.array([100.0, 100.0]), _cp)
+verifie("plancher : un ATR calme est releve a atr_min_bps",
+        abs(_ae[0] - _cp.atr_min_bps * 1e-4 * 100.0) < 1e-12, str(_ae))
+verifie("plancher : un ATR agite reste tel quel", abs(_ae[1] - 0.02) < 1e-12)
+verifie("plancher : le cout ne depasse jamais ~0.2 R au plus petit stop",
+        3.5 / (min(_cp.sl_atr) * _cp.atr_min_bps) <= 0.25)
+
 print("\n2. LES REGLES DES PARTIES")
 torch.manual_seed(0)
 cfgj = replace(J.JeuConfig(), horizon_max=10, jetons=3, lookback=4)
