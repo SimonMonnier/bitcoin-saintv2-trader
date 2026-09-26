@@ -166,6 +166,29 @@ verifie("les coups de l'expert ne se chevauchent pas", not chev)
 verifie("l'expert ne lit pas au-dela de la fenetre",
         all(e[0] + 1 + cfge.horizon_max < 2800 for e in ex))
 
+print("\n4b. L'EXPERT REALISTE")
+yx = J.cibles_expert(R)
+verifie("la cible est le R moyen de tous les coups d'un sens",
+        abs(yx[500, 0] - np.clip(np.nanmean(R[500, 0]), -3, 5)) < 1e-5)
+pred_s = np.full((M, 2), np.nan, np.float32)
+pred_s[:, 0] = -1.0
+pred_s[:, 1] = -1.0
+pred_s[300, 0] = 0.5        # une seule minute d'achat predite positive
+pred_s[1200, 1] = 0.7       # une de vente
+cx = J.coups_expert_predits(jours, pred_s, D, 2800, cfgj)
+verifie("l'expert n'enseigne que les minutes predites positives",
+        sorted((c_[0], c_[1]) for c_ in cx) == [(300, 0), (1200, 1)], str(cx))
+sx, kx = J.joue_expert(jours, pred_s, R, D, S, 2800, 0.1, cfgj)
+verifie("l'expert joue seul, au seuil, sans voir la suite du jour",
+        sorted((c_[1], c_[2]) for c_ in kx) == [(300, 0), (1200, 1)])
+verifie("son score est la somme de ses coups",
+        abs(sx.sum() - sum(c_[5] for c_ in kx)) < 1e-9)
+Xg = np.random.default_rng(3).normal(0, 1, (M, N_BASE_FEATURES)).astype(np.float32)
+cfgx = replace(cfgj, expert_arbres=20, expert_blocs=2, expert_pas_app=3)
+px = J.expert_realiste(Xg, yx, 2000, 2400, cfgx)
+verifie("l'expert predit le train et la validation, rien au-dela",
+        np.isfinite(px[:2400]).all() and np.isnan(px[2400:]).all())
+
 print("\n5. UNE MISE A JOUR PPO ET UNE PASSE D'IMITATION")
 pol2 = J.PolitiqueJeu(cfgj)
 opt2 = J.optimiseurs(pol2, cfgj)
@@ -185,7 +208,8 @@ bar_av = [q.detach().clone() for k in ("gain", "perte")
           for q in pol2.groupes_jeu()[k]]
 ent_av = [q.detach().clone() for k in ("achat", "vente")
           for q in pol2.groupes_jeu()[k]]
-J.imite_expert(pol2, opt2, jours, R, D, Xn, 2800, cfgi, "cpu", rng)
+J.imite_expert(pol2, opt2, J.coups_expert(jours, R, D, 2800, cfgi), jours,
+               Xn, 2800, cfgi, "cpu", rng)
 bar_ap = [q for k in ("gain", "perte") for q in pol2.groupes_jeu()[k]]
 ent_ap = [q for k in ("achat", "vente") for q in pol2.groupes_jeu()[k]]
 verifie("l'imitation n'enseigne pas les barrieres",

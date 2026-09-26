@@ -39,6 +39,16 @@ chevauchement, au plus `expert_k`, chacun rapportant au moins
 `expert_R_min` R net. C'est ce qu'a fait AlphaGo avec des parties humaines
 avant de jouer contre lui-meme. Puis PPO joue, et le jeu seul juge.
 
+L'EXPERT EST REALISTE DEPUIS LE RUN kairos_jeu_btc03. Celui qui lisait
+l'avenir enseignait des coups qu'aucune observation ne permet de
+reconnaitre. Il est remplace par un LightGBM appris sur le PASSE, qui
+predit le R net moyen d'un achat et d'une vente a chaque minute ; sur le
+train, chaque bloc est predit par un modele qui ne l'a pas appris
+(validation croisee par blocs purges). `mesure_sources_btc.py` a mesure
+qu'un tel modele capte +3.3 bps par trade sur ses 2 % de signaux les plus
+forts, hors echantillon. L'expert joue d'abord SEUL la validation : c'est
+la reference que le PPO doit battre.
+
 L'EXPERT N'ENSEIGNE QUE L'ENTREE — quand, et dans quel sens. Premier
 lancement, 2026-09-26 : imites, l'objectif et le stop etaient TOUJOURS
 8 ATR et 2 ATR — le coup qui rapporte le plus de R quand on connait
@@ -87,7 +97,7 @@ N_ETAT = 5          # le bloc de position de l'observation porte l'etat du jeu
 
 @dataclass
 class JeuConfig:
-    prefixe: str = "kairos_jeu_btc02"
+    prefixe: str = "kairos_jeu_btc03"
     cache: str = "data_cache_BTCUSD_M1.pkl"
     # --- le modele : celui du run PPO, a l'identique ---
     lookback: int = 4
@@ -97,13 +107,20 @@ class JeuConfig:
     n_freq: int = 2
     mlp_dim: int = 32
     # --- les regles ---
-    jetons: int = 6
+    # 6 -> 3 LE 2026-09-26 (run kairos_jeu_btc03). La politique jouait tous
+    # ses jetons, ~5.5 coups par jour, donc aussi des signaux moyens. La
+    # mesure dit que l'avantage ne vit que dans les plus forts : +1.2 bps
+    # sur les 10 % du sommet, +3.3 sur les 2 %.
+    jetons: int = 3
     vie_R: float = 3.0
     # En ATR de la barre de decision. L'ATR M1 du BTC vaut ~7 bps, un
     # mouvement de 15 minutes ~2.5 ATR : les coups vont de la demi-heure a
     # quelques heures.
-    tp_atr: Tuple[float, ...] = (2.0, 4.0, 8.0)
-    sl_atr: Tuple[float, ...] = (2.0, 4.0, 8.0)
+    # 16 ATR ET 240 MINUTES AJOUTES LE 2026-09-26 (run kairos_jeu_btc03) :
+    # le cout se paie une fois par coup, le mouvement capte grandit avec la
+    # duree, et plusieurs colonnes portent davantage a 60 minutes qu'a 15.
+    tp_atr: Tuple[float, ...] = (2.0, 4.0, 8.0, 16.0)
+    sl_atr: Tuple[float, ...] = (2.0, 4.0, 8.0, 16.0)
     # LE PLANCHER DE VOLATILITE DES BARRIERES — 2026-09-26, run
     # kairos_jeu_btc01. L'ATR M1 du BTC tombe a 2 bps dans les 10 % de
     # minutes les plus calmes, pour 3.5 bps de cout par coup. Un stop de
@@ -117,7 +134,7 @@ class JeuConfig:
     # depasse jamais ~0.2 R. En marche agite, rien ne change ; en marche
     # calme, le coup est plus petit au lieu d'etre mange par le spread.
     atr_min_bps: float = 8.0
-    horizon_max: int = 120
+    horizon_max: int = 240
     # Glissements ESPERES (la moitie des bornes de `training.PPOConfig`) :
     # entree toujours, sortie au stop et au temps, jamais a l'objectif.
     glissement_entree_bps: float = 0.5
@@ -133,11 +150,15 @@ class JeuConfig:
     rampe_cout: int = 10
     parties_par_epoch: int = 256
     # --- l'expert ---
-    expert_k: int = 12
-    expert_R_min: float = 1.0
-    expert_pas_neg: int = 10
-    expert_poids_pos: float = 3.0
+    expert_k: int = 4
+    expert_R_min: float = 1.0          # l'ancien expert, qui lisait l'avenir
+    expert_pas_neg: int = 15
+    expert_poids_pos: float = 5.0
     expert_epochs: int = 3
+    # L'EXPERT REALISTE : LightGBM, validation croisee par blocs purges.
+    expert_blocs: int = 4
+    expert_pas_app: int = 5
+    expert_arbres: int = 300
     # --- PPO ---
     lr: float = 5e-4
     gamma: float = 0.9995          # par minute
@@ -616,18 +637,146 @@ def coups_expert(jours, R, D, fin_valide: int, cfg: JeuConfig):
     return out
 
 
-def imite_expert(policy, optims, jours, R, D, Xn, fin_valide, cfg, device, rng):
+def cibles_expert(R: np.ndarray) -> np.ndarray:
+    """(N, 2) : le R net MOYEN de tous les coups d'un sens, a chaque minute.
+
+    C'est la valeur d'acheter (ou de vendre) maintenant, toutes barrieres
+    confondues — plus lisse que le meilleur coup, et sans choisir a la
+    place du PPO les barrieres qu'il doit apprendre.
+    """
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        y = np.nanmean(R.reshape(R.shape[0], 2, -1), axis=2)
+    return np.clip(y, -3.0, 5.0).astype(np.float32)
+
+
+def expert_realiste(Xn, y, n_tr: int, fin_pred: int, cfg: JeuConfig):
+    """Les predictions de l'expert : (N, 2), NaN hors de [0, fin_pred).
+
+    SUR LE TRAIN, VALIDATION CROISEE PAR BLOCS PURGES : chaque bloc est
+    predit par un modele appris sur les AUTRES, sans les `horizon_max`
+    minutes qui le bordent — un coup y lirait le bloc predit. Les coups que
+    l'expert enseigne sont donc choisis sur des minutes qu'il n'a pas
+    apprises, comme ils le seraient en direct.
+
+    AU-DELA DU TRAIN (la validation), un modele appris sur tout le train.
+    Rien n'est predit au-dela de `fin_pred` : le test n'est pas touche.
+    """
+    import lightgbm as lgb
+    H = int(cfg.horizon_max)
+    N = len(Xn)
+    pred = np.full((N, 2), np.nan, np.float32)
+    app_tout = np.arange(0, max(n_tr - H - 1, 0), cfg.expert_pas_app)
+
+    def _modeles(idx):
+        ms = []
+        for s_ in range(2):
+            ok = idx[np.isfinite(y[idx, s_])]
+            m = lgb.LGBMRegressor(
+                n_estimators=cfg.expert_arbres, learning_rate=0.03,
+                num_leaves=31, min_child_samples=400, subsample=0.7,
+                subsample_freq=1, colsample_bytree=0.7, reg_lambda=5.0,
+                n_jobs=4, verbose=-1)
+            m.fit(Xn[ok], y[ok, s_])
+            ms.append(m)
+        return ms
+
+    bornes = np.linspace(0, n_tr, cfg.expert_blocs + 1).astype(np.int64)
+    for b in range(cfg.expert_blocs):
+        a0, b0 = int(bornes[b]), int(bornes[b + 1])
+        app = app_tout[(app_tout < a0 - H - 1) | (app_tout >= b0 + H + 1)]
+        ms = _modeles(app)
+        for s_ in range(2):
+            pred[a0:b0, s_] = ms[s_].predict(Xn[a0:b0])
+    ms = _modeles(app_tout)
+    for s_ in range(2):
+        pred[n_tr:fin_pred, s_] = ms[s_].predict(Xn[n_tr:fin_pred])
+    return pred
+
+
+def _ref(cfg: JeuConfig):
+    """Le coup de reference de l'expert : objectif et stop de 4 ATR, les
+    deuxiemes du menu."""
+    return min(1, len(cfg.tp_atr) - 1), min(1, len(cfg.sl_atr) - 1)
+
+
+def coups_expert_predits(jours, pred, D, fin_valide: int, cfg: JeuConfig):
+    """Chaque jour, les minutes que l'expert PREDIT les meilleures.
+
+    Au plus `expert_k`, sans chevauchement, et seulement si le R net
+    predit est positif. Meme format que `coups_expert`.
+    """
+    H, L = int(cfg.horizon_max), int(cfg.lookback)
+    ri, rj = _ref(cfg)
+    out = []
+    for a0, b0 in jours:
+        ts = np.arange(max(a0, L - 1), b0)
+        ts = ts[ts + 1 + H < fin_valide]
+        if len(ts) == 0:
+            continue
+        p_ = pred[ts]
+        ok = np.isfinite(p_).all(1)
+        ts, p_ = ts[ok], p_[ok]
+        if len(ts) == 0:
+            continue
+        sens = p_.argmax(1)
+        v = p_.max(1)
+        occupe = np.zeros(b0 - a0 + H + 2, bool)
+        pris = 0
+        for q in np.argsort(-v, kind="stable"):
+            if v[q] <= 0.0 or pris >= cfg.expert_k:
+                break
+            t0 = int(ts[q])
+            d0 = int(D[t0, sens[q], ri, rj])
+            if occupe[t0 - a0: t0 - a0 + d0 + 1].any():
+                continue
+            occupe[t0 - a0: t0 - a0 + d0 + 1] = True
+            out.append((t0, int(sens[q]), ri, rj, float(v[q]), int(b0)))
+            pris += 1
+    return out
+
+
+def joue_expert(jours, pred, R, D, S, fin_valide: int, seuil: float,
+                cfg: JeuConfig):
+    """L'expert joue SEUL, minute apres minute, SANS voir la suite du jour.
+
+    Il ouvre le coup de reference des que son R predit depasse `seuil`,
+    avec les memes regles que le PPO : jetons, vie, un coup a la fois.
+    Rend (scores, coups) au format de `joue`.
+    """
+    H, L = int(cfg.horizon_max), int(cfg.lookback)
+    ri, rj = _ref(cfg)
+    scores, coups = [], []
+    for g, (a0, b0) in enumerate(jours):
+        t, jet, sc = max(int(a0), L - 1), cfg.jetons, 0.0
+        while t < b0 and jet > 0 and sc > -cfg.vie_R:
+            p_ = pred[t]
+            if (t + 1 + H < fin_valide and np.isfinite(p_).all()
+                    and float(p_.max()) >= seuil):
+                s_ = int(p_.argmax())
+                r = float(R[t, s_, ri, rj])
+                d = int(D[t, s_, ri, rj])
+                coups.append((g, t, s_, ri, rj, r, d, int(S[t, s_, ri, rj])))
+                sc += r
+                jet -= 1
+                t += d
+            else:
+                t += 1
+        scores.append(sc)
+    return np.asarray(scores), coups
+
+
+def imite_expert(policy, optims, pos, jours, Xn, fin_valide, cfg, device, rng):
     """L'apprentissage par imitation : l'ENTREE de l'expert, et elle seule.
 
     Les tetes de barrieres n'y apprennent rien : le choix a posteriori de
     l'expert est biaise vers le coup le plus risque. Voir l'en-tete.
     """
-    pos = coups_expert(jours, R, D, fin_valide, cfg)
     n_j = max(len(jours), 1)
-    print(f"  expert  {len(pos):,} coups sur {len(jours)} journees "
-          f"({len(pos)/n_j:.1f} par jour), {np.mean([p[4] for p in pos]):+.2f} R "
-          f"en moyenne a posteriori — c'est l'avenir qu'il lit, pas un "
-          f"objectif atteignable", flush=True)
+    print(f"  expert  {len(pos):,} coups enseignes sur {len(jours)} journees "
+          f"({len(pos)/n_j:.1f} par jour), choisis sur des minutes que "
+          f"l'expert n'a pas apprises", flush=True)
     t_pos = {p[0] for p in pos}
     H, L = int(cfg.horizon_max), int(cfg.lookback)
     neg = []
@@ -815,7 +964,31 @@ def main() -> int:
             print(f"  reprend {precedent}", flush=True)
         depart_zero = precedent is None
         if depart_zero:
-            imite_expert(policy, optims, j_tr, R1, D1, Xn, a_va, cfg, device, rng)
+            t_ex = time.time()
+            y_ex = cibles_expert(R1)
+            pred = expert_realiste(Xn, y_ex, a_va, a_te, cfg)
+            ics = []
+            for s_ in range(2):
+                ok = np.isfinite(pred[a_va:a_te, s_]) & np.isfinite(y_ex[a_va:a_te, s_])
+                ics.append(pd.Series(pred[a_va:a_te, s_][ok]).corr(
+                    pd.Series(y_ex[a_va:a_te, s_][ok]), method="spearman"))
+            vmax = np.nanmax(pred[:a_va], axis=1)
+            seuil = max(0.0, float(np.nanquantile(vmax, 1 - 2.0 * cfg.jetons / 1440)))
+            print(f"  expert  realiste : LightGBM appris sur le passe, "
+                  f"{time.time() - t_ex:.0f} s — correlation avec le R moyen "
+                  f"en validation : achat {ics[0]:+.3f}, vente {ics[1]:+.3f}", flush=True)
+            se, ce = joue_expert(j_va, pred, R1, D1, S1, a_te, seuil, cfg)
+            be = bilan(se, ce, c, atr, sp, cfg)
+            print(f"  expert  JOUE SEUL LA VALIDATION (seuil {seuil:+.3f} R) : "
+                  f"{ligne_bilan(be, cfg)}", flush=True)
+            pos = coups_expert_predits(j_tr, pred, D1, a_va, cfg)
+            ri_, rj_ = _ref(cfg)
+            r_pos = [float(R1[q[0], q[1], ri_, rj_]) for q in pos]
+            print(f"  expert  ses coups d'entrainement ont rapporte "
+                  f"{np.mean(r_pos) if r_pos else float('nan'):+.3f} R en moyenne "
+                  f"(predits sans les avoir appris)", flush=True)
+            del pred, y_ex
+            imite_expert(policy, optims, pos, j_tr, Xn, a_va, cfg, device, rng)
         best_path = f"best_{cfg.prefixe}{suffixe}.pth"
         record = 0.0
         garde_rec = None
