@@ -317,10 +317,10 @@ verifie("la moitie de la journee restante vaut 0.5 en M15", abs(et15[0, 2] - 0.5
 verifie("l'horizon est de 32 bougies, huit heures", c15.horizon_max == 32)
 
 print("\n7. LE JEU MULTI-MARCHES")
-cm = J.JeuConfig()
 import prepare_multi_m15 as PM
-verifie("le jeu par defaut joue les sept marches",
-        tuple(cm.marches) == tuple(PM.MARCHES), str(cm.marches))
+cm = replace(J.JeuConfig(), marches=tuple(PM.MARCHES), cache="data_cache_MULTI_M15.pkl")
+verifie("le jeu par defaut est le BTC seul ; le multi-marches reste disponible",
+        tuple(J.JeuConfig().marches) == () and tuple(cm.marches) == tuple(PM.MARCHES))
 verifie("il lit les features communes, avec une colonne par marche",
         J.colonnes_jeu(cm) == list(PM.FEATURE_COLS_MULTI)
         and all(f"m_{m}" in PM.FEATURE_COLS_MULTI for m in PM.MARCHES)

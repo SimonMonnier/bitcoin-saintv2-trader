@@ -110,7 +110,7 @@ N_ETAT = 5          # le bloc de position de l'observation porte l'etat du jeu
 
 @dataclass
 class JeuConfig:
-    prefixe: str = "kairos_multi_m15_02"
+    prefixe: str = "kairos_jeu_m15_06"
     # LE JEU EN BOUGIES DE 15 MINUTES — 2026-09-27, demande du proprietaire :
     # « recommence le jeu avec des bougies de 15 minutes, et pas M1 pour
     # entrer ». Le modele voit des bougies M15 (contextes H1 et H4, voir
@@ -120,7 +120,7 @@ class JeuConfig:
     # CE QUE CELA CHANGE AU COUT : l'ATR M15 median vaut 26 bps, l'ATR M1
     # environ 6, pour le meme cout de ~3.3 bps par coup. Rapporte au
     # mouvement d'une bougie, il pese quatre fois moins.
-    cache: str = "data_cache_MULTI_M15.pkl"
+    cache: str = "data_cache_BTCUSD_M15.pkl"
     minutes_par_barre: int = 15
     # LE JEU MULTI-MARCHES — 2026-09-27, demande du proprietaire : un seul
     # jeu qui trade le BTC, l'ETH, l'or et les indices a petit spread et
@@ -131,8 +131,14 @@ class JeuConfig:
     # l'expert ; le resultat du JOUR est la somme des marches, et le
     # drawdown se mesure sur le compte commun, coups dans l'ordre du temps.
     # Vide = le jeu d'un seul marche (`cache`).
-    marches: Tuple[str, ...] = ("BTCUSD", "ETHUSD", "XAUUSD", "NAS100", "SP500",
-                                "DJ30", "GER40")
+    #
+    # DESACTIVE LE 2026-09-27 (run kairos_multi_m15_02 arrete a l'epoch 2) :
+    # meme avec un expert par marche, correlation de -0.02 a +0.05 en
+    # validation (2024-09 -> 2025-05), 16 coups par jour, profit factor 0.92,
+    # drawdown -108 % a 0.5 % de mise. Retour au BTC seul, le seul jeu positif
+    # au test. Pour rejouer le multi-marches : les sept marches ici, et
+    # `cache` = data_cache_MULTI_M15.pkl.
+    marches: Tuple[str, ...] = ()
     # LE PLANCHER DES BARRIERES, PAR MARCHE : cinq fois son cout median
     # (spread + glissements), jamais sous 10 bps. Le cout ne depasse donc
     # jamais ~0.2 R, sur le BTC (17 bps) comme sur l'ETH (58) ou le Dow (10).
