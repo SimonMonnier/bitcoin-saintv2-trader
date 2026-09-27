@@ -253,6 +253,24 @@ verifie("les departs tires restent dans la journee, avant la marge",
         bool(((dt_[:, 0] >= jours[:, 0]) & (dt_[:, 0] <= jours[:, 1] - 240)).all()
              and (dt_[:, 1] == jours[:, 1]).all()), str(dt_[:, 0]))
 
+print("\n5b. LE BILAN DETAILLE")
+# Quatre coups : +1, -1, +2, -1 R, dans cet ordre ; deux longs, deux shorts.
+cz = [(0, 10, 0, 0, 0, 1.0, 1, 0), (0, 20, 1, 0, 0, -1.0, 1, 1),
+      (1, 30, 0, 0, 0, 2.0, 1, 0), (1, 40, 1, 0, 0, -1.0, 1, 1)]
+bz = J.bilan(np.array([0.0, 1.0]), cz, np.full(60, 100.0), np.full(60, 1.0),
+             np.zeros(60), cfgj)
+verifie("gagnants, perdants, longs, shorts",
+        (bz["gagnants"], bz["perdants"], bz["longs"], bz["shorts"]) == (2, 2, 2, 2))
+verifie("win rate et profit factor", abs(bz["win_rate"] - 0.5) < 1e-12
+        and abs(bz["pf"] - 1.5) < 1e-12)
+verifie("drawdown : la pire baisse du compte, dans l'ordre du temps",
+        abs(bz["dd_dollars"] + 10.0) < 1e-9, "%.2f $" % bz["dd_dollars"])
+verifie("total en dollars", abs(bz["total_dollars"] - 10.0) < 1e-9)
+verifie("la ligne lisible dit tout",
+        all(k in J.ligne_detail(bz, cfgj) for k in
+            ("gagnants", "perdants", "win rate", "longs", "shorts",
+             "profit factor", "drawdown")))
+
 print("\n6. LE JEU EN BOUGIES DE 15 MINUTES")
 c15 = J.JeuConfig()
 verifie("le jeu par defaut est en M15, 96 bougies par jour",

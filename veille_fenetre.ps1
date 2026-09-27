@@ -130,10 +130,10 @@ Write-Host ''
 # entre deux. Une epoch dure cinq minutes ; la fenetre restait donc muette
 # cinq minutes d'affilee, ce qui est indistinguable d'une fenetre cassee.
 # Une veille qui ne dit pas « je travaille » ne sert a rien.
-$essentiel = '^(EPOCH |  (PnL|train |sens |tenue |sommet du tri|sommet \d+ min|critere net|sauvegarde |evolution )|  phase  (PPO (entree|sortie)|marge entree|avantage brut|cout entrainement)|\[COLLECTE\]|SORTIE |CIBLE |          (une seule|AUCUN plafond|SHORT)|  (non )?retenu|  garde |  . NEW BEST|  . REFUSE|    a battu|  expert |  reprend |FIN |=== |--- Fold |Traceback|.*Error)'
+$essentiel = '^(EPOCH |  (PnL|train |sens |tenue |sommet du tri|sommet \d+ min|critere net|sauvegarde |evolution )|  phase  (PPO (entree|sortie)|marge entree|avantage brut|cout entrainement)|\[COLLECTE\]|SORTIE |CIBLE |          (une seule|AUCUN plafond|SHORT)|  (non )?retenu|  garde |  . NEW BEST|  . REFUSE|    a battu|  expert |  reprend |  bilan |TEST fold \d+ bilan |FIN |=== |--- Fold |Traceback|.*Error)'
 
 # LE DETAIL : tout le reste — diagnostics, phases du reseau, cadence.
-$detaille = '^(EPOCH |  (PnL|point mort|classement|sommet du tri|sommet \d+ min|vs |sens |actions |entrees |critere net|sauvegarde |evolution |dimension|train |tenue |phase |cadence |\. |temps :)|\[COLLECTE\]|          SHORT|  (non )?retenu|  garde |  . NEW BEST|  jeu |  expert |  reprend |  (normalisation|table des coups|modele|regles|un R) |TEST |FIN |=== |--- Fold |Traceback|.*Error)'
+$detaille = '^(EPOCH |  (PnL|point mort|classement|sommet du tri|sommet \d+ min|vs |sens |actions |entrees |critere net|sauvegarde |evolution |dimension|train |tenue |phase |cadence |\. |temps :)|\[COLLECTE\]|          SHORT|  (non )?retenu|  garde |  . NEW BEST|  jeu |  bilan |TEST fold \d+ bilan |  expert |  reprend |  (normalisation|table des coups|modele|regles|un R) |TEST |FIN |=== |--- Fold |Traceback|.*Error)'
 
 $garde = if ($Detail) { $detaille } else { $essentiel }
 $ansi = [regex]"$([char]27)\[[0-9;]*m"
@@ -165,6 +165,15 @@ function Verdict([string]$nu) {
         $dol = [double]::Parse($Matches[4], $inv)
         $c = if ($dol -gt 0) { '32' } else { '31' }
         return @('', "$esc[1;$($c)m  RESULTAT FINAL du fold $($Matches[1]) sur des jours JAMAIS utilises : $($Matches[4]) dollars par jour ($($Matches[5])% de jours gagnants sur $($Matches[6]))$esc[0m", '')
+    }
+    # LE BILAN DETAILLE, sous le verdict - 2026-09-27, demande du
+    # proprietaire : gagnants, perdants, win rate, longs, shorts, profit
+    # factor, drawdown. Le jeu l'ecrit deja lisible ; on le met en retrait.
+    if ($nu -match '^  bilan  (.*)$') {
+        return @("      $($Matches[1])")
+    }
+    if ($nu -match '^TEST fold (\d+) bilan  (.*)$') {
+        return @("      $($Matches[2])", '')
     }
     if ($nu -match '^  sauvegarde  NOUVEAU MEILLEUR : ([+-][0-9.]+) R/partie') {
         return @("$esc[1;32m  >>> MODELE SAUVEGARDE : le plus rentable jusqu ici en validation$esc[0m")

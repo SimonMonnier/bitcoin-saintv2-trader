@@ -952,7 +952,20 @@ def bilan(scores, coups, close, atr, sp, cfg: JeuConfig,
     cout = frac * (sp[t] + cfg.glissement_entree_bps
                    + np.where(so != 0, cfg.glissement_sortie_bps, 0.0))
     g, p = r[r > 0].sum(), -r[r < 0].sum()
+    # LE DRAWDOWN — la pire baisse du compte, sommet a creux, en dollars et
+    # en % du capital, les coups joues dans l'ordre du temps. Demande du
+    # proprietaire, 2026-09-27, avec les comptes ci-dessous.
+    ordre = np.argsort(t, kind="stable")
+    eq = cfg.capital + np.cumsum(r[ordre] * cfg.risque_dollars)
+    eq = np.concatenate([[cfg.capital], eq])
+    pic = np.maximum.accumulate(eq)
+    dd_d = float((eq - pic).min())
+    dd_p = float(((eq - pic) / pic).min())
     return b | {
+        "gagnants": int((r > 0).sum()), "perdants": int((r < 0).sum()),
+        "longs": int((s == 0).sum()), "shorts": int((s == 1).sum()),
+        "win_rate": float((r > 0).mean()), "dd_dollars": dd_d, "dd_pct": dd_p,
+        "total_dollars": float(r.sum() * cfg.risque_dollars),
         "net": float(net.mean()), "brut": float((net + cout).mean()),
         "cout": float(cout.mean()), "pf": float(g / p) if p > 0 else float("inf"),
         "achat": float(np.mean(s == 0)),
@@ -963,6 +976,17 @@ def bilan(scores, coups, close, atr, sp, cfg: JeuConfig,
         "t_brut": float((net + cout).mean() / ((net + cout).std(ddof=1)
                         / np.sqrt(n) + 1e-12)) if n > 1 else float("nan"),
     }
+
+
+def ligne_detail(b, cfg: JeuConfig) -> str:
+    """Le bilan lisible : gagnants, perdants, longs, shorts, PF, drawdown."""
+    if b["coups"] == 0:
+        return "aucun trade"
+    return (f"{b['coups']} trades : {b['gagnants']} gagnants, {b['perdants']} perdants "
+            f"(win rate {100 * b['win_rate']:.1f} %)  |  {b['longs']} longs, "
+            f"{b['shorts']} shorts  |  profit factor {b['pf']:.2f}  |  drawdown max "
+            f"{b['dd_dollars']:+.2f} $ ({100 * b['dd_pct']:+.1f} %)  |  total "
+            f"{b['total_dollars']:+.2f} $ sur {b['parties']} jours")
 
 
 def ligne_bilan(b, cfg: JeuConfig) -> str:
@@ -982,7 +1006,7 @@ def ligne_style(b, cfg: JeuConfig) -> str:
     so = b["sorties"]
     return (f"achat {100 * b['achat']:.0f}% vente {100 * (1 - b['achat']):.0f}%  |  "
             f"sorties objectif {100 * so[0]:.0f}% stop {100 * so[1]:.0f}% "
-            f"temps {100 * so[2]:.0f}%  duree {b['duree']:.0f} min  |  objectif "
+            f"temps {100 * so[2]:.0f}%  duree {b['duree'] * cfg.minutes_par_barre:.0f} min  |  objectif "
             + "/".join(f"{100 * x:.0f}" for x in b["tp"])
             + f"% sur {'/'.join(f'{x:g}' for x in cfg.tp_atr)} ATR  stop "
             + "/".join(f"{100 * x:.0f}" for x in b["sl"])
@@ -1004,12 +1028,13 @@ def main() -> int:
         json.dump(asdict(cfg), fh, indent=1, default=str)
 
     print("=" * 70)
-    print("  KAIROS EN JEU — BTCUSD M1 : une journee = une partie")
+    print(f"  KAIROS EN JEU — BTCUSD M{cfg.minutes_par_barre} : une journee = une partie")
     print("=" * 70)
     print(f"  regles : {cfg.jetons} coups par partie, fin de partie a "
           f"-{cfg.vie_R:g} R, coup = sens + objectif {cfg.tp_atr} ATR + stop "
-          f"{cfg.sl_atr} ATR, temps limite {cfg.horizon_max} min")
-    print(f"  barrieres placees sur l'ATR M1, jamais sous {cfg.atr_min_bps:g} bps "
+          f"{cfg.sl_atr} ATR, temps limite {cfg.horizon_max} bougies "
+          f"({cfg.horizon_max * cfg.minutes_par_barre} min)")
+    print(f"  barrieres placees sur l'ATR M{cfg.minutes_par_barre}, jamais sous {cfg.atr_min_bps:g} bps "
           f"(stop minimum {min(cfg.sl_atr) * cfg.atr_min_bps:g} bps)")
     print(f"  un R = {cfg.risque_dollars:.0f}$ ({cfg.risque_pct:g}% de "
           f"{cfg.capital:.0f}$)  |  quatre tetes : achat, vente, gain (objectif), "
@@ -1044,7 +1069,7 @@ def main() -> int:
     t0 = time.time()
     R0, D0, _ = table_coups(o, h, l, sp, atr, cfg, 0.0)
     R1, D1, S1 = table_coups(o, h, l, sp, atr, cfg, 1.0)
-    print(f"  table des coups : {N:,} minutes x {R1[0].size} coups, sans cout et "
+    print(f"  table des coups : {N:,} bougies x {R1[0].size} coups, sans cout et "
           f"au cout reel, {time.time() - t0:.0f} s", flush=True)
 
     # L'EXPERT, APPRIS SUR LE TRAIN DU FOLD 1 SEULEMENT. Voir l'en-tete.
@@ -1144,6 +1169,7 @@ def main() -> int:
             nom = "EXPERT IMITE" if epoch == 0 else f"cout {100 * frac:.0f}%"
             print(f"\nEPOCH {epoch:03d}  {nom:>12}  VAL  {ligne_bilan(bv, cfg)}  "
                   f"{(time.time() - t_ep) / 60:.1f} min", flush=True)
+            print(f"  bilan  {ligne_detail(bv, cfg)}", flush=True)
             print(f"  jeu  validation  {ligne_style(bv, cfg)}", flush=True)
             if st is not None:
                 print(f"  jeu  entrainement  {ligne_bilan(b_tr, cfg)}", flush=True)
@@ -1181,6 +1207,7 @@ def main() -> int:
         bt = bilan(s_t, c_t, c, atr, sp, cfg)
         print(f"\nTEST fold {fold + 1} ({os.path.basename(src)})  {ligne_bilan(bt, cfg)}",
               flush=True)
+        print(f"TEST fold {fold + 1} bilan  {ligne_detail(bt, cfg)}", flush=True)
         print(f"TEST fold {fold + 1}  {ligne_style(bt, cfg)}", flush=True)
         with open(f"test_{cfg.prefixe}{suffixe}.json", "w", encoding="utf-8") as fh:
             json.dump({k: v for k, v in bt.items()}, fh, indent=1, default=str)
