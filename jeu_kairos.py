@@ -110,7 +110,7 @@ N_ETAT = 5          # le bloc de position de l'observation porte l'etat du jeu
 
 @dataclass
 class JeuConfig:
-    prefixe: str = "kairos_multi_m15_01"
+    prefixe: str = "kairos_multi_m15_02"
     # LE JEU EN BOUGIES DE 15 MINUTES — 2026-09-27, demande du proprietaire :
     # « recommence le jeu avec des bougies de 15 minutes, et pas M1 pour
     # entrer ». Le modele voit des bougies M15 (contextes H1 et H4, voir
@@ -872,6 +872,24 @@ def expert_multi(Xn, y, t_ns, dans_train: np.ndarray, fin_tr: np.ndarray,
     return pred, ms
 
 
+def extras_btc(temps_bloc: pd.Series):
+    """Les features Binance et Coinbase du BTC M15, alignees sur ses bougies.
+
+    Elles ne concernent que le BTC, et le cache M15 qui les porte ne commence
+    qu'en novembre 2024 : avant, elles valent NaN, ce que LightGBM sait
+    traiter. Elles ne vont qu'a l'EXPERT du BTC, pas au modele commun.
+    Rend None si le cache est absent.
+    """
+    import features_scalping as FS
+    f = "data_cache_BTCUSD_M15.pkl"
+    if not os.path.exists(f):
+        return None
+    cols = FS.colonnes_flux(15) + FS.COLONNES_COINBASE + ["flux_rang", "creux_x_flux"]
+    b = pd.read_pickle(f)[["time"] + cols]
+    m = pd.DataFrame({"time": temps_bloc.values}).merge(b, on="time", how="left")
+    return m[cols].to_numpy(np.float32)
+
+
 def par_jour(scores: np.ndarray, jours: np.ndarray, dates: np.ndarray) -> np.ndarray:
     """Le score de chaque JOUR : la somme des parties de tous les marches."""
     if len(scores) == 0:
@@ -1510,9 +1528,33 @@ def main_multi(cfg: JeuConfig) -> int:
     t_ex = time.time()
     fin_tr1 = fin_segment(t_ns, blocs, bornes[0][1])
     y_ex = cibles_expert(R1)
-    pred, modeles_expert = expert_multi(Xn, y_ex, t_ns, dans_train1, fin_tr1, cfg)
-    for s_, nom in enumerate(("achat", "vente")):
-        modeles_expert[s_].booster_.save_model(f"expert_{cfg.prefixe}_{nom}.txt")
+    # UN EXPERT PAR MARCHE — 2026-09-27, run kairos_multi_m15_02. Le run
+    # m15_01 n'en avait qu'un pour les sept : correlation +0.019 a l'achat
+    # et +0.010 a la vente en validation, contre +0.088 et +0.043 pour
+    # l'expert du BTC seul. Un seul modele moyennait des marches qui ne se
+    # comportent pas pareil, et le BTC avait perdu ses sources. Chaque marche
+    # a desormais le sien, appris sur ses seules bougies ; celui du BTC lit
+    # en plus Binance et Coinbase (`extras_btc`). Le SAINT reste commun.
+    pred = np.full((N, 2), np.nan, np.float32)
+    va1 = (t_ns >= bornes[0][1]) & (t_ns < bornes[0][2])
+    for nom, a, b in blocs:
+        Xb = Xn[a:b]
+        ex = extras_btc(d["time"].iloc[a:b]) if nom == "BTCUSD" else None
+        if ex is not None:
+            Xb = np.concatenate([Xb, ex], axis=1)
+        pb, ms = expert_multi(Xb, y_ex[a:b], t_ns[a:b], dans_train1[a:b],
+                              fin_tr1[a:b] - a, cfg)
+        pred[a:b] = pb
+        for s_, sens in enumerate(("achat", "vente")):
+            ms[s_].booster_.save_model(f"expert_{cfg.prefixe}_{nom}_{sens}.txt")
+        ic_m = []
+        for s_ in range(2):
+            ok = va1[a:b] & np.isfinite(y_ex[a:b, s_])
+            ic_m.append(pd.Series(pb[ok, s_]).corr(pd.Series(y_ex[a:b][ok, s_]),
+                                                   method="spearman"))
+        print(f"  expert  {nom:8s} correlation en validation : achat {ic_m[0]:+.3f}  "
+              f"vente {ic_m[1]:+.3f}" + ("  (+ Binance et Coinbase)" if ex is not None else ""),
+              flush=True)
     FE = np.concatenate([features_expert(pred[a:b], fenetre=10_000 // int(cfg.minutes_par_barre))
                          for _, a, b in blocs])
     rangs_ex = FE[:, 2:4].copy()
@@ -1525,13 +1567,12 @@ def main_multi(cfg: JeuConfig) -> int:
     noms_entree = cols + NOMS_EXPERT[:cfg.n_expert]
     np.savez(f"{cfg.prefixe}_norm.npz", mean=stats["mean"], std=stats["std"],
              features=np.array(noms_entree))
-    va1 = (t_ns >= bornes[0][1]) & (t_ns < bornes[0][2])
     ics = []
     for s_ in range(2):
         ok = va1 & np.isfinite(y_ex[:, s_])
         ics.append(pd.Series(pred[ok, s_]).corr(pd.Series(y_ex[ok, s_]), method="spearman"))
-    print(f"  expert  LightGBM appris sur le train du fold 1, {time.time() - t_ex:.0f} s ; "
-          f"correlation avec le R moyen en validation : achat {ics[0]:+.3f}, "
+    print(f"  expert  sept LightGBM appris sur le train du fold 1, {time.time() - t_ex:.0f} s ; "
+          f"correlation avec le R moyen en validation, tous marches : achat {ics[0]:+.3f}, "
           f"vente {ics[1]:+.3f} ; porte d'entree : rang de l'expert >= "
           f"{cfg.porte_rang_expert:g} dans le sens joue ({len(noms_entree)} entrees)",
           flush=True)

@@ -347,6 +347,12 @@ verifie("le bilan par marche", "A 1 trades" in J.ligne_marches(cz2, mk, cfgj)
 bo = J.bilan(np.array([0.0]), [(0, 6, 0, 0, 0, -1.0, 1, 1), (0, 1, 0, 0, 0, 2.0, 1, 0)],
              np.full(9, 100.0), np.full(9, 1.0), np.zeros(9), cfgj,
              ordre=np.array([0, 5, 0, 0, 0, 0, 1, 0, 0], np.int64))
+import pandas as _pd
+_tb = _pd.Series(_pd.to_datetime(["2020-01-01 00:00", "2025-06-02 10:15"]))
+_eb = J.extras_btc(_tb)
+verifie("les sources du BTC s'alignent sur ses bougies, NaN avant leur debut",
+        _eb is not None and _eb.shape[0] == 2 and np.isnan(_eb[0]).all()
+        and np.isfinite(_eb[1]).any(), "" if _eb is None else str(_eb.shape))
 verifie("le drawdown suit l'ordre du TEMPS, pas celui des lignes",
         abs(bo["dd_dollars"] + 10.0) < 1e-9, "%.2f" % bo["dd_dollars"])
 
