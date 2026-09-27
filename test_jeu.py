@@ -101,7 +101,7 @@ torch.manual_seed(0)
 # Mise de 1 % (10 $ par R) : les comptes des tests de bilan s'y referent,
 # independamment de la mise du jeu (0.5 % depuis m15_05).
 cfgj = replace(J.JeuConfig(), horizon_max=10, jetons=3, lookback=4, n_expert=0,
-               minutes_par_barre=1, risque_pct=1.0)
+               minutes_par_barre=1, risque_pct=1.0, marches=())
 pol = J.PolitiqueJeu(cfgj)
 g = pol.groupes_jeu()
 verifie("six groupes, dont les quatre tetes", sorted(g) ==
@@ -297,8 +297,8 @@ trg = [[(5, None, 3, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, +1.0, 1, True)]]
 verifie("les gains ne changent pas", abs(J.avantages(trg, cfgj)[0][13] - 1.0) < 1e-12)
 
 print("\n6. LE JEU EN BOUGIES DE 15 MINUTES")
-c15 = J.JeuConfig()
-verifie("le jeu par defaut est en M15, 96 bougies par jour",
+c15 = replace(J.JeuConfig(), marches=())
+verifie("le jeu d'un marche en M15 : 96 bougies par jour",
         c15.minutes_par_barre == 15 and c15.barres_par_jour == 96)
 import prepare_btc_m15 as P15
 verifie("il lit les features du M15", J.colonnes_jeu(c15) == list(P15.FEATURE_COLS_M15))
@@ -315,6 +315,40 @@ verifie("le modele M15 lit ses colonnes, celles de l'expert et l'etat",
 et15 = J.etat_jeu(np.array([3]), np.array([0.0]), np.array([48]), c15)
 verifie("la moitie de la journee restante vaut 0.5 en M15", abs(et15[0, 2] - 0.5) < 1e-6)
 verifie("l'horizon est de 32 bougies, huit heures", c15.horizon_max == 32)
+
+print("\n7. LE JEU MULTI-MARCHES")
+cm = J.JeuConfig()
+import prepare_multi_m15 as PM
+verifie("le jeu par defaut joue les sept marches",
+        tuple(cm.marches) == tuple(PM.MARCHES), str(cm.marches))
+verifie("il lit les features communes, avec une colonne par marche",
+        J.colonnes_jeu(cm) == list(PM.FEATURE_COLS_MULTI)
+        and all(f"m_{m}" in PM.FEATURE_COLS_MULTI for m in PM.MARCHES)
+        and not any(c.startswith(("ofi_", "prime_cb", "taker")) for c in PM.FEATURE_COLS_MULTI))
+pm_ = J.PolitiqueJeu(cm)
+xm_ = torch.zeros(2, cm.lookback, len(PM.FEATURE_COLS_MULTI) + cm.n_expert + J.N_ETAT)
+verifie("le modele multi lit ses colonnes, l'expert et l'etat", pm_.jeu(xm_)[0].shape == (2, 3))
+mk = np.array(["A"] * 5 + ["B"] * 4)
+bl = J.blocs_marches(mk)
+verifie("les blocs de marches", bl == [("A", 0, 5), ("B", 5, 9)], str(bl))
+tn = np.array([0, 10, 20, 30, 40, 0, 10, 20, 30], np.int64)
+fs = J.fin_segment(tn, bl, 25)
+verifie("la fin du segment reste dans le bloc du marche",
+        list(fs[:5]) == [3] * 5 and list(fs[5:]) == [8] * 4, str(fs))
+verifie("une borne par ligne dans la regle des coups",
+        J._lim(fs, np.array([0, 6])).tolist() == [3, 8] and J._lim(7, 3) == 7)
+pj_ = J.par_jour(np.array([1.0, -0.5, 2.0]), np.array([[0, 2], [5, 7], [2, 4]]),
+                 np.array(["j1", "j1", "j2", "j2", "j2", "j1", "j1", "j1", "j1"]))
+verifie("le score du jour est la somme des marches", sorted(pj_.tolist()) == [0.5, 2.0],
+        str(pj_))
+cz2 = [(0, 3, 0, 0, 0, 1.0, 1, 0), (1, 6, 1, 0, 0, -1.0, 1, 1)]
+verifie("le bilan par marche", "A 1 trades" in J.ligne_marches(cz2, mk, cfgj)
+        and "B 1 trades" in J.ligne_marches(cz2, mk, cfgj))
+bo = J.bilan(np.array([0.0]), [(0, 6, 0, 0, 0, -1.0, 1, 1), (0, 1, 0, 0, 0, 2.0, 1, 0)],
+             np.full(9, 100.0), np.full(9, 1.0), np.zeros(9), cfgj,
+             ordre=np.array([0, 5, 0, 0, 0, 0, 1, 0, 0], np.int64))
+verifie("le drawdown suit l'ordre du TEMPS, pas celui des lignes",
+        abs(bo["dd_dollars"] + 10.0) < 1e-9, "%.2f" % bo["dd_dollars"])
 
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)

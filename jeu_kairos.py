@@ -110,7 +110,7 @@ N_ETAT = 5          # le bloc de position de l'observation porte l'etat du jeu
 
 @dataclass
 class JeuConfig:
-    prefixe: str = "kairos_jeu_m15_05"
+    prefixe: str = "kairos_multi_m15_01"
     # LE JEU EN BOUGIES DE 15 MINUTES — 2026-09-27, demande du proprietaire :
     # « recommence le jeu avec des bougies de 15 minutes, et pas M1 pour
     # entrer ». Le modele voit des bougies M15 (contextes H1 et H4, voir
@@ -120,8 +120,24 @@ class JeuConfig:
     # CE QUE CELA CHANGE AU COUT : l'ATR M15 median vaut 26 bps, l'ATR M1
     # environ 6, pour le meme cout de ~3.3 bps par coup. Rapporte au
     # mouvement d'une bougie, il pese quatre fois moins.
-    cache: str = "data_cache_BTCUSD_M15.pkl"
+    cache: str = "data_cache_MULTI_M15.pkl"
     minutes_par_barre: int = 15
+    # LE JEU MULTI-MARCHES — 2026-09-27, demande du proprietaire : un seul
+    # jeu qui trade le BTC, l'ETH, l'or et les indices a petit spread et
+    # bonne volatilite, pour maximiser le nombre de trades et le profit en
+    # gardant un drawdown bas. Voir `prepare_multi_m15` et `main_multi`.
+    #
+    # CHAQUE MARCHE JOUE SA JOURNEE, avec ses jetons, sa vie et la porte de
+    # l'expert ; le resultat du JOUR est la somme des marches, et le
+    # drawdown se mesure sur le compte commun, coups dans l'ordre du temps.
+    # Vide = le jeu d'un seul marche (`cache`).
+    marches: Tuple[str, ...] = ("BTCUSD", "ETHUSD", "XAUUSD", "NAS100", "SP500",
+                                "DJ30", "GER40")
+    # LE PLANCHER DES BARRIERES, PAR MARCHE : cinq fois son cout median
+    # (spread + glissements), jamais sous 10 bps. Le cout ne depasse donc
+    # jamais ~0.2 R, sur le BTC (17 bps) comme sur l'ETH (58) ou le Dow (10).
+    plancher_couts: float = 5.0
+    plancher_min_bps: float = 10.0
     # --- le modele : celui du run PPO, a l'identique ---
     lookback: int = 4
     d_model: int = 8
@@ -277,7 +293,10 @@ class JeuConfig:
 
 
 def colonnes_jeu(cfg: "JeuConfig") -> list:
-    """Les features du cache que joue ce jeu : M15 ou M1."""
+    """Les features du cache que joue ce jeu : multi-marches, M15 ou M1."""
+    if tuple(getattr(cfg, "marches", ())):
+        from prepare_multi_m15 import FEATURE_COLS_MULTI
+        return list(FEATURE_COLS_MULTI)
     if int(cfg.minutes_par_barre) == 15:
         from prepare_btc_m15 import FEATURE_COLS_M15
         return list(FEATURE_COLS_M15)
@@ -544,6 +563,12 @@ def departs_tires(jours: np.ndarray, rng, marge: int = 240) -> np.ndarray:
     return j
 
 
+def _lim(fin_valide, t):
+    """La borne d'un coup : un entier, ou une borne PAR LIGNE (multi-marches :
+    la fin du segment dans le bloc du marche)."""
+    return fin_valide[t] if isinstance(fin_valide, np.ndarray) else fin_valide
+
+
 def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
          cfg: JeuConfig, device, explore: bool, gen=None,
          collecte: bool = False, rangs=None):
@@ -569,7 +594,7 @@ def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
         tt = t[g]
         et = etat_jeu(jet[g], score[g], fin[g] - tt, cfg)
         ob = observations(Xn, tt, et, L)
-        peut_np = (jet[g] > 0) & (tt + 1 + H < fin_valide)
+        peut_np = (jet[g] > 0) & (tt + 1 + H < _lim(fin_valide, tt))
         # LA PORTE DE L'EXPERT, par sens. Voir `porte_rang_expert`.
         pa_np, pv_np = portes(peut_np, tt, rangs, cfg)
         with torch.no_grad():
@@ -744,7 +769,7 @@ def coups_expert(jours, R, D, fin_valide: int, cfg: JeuConfig):
     out = []
     for a0, b0 in jours:
         ts = np.arange(max(a0, L - 1), b0)
-        ts = ts[ts + 1 + H < fin_valide]
+        ts = ts[ts + 1 + H < _lim(fin_valide, ts)]
         if len(ts) == 0:
             continue
         Rt = R[ts].reshape(len(ts), -1)
@@ -766,6 +791,108 @@ def coups_expert(jours, R, D, fin_valide: int, cfg: JeuConfig):
             out.append((t0, s, i, j, float(rb[q]), int(b0)))
             pris += 1
     return out
+
+
+def blocs_marches(marche: np.ndarray):
+    """Les blocs contigus d'un meme marche : [(nom, debut, fin), ...]."""
+    out, a = [], 0
+    for i in range(1, len(marche) + 1):
+        if i == len(marche) or marche[i] != marche[a]:
+            out.append((str(marche[a]), a, i))
+            a = i
+    return out
+
+
+def fin_segment(t_ns: np.ndarray, blocs, t_fin_ns) -> np.ndarray:
+    """Pour chaque ligne : le premier indice de SON bloc a partir de `t_fin`.
+    Un coup n'est permis que s'il se resout avant — ni le segment suivant,
+    ni le marche suivant ne sont lus."""
+    out = np.empty(len(t_ns), np.int64)
+    for _, a, b in blocs:
+        out[a:b] = a + int(np.searchsorted(t_ns[a:b], t_fin_ns, side="left"))
+    return out
+
+
+def journees_multi(temps: pd.Series, blocs, t0_ns, t1_ns, min_barres: int) -> np.ndarray:
+    """Les journees entieres de [t0, t1), marche par marche."""
+    t_ns = temps.values.astype("int64")
+    out = []
+    for _, a, b in blocs:
+        i0 = a + int(np.searchsorted(t_ns[a:b], t0_ns, side="left"))
+        i1 = a + int(np.searchsorted(t_ns[a:b], t1_ns, side="left"))
+        if i1 - i0 < min_barres:
+            continue
+        j = journees(temps.iloc[a:b].reset_index(drop=True), i0 - a, i1 - a, min_barres)
+        if len(j):
+            out.append(j + a)
+    return np.concatenate(out) if out else np.zeros((0, 2), np.int64)
+
+
+def expert_multi(Xn, y, t_ns, dans_train: np.ndarray, fin_tr: np.ndarray,
+                 cfg: JeuConfig):
+    """L'expert multi-marches : (predictions (N, 2), modeles du train entier).
+
+    Les memes regles que `expert_realiste`, en DATES : les blocs croises du
+    train sont des tranches de temps communes a tous les marches, purgees
+    de `horizon_max` bougies de part et d'autre ; tout ce qui n'est pas le
+    train est note par le modele du train entier."""
+    import lightgbm as lgb
+    H = int(cfg.horizon_max)
+    purge = np.int64((H + 1) * int(cfg.minutes_par_barre) * 60 * 10**9)
+    idx_tr = np.flatnonzero(dans_train)
+    ok = idx_tr[idx_tr + 1 + H < fin_tr[idx_tr]]
+    pred = np.full((len(Xn), 2), np.nan, np.float32)
+
+    def _modeles(idx):
+        ms = []
+        for s_ in range(2):
+            u = idx[np.isfinite(y[idx, s_])]
+            m = lgb.LGBMRegressor(
+                n_estimators=cfg.expert_arbres, learning_rate=0.03, num_leaves=31,
+                min_child_samples=400, subsample=0.7, subsample_freq=1,
+                colsample_bytree=0.7, reg_lambda=5.0, n_jobs=4, verbose=-1)
+            m.fit(Xn[u], y[u, s_])
+            ms.append(m)
+        return ms
+
+    bornes = np.quantile(t_ns[idx_tr], np.linspace(0, 1, cfg.expert_blocs + 1))
+    for b in range(cfg.expert_blocs):
+        e0, e1 = np.int64(bornes[b]), np.int64(bornes[b + 1])
+        der = b == cfg.expert_blocs - 1
+        dans_b = (t_ns[idx_tr] >= e0) & ((t_ns[idx_tr] <= e1) if der else (t_ns[idx_tr] < e1))
+        app = ok[(t_ns[ok] < e0 - purge) | (t_ns[ok] > e1 + purge)][::cfg.expert_pas_app]
+        ms = _modeles(app)
+        r = idx_tr[dans_b]
+        for s_ in range(2):
+            pred[r, s_] = ms[s_].predict(Xn[r])
+    ms = _modeles(ok[::cfg.expert_pas_app])
+    hors = np.flatnonzero(~dans_train)
+    for s_ in range(2):
+        pred[hors, s_] = ms[s_].predict(Xn[hors])
+    return pred, ms
+
+
+def par_jour(scores: np.ndarray, jours: np.ndarray, dates: np.ndarray) -> np.ndarray:
+    """Le score de chaque JOUR : la somme des parties de tous les marches."""
+    if len(scores) == 0:
+        return np.zeros(0)
+    return pd.Series(scores).groupby(dates[jours[:, 0]]).sum().to_numpy()
+
+
+def ligne_marches(coups, marche: np.ndarray, cfg: JeuConfig) -> str:
+    """Trades, dollars et profit factor de chaque marche."""
+    if not coups:
+        return "par marche : aucun trade"
+    c = np.array(coups)
+    t, r = c[:, 1].astype(np.int64), c[:, 5]
+    m = marche[t]
+    parts = []
+    for nom in dict.fromkeys(m):
+        rr = r[m == nom]
+        g, p = rr[rr > 0].sum(), -rr[rr < 0].sum()
+        parts.append(f"{nom} {len(rr)} trades {rr.sum() * cfg.risque_dollars:+.1f} $ "
+                     f"PF {g / p if p > 0 else float('inf'):.2f}")
+    return "par marche : " + "  |  ".join(parts)
 
 
 def cibles_expert(R: np.ndarray) -> np.ndarray:
@@ -865,7 +992,7 @@ def coups_expert_predits(jours, pred, D, fin_valide: int, cfg: JeuConfig):
     out = []
     for a0, b0 in jours:
         ts = np.arange(max(a0, L - 1), b0)
-        ts = ts[ts + 1 + H < fin_valide]
+        ts = ts[ts + 1 + H < _lim(fin_valide, ts)]
         if len(ts) == 0:
             continue
         p_ = pred[ts]
@@ -905,7 +1032,7 @@ def joue_expert(jours, pred, R, D, S, fin_valide: int, seuil: float,
         t, jet, sc = max(int(a0), L - 1), cfg.jetons, 0.0
         while t < b0 and jet > 0 and sc > -cfg.vie_R:
             p_ = pred[t]
-            if (t + 1 + H < fin_valide and np.isfinite(p_).all()
+            if (t + 1 + H < _lim(fin_valide, t) and np.isfinite(p_).all()
                     and float(p_.max()) >= seuil):
                 s_ = int(p_.argmax())
                 r = float(R[t, s_, ri, rj])
@@ -935,7 +1062,7 @@ def imite_expert(policy, optims, pos, jours, Xn, fin_valide, cfg, device, rng):
     neg = []
     for a0, b0 in jours:
         for t0 in range(max(a0, L - 1), b0, cfg.expert_pas_neg):
-            if t0 not in t_pos and t0 + 1 + H < fin_valide:
+            if t0 not in t_pos and t0 + 1 + H < _lim(fin_valide, t0):
                 neg.append((t0, b0))
     tt = np.array([p[0] for p in pos] + [q[0] for q in neg], np.int64)
     fin = np.array([p[5] for p in pos] + [q[1] for q in neg], np.int64)
@@ -977,7 +1104,7 @@ def imite_expert(policy, optims, pos, jours, Xn, fin_valide, cfg, device, rng):
 # LE BILAN D'UNE SERIE DE PARTIES
 # ======================================================================
 def bilan(scores, coups, close, atr, sp, cfg: JeuConfig,
-          frac: float = 1.0) -> Dict[str, float]:
+          frac: float = 1.0, ordre=None) -> Dict[str, float]:
     ksl = np.asarray(cfg.sl_atr)
     n = len(coups)
     b = {"parties": len(scores), "score": float(np.mean(scores)) if len(scores) else 0.0,
@@ -1000,7 +1127,9 @@ def bilan(scores, coups, close, atr, sp, cfg: JeuConfig,
     # LE DRAWDOWN — la pire baisse du compte, sommet a creux, en dollars et
     # en % du capital, les coups joues dans l'ordre du temps. Demande du
     # proprietaire, 2026-09-27, avec les comptes ci-dessous.
-    ordre = np.argsort(t, kind="stable")
+    # EN MULTI-MARCHES, l'indice d'une ligne ne suit pas le temps (les
+    # marches sont empiles) : `ordre` donne l'instant de chaque ligne.
+    ordre = np.argsort(t if ordre is None else np.asarray(ordre)[t], kind="stable")
     eq = cfg.capital + np.cumsum(r[ordre] * cfg.risque_dollars)
     eq = np.concatenate([[cfg.capital], eq])
     pic = np.maximum.accumulate(eq)
@@ -1099,6 +1228,8 @@ def ligne_style(b, cfg: JeuConfig) -> str:
 # ======================================================================
 def main() -> int:
     cfg = JeuConfig()
+    if tuple(cfg.marches):
+        return main_multi(cfg)
     rng = np.random.default_rng(cfg.graine)
     torch.manual_seed(cfg.graine)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1291,6 +1422,223 @@ def main() -> int:
               flush=True)
         print(f"TEST fold {fold + 1} bilan  {ligne_detail(bt, cfg)}", flush=True)
         print(f"TEST fold {fold + 1} bilan  {ligne_prudente(bt, cfg)}", flush=True)
+        print(f"TEST fold {fold + 1}  {ligne_style(bt, cfg)}", flush=True)
+        with open(f"test_{cfg.prefixe}{suffixe}.json", "w", encoding="utf-8") as fh:
+            json.dump({k: v for k, v in bt.items()}, fh, indent=1, default=str)
+        precedent = src
+    print("\nFIN du walk-forward", flush=True)
+    return 0
+
+
+def main_multi(cfg: JeuConfig) -> int:
+    """Le jeu multi-marches. Voir `marches`."""
+    rng = np.random.default_rng(cfg.graine)
+    torch.manual_seed(cfg.graine)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    manifeste = f"run_{cfg.prefixe}.json"
+    if os.path.exists(manifeste):
+        raise FileExistsError(f"{manifeste} existe : nouveau prefixe, ou lancer.ps1")
+    with open(manifeste, "w", encoding="utf-8") as fh:
+        json.dump(asdict(cfg), fh, indent=1, default=str)
+    cols = colonnes_jeu(cfg)
+    print("=" * 70)
+    print(f"  KAIROS EN JEU — {len(cfg.marches)} MARCHES M{cfg.minutes_par_barre} : "
+          f"une journee = une partie par marche, le jour = leur somme")
+    print("=" * 70)
+    print(f"  marches : {', '.join(cfg.marches)}")
+    print(f"  regles : {cfg.jetons} coups par marche et par jour, fin de partie a "
+          f"-{cfg.vie_R:g} R, coup = sens + objectif {cfg.tp_atr} ATR + stop "
+          f"{cfg.sl_atr} ATR, temps limite {cfg.horizon_max} bougies "
+          f"({cfg.horizon_max * cfg.minutes_par_barre} min)")
+    print(f"  un R = {cfg.risque_dollars:.0f}$ ({cfg.risque_pct:g}% de "
+          f"{cfg.capital:.0f}$)  |  quatre tetes : achat, vente, gain (objectif), "
+          f"perte (stop), chacune son optimiseur  |  {device}", flush=True)
+
+    d = pd.read_pickle(cfg.cache)
+    d = d[d["marche"].isin(cfg.marches)].reset_index(drop=True)
+    # SANS DOUBLON : `spread_bar` est aussi une feature. Deux colonnes du meme
+    # nom feraient de `d["spread_bar"]` un tableau a deux colonnes.
+    d = d[list(dict.fromkeys(["time", "marche", "open", "high", "low", "close",
+                              "atr_14", "spread_bar"] + cols))].reset_index(drop=True)
+    N = len(d)
+    marche = d["marche"].to_numpy()
+    blocs = blocs_marches(marche)
+    t_ns = d["time"].values.astype("int64")
+    dates = d["time"].dt.normalize().values
+    o, h, l, c = (d[k].to_numpy(np.float64) for k in ("open", "high", "low", "close"))
+    sp = d["spread_bar"].to_numpy(np.float64)
+    # LE PLANCHER PAR MARCHE. Voir `plancher_couts`.
+    plancher = np.empty(N)
+    for nom, a, b in blocs:
+        cout_med = float(np.median(sp[a:b])) + cfg.glissement_entree_bps + cfg.glissement_sortie_bps
+        plancher[a:b] = max(cfg.plancher_min_bps, cfg.plancher_couts * cout_med)
+        print(f"  {nom:8s} {b - a:6d} bougies  {d['time'].iloc[a]:%Y-%m-%d} -> "
+              f"{d['time'].iloc[b - 1]:%Y-%m-%d}  cout med {cout_med:5.2f} bps  "
+              f"plancher des barrieres {plancher[a]:5.1f} bps", flush=True)
+    atr = np.maximum(d["atr_14"].to_numpy(np.float64), plancher * 1e-4 * c)
+
+    # LES FENETRES EN DATES, communes a tous les marches.
+    t0, t1 = int(t_ns.min()), int(t_ns.max()) + 1
+    span = t1 - t0
+    bornes = []
+    for f in range(cfg.n_folds):
+        a_ = t0 + int(f * cfg.part_test * span)
+        va = a_ + int(cfg.part_train * span)
+        te = va + int(cfg.part_val * span)
+        fi = min(te + int(cfg.part_test * span), t1)
+        bornes.append((a_, va, te, fi))
+    dans_train1 = t_ns < bornes[0][1]
+
+    X = d[cols].to_numpy(np.float32)
+    stats = {"mean": X[dans_train1].astype(np.float64).mean(0).astype(np.float32),
+             "std": X[dans_train1].astype(np.float64).std(0).astype(np.float32)}
+    Xn = safe_normalize(X, stats).astype(np.float32)
+    del X
+
+    t_tab = time.time()
+    tabs = {}
+    for frac in (0.0, 1.0):
+        parts = [table_coups(o[a:b], h[a:b], l[a:b], sp[a:b], atr[a:b], cfg, frac)
+                 for _, a, b in blocs]
+        tabs[frac] = tuple(np.concatenate([p_[k] for p_ in parts]) for k in range(3))
+    R0, D0, _ = tabs[0.0]
+    R1, D1, S1 = tabs[1.0]
+    del tabs
+    print(f"  table des coups : {N:,} bougies x {R1[0].size} coups, marche par "
+          f"marche, {time.time() - t_tab:.0f} s", flush=True)
+
+    t_ex = time.time()
+    fin_tr1 = fin_segment(t_ns, blocs, bornes[0][1])
+    y_ex = cibles_expert(R1)
+    pred, modeles_expert = expert_multi(Xn, y_ex, t_ns, dans_train1, fin_tr1, cfg)
+    for s_, nom in enumerate(("achat", "vente")):
+        modeles_expert[s_].booster_.save_model(f"expert_{cfg.prefixe}_{nom}.txt")
+    FE = np.concatenate([features_expert(pred[a:b], fenetre=10_000 // int(cfg.minutes_par_barre))
+                         for _, a, b in blocs])
+    rangs_ex = FE[:, 2:4].copy()
+    m_e = FE[dans_train1].astype(np.float64).mean(0)
+    s_e = FE[dans_train1].astype(np.float64).std(0)
+    FEn = np.clip((FE - m_e) / (s_e + 1e-8), -5.0, 5.0).astype(np.float32)
+    Xn = np.concatenate([Xn, FEn[:, :cfg.n_expert]], axis=1)
+    stats = {"mean": np.concatenate([stats["mean"], m_e[:cfg.n_expert].astype(np.float32)]),
+             "std": np.concatenate([stats["std"], s_e[:cfg.n_expert].astype(np.float32)])}
+    noms_entree = cols + NOMS_EXPERT[:cfg.n_expert]
+    np.savez(f"{cfg.prefixe}_norm.npz", mean=stats["mean"], std=stats["std"],
+             features=np.array(noms_entree))
+    va1 = (t_ns >= bornes[0][1]) & (t_ns < bornes[0][2])
+    ics = []
+    for s_ in range(2):
+        ok = va1 & np.isfinite(y_ex[:, s_])
+        ics.append(pd.Series(pred[ok, s_]).corr(pd.Series(y_ex[ok, s_]), method="spearman"))
+    print(f"  expert  LightGBM appris sur le train du fold 1, {time.time() - t_ex:.0f} s ; "
+          f"correlation avec le R moyen en validation : achat {ics[0]:+.3f}, "
+          f"vente {ics[1]:+.3f} ; porte d'entree : rang de l'expert >= "
+          f"{cfg.porte_rang_expert:g} dans le sens joue ({len(noms_entree)} entrees)",
+          flush=True)
+
+    policy = PolitiqueJeu(cfg).to(device)
+    optims = optimiseurs(policy, cfg)
+    n_par = sum(q.numel() for v in policy.groupes_jeu().values() for q in v)
+    print(f"  modele : {n_par:,} parametres entraines", flush=True)
+
+    def _bilan(scores, jours, coups, frac=1.0):
+        return bilan(par_jour(scores, jours, dates), coups, c, atr, sp, cfg,
+                     frac=frac, ordre=t_ns)
+
+    _fmt = lambda x: pd.Timestamp(x).strftime("%Y-%m-%d")
+    precedent = None
+    _mb = int(0.4 * cfg.barres_par_jour)
+    for fold, (a_, va, te, fi) in enumerate(bornes):
+        suffixe = f"_wf{fold + 1}"
+        j_tr = journees_multi(d["time"], blocs, a_, va, _mb)
+        j_va = journees_multi(d["time"], blocs, va, te, _mb)
+        j_te = journees_multi(d["time"], blocs, te, fi, _mb)
+        fin_tr = fin_segment(t_ns, blocs, va)
+        fin_va = fin_segment(t_ns, blocs, te)
+        fin_te = fin_segment(t_ns, blocs, fi)
+        n_jv = len(np.unique(dates[j_va[:, 0]])) if len(j_va) else 0
+        print(f"\n--- Fold {fold + 1} : train {_fmt(a_)} -> {_fmt(va)} ({len(j_tr)} parties)  "
+              f"validation -> {_fmt(te)} ({len(j_va)} parties, {n_jv} jours)  "
+              f"test -> {_fmt(fi)} ({len(j_te)} parties) ---", flush=True)
+        if precedent is not None:
+            policy.load_state_dict(torch.load(precedent, map_location=device,
+                                              weights_only=False)["modele"])
+            optims = optimiseurs(policy, cfg)
+            print(f"  reprend {precedent}", flush=True)
+        depart_zero = precedent is None
+        if depart_zero:
+            pos = coups_expert_predits(j_tr, pred, D1, fin_tr, cfg)
+            ri_, rj_ = _ref(cfg)
+            r_pos = [float(R1[q[0], q[1], ri_, rj_]) for q in pos]
+            print(f"  expert  ses coups d'entrainement ont rapporte "
+                  f"{np.mean(r_pos) if r_pos else float('nan'):+.3f} R en moyenne "
+                  f"(predits sans les avoir appris)", flush=True)
+            imite_expert(policy, optims, pos, j_tr, Xn, fin_tr, cfg, device, rng)
+        best_path = f"best_{cfg.prefixe}{suffixe}.pth"
+        record, garde_rec = 0.0, None
+        for epoch in range(0 if depart_zero else 1, cfg.epochs + 1):
+            t_ep = time.time()
+            frac = (min(1.0, max(0.0, (epoch - 1) / cfg.rampe_cout))
+                    if (depart_zero and cfg.rampe_cout > 0) else 1.0)
+            st = b_tr = None
+            if epoch >= 1:
+                Rf = (1 - frac) * R0 + frac * R1 if frac < 1.0 else R1
+                Df = D1 if frac >= 0.5 else D0
+                choix = rng.choice(len(j_tr), size=min(cfg.parties_par_epoch, len(j_tr)),
+                                   replace=False)
+                sc, cp, tr = joue(policy, departs_tires(
+                                      j_tr[choix], rng, 240 // int(cfg.minutes_par_barre)),
+                                  Xn, Rf, Df, S1, fin_tr, cfg, device, explore=True,
+                                  collecte=True, rangs=rangs_ex)
+                b_tr = bilan(sc, cp, c, atr, sp, cfg, frac=frac, ordre=t_ns)
+                st = maj_ppo(policy, optims, avantages(tr, cfg), Xn, cfg, device, rng)
+                del Rf
+            gen = torch.Generator(device=device)
+            gen.manual_seed(cfg.graine)
+            sv, cv, _ = joue(policy, j_va, Xn, R1, D1, S1, fin_va, cfg, device,
+                             explore=False, gen=gen, rangs=rangs_ex)
+            bv = _bilan(sv, j_va, cv)
+            nom = "EXPERT IMITE" if epoch == 0 else f"cout {100 * frac:.0f}%"
+            print(f"\nEPOCH {epoch:03d}  {nom:>12}  VAL  {ligne_bilan(bv, cfg)}  "
+                  f"{(time.time() - t_ep) / 60:.1f} min", flush=True)
+            print(f"  bilan  {ligne_detail(bv, cfg)}", flush=True)
+            print(f"  bilan  {ligne_prudente(bv, cfg)}", flush=True)
+            print(f"  bilan  {ligne_marches(cv, marche, cfg)}", flush=True)
+            print(f"  jeu  validation  {ligne_style(bv, cfg)}", flush=True)
+            if st is not None:
+                print(f"  jeu  entrainement  {ligne_bilan(b_tr, cfg)}", flush=True)
+                print(f"  jeu  PPO  {st['n']:,} decisions ({st['n_coups']:,} coups)  "
+                      f"H entree {st['H']:.3f}/1.099  H barrieres {st['Hb']:.3f}/1.386  "
+                      f"KL {st['kl']:+.4f}  clip {100 * st['clip']:.0f}%", flush=True)
+            etat = {"modele": policy.state_dict(), "config": asdict(cfg),
+                    "features": noms_entree, "mean": stats["mean"], "std": stats["std"],
+                    "epoch": epoch, "fold": fold + 1}
+            torch.save(etat, f"last_{cfg.prefixe}{suffixe}.pth")
+            if bv["coups"] >= cfg.min_coups_val and bv["score"] > record:
+                record, garde_rec = bv["score"], epoch
+                torch.save(etat, best_path)
+                print(f"  sauvegarde  NOUVEAU MEILLEUR : {bv['score']:+.3f} R/partie "
+                      f"en validation, {bv['coups']} coups -> {best_path}", flush=True)
+            else:
+                pourquoi = (f"{bv['coups']} coups, il en faut {cfg.min_coups_val}"
+                            if bv["coups"] < cfg.min_coups_val else
+                            f"{bv['score']:+.3f} R/partie ne bat pas {record:+.3f}")
+                print(f"  garde  rien de sauvegarde : {pourquoi}"
+                      + (f" (meilleur : epoch {garde_rec})" if garde_rec is not None else ""),
+                      flush=True)
+        src = best_path if os.path.exists(best_path) else f"last_{cfg.prefixe}{suffixe}.pth"
+        policy.load_state_dict(torch.load(src, map_location=device,
+                                          weights_only=False)["modele"])
+        gen = torch.Generator(device=device)
+        gen.manual_seed(cfg.graine)
+        s_t, c_t, _ = joue(policy, j_te, Xn, R1, D1, S1, fin_te, cfg, device,
+                           explore=False, gen=gen, rangs=rangs_ex)
+        bt = _bilan(s_t, j_te, c_t)
+        print(f"\nTEST fold {fold + 1} ({os.path.basename(src)})  {ligne_bilan(bt, cfg)}",
+              flush=True)
+        print(f"TEST fold {fold + 1} bilan  {ligne_detail(bt, cfg)}", flush=True)
+        print(f"TEST fold {fold + 1} bilan  {ligne_prudente(bt, cfg)}", flush=True)
+        print(f"TEST fold {fold + 1} bilan  {ligne_marches(c_t, marche, cfg)}", flush=True)
         print(f"TEST fold {fold + 1}  {ligne_style(bt, cfg)}", flush=True)
         with open(f"test_{cfg.prefixe}{suffixe}.json", "w", encoding="utf-8") as fh:
             json.dump({k: v for k, v in bt.items()}, fh, indent=1, default=str)

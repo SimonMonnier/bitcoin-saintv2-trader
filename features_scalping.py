@@ -300,7 +300,7 @@ def coinbase(d: pd.DataFrame, mpb: int = 1) -> pd.DataFrame:
     return d
 
 
-def ancres(d: pd.DataFrame, t: pd.Series = None) -> pd.DataFrame:
+def ancres(d: pd.DataFrame, t: pd.Series = None, unite_rond: float = 1000.0) -> pd.DataFrame:
     utc = utc_depuis_serveur(d["time"] if t is None else t)
     jour = utc.dt.floor("D")
     g = d.groupby(jour)
@@ -319,16 +319,27 @@ def ancres(d: pd.DataFrame, t: pd.Series = None) -> pd.DataFrame:
     d["pos_range_jour"] = ((c - bas) / largeur.replace(0, np.nan)).fillna(0.5)
     d["dist_haut_veille"] = (c - jour.map(j["h_veille"])) / typ
     d["dist_bas_veille"] = (c - jour.map(j["l_veille"])) / typ
-    d["dist_rond"] = (((c + 500.0) % 1000.0) - 500.0) / typ
+    # LE NOMBRE ROND DEPEND DU PRIX : le millier de dollars pour le BTC, la
+    # centaine pour l'or ou le S&P 500. Voir `unite_ronde`.
+    u = float(unite_rond)
+    d["dist_rond"] = (((c + u / 2.0) % u) - u / 2.0) / typ
     return d
 
 
-def rangs(d: pd.DataFrame, mpb: int = 1) -> pd.DataFrame:
+def unite_ronde(prix: float) -> float:
+    """Le nombre rond d'un marche : la puissance de dix la plus proche de 1 %
+    de son prix. BTC ~110 000 -> 1 000 ; or ~3 700 -> 100 ; S&P ~6 600 -> 100."""
+    return float(10.0 ** np.round(np.log10(0.01 * float(prix))))
+
+
+def rangs(d: pd.DataFrame, mpb: int = 1, avec_flux: bool = True) -> pd.DataFrame:
     # Voir `saint_core.FEATURE_COLS_RANGS` : le creux et le flux fort,
     # +11.95 bps a 480 minutes sur 20 mois de 23. Deux semaines, en lignes.
     fen, mini = _n(_FEN_RANG, mpb), _n(_MIN_RANG, mpb)
     d["creux_rang"] = (d["close_ema_dev"]
                        .rolling(fen, min_periods=mini).rank(pct=True))
+    if not avec_flux:
+        return d
     d["flux_rang"] = (d["taker_buy_base"]
                       .rolling(fen, min_periods=mini).rank(pct=True))
     # L'INTERACTION MESUREE, donnee telle quelle : fort quand le cours est
@@ -346,7 +357,8 @@ def creneau_de(d: pd.DataFrame, t: pd.Series = None) -> pd.Series:
     return q + 96 * we
 
 
-def ajoute(d: pd.DataFrame, mpb: int = 1) -> pd.DataFrame:
+def ajoute(d: pd.DataFrame, mpb: int = 1, sources: bool = True,
+           unite_rond: float = 1000.0) -> pd.DataFrame:
     """Toutes les colonnes de ce fichier, sur un cadre deja passe par
     `prepare_m5.construit` (il faut `close_ema_dev`), en bougies de `mpb`
     minutes.
@@ -360,10 +372,13 @@ def ajoute(d: pd.DataFrame, mpb: int = 1) -> pd.DataFrame:
     cr = creneau_de(d, t)
     d = horloge(d, t)
     d = regime(d, cr, mpb)
-    d = flux(d, cr, mpb)
-    d = coinbase(d, mpb)
-    d = ancres(d, t)
-    d = rangs(d, mpb)
+    # SANS SOURCES : ni Binance ni Coinbase — elles n'existent que pour le
+    # BTC. Le jeu multi-marches s'en passe pour tous les marches.
+    if sources:
+        d = flux(d, cr, mpb)
+        d = coinbase(d, mpb)
+    d = ancres(d, t, unite_rond)
+    d = rangs(d, mpb, avec_flux=sources)
     return d
 
 
