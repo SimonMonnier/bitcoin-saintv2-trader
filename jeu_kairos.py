@@ -200,7 +200,11 @@ class JeuConfig:
     # reduire le drawdown. Le jeu apprend en R, donc les decisions ne
     # changent pas ; les dollars et le drawdown sont divises par deux, le
     # rapport gain / drawdown est inchange. C'est la mise du live.
-    risque_pct: float = 0.5
+    #
+    # REMISE A 1 % LE 2026-09-27, demande du proprietaire : retrouver les gains
+    # en dollars d'avant. Le drawdown redouble avec eux (~-7 a -15 % en
+    # validation, -13.6 % au test du fold 1).
+    risque_pct: float = 1.0
     # --- le walk-forward : les memes proportions que le run PPO ---
     part_train: float = 0.55
     part_val: float = 0.15
