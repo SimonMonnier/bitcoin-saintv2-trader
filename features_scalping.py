@@ -123,6 +123,31 @@ COLONNES_COINBASE = [
 # Normes de creneau : quart d'heure de la journee, semaine et week-end
 # separes. 300 observations = 20 jours ouvres d'un creneau de 15 minutes.
 _FEN_CRENEAU, _MIN_CRENEAU = 300, 60
+
+# LA DUREE D'UNE BOUGIE, EN MINUTES — 2026-09-27, le jeu passe en M15.
+#
+# Toutes les fenetres de ce fichier etaient ecrites en LIGNES de M1 : 15,
+# 60, 240, 1440, 20 000. Sur des bougies de 15 minutes, les memes nombres
+# couvriraient quinze fois plus de temps, et les colonnes porteraient un nom
+# qui ment. Elles sont donc exprimees en MINUTES et converties en lignes par
+# `_n`. Avec `mpb = 1`, chaque nombre est inchange : le M1 est identique.
+
+
+def _n(minutes: float, mpb: int, mini: int = 1) -> int:
+    """Des minutes aux lignes, pour des bougies de `mpb` minutes."""
+    return max(int(mini), int(round(float(minutes) / int(mpb))))
+
+
+def horizons_ofi(mpb: int = 1):
+    """Les trois horizons de l'OFI, en minutes. En M1 : 5, 15, 60. Plus
+    court qu'une bougie n'a pas de sens : en M15, 15, 60 et 240."""
+    return (5, 15, 60) if int(mpb) == 1 else (int(mpb), 4 * int(mpb), 16 * int(mpb))
+
+
+def colonnes_flux(mpb: int = 1):
+    """Les colonnes de flux, les noms d'OFI suivant leurs horizons REELS."""
+    return (["taker_ratio"] + [f"ofi_{k}" for k in horizons_ofi(mpb)]
+            + ["flux_taille_trade", "volume_rel_creneau", "ecart_binance"])
 # Rangs glissants : deux semaines de M1. Voir `saint_core.FEATURE_COLS_RANGS`.
 _FEN_RANG, _MIN_RANG = 20_000, 2_000
 # Range journalier typique : moyenne des 20 derniers jours.
@@ -169,18 +194,25 @@ def aligne_coinbase(cb: pd.DataFrame) -> pd.DataFrame:
     return out.drop_duplicates("time").sort_values("time").reset_index(drop=True)
 
 
-def _rel_creneau(x: pd.Series, creneau: pd.Series) -> pd.Series:
-    """x moins sa moyenne sur les 300 dernieres minutes du MEME creneau.
+def _rel_creneau(x: pd.Series, creneau: pd.Series, mpb: int = 1) -> pd.Series:
+    """x moins sa moyenne sur les ~20 derniers jours du MEME creneau.
 
-    DECALEE D'UNE LIGNE DANS LE GROUPE : la minute courante n'entre pas
+    En M1, un creneau de 15 minutes compte 15 lignes par jour : 300 lignes
+    font 20 jours. En M15 il n'en compte qu'une : 20 lignes font 20 jours.
+
+    DECALEE D'UNE LIGNE DANS LE GROUPE : la ligne courante n'entre pas
     dans sa propre norme."""
+    fen = max(20, _n(_FEN_CRENEAU, mpb))
+    mini = max(4, _n(_MIN_CRENEAU, mpb))
     norme = x.groupby(creneau).transform(
-        lambda s: s.shift(1).rolling(_FEN_CRENEAU, min_periods=_MIN_CRENEAU).mean())
+        lambda s: s.shift(1).rolling(fen, min_periods=mini).mean())
     return x - norme
 
 
-def horloge(d: pd.DataFrame) -> pd.DataFrame:
-    t = d["time"]
+def horloge(d: pd.DataFrame, t: pd.Series = None) -> pd.DataFrame:
+    """`t` : l'instant de la DECISION de chaque ligne. En M1 c'est `time` ;
+    en M15, la derniere minute de la bougie, pas son ouverture."""
+    t = d["time"] if t is None else t
     ny = t - pd.Timedelta(hours=DECALAGE_SERVEUR_NY_H)
     minute_ny = ny.dt.hour * 60 + ny.dt.minute
     ouvre = ny.dt.dayofweek < 5
@@ -202,66 +234,74 @@ def horloge(d: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def regime(d: pd.DataFrame, creneau: pd.Series) -> pd.DataFrame:
+def regime(d: pd.DataFrame, creneau: pd.Series, mpb: int = 1) -> pd.DataFrame:
     sp = d["spread_bar"].clip(lower=1e-3)
-    d["spread_rel_creneau"] = _rel_creneau(np.log(sp), creneau)
+    d["spread_rel_creneau"] = _rel_creneau(np.log(sp), creneau, mpb)
     # PAS DE « SAUT DE SPREAD » : mesure le 2026-09-26, le spread du
     # courtier ne bouge presque pas dans la minute (log max/moyen = 0.006,
     # ecart-type 0.0005). Une colonne quasi constante, une fois normalisee,
     # n'est que du bruit amplifie.
-    d["ticks_rel_creneau"] = _rel_creneau(np.log1p(d["tick_n"]), creneau)
+    d["ticks_rel_creneau"] = _rel_creneau(np.log1p(d["tick_n"]), creneau, mpb)
     r = np.log(d["close"]).diff()
-    rv15 = np.sqrt((r * r).rolling(15, min_periods=10).mean())
-    rv240 = np.sqrt((r * r).rolling(240, min_periods=120).mean())
-    d["vol_rel_creneau"] = _rel_creneau(np.log(rv15 + 1e-7), creneau)
-    d["vol_court_long"] = np.log((rv15 + 1e-7) / (rv240 + 1e-7))
-    # Entre 1/sqrt(15) — quinze minutes egales — et 1 : une seule minute a
-    # tout fait.
-    d["saut_ratio"] = (r.abs().rolling(15, min_periods=10).max()
-                       / (np.sqrt((r * r).rolling(15, min_periods=10).sum()) + 1e-9))
+    # FENETRE COURTE ET LONGUE : 15 et 240 minutes en M1. En M15, 15 minutes
+    # ne feraient qu'une bougie : la courte passe a 4 bougies (1 h), la
+    # longue a 64 (16 h).
+    nc = _n(max(15, 4 * mpb), mpb)
+    nl = _n(max(240, 64 * mpb), mpb)
+    mc, ml = max(2, 2 * nc // 3), max(2, nl // 2)
+    rvc = np.sqrt((r * r).rolling(nc, min_periods=mc).mean())
+    rvl = np.sqrt((r * r).rolling(nl, min_periods=ml).mean())
+    d["vol_rel_creneau"] = _rel_creneau(np.log(rvc + 1e-7), creneau, mpb)
+    d["vol_court_long"] = np.log((rvc + 1e-7) / (rvl + 1e-7))
+    # Entre 1/sqrt(n) — n barres egales — et 1 : une seule barre a tout fait.
+    d["saut_ratio"] = (r.abs().rolling(nc, min_periods=mc).max()
+                       / (np.sqrt((r * r).rolling(nc, min_periods=mc).sum()) + 1e-9))
     return d
 
 
-def flux(d: pd.DataFrame, creneau: pd.Series) -> pd.DataFrame:
+def flux(d: pd.DataFrame, creneau: pd.Series, mpb: int = 1) -> pd.DataFrame:
     vb = d["bn_volume"]
     tb = d["taker_buy_base"]
     d["taker_ratio"] = (tb / vb.replace(0, np.nan)).clip(0, 1)
     # L'OFI SIGNE : achats agressifs moins ventes agressives, sur le volume.
     # Entre -1 (tout vendu a l'agression) et +1.
     signe = 2.0 * tb - vb
-    for k in (5, 15, 60):
-        d[f"ofi_{k}"] = (signe.rolling(k, min_periods=max(2, k // 2)).sum()
-                         / (vb.rolling(k, min_periods=max(2, k // 2)).sum() + 1e-12))
+    for k in horizons_ofi(mpb):
+        nk = _n(k, mpb)
+        mk = max(2, nk // 2) if mpb == 1 else max(1, nk // 2)
+        d[f"ofi_{k}"] = (signe.rolling(nk, min_periods=mk).sum()
+                         / (vb.rolling(nk, min_periods=mk).sum() + 1e-12))
     taille = np.log((d["bn_quote_vol"]
                      / d["nb_trades"].replace(0, np.nan)).clip(lower=1e-9))
-    d["flux_taille_trade"] = taille - taille.rolling(1440, min_periods=360).mean()
-    d["volume_rel_creneau"] = _rel_creneau(np.log1p(vb), creneau)
+    d["flux_taille_trade"] = taille - taille.rolling(
+        _n(1440, mpb), min_periods=_n(360, mpb)).mean()
+    d["volume_rel_creneau"] = _rel_creneau(np.log1p(vb), creneau, mpb)
     # LE COURTIER CONTRE BINANCE. Le courtier cote un BID, Binance un
     # dernier echange : l'ecart a un niveau permanent. Seul son ecart a sa
     # normale de l'heure dit qui est en avance sur qui.
     e = (d["close"] / d["bn_close"] - 1.0) * 1e4
-    d["ecart_binance"] = e - e.rolling(60, min_periods=30).mean()
+    d["ecart_binance"] = e - e.rolling(_n(60, mpb), min_periods=_n(30, mpb)).mean()
     return d
 
 
-def coinbase(d: pd.DataFrame) -> pd.DataFrame:
+def coinbase(d: pd.DataFrame, mpb: int = 1) -> pd.DataFrame:
     """La demande americaine, et l'avance de Coinbase sur le courtier.
 
     COINBASE N'EMET PAS DE BOUGIE SANS TRANSACTION : une minute absente est
     une minute sans echange, donc au meme prix. Le dernier prix est
     prolonge, cinq minutes au plus.
     """
-    cb = d["cb_close"].ffill(limit=5)
+    cb = d["cb_close"].ffill(limit=_n(5, mpb))
     e = (cb / d["bn_close"] - 1.0) * 1e4
-    d["prime_cb_dev_60"] = e - e.rolling(60, min_periods=30).mean()
-    d["prime_cb_chg_15"] = e - e.shift(15)
+    d["prime_cb_dev_60"] = e - e.rolling(_n(60, mpb), min_periods=_n(30, mpb)).mean()
+    d["prime_cb_chg_15"] = e - e.shift(_n(15, mpb))
     e = (cb / d["close"] - 1.0) * 1e4
-    d["cb_ecart_courtier"] = e - e.rolling(60, min_periods=30).mean()
+    d["cb_ecart_courtier"] = e - e.rolling(_n(60, mpb), min_periods=_n(30, mpb)).mean()
     return d
 
 
-def ancres(d: pd.DataFrame) -> pd.DataFrame:
-    utc = utc_depuis_serveur(d["time"])
+def ancres(d: pd.DataFrame, t: pd.Series = None) -> pd.DataFrame:
+    utc = utc_depuis_serveur(d["time"] if t is None else t)
     jour = utc.dt.floor("D")
     g = d.groupby(jour)
     ouverture = g["open"].transform("first")
@@ -283,38 +323,47 @@ def ancres(d: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def rangs(d: pd.DataFrame) -> pd.DataFrame:
+def rangs(d: pd.DataFrame, mpb: int = 1) -> pd.DataFrame:
     # Voir `saint_core.FEATURE_COLS_RANGS` : le creux et le flux fort,
-    # +11.95 bps a 480 minutes sur 20 mois de 23.
+    # +11.95 bps a 480 minutes sur 20 mois de 23. Deux semaines, en lignes.
+    fen, mini = _n(_FEN_RANG, mpb), _n(_MIN_RANG, mpb)
     d["creux_rang"] = (d["close_ema_dev"]
-                       .rolling(_FEN_RANG, min_periods=_MIN_RANG).rank(pct=True))
+                       .rolling(fen, min_periods=mini).rank(pct=True))
     d["flux_rang"] = (d["taker_buy_base"]
-                      .rolling(_FEN_RANG, min_periods=_MIN_RANG).rank(pct=True))
+                      .rolling(fen, min_periods=mini).rank(pct=True))
     # L'INTERACTION MESUREE, donnee telle quelle : fort quand le cours est
     # au fond ET que le volume agressif est fort.
     d["creux_x_flux"] = (1.0 - d["creux_rang"]) * d["flux_rang"]
     return d
 
 
-def creneau_de(d: pd.DataFrame) -> pd.Series:
+def creneau_de(d: pd.DataFrame, t: pd.Series = None) -> pd.Series:
     """Le quart d'heure de la journee (heure de New York), semaine et week-end separes."""
-    ny = d["time"] - pd.Timedelta(hours=DECALAGE_SERVEUR_NY_H)
+    t = d["time"] if t is None else t
+    ny = t - pd.Timedelta(hours=DECALAGE_SERVEUR_NY_H)
     q = (ny.dt.hour * 4 + ny.dt.minute // 15).astype(np.int64)
-    we = (utc_depuis_serveur(d["time"]).dt.dayofweek >= 5).astype(np.int64)
+    we = (utc_depuis_serveur(t).dt.dayofweek >= 5).astype(np.int64)
     return q + 96 * we
 
 
-def ajoute(d: pd.DataFrame) -> pd.DataFrame:
-    """Toutes les colonnes de ce fichier, sur un cadre M1 deja passe par
-    `prepare_m5.construit` (il faut `close_ema_dev`)."""
+def ajoute(d: pd.DataFrame, mpb: int = 1) -> pd.DataFrame:
+    """Toutes les colonnes de ce fichier, sur un cadre deja passe par
+    `prepare_m5.construit` (il faut `close_ema_dev`), en bougies de `mpb`
+    minutes.
+
+    L'HEURE D'UNE BOUGIE EST CELLE DE SON OUVERTURE ; la decision, elle, se
+    prend a sa CLOTURE. L'horloge, les creneaux et les journees se lisent
+    donc a la derniere minute de la bougie — en M1, c'est la meme.
+    """
     d = d.sort_values("time").reset_index(drop=True)
-    cr = creneau_de(d)
-    d = horloge(d)
-    d = regime(d, cr)
-    d = flux(d, cr)
-    d = coinbase(d)
-    d = ancres(d)
-    d = rangs(d)
+    t = d["time"] + pd.Timedelta(minutes=int(mpb) - 1)
+    cr = creneau_de(d, t)
+    d = horloge(d, t)
+    d = regime(d, cr, mpb)
+    d = flux(d, cr, mpb)
+    d = coinbase(d, mpb)
+    d = ancres(d, t)
+    d = rangs(d, mpb)
     return d
 
 

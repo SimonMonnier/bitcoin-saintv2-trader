@@ -110,8 +110,18 @@ N_ETAT = 5          # le bloc de position de l'observation porte l'etat du jeu
 
 @dataclass
 class JeuConfig:
-    prefixe: str = "kairos_jeu_btc05"
-    cache: str = "data_cache_BTCUSD_M1.pkl"
+    prefixe: str = "kairos_jeu_m15_01"
+    # LE JEU EN BOUGIES DE 15 MINUTES — 2026-09-27, demande du proprietaire :
+    # « recommence le jeu avec des bougies de 15 minutes, et pas M1 pour
+    # entrer ». Le modele voit des bougies M15 (contextes H1 et H4, voir
+    # `prepare_btc_m15`) et ne decide qu'a leur cloture. Une partie reste
+    # une journee : 96 decisions au lieu de 1440.
+    #
+    # CE QUE CELA CHANGE AU COUT : l'ATR M15 median vaut 26 bps, l'ATR M1
+    # environ 6, pour le meme cout de ~3.3 bps par coup. Rapporte au
+    # mouvement d'une bougie, il pese quatre fois moins.
+    cache: str = "data_cache_BTCUSD_M15.pkl"
+    minutes_par_barre: int = 15
     # --- le modele : celui du run PPO, a l'identique ---
     lookback: int = 4
     d_model: int = 8
@@ -132,8 +142,12 @@ class JeuConfig:
     # 16 ATR ET 240 MINUTES AJOUTES LE 2026-09-26 (run kairos_jeu_btc03) :
     # le cout se paie une fois par coup, le mouvement capte grandit avec la
     # duree, et plusieurs colonnes portent davantage a 60 minutes qu'a 15.
-    tp_atr: Tuple[float, ...] = (2.0, 4.0, 8.0, 16.0)
-    sl_atr: Tuple[float, ...] = (2.0, 4.0, 8.0, 16.0)
+    #
+    # EN M15 LE MENU EST EN ATR M15, quatre fois plus grand : 1 a 8 ATR,
+    # soit ~26 a ~210 bps en mediane — le meme ordre de grandeur que 4 a 32
+    # ATR M1.
+    tp_atr: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
+    sl_atr: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
     # LE PLANCHER DE VOLATILITE DES BARRIERES — 2026-09-26, run
     # kairos_jeu_btc01. L'ATR M1 du BTC tombe a 2 bps dans les 10 % de
     # minutes les plus calmes, pour 3.5 bps de cout par coup. Un stop de
@@ -146,8 +160,11 @@ class JeuConfig:
     # `atr_min_bps` : a 8 bps, le stop fait au moins 16 bps et le cout ne
     # depasse jamais ~0.2 R. En marche agite, rien ne change ; en marche
     # calme, le coup est plus petit au lieu d'etre mange par le spread.
-    atr_min_bps: float = 8.0
-    horizon_max: int = 240
+    # En M15 : l'ATR ne descend pas sous 20 bps (p10 : 13), le plus petit
+    # stop fait 20 bps et le cout ne depasse jamais ~0.17 R.
+    atr_min_bps: float = 20.0
+    # EN BOUGIES : 32 bougies M15, huit heures.
+    horizon_max: int = 32
     # Glissements ESPERES (la moitie des bornes de `training.PPOConfig`) :
     # entree toujours, sortie au stop et au temps, jamais a l'objectif.
     glissement_entree_bps: float = 0.5
@@ -165,12 +182,14 @@ class JeuConfig:
     # --- l'expert ---
     expert_k: int = 4
     expert_R_min: float = 1.0          # l'ancien expert, qui lisait l'avenir
-    expert_pas_neg: int = 15
+    # EN M15, une bougie sur deux : il n'y en a que 96 par jour.
+    expert_pas_neg: int = 2
     expert_poids_pos: float = 5.0
     expert_epochs: int = 3
     # L'EXPERT REALISTE : LightGBM, validation croisee par blocs purges.
     expert_blocs: int = 4
-    expert_pas_app: int = 5
+    # EN M15, toutes les bougies : 34 000 lignes d'apprentissage.
+    expert_pas_app: int = 1
     expert_arbres: int = 300
     # Les colonnes de l'expert ajoutees a l'observation. Voir `features_expert`.
     n_expert: int = 4
@@ -210,6 +229,20 @@ class JeuConfig:
     def risque_dollars(self) -> float:
         return self.capital * self.risque_pct / 100.0
 
+    @property
+    def barres_par_jour(self) -> int:
+        return 1440 // int(self.minutes_par_barre)
+
+
+def colonnes_jeu(cfg: "JeuConfig") -> list:
+    """Les features du cache que joue ce jeu : M15 ou M1."""
+    if int(cfg.minutes_par_barre) == 15:
+        from prepare_btc_m15 import FEATURE_COLS_M15
+        return list(FEATURE_COLS_M15)
+    if int(cfg.minutes_par_barre) == 1:
+        return list(FEATURE_COLS)
+    raise ValueError(f"pas de jeu de features pour {cfg.minutes_par_barre} min")
+
 
 # ======================================================================
 # LE MODELE — le SAINT du run, deux tetes de barrieres en plus
@@ -221,7 +254,7 @@ class PolitiqueJeu(SAINTPolicySingleHead):
 
     def __init__(self, cfg: JeuConfig):
         super().__init__(
-            n_features=len(FEATURE_COLS) + cfg.n_expert + N_ETAT,
+            n_features=len(colonnes_jeu(cfg)) + cfg.n_expert + N_ETAT,
             d_model=cfg.d_model,
             num_blocks=cfg.num_blocks, heads=cfg.heads, n_freq=cfg.n_freq,
             mlp_dim=cfg.mlp_dim, lecture="colonnes", dropout=0.05, ff_mult=2,
@@ -390,7 +423,8 @@ def table_coups(o, h, l, sp, atr, cfg: JeuConfig, frac: float):
 # ======================================================================
 # LES PARTIES
 # ======================================================================
-def journees(temps: pd.Series, debut: int, fin: int) -> np.ndarray:
+def journees(temps: pd.Series, debut: int, fin: int,
+             min_barres: int = 600) -> np.ndarray:
     """Les journees ENTIERES de [debut, fin) : (n, 2) indices [a, b)."""
     jour = temps.dt.normalize().to_numpy()
     idx = np.arange(len(jour))
@@ -398,7 +432,7 @@ def journees(temps: pd.Series, debut: int, fin: int) -> np.ndarray:
     g = df.groupby("j")["i"].agg(["min", "max"])
     g = g[(g["min"] >= debut) & (g["max"] < fin)]
     # UNE JOURNEE TROP COURTE (trou de donnees) n'est pas une partie.
-    g = g[(g["max"] - g["min"]) >= 600]
+    g = g[(g["max"] - g["min"]) >= min_barres]
     return np.stack([g["min"].to_numpy(), g["max"].to_numpy() + 1], 1)
 
 
@@ -408,7 +442,7 @@ def etat_jeu(jetons, score, reste_min, cfg: JeuConfig) -> np.ndarray:
     return np.stack([
         jetons / float(cfg.jetons),
         np.clip(score / cfg.vie_R, -1.0, 3.0),
-        np.clip(reste_min / 1440.0, 0.0, 1.0),
+        np.clip(reste_min / float(cfg.barres_par_jour), 0.0, 1.0),
         np.clip((score + cfg.vie_R) / cfg.vie_R, 0.0, 3.0),
         np.zeros(n),
     ], 1).astype(np.float32)
@@ -983,7 +1017,7 @@ def main() -> int:
 
     d = pd.read_pickle(cfg.cache)
     cols = list(dict.fromkeys(["time", "open", "high", "low", "close", "atr_14",
-                               "spread_bar"] + list(FEATURE_COLS)))
+                               "spread_bar"] + colonnes_jeu(cfg)))
     d = d[cols].reset_index(drop=True)
     N = len(d)
     o, h, l, c = (d[k].to_numpy(np.float64) for k in ("open", "high", "low", "close"))
@@ -993,17 +1027,18 @@ def main() -> int:
     sp = d["spread_bar"].to_numpy(np.float64)
     n_tr, n_va, n_te = (int(N * x) for x in (cfg.part_train, cfg.part_val, cfg.part_test))
     pas_wf = n_te
-    print(f"[CACHE] {N:,} minutes, {len(FEATURE_COLS)} features, "
+    print(f"[CACHE] {N:,} bougies de {cfg.minutes_par_barre} min, "
+          f"{len(colonnes_jeu(cfg))} features, "
           f"{d['time'].iloc[0]} -> {d['time'].iloc[-1]}", flush=True)
 
-    X = d[list(FEATURE_COLS)].to_numpy(np.float32)
+    X = d[colonnes_jeu(cfg)].to_numpy(np.float32)
     mean = X[:n_tr].astype(np.float64).mean(0)
     std = X[:n_tr].astype(np.float64).std(0)
     stats = {"mean": mean.astype(np.float32), "std": std.astype(np.float32)}
     Xn = safe_normalize(X, stats).astype(np.float32)
     del X
     np.savez(f"{cfg.prefixe}_norm.npz", mean=stats["mean"], std=stats["std"],
-             features=np.array(list(FEATURE_COLS)))
+             features=np.array(colonnes_jeu(cfg)))
     print(f"  normalisation figee sur le train du fold 1 [0 : {n_tr:,})", flush=True)
 
     t0 = time.time()
@@ -1018,7 +1053,8 @@ def main() -> int:
     pred, modeles_expert = expert_realiste(Xn, y_ex, n_tr, N, cfg)
     for s_, nom in enumerate(("achat", "vente")):
         modeles_expert[s_].booster_.save_model(f"expert_{cfg.prefixe}_{nom}.txt")
-    FE = features_expert(pred)
+    # LE RANG GLISSANT SUR ~7 JOURS, en bougies.
+    FE = features_expert(pred, fenetre=10_000 // int(cfg.minutes_par_barre))
     # Les rangs BRUTS, pour la porte d'entree (pas les colonnes normalisees).
     rangs_ex = FE[:, 2:4].copy()
     m_e = FE[:n_tr].astype(np.float64).mean(0)
@@ -1027,7 +1063,7 @@ def main() -> int:
     Xn = np.concatenate([Xn, FEn[:, :cfg.n_expert]], axis=1)
     stats = {"mean": np.concatenate([stats["mean"], m_e[:cfg.n_expert].astype(np.float32)]),
              "std": np.concatenate([stats["std"], s_e[:cfg.n_expert].astype(np.float32)])}
-    noms_entree = list(FEATURE_COLS) + NOMS_EXPERT[:cfg.n_expert]
+    noms_entree = colonnes_jeu(cfg) + NOMS_EXPERT[:cfg.n_expert]
     np.savez(f"{cfg.prefixe}_norm.npz", mean=stats["mean"], std=stats["std"],
              features=np.array(noms_entree))
     ics = []
@@ -1056,9 +1092,11 @@ def main() -> int:
         a_tr, a_va, a_te = s0, s0 + n_tr, s0 + n_tr + n_va
         f_te = min(a_te + n_te, N)
         suffixe = f"_wf{fold + 1}"
-        j_tr = journees(d["time"], a_tr, a_va)
-        j_va = journees(d["time"], a_va, a_te)
-        j_te = journees(d["time"], a_te, f_te)
+        # UNE PARTIE = UNE JOURNEE, et au moins 40 % de ses bougies.
+        _mb = int(0.4 * cfg.barres_par_jour)
+        j_tr = journees(d["time"], a_tr, a_va, _mb)
+        j_va = journees(d["time"], a_va, a_te, _mb)
+        j_te = journees(d["time"], a_te, f_te, _mb)
         print(f"\n--- Fold {fold + 1} : train [{a_tr:,} : {a_va:,}) {len(j_tr)} parties  "
               f"validation [{a_va:,} : {a_te:,}) {len(j_va)} parties  "
               f"test {len(j_te)} parties ---", flush=True)
@@ -1091,7 +1129,8 @@ def main() -> int:
                 Df = D1 if frac >= 0.5 else D0
                 choix = rng.choice(len(j_tr), size=min(cfg.parties_par_epoch, len(j_tr)),
                                    replace=False)
-                sc, cp, tr = joue(policy, departs_tires(j_tr[choix], rng), Xn,
+                sc, cp, tr = joue(policy, departs_tires(
+                                      j_tr[choix], rng, 240 // int(cfg.minutes_par_barre)), Xn,
                                   Rf, Df, S1, a_va, cfg, device, explore=True,
                                   collecte=True, rangs=rangs_ex)
                 b_tr = bilan(sc, cp, c, atr, sp, cfg, frac=frac)

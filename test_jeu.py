@@ -96,7 +96,10 @@ verifie("plancher : le cout ne depasse jamais ~0.2 R au plus petit stop",
 
 print("\n2. LES REGLES DES PARTIES")
 torch.manual_seed(0)
-cfgj = replace(J.JeuConfig(), horizon_max=10, jetons=3, lookback=4, n_expert=0)
+# LES TESTS DES REGLES JOUENT EN M1 : leurs donnees synthetiques ont les
+# 71 colonnes du M1. Le M15 a les siennes (voir la derniere section).
+cfgj = replace(J.JeuConfig(), horizon_max=10, jetons=3, lookback=4, n_expert=0,
+               minutes_par_barre=1)
 pol = J.PolitiqueJeu(cfgj)
 g = pol.groupes_jeu()
 verifie("six groupes, dont les quatre tetes", sorted(g) ==
@@ -249,6 +252,26 @@ dt_ = J.departs_tires(jours, np.random.default_rng(1))
 verifie("les departs tires restent dans la journee, avant la marge",
         bool(((dt_[:, 0] >= jours[:, 0]) & (dt_[:, 0] <= jours[:, 1] - 240)).all()
              and (dt_[:, 1] == jours[:, 1]).all()), str(dt_[:, 0]))
+
+print("\n6. LE JEU EN BOUGIES DE 15 MINUTES")
+c15 = J.JeuConfig()
+verifie("le jeu par defaut est en M15, 96 bougies par jour",
+        c15.minutes_par_barre == 15 and c15.barres_par_jour == 96)
+import prepare_btc_m15 as P15
+verifie("il lit les features du M15", J.colonnes_jeu(c15) == list(P15.FEATURE_COLS_M15))
+verifie("ses OFI portent leurs horizons reels (15, 60, 240 min)",
+        all(f"ofi_{k}" in P15.FEATURE_COLS_M15 for k in (15, 60, 240))
+        and "ofi_5" not in P15.FEATURE_COLS_M15)
+verifie("ses contextes sont le H1 et le H4",
+        "close_h1_dev" in P15.FEATURE_COLS_M15 and "close_h4_dev" in P15.FEATURE_COLS_M15
+        and not any(c.endswith("_m5") for c in P15.FEATURE_COLS_M15))
+p15 = J.PolitiqueJeu(c15)
+x15 = torch.zeros(2, c15.lookback, len(P15.FEATURE_COLS_M15) + c15.n_expert + J.N_ETAT)
+verifie("le modele M15 lit ses colonnes, celles de l'expert et l'etat",
+        p15.jeu(x15)[0].shape == (2, 3))
+et15 = J.etat_jeu(np.array([3]), np.array([0.0]), np.array([48]), c15)
+verifie("la moitie de la journee restante vaut 0.5 en M15", abs(et15[0, 2] - 0.5) < 1e-6)
+verifie("l'horizon est de 32 bougies, huit heures", c15.horizon_max == 32)
 
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)
