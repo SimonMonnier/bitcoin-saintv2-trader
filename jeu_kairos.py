@@ -110,7 +110,7 @@ N_ETAT = 5          # le bloc de position de l'observation porte l'etat du jeu
 
 @dataclass
 class JeuConfig:
-    prefixe: str = "kairos_jeu_m15_02"
+    prefixe: str = "kairos_jeu_m15_03"
     # LE JEU EN BOUGIES DE 15 MINUTES — 2026-09-27, demande du proprietaire :
     # « recommence le jeu avec des bougies de 15 minutes, et pas M1 pour
     # entrer ». Le modele voit des bougies M15 (contextes H1 et H4, voir
@@ -134,10 +134,10 @@ class JeuConfig:
     # ses jetons, ~5.5 coups par jour, donc aussi des signaux moyens. La
     # mesure dit que l'avantage ne vit que dans les plus forts : +1.2 bps
     # sur les 10 % du sommet, +3.3 sur les 2 %.
-    # 3 -> 10 LE 2026-09-27 (run kairos_jeu_m15_02), demande du proprietaire :
-    # davantage de trades par jour. En M15, le run m15_01 jouait ~2 coups
-    # par jour avec 3 jetons, rentable en validation. On regarde ce que
-    # donnent dix.
+    # 3 -> 10 LE 2026-09-27, demande du proprietaire : davantage de trades
+    # par jour. En M15, le run m15_01 jouait ~2 coups par jour avec 3
+    # jetons, rentable en validation. SEUL CE REGLAGE CHANGE dans m15_03 :
+    # m15_02 avait aussi elargi la porte et l'expert, sans demande.
     jetons: int = 10
     vie_R: float = 3.0
     # En ATR de la barre de decision. L'ATR M1 du BTC vaut ~7 bps, un
@@ -184,8 +184,7 @@ class JeuConfig:
     rampe_cout: int = 10
     parties_par_epoch: int = 256
     # --- l'expert ---
-    # L'expert enseigne autant de coups par jour que la partie a de jetons.
-    expert_k: int = 10
+    expert_k: int = 4
     expert_R_min: float = 1.0          # l'ancien expert, qui lisait l'avenir
     # EN M15, une bougie sur deux : il n'y en a que 96 par jour.
     expert_pas_neg: int = 2
@@ -214,11 +213,10 @@ class JeuConfig:
     # A l'interieur de la porte, le PPO et les quatre tetes decident de tout :
     # entrer ou non, le sens, l'objectif, le stop. 0 = pas de porte.
     #
-    # 0.90 -> 0.80 LE 2026-09-27 (run kairos_jeu_m15_02) : dix jetons ne se
-    # jouent pas si la porte ne s'ouvre que sur 10 % des bougies de chaque
-    # sens. Elargie aux 20 % du sommet, pas supprimee : en M1, les coups pris
-    # au-dela etaient ceux qui perdaient.
-    porte_rang_expert: float = 0.80
+    # LE RUN m15_02 L'AVAIT ELARGIE A 0.80 SANS QUE LE PROPRIETAIRE L'AIT
+    # DEMANDE — seul le nombre de jetons devait changer. Remise a 0.90 le
+    # 2026-09-27 (run m15_03).
+    porte_rang_expert: float = 0.90
     # --- PPO ---
     lr: float = 5e-4
     gamma: float = 0.9995          # par minute
