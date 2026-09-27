@@ -110,7 +110,7 @@ N_ETAT = 5          # le bloc de position de l'observation porte l'etat du jeu
 
 @dataclass
 class JeuConfig:
-    prefixe: str = "kairos_jeu_m15_04"
+    prefixe: str = "kairos_jeu_m15_05"
     # LE JEU EN BOUGIES DE 15 MINUTES — 2026-09-27, demande du proprietaire :
     # « recommence le jeu avec des bougies de 15 minutes, et pas M1 pour
     # entrer ». Le modele voit des bougies M15 (contextes H1 et H4, voir
@@ -174,7 +174,11 @@ class JeuConfig:
     glissement_entree_bps: float = 0.5
     glissement_sortie_bps: float = 1.0
     capital: float = 1000.0
-    risque_pct: float = 1.0
+    # 1 % -> 0.5 % LE 2026-09-27 (run m15_05), demande du proprietaire :
+    # reduire le drawdown. Le jeu apprend en R, donc les decisions ne
+    # changent pas ; les dollars et le drawdown sont divises par deux, le
+    # rapport gain / drawdown est inchange. C'est la mise du live.
+    risque_pct: float = 0.5
     # --- le walk-forward : les memes proportions que le run PPO ---
     part_train: float = 0.55
     part_val: float = 0.15
@@ -241,7 +245,16 @@ class JeuConfig:
     #    seulement : un coup perdant compte `poids_pertes` fois. La politique
     #    prefere alors les coups qui enchainent moins de pertes. Le score
     #    affiche, la vie et la sauvegarde restent en vrais R.
-    poids_pertes: float = 1.5
+    #
+    # REMIS A 1.0 LE 2026-09-27 (run m15_05). Mesure du run m15_04 contre
+    # m15_03, memes epochs 1 a 12 de validation : le drawdown etait divise
+    # par deux (-4 a -8 % contre -6 a -15 %), mais le gain par trois
+    # (~+120 $ contre ~+350 $ sur 97 jours) ; le rapport gain / drawdown
+    # tombait de ~3.3 a ~2.3. Le modele devenait prudent — objectifs plus
+    # proches, win rate jusqu'a 64 % — et chaque coup rapportait moins.
+    # Reduire la mise (`risque_pct`) divise le drawdown sans toucher ce
+    # rapport : c'est ce levier qui est garde.
+    poids_pertes: float = 1.0
     # 2. LA MISE REDUITE EN BAISSE — la regle des gerants : quand le compte
     #    est a plus de `seuil_baisse` sous son plus haut, chaque coup ne
     #    risque plus que `mise_en_baisse` fois la mise ; elle revient

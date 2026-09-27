@@ -98,8 +98,10 @@ print("\n2. LES REGLES DES PARTIES")
 torch.manual_seed(0)
 # LES TESTS DES REGLES JOUENT EN M1 : leurs donnees synthetiques ont les
 # 71 colonnes du M1. Le M15 a les siennes (voir la derniere section).
+# Mise de 1 % (10 $ par R) : les comptes des tests de bilan s'y referent,
+# independamment de la mise du jeu (0.5 % depuis m15_05).
 cfgj = replace(J.JeuConfig(), horizon_max=10, jetons=3, lookback=4, n_expert=0,
-               minutes_par_barre=1)
+               minutes_par_barre=1, risque_pct=1.0)
 pol = J.PolitiqueJeu(cfgj)
 g = pol.groupes_jeu()
 verifie("six groupes, dont les quatre tetes", sorted(g) ==
