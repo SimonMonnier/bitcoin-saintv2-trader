@@ -285,8 +285,13 @@ class JeuConfig:
     #    combien on y met. Elle se joue jour apres jour dans l'ordre, en
     #    validation, au test et en live ; le bilan la montre a cote de la
     #    mise fixe, avec le rapport gain / drawdown des deux.
+    #
+    # RETIREE LE 2026-09-27, demande du proprietaire. Mesure au test : +29.40
+    # contre +22.97 $ au fold 1, mais -32.30 contre -5.67 $ au fold 2. Avec
+    # `mise_en_baisse` a 1.0 la regle ne change plus rien, et le bilan ne
+    # l'affiche plus. `compte_prudent` reste pour qui voudrait la remesurer.
     seuil_baisse: float = 0.05
-    mise_en_baisse: float = 0.5
+    mise_en_baisse: float = 1.0
     graine: int = 7
 
     @property
@@ -1406,7 +1411,6 @@ def main() -> int:
             print(f"\nEPOCH {epoch:03d}  {nom:>12}  VAL  {ligne_bilan(bv, cfg)}  "
                   f"{(time.time() - t_ep) / 60:.1f} min", flush=True)
             print(f"  bilan  {ligne_detail(bv, cfg)}", flush=True)
-            print(f"  bilan  {ligne_prudente(bv, cfg)}", flush=True)
             print(f"  jeu  validation  {ligne_style(bv, cfg)}", flush=True)
             if st is not None:
                 print(f"  jeu  entrainement  {ligne_bilan(b_tr, cfg)}", flush=True)
@@ -1445,7 +1449,6 @@ def main() -> int:
         print(f"\nTEST fold {fold + 1} ({os.path.basename(src)})  {ligne_bilan(bt, cfg)}",
               flush=True)
         print(f"TEST fold {fold + 1} bilan  {ligne_detail(bt, cfg)}", flush=True)
-        print(f"TEST fold {fold + 1} bilan  {ligne_prudente(bt, cfg)}", flush=True)
         print(f"TEST fold {fold + 1}  {ligne_style(bt, cfg)}", flush=True)
         with open(f"test_{cfg.prefixe}{suffixe}.json", "w", encoding="utf-8") as fh:
             json.dump({k: v for k, v in bt.items()}, fh, indent=1, default=str)
@@ -1649,7 +1652,6 @@ def main_multi(cfg: JeuConfig) -> int:
             print(f"\nEPOCH {epoch:03d}  {nom:>12}  VAL  {ligne_bilan(bv, cfg)}  "
                   f"{(time.time() - t_ep) / 60:.1f} min", flush=True)
             print(f"  bilan  {ligne_detail(bv, cfg)}", flush=True)
-            print(f"  bilan  {ligne_prudente(bv, cfg)}", flush=True)
             print(f"  bilan  {ligne_marches(cv, marche, cfg)}", flush=True)
             print(f"  jeu  validation  {ligne_style(bv, cfg)}", flush=True)
             if st is not None:
@@ -1684,7 +1686,6 @@ def main_multi(cfg: JeuConfig) -> int:
         print(f"\nTEST fold {fold + 1} ({os.path.basename(src)})  {ligne_bilan(bt, cfg)}",
               flush=True)
         print(f"TEST fold {fold + 1} bilan  {ligne_detail(bt, cfg)}", flush=True)
-        print(f"TEST fold {fold + 1} bilan  {ligne_prudente(bt, cfg)}", flush=True)
         print(f"TEST fold {fold + 1} bilan  {ligne_marches(c_t, marche, cfg)}", flush=True)
         print(f"TEST fold {fold + 1}  {ligne_style(bt, cfg)}", flush=True)
         with open(f"test_{cfg.prefixe}{suffixe}.json", "w", encoding="utf-8") as fh:
