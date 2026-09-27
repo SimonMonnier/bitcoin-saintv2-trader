@@ -271,6 +271,29 @@ verifie("la ligne lisible dit tout",
             ("gagnants", "perdants", "win rate", "longs", "shorts",
              "profit factor", "drawdown")))
 
+print("\n5c. LE DRAWDOWN")
+cd = replace(cfgj, seuil_baisse=0.05, mise_en_baisse=0.5)
+# 1000 $, 10 $ par R : apres -5 R le compte est a -5 %, au seuil ; les coups
+# suivants ne risquent plus que 5 $, jusqu'au retour au plus haut.
+ep = J.compte_prudent(np.array([-1.0] * 6 + [-1.0, +2.0, +20.0, -1.0]), cd)
+verifie("les cinq premieres pertes a mise entiere", abs(ep[5] - 950.0) < 1e-9, str(ep[:8]))
+verifie("a 5 % sous le plus haut, la mise est reduite de moitie",
+        abs(ep[6] - 945.0) < 1e-9 and abs(ep[7] - 940.0) < 1e-9 and abs(ep[8] - 950.0) < 1e-9)
+verifie("elle revient entiere au nouveau plus haut",
+        abs(ep[9] - 1050.0) < 1e-9 and abs(ep[10] - 1040.0) < 1e-9, str(ep[8:]))
+bz2 = J.bilan(np.array([0.0, 1.0]), cz, np.full(60, 100.0), np.full(60, 1.0),
+              np.zeros(60), cfgj)
+verifie("le bilan porte le compte prudent et son drawdown",
+        "prudent_total" in bz2 and bz2["prudent_dd_dollars"] <= 0
+        and "gain / drawdown" in J.ligne_prudente(bz2, cfgj))
+trp = [[(5, None, 3, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, -1.0, 1, True)]]
+a1 = J.avantages(trp, replace(cfgj, poids_pertes=1.0))[0][13]
+a2 = J.avantages(trp, replace(cfgj, poids_pertes=1.5))[0][13]
+verifie("les pertes pesent 1.5 fois dans la recompense du PPO",
+        abs(a1 + 1.0) < 1e-12 and abs(a2 + 1.5) < 1e-12, f"{a1:+.2f} / {a2:+.2f}")
+trg = [[(5, None, 3, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, +1.0, 1, True)]]
+verifie("les gains ne changent pas", abs(J.avantages(trg, cfgj)[0][13] - 1.0) < 1e-12)
+
 print("\n6. LE JEU EN BOUGIES DE 15 MINUTES")
 c15 = J.JeuConfig()
 verifie("le jeu par defaut est en M15, 96 bougies par jour",

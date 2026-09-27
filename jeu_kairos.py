@@ -110,7 +110,7 @@ N_ETAT = 5          # le bloc de position de l'observation porte l'etat du jeu
 
 @dataclass
 class JeuConfig:
-    prefixe: str = "kairos_jeu_m15_03"
+    prefixe: str = "kairos_jeu_m15_04"
     # LE JEU EN BOUGIES DE 15 MINUTES — 2026-09-27, demande du proprietaire :
     # « recommence le jeu avec des bougies de 15 minutes, et pas M1 pour
     # entrer ». Le modele voit des bougies M15 (contextes H1 et H4, voir
@@ -231,6 +231,27 @@ class JeuConfig:
     max_grad_norm: float = 0.6
     # --- la sauvegarde ---
     min_coups_val: int = 30
+    # --- LE DRAWDOWN — 2026-09-27, run kairos_jeu_m15_04, demande du
+    # proprietaire : « tres bons resultats, a part le drawdown ». Le run m15_03
+    # (10 jetons) gagnait +0.3 a +3.6 $/jour en validation, pour un drawdown
+    # de -7 a -15 % : a 1 % de risque par coup et un win rate de 31 a 45 %,
+    # dix pertes d'affilee ne sont pas rares.
+    #
+    # 1. LES PERTES PESENT PLUS DANS LA RECOMPENSE DU PPO, a l'entrainement
+    #    seulement : un coup perdant compte `poids_pertes` fois. La politique
+    #    prefere alors les coups qui enchainent moins de pertes. Le score
+    #    affiche, la vie et la sauvegarde restent en vrais R.
+    poids_pertes: float = 1.5
+    # 2. LA MISE REDUITE EN BAISSE — la regle des gerants : quand le compte
+    #    est a plus de `seuil_baisse` sous son plus haut, chaque coup ne
+    #    risque plus que `mise_en_baisse` fois la mise ; elle revient
+    #    entiere au nouveau plus haut. C'est une regle de GESTION, pas de
+    #    decision : elle ne change pas quels coups sont bons, seulement
+    #    combien on y met. Elle se joue jour apres jour dans l'ordre, en
+    #    validation, au test et en live ; le bilan la montre a cote de la
+    #    mise fixe, avec le rapport gain / drawdown des deux.
+    seuil_baisse: float = 0.05
+    mise_en_baisse: float = 0.5
     graine: int = 7
 
     @property
@@ -600,6 +621,9 @@ def avantages(trans, cfg: JeuConfig):
         prochain_v, prochain_a = 0.0, 0.0
         for k in range(n - 1, -1, -1):
             (_, _, _, _, _, _, _, _, _, vk, rk, dk, fk) = tr[k]
+            # LES PERTES PESENT PLUS. Voir `poids_pertes`.
+            if rk < 0.0:
+                rk = rk * float(getattr(cfg, "poids_pertes", 1.0))
             g = cfg.gamma ** dk
             suite = 0.0 if fk else 1.0
             delta = rk + g * prochain_v * suite - vk
@@ -969,7 +993,13 @@ def bilan(scores, coups, close, atr, sp, cfg: JeuConfig,
     pic = np.maximum.accumulate(eq)
     dd_d = float((eq - pic).min())
     dd_p = float(((eq - pic) / pic).min())
+    # LA MISE REDUITE EN BAISSE, jouee dans le meme ordre. Voir `seuil_baisse`.
+    ep = compte_prudent(r[ordre], cfg)
+    pic_p = np.maximum.accumulate(ep)
     return b | {
+        "prudent_total": float(ep[-1] - cfg.capital),
+        "prudent_dd_dollars": float((ep - pic_p).min()),
+        "prudent_dd_pct": float(((ep - pic_p) / pic_p).min()),
         "gagnants": int((r > 0).sum()), "perdants": int((r < 0).sum()),
         "longs": int((s == 0).sum()), "shorts": int((s == 1).sum()),
         "win_rate": float((r > 0).mean()), "dd_dollars": dd_d, "dd_pct": dd_p,
@@ -984,6 +1014,36 @@ def bilan(scores, coups, close, atr, sp, cfg: JeuConfig,
         "t_brut": float((net + cout).mean() / ((net + cout).std(ddof=1)
                         / np.sqrt(n) + 1e-12)) if n > 1 else float("nan"),
     }
+
+
+def compte_prudent(r_ordonnes: np.ndarray, cfg: JeuConfig) -> np.ndarray:
+    """Le compte, coup apres coup, avec la mise reduite en baisse.
+
+    Avant chaque coup : si le compte est a plus de `seuil_baisse` sous son
+    plus haut, la mise vaut `mise_en_baisse` ; sinon elle est entiere.
+    Rend le compte apres chaque coup, capital de depart en tete.
+    """
+    eq = [float(cfg.capital)]
+    pic = float(cfg.capital)
+    for r in r_ordonnes:
+        baisse = (pic - eq[-1]) / pic
+        m = float(cfg.mise_en_baisse) if baisse >= float(cfg.seuil_baisse) else 1.0
+        eq.append(eq[-1] + float(r) * cfg.risque_dollars * m)
+        pic = max(pic, eq[-1])
+    return np.asarray(eq)
+
+
+def ligne_prudente(b, cfg: JeuConfig) -> str:
+    """Le meme bilan, mise reduite en baisse — gain, drawdown, et leur rapport."""
+    if b["coups"] == 0:
+        return "aucun trade"
+    r_fixe = b["total_dollars"] / abs(b["dd_dollars"]) if b["dd_dollars"] < 0 else float("inf")
+    r_prud = (b["prudent_total"] / abs(b["prudent_dd_dollars"])
+              if b["prudent_dd_dollars"] < 0 else float("inf"))
+    return (f"mise reduite de moitie a -{100 * cfg.seuil_baisse:g} % du plus haut : total "
+            f"{b['prudent_total']:+.2f} $  |  drawdown max {b['prudent_dd_dollars']:+.2f} $ "
+            f"({100 * b['prudent_dd_pct']:+.1f} %)  |  gain / drawdown {r_prud:.1f} "
+            f"(mise fixe : {r_fixe:.1f})")
 
 
 def ligne_detail(b, cfg: JeuConfig) -> str:
@@ -1178,6 +1238,7 @@ def main() -> int:
             print(f"\nEPOCH {epoch:03d}  {nom:>12}  VAL  {ligne_bilan(bv, cfg)}  "
                   f"{(time.time() - t_ep) / 60:.1f} min", flush=True)
             print(f"  bilan  {ligne_detail(bv, cfg)}", flush=True)
+            print(f"  bilan  {ligne_prudente(bv, cfg)}", flush=True)
             print(f"  jeu  validation  {ligne_style(bv, cfg)}", flush=True)
             if st is not None:
                 print(f"  jeu  entrainement  {ligne_bilan(b_tr, cfg)}", flush=True)
@@ -1216,6 +1277,7 @@ def main() -> int:
         print(f"\nTEST fold {fold + 1} ({os.path.basename(src)})  {ligne_bilan(bt, cfg)}",
               flush=True)
         print(f"TEST fold {fold + 1} bilan  {ligne_detail(bt, cfg)}", flush=True)
+        print(f"TEST fold {fold + 1} bilan  {ligne_prudente(bt, cfg)}", flush=True)
         print(f"TEST fold {fold + 1}  {ligne_style(bt, cfg)}", flush=True)
         with open(f"test_{cfg.prefixe}{suffixe}.json", "w", encoding="utf-8") as fh:
             json.dump({k: v for k, v in bt.items()}, fh, indent=1, default=str)
