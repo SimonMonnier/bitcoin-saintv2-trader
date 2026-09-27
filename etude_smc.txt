@@ -1,0 +1,130 @@
+causalite verifiee sur 110 bougies : les decisions ne lisent pas l'avenir
+  BTCUSD     M15 1: 1617  2:  173  3:   65  4:  757  5:  192 trades
+  BTCUSD     H1  1:  371  2:   45  3:    8  4:  174  5:   55 trades
+  BTCUSD     H4  1:  102  2:   11  4:   42  5:   13 trades
+  ETHUSD     M15 1: 1593  2:  179  3:   57  4:  677  5:  185 trades
+  ETHUSD     H1  1:  386  2:   48  3:   14  4:  190  5:   51 trades
+  ETHUSD     H4  1:   97  2:    9  4:   43  5:   11 trades
+  XAUUSD     M15 1: 1875  2:  225  3:   97  4:  760  5:  174 trades
+  XAUUSD     H1  1:  436  2:   55  3:   22  4:  180  5:   39 trades
+  XAUUSD     H4  1:  111  2:    8  4:   48  5:   17 trades
+  NAS100     M15 1: 1833  2:  270  3:  144  4:  806  5:  223 trades
+  NAS100     H1  1:  410  2:   58  3:   26  4:  187  5:   46 trades
+  NAS100     H4  1:  124  2:   19  4:   55  5:   11 trades
+  SP500      M15 1: 1634  2:  280  3:  138  4:  790  5:  180 trades
+  SP500      H1  1:  452  2:   51  3:   19  4:  192  5:   47 trades
+  SP500      H4  1:  133  2:   16  4:   58  5:   21 trades
+  DJ30       M15 1: 1731  2:  264  3:  127  4:  801  5:  204 trades
+  DJ30       H1  1:  446  2:   50  3:   22  4:  166  5:   45 trades
+  DJ30       H4  1:  126  2:   14  4:   60  5:   11 trades
+  GER40      M15 1: 1626  2:  257  3:  128  4:  720  5:  176 trades
+  GER40      H1  1:  473  2:   60  3:   28  4:  196  5:   49 trades
+  GER40      H4  1:  125  2:   18  4:   65  5:    8 trades
+  BTCUSD     D1  1:   51  2:    5  4:   15  5:    4 trades
+  ETHUSD     D1  1:   59  2:    3  4:   21  5:    8 trades
+  XAUUSD     D1  1:   85  2:    8  4:   42  5:    6 trades
+  XAGUSD     D1  1:   62  2:   11  4:   33  5:   11 trades
+  COPPER-C   D1  1:   36  2:    4  4:   12  5:    2 trades
+  CL-OIL     D1  1:   95  2:    7  4:   27  5:    8 trades
+  SP500      D1  1:   87  2:   23  4:   35  5:    9 trades
+  NAS100     D1  1:   60  2:   19  4:   24  5:    7 trades
+  DJ30       D1  1:   88  2:   17  4:   34  5:    9 trades
+  GER40      D1  1:   80  2:   16  4:   38  5:    8 trades
+  UK100      D1  1:   74  2:   12  4:   32  5:    8 trades
+  Nikkei225  D1  1:   43  2:    9  4:   26  5:    4 trades
+  EURUSD     D1  1:   82  2:    9  4:   40  5:    9 trades
+  GBPUSD     D1  1:   88  2:   13  4:   37  5:    5 trades
+  USDJPY     D1  1:   76  2:   11  4:   35  5:    9 trades
+  AUDUSD     D1  1:   93  2:   13  4:   36  5:    9 trades
+  USDCAD     D1  1:   86  2:   12  4:   36  5:    2 trades
+  NZDUSD     D1  1:   93  2:   13  4:   34  5:   10 trades
+  USDCHF     D1  1:   93  2:   10  4:   40  5:    4 trades
+  AUDJPY     D1  1:   87  2:   13  4:   36  5:    7 trades
+  USDX       D1  1:   70  2:   12  4:   33  5:    6 trades
+
+====================================================================================================
+VERDICT PRINCIPAL : BTC ET OR, chaque strategie, chaque unite de temps (mise 1 % = 10 $ par trade)
+====================================================================================================
+
+BTCUSD M15
+  1 chasse de liquidite             1617 trades   303 G / 1314 P  WR 18.7 %  L/S 734/883  PF 0.62  -0.328 R/trade (t -7.9)  total -5297.07 $  DD -5297.07 $  RENTABLE ? NON
+  2 chasse + CHoCH + FVG (ICT)       173 trades    36 G /  137 P  WR 20.8 %  L/S 85/88  PF 0.61  -0.315 R/trade (t -3.0)  total  -544.78 $  DD  -621.68 $  RENTABLE ? NON
+  3 idem, killzones seulement         65 trades    14 G /   51 P  WR 21.5 %  L/S 28/37  PF 0.71  -0.233 R/trade (t -1.2)  total  -151.38 $  DD  -215.37 $  RENTABLE ? NON
+  4 BOS + order block                757 trades   152 G /  605 P  WR 20.1 %  L/S 398/359  PF 0.84  -0.133 R/trade (t -1.9)  total -1008.07 $  DD -1312.67 $  RENTABLE ? NON
+  5 BOS + FVG                        192 trades    48 G /  144 P  WR 25.0 %  L/S 97/95  PF 0.93  -0.055 R/trade (t -0.4)  total  -106.48 $  DD  -301.89 $  RENTABLE ? NON
+
+BTCUSD H1
+  1 chasse de liquidite              371 trades    71 G /  300 P  WR 19.1 %  L/S 166/205  PF 0.70  -0.247 R/trade (t -2.8)  total  -916.94 $  DD  -923.20 $  RENTABLE ? NON
+  2 chasse + CHoCH + FVG (ICT)        45 trades    10 G /   35 P  WR 22.2 %  L/S 24/21  PF 0.72  -0.222 R/trade (t -1.0)  total   -99.99 $  DD  -106.19 $  RENTABLE ? NON
+  3 idem, killzones seulement          8 trades     0 G /    8 P  WR  0.0 %  L/S 5/3  PF 0.00  -1.015 R/trade (t -128.5)  total   -81.24 $  DD   -81.24 $  RENTABLE ? NON
+  4 BOS + order block                174 trades    31 G /  143 P  WR 17.8 %  L/S 78/96  PF 0.76  -0.204 R/trade (t -1.4)  total  -355.44 $  DD  -530.01 $  RENTABLE ? NON
+  5 BOS + FVG                         55 trades    16 G /   39 P  WR 29.1 %  L/S 26/29  PF 1.09  +0.067 R/trade (t +0.3)  total   +36.74 $  DD  -110.86 $  RENTABLE ? OUI
+
+BTCUSD H4
+  1 chasse de liquidite              102 trades    21 G /   81 P  WR 20.6 %  L/S 44/58  PF 0.83  -0.135 R/trade (t -0.7)  total  -137.65 $  DD  -178.76 $  RENTABLE ? NON
+  2 chasse + CHoCH + FVG (ICT)        11 trades     1 G /   10 P  WR  9.1 %  L/S 7/4  PF 0.16  -0.813 R/trade (t -3.2)  total   -89.43 $  DD   -89.43 $  RENTABLE ? NON
+  4 BOS + order block                 42 trades     7 G /   35 P  WR 16.7 %  L/S 21/21  PF 1.06  +0.052 R/trade (t +0.1)  total   +21.77 $  DD  -144.13 $  RENTABLE ? OUI
+  5 BOS + FVG                         13 trades     2 G /   11 P  WR 15.4 %  L/S 7/6  PF 0.51  -0.423 R/trade (t -1.0)  total   -54.96 $  DD   -81.34 $  RENTABLE ? NON
+
+BTCUSD D1
+  1 chasse de liquidite               51 trades     8 G /   43 P  WR 15.7 %  L/S 25/26  PF 0.49  -0.441 R/trade (t -2.1)  total  -225.00 $  DD  -235.79 $  RENTABLE ? NON
+  2 chasse + CHoCH + FVG (ICT)         5 trades     0 G /    5 P  WR  0.0 %  L/S 4/1  PF 0.00  -1.175 R/trade (t -8.3)  total   -58.73 $  DD   -58.73 $  RENTABLE ? NON
+  4 BOS + order block                 15 trades     1 G /   14 P  WR  6.7 %  L/S 7/8  PF 0.31  -0.657 R/trade (t -1.8)  total   -98.52 $  DD  -112.79 $  RENTABLE ? NON
+  5 BOS + FVG                          4 trades     1 G /    3 P  WR 25.0 %  L/S 2/2  PF 1.26  +0.204 R/trade (t +0.2)  total    +8.16 $  DD   -20.97 $  RENTABLE ? OUI
+
+XAUUSD M15
+  1 chasse de liquidite             1875 trades   381 G / 1494 P  WR 20.3 %  L/S 895/980  PF 0.62  -0.335 R/trade (t -8.4)  total -6289.25 $  DD -6565.82 $  RENTABLE ? NON
+  2 chasse + CHoCH + FVG (ICT)       225 trades    72 G /  153 P  WR 32.0 %  L/S 130/95  PF 1.06  +0.041 R/trade (t +0.4)  total   +93.21 $  DD  -186.04 $  RENTABLE ? OUI
+  3 idem, killzones seulement         97 trades    25 G /   72 P  WR 25.8 %  L/S 54/43  PF 0.79  -0.158 R/trade (t -1.0)  total  -153.63 $  DD  -209.22 $  RENTABLE ? NON
+  4 BOS + order block                760 trades   172 G /  588 P  WR 22.6 %  L/S 403/357  PF 0.98  -0.020 R/trade (t -0.3)  total  -155.22 $  DD  -727.44 $  RENTABLE ? NON
+  5 BOS + FVG                        174 trades    42 G /  132 P  WR 24.1 %  L/S 87/87  PF 0.91  -0.068 R/trade (t -0.5)  total  -119.13 $  DD  -304.97 $  RENTABLE ? NON
+
+XAUUSD H1
+  1 chasse de liquidite              436 trades    80 G /  356 P  WR 18.3 %  L/S 206/230  PF 0.66  -0.299 R/trade (t -3.5)  total -1302.30 $  DD -1498.87 $  RENTABLE ? NON
+  2 chasse + CHoCH + FVG (ICT)        55 trades    16 G /   39 P  WR 29.1 %  L/S 35/20  PF 0.99  -0.009 R/trade (t -0.0)  total    -4.73 $  DD  -127.47 $  RENTABLE ? NON
+  3 idem, killzones seulement         22 trades     6 G /   16 P  WR 27.3 %  L/S 10/12  PF 0.99  -0.010 R/trade (t -0.0)  total    -2.19 $  DD   -63.02 $  RENTABLE ? NON
+  4 BOS + order block                180 trades    37 G /  143 P  WR 20.6 %  L/S 100/80  PF 0.81  -0.159 R/trade (t -1.2)  total  -285.81 $  DD  -456.41 $  RENTABLE ? NON
+  5 BOS + FVG                         39 trades    11 G /   28 P  WR 28.2 %  L/S 25/14  PF 1.12  +0.079 R/trade (t +0.3)  total   +30.95 $  DD   -80.99 $  RENTABLE ? OUI
+
+XAUUSD H4
+  1 chasse de liquidite              111 trades    18 G /   93 P  WR 16.2 %  L/S 47/64  PF 0.64  -0.310 R/trade (t -1.7)  total  -343.98 $  DD  -343.98 $  RENTABLE ? NON
+  2 chasse + CHoCH + FVG (ICT)         8 trades     4 G /    4 P  WR 50.0 %  L/S 6/2  PF 1.84  +0.451 R/trade (t +0.8)  total   +36.08 $  DD   -20.83 $  RENTABLE ? OUI
+  4 BOS + order block                 48 trades     9 G /   39 P  WR 18.8 %  L/S 28/20  PF 0.69  -0.271 R/trade (t -1.0)  total  -130.29 $  DD  -177.72 $  RENTABLE ? NON
+  5 BOS + FVG                         17 trades     5 G /   12 P  WR 29.4 %  L/S 6/11  PF 1.04  +0.027 R/trade (t +0.1)  total    +4.58 $  DD   -50.75 $  RENTABLE ? OUI
+
+XAUUSD D1
+  1 chasse de liquidite               85 trades    23 G /   62 P  WR 27.1 %  L/S 36/49  PF 1.02  +0.013 R/trade (t +0.1)  total   +10.82 $  DD  -180.91 $  RENTABLE ? OUI
+  2 chasse + CHoCH + FVG (ICT)         8 trades     2 G /    6 P  WR 25.0 %  L/S 4/4  PF 0.73  -0.212 R/trade (t -0.4)  total   -16.99 $  DD   -34.81 $  RENTABLE ? NON
+  4 BOS + order block                 42 trades    12 G /   30 P  WR 28.6 %  L/S 28/14  PF 1.23  +0.173 R/trade (t +0.6)  total   +72.50 $  DD   -62.39 $  RENTABLE ? OUI
+  5 BOS + FVG                          6 trades     2 G /    4 P  WR 33.3 %  L/S 6/0  PF 1.13  +0.094 R/trade (t +0.1)  total    +5.65 $  DD   -43.76 $  RENTABLE ? OUI
+
+====================================================================================================
+CHAQUE STRATEGIE, BTC ET OR REUNIS (toutes unites de temps)
+====================================================================================================
+  1 chasse de liquidite             4648 trades   905 G / 3743 P  WR 19.5 %  L/S 2153/2495  PF 0.64  -0.312 R/trade (t -12.4)  total -14501.37 $  DD -14649.77 $  RENTABLE ? NON
+  2 chasse + CHoCH + FVG (ICT)       530 trades   141 G /  389 P  WR 26.6 %  L/S 295/235  PF 0.83  -0.129 R/trade (t -1.9)  total  -685.37 $  DD  -688.46 $  RENTABLE ? NON
+  3 idem, killzones seulement        192 trades    45 G /  147 P  WR 23.4 %  L/S 97/95  PF 0.74  -0.202 R/trade (t -1.8)  total  -388.44 $  DD  -397.56 $  RENTABLE ? NON
+  4 BOS + order block               2018 trades   421 G / 1597 P  WR 20.9 %  L/S 1063/955  PF 0.88  -0.096 R/trade (t -2.1)  total -1939.07 $  DD -2478.41 $  RENTABLE ? NON
+  5 BOS + FVG                        500 trades   127 G /  373 P  WR 25.4 %  L/S 256/244  PF 0.95  -0.039 R/trade (t -0.5)  total  -194.48 $  DD  -551.14 $  RENTABLE ? NON
+
+====================================================================================================
+CONTROLE : TOUS LES MARCHES (7 en M15/H1/H4, 21 en D1)
+====================================================================================================
+  1 chasse de liquidite            17289 trades  3407 G / 13882 P  WR 19.7 %  L/S 7637/9652  PF 0.64  -0.313 R/trade (t -23.4)  total -54087.31 $  DD -54142.68 $  RENTABLE ? NON
+  2 chasse + CHoCH + FVG (ICT)      2350 trades   676 G / 1674 P  WR 28.8 %  L/S 1294/1056  PF 0.89  -0.084 R/trade (t -2.6)  total -1966.27 $  DD -2011.07 $  RENTABLE ? NON
+  3 idem, killzones seulement        895 trades   249 G /  646 P  WR 27.8 %  L/S 477/418  PF 0.91  -0.066 R/trade (t -1.2)  total  -587.06 $  DD  -657.54 $  RENTABLE ? NON
+  4 BOS + order block               7633 trades  1494 G / 6139 P  WR 19.6 %  L/S 4063/3570  PF 0.81  -0.161 R/trade (t -7.1)  total -12281.61 $  DD -12900.27 $  RENTABLE ? NON
+  5 BOS + FVG                       1903 trades   441 G / 1462 P  WR 23.2 %  L/S 988/915  PF 0.84  -0.126 R/trade (t -3.2)  total -2389.32 $  DD -2548.40 $  RENTABLE ? NON
+
+  combinaisons marche x unite de temps x strategie avec au moins 30 trades : 113
+  rentables : 28  |  gain significatif (t > 2) : 1 (le hasard seul en donnerait ~3)
+    CL-OIL     D1  1 chasse de liquidite              95 trades  PF 1.88  +0.577 R  t +2.3  total +548.10 $
+
+====================================================================================================
+SANS AUCUN FRAIS (spread, glissement et swap a zero) : BTC et or, toutes unites de temps
+====================================================================================================
+  1 chasse de liquidite             4634 trades   989 G / 3645 P  WR 21.3 %  L/S 2150/2484  PF 0.92  -0.064 R/trade (t -2.2)  total -2970.82 $  DD -3444.05 $  RENTABLE ? NON
+  2 chasse + CHoCH + FVG (ICT)       528 trades   146 G /  382 P  WR 27.7 %  L/S 298/230  PF 0.91  -0.064 R/trade (t -0.9)  total  -337.84 $  DD  -456.16 $  RENTABLE ? NON
+  3 idem, killzones seulement        193 trades    48 G /  145 P  WR 24.9 %  L/S 99/94  PF 0.81  -0.140 R/trade (t -1.3)  total  -270.01 $  DD  -331.76 $  RENTABLE ? NON
+  4 BOS + order block               2040 trades   448 G / 1592 P  WR 22.0 %  L/S 1085/955  PF 1.00  +0.002 R/trade (t +0.0)  total   +41.35 $  DD -1324.36 $  RENTABLE ? OUI
+  5 BOS + FVG                        504 trades   133 G /  371 P  WR 26.4 %  L/S 260/244  PF 1.04  +0.033 R/trade (t +0.4)  total  +164.47 $  DD  -439.68 $  RENTABLE ? OUI
