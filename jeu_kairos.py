@@ -110,7 +110,7 @@ N_ETAT = 5          # le bloc de position de l'observation porte l'etat du jeu
 
 @dataclass
 class JeuConfig:
-    prefixe: str = "kairos_jeu_m15_06"
+    prefixe: str = "kairos_jeu_m15_07"
     # LE JEU EN BOUGIES DE 15 MINUTES — 2026-09-27, demande du proprietaire :
     # « recommence le jeu avec des bougies de 15 minutes, et pas M1 pour
     # entrer ». Le modele voit des bougies M15 (contextes H1 et H4, voir
