@@ -530,5 +530,18 @@ _jm = J.journees_multi(_tm, _bl, _pd.Timestamp("2024-01-01").value,
 verifie("deux marches, deux semaines chacun : quatre parties, chacune dans son marche",
         _jm.shape == (4, 2) and _jm[:2].max() <= 336 and _jm[2:].min() >= 336, str(_jm.tolist()))
 
+print("\n10. LA VALIDATION CROISEE PURGEE")
+_pm, _te, _va = J.masque_blocs(1000, 10, 0, 30)
+verifie("le bloc de test et la validation (le bloc le plus eloigne)",
+        _te == (0, 100) and _va == (500, 600))
+verifie("la zone tampon est retiree de l'entrainement, des deux cotes",
+        not _pm[:130].any() and _pm[130:470].all() and not _pm[470:630].any() and _pm[630:].all())
+_px = J.prochain_exclu(_pm)
+verifie("un coup d'entrainement ne peut pas lire la zone exclue suivante",
+        _px[200] == 470 and _px[700] == 1000 and _px[50] == 50)
+_pm9, _te9, _va9 = J.masque_blocs(1000, 10, 9, 30)
+verifie("le dernier bloc aussi : test a la fin, validation au milieu",
+        _te9 == (900, 1000) and _va9 == (400, 500) and not _pm9[870:].any())
+
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)
