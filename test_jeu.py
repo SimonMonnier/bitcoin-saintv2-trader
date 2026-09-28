@@ -477,12 +477,13 @@ print("\n9. LE MULTI-MARCHES H1 (le BTC et les indices)")
 import prepare_multi_h1 as PMH
 cmh = replace(J.JeuConfig(), marches=tuple(PMH.MARCHES), cache=PMH.SORTIE,
               minutes_par_barre=60, partie="semaine", horizon_max=72, expert_k=6,
-              expert_pas_neg=1)
+              expert_pas_neg=1, porte_rang_expert=0.90)
 _dft = J.JeuConfig()
 import prepare_btc_m5 as P5
 verifie("par defaut : le BTC seul en M5, une journee par partie, 10 jetons, une position",
         tuple(_dft.marches) == () and _dft.cache == P5.SORTIE and _dft.positions_max == 1
-        and _dft.jetons == 10 and _dft.expert_k == 4 and _dft.partie == "jour"
+        and _dft.jetons == 10 and _dft.expert_k == 10 and _dft.partie == "jour"
+        and _dft.porte_rang_expert == 0.85
         and _dft.minutes_par_barre == 5 and _dft.horizon_max == 96
         and _dft.barres_par_partie == 288)
 verifie("le M5 lit ses colonnes, dont l'ecart Coinbase / Binance",

@@ -141,7 +141,12 @@ class JeuConfig:
     # Le run H1 precedent : kairos_jeu_h1_blocs_01, cache
     # data_cache_BTCUSD_H1_BINANCE.pkl, 60 min, partie "semaine", horizon 72,
     # expert_k 6, expert_pas_neg 1.
-    prefixe: str = "kairos_jeu_m5_01"
+    # PLUS DE TRADES, MEME DIX JETONS — 2026-09-28 (run m5_02), demande du
+    # proprietaire : « une selectivite plus large ». Seuls la porte (0.90 ->
+    # 0.85) et l'expert (4 -> 10 coups enseignes par jour) changent. Le run
+    # m5_01 jouait 1.8 a 3 coups par jour sur ses 10 jetons ; test du bloc 1
+    # +465.49 $, PF 1.31.
+    prefixe: str = "kairos_jeu_m5_02"
     # LA VALIDATION CROISEE PURGEE — 2026-09-28, demande du proprietaire :
     # « entrainer le modele sur des periodes aleatoires pour qu'il apprenne
     # tous les types de marches ». Le walk-forward (h1_05) : +447.56, -441.18,
@@ -318,7 +323,11 @@ class JeuConfig:
     # `positions_max` (voir `coups_expert_predits`). REMIS A 6 LE 2026-09-28
     # (run kairos_multi_h1_01) : la configuration du run h1_01.
     # EN M5 : 4 coups enseignes par JOUR (comme le M15).
-    expert_k: int = 4
+    # 4 -> 10 LE 2026-09-28 (run m5_02), demande du proprietaire : plus de
+    # trades avec les memes dix jetons. L'expert enseigne jusqu'a 10 coups par
+    # jour, autant que les jetons ; le run m5_01 en enseignait 4 et le PPO en
+    # jouait 2 a 3.
+    expert_k: int = 10
     expert_R_min: float = 1.0          # l'ancien expert, qui lisait l'avenir
     # EN M15, une bougie sur deux : il n'y en a que 96 par jour. EN H1, toutes.
     # EN M5 : une bougie sur trois pour les attentes (288 par jour).
@@ -351,7 +360,21 @@ class JeuConfig:
     # LE RUN m15_02 L'AVAIT ELARGIE A 0.80 SANS QUE LE PROPRIETAIRE L'AIT
     # DEMANDE — seul le nombre de jetons devait changer. Remise a 0.90 le
     # 2026-09-27 (run m15_03).
-    porte_rang_expert: float = 0.90
+    #
+    # 0.90 -> 0.85 LE 2026-09-28 (run m5_02), demande du proprietaire : « une
+    # selectivite plus large ». `mesure_porte_m5.py`, blocs 1 et 2 du run
+    # m5_01, R net moyen des 16 coups du sens joue (cout plein) par tranche de
+    # rang, le test NON LU :
+    #
+    #     rang          validation b1   validation b2   entrainement b1 / b2
+    #     0.90 - 0.95   -0.000          +0.022          +0.018 / +0.001
+    #     0.85 - 0.90   -0.003          -0.016          -0.008 / -0.005
+    #     0.80 - 0.85   -0.014          -0.018          -0.018 / -0.019 (t -2.3)
+    #     0.70 - 0.80   -0.021          -0.023          -0.032 / -0.030 (t -5)
+    #
+    # La tranche 0.85 - 0.90 est a l'equilibre : le PPO peut y choisir. Sous
+    # 0.85, elle perd a chaque mesure. La porte s'arrete donc a 0.85.
+    porte_rang_expert: float = 0.85
     # --- PPO ---
     lr: float = 5e-4
     gamma: float = 0.9995          # par minute
