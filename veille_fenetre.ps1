@@ -147,6 +147,13 @@ $inv = [Globalization.CultureInfo]::InvariantCulture
 # dollars par jour, sur les journees de validation que le modele n'a jamais
 # vues. Vert si l'on gagne, rouge si l'on perd. La vue detaillee garde tout.
 function Verdict([string]$nu) {
+    # UNE PARTIE = UN JOUR OU UNE SEMAINE - 2026-09-28, jeu H1 : le jeu
+    # l'annonce dans sa banniere, et chaque montant se dit dans cette unite.
+    if ($nu -match 'KAIROS EN JEU.*une semaine = une partie') { $script:unite = 'semaine' }
+    elseif ($nu -match 'KAIROS EN JEU') { $script:unite = 'jour' }
+    $u = $script:unite
+    $vus = if ($u -eq 'semaine') { 'semaines jamais vues' } else { 'jours jamais vus' }
+    $gagn = if ($u -eq 'semaine') { 'semaines gagnantes' } else { 'jours gagnants' }
     if ($nu -match '^EPOCH (\d+)\s+(.+?)\s+VAL\s+score ([+-][0-9.]+) R/partie \(([+-][0-9.]+)\$\)\s+gagnees (\d+)% perdues \d+% sur (\d+)\s+coups (\d+) \(([0-9.]+)/partie') {
         # COPIE D'ABORD : un -match reussi plus bas ecraserait $Matches.
         $m = $Matches.Clone()
@@ -155,16 +162,16 @@ function Verdict([string]$nu) {
         $mot = if ($dol -gt 0) { 'OUI' } else { 'NON' }
         $niv = if ($m[2] -match 'EXPERT') { 'apres imitation de l expert' } else { "entrainement a $($m[2] -replace 'cout ', '') du cout reel" }
         return @('', "EPOCH $($m[1])   ($niv)",
-                 "$esc[1;$($c)m  RENTABLE ?  $mot   $($m[4]) dollars par jour$esc[0m   (validation : $($m[6]) jours jamais vus, $($m[5])% de jours gagnants, $($m[8]) trades par jour)")
+                 "$esc[1;$($c)m  RENTABLE ?  $mot   $($m[4]) dollars par $u$esc[0m   (validation : $($m[6]) $vus, $($m[5])% de $gagn, $($m[8]) trades par $u)")
     }
     if ($nu -match '^EPOCH (\d+)\s+(.+?)\s+VAL\s+parties (\d+)\s+AUCUN COUP JOUE') {
         return @('', "EPOCH $($Matches[1])",
-                 "$esc[1;33m  RENTABLE ?  NON   aucun trade joue sur les $($Matches[3]) jours de validation$esc[0m")
+                 "$esc[1;33m  RENTABLE ?  NON   aucun trade joue sur les $($Matches[3]) parties de validation$esc[0m")
     }
     if ($nu -match '^TEST fold (\d+) \(([^)]*)\)\s+score ([+-][0-9.]+) R/partie \(([+-][0-9.]+)\$\)\s+gagnees (\d+)% perdues \d+% sur (\d+)') {
         $dol = [double]::Parse($Matches[4], $inv)
         $c = if ($dol -gt 0) { '32' } else { '31' }
-        return @('', "$esc[1;$($c)m  RESULTAT FINAL du fold $($Matches[1]) sur des jours JAMAIS utilises : $($Matches[4]) dollars par jour ($($Matches[5])% de jours gagnants sur $($Matches[6]))$esc[0m", '')
+        return @('', "$esc[1;$($c)m  RESULTAT FINAL du fold $($Matches[1]) sur des $($u)s JAMAIS utilise(e)s : $($Matches[4]) dollars par $u ($($Matches[5])% de $gagn sur $($Matches[6]))$esc[0m", '')
     }
     # LE BILAN DETAILLE, sous le verdict - 2026-09-27, demande du
     # proprietaire : gagnants, perdants, win rate, longs, shorts, profit
@@ -181,6 +188,7 @@ function Verdict([string]$nu) {
     return $null
 }
 
+$script:unite = 'jour'
 $flux = $null
 $lecteur = $null
 $cle = ''

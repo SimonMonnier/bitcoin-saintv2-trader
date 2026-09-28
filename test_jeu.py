@@ -33,7 +33,8 @@ def verifie(nom, cond, detail=""):
 # Un marche plat a 100, ATR 1, sans cout : chaque coup se lit a la main.
 cfg0 = replace(J.JeuConfig(), horizon_max=10, tp_atr=(2.0, 4.0),
                sl_atr=(2.0, 4.0), glissement_entree_bps=0.0,
-               glissement_sortie_bps=0.0)
+               glissement_sortie_bps=0.0, minutes_par_barre=1, partie="jour",
+               swap_achat_bps_jour=0.0, swap_vente_bps_jour=0.0)
 N = 60
 
 
@@ -101,7 +102,8 @@ torch.manual_seed(0)
 # Mise de 1 % (10 $ par R) : les comptes des tests de bilan s'y referent,
 # independamment de la mise du jeu (0.5 % depuis m15_05).
 cfgj = replace(J.JeuConfig(), horizon_max=10, jetons=3, lookback=4, n_expert=0,
-               minutes_par_barre=1, risque_pct=1.0, marches=())
+               minutes_par_barre=1, risque_pct=1.0, marches=(), partie="jour",
+               swap_achat_bps_jour=0.0, swap_vente_bps_jour=0.0)
 pol = J.PolitiqueJeu(cfgj)
 g = pol.groupes_jeu()
 verifie("six groupes, dont les quatre tetes", sorted(g) ==
@@ -297,7 +299,8 @@ trg = [[(5, None, 3, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, +1.0, 1, True)]]
 verifie("les gains ne changent pas", abs(J.avantages(trg, cfgj)[0][13] - 1.0) < 1e-12)
 
 print("\n6. LE JEU EN BOUGIES DE 15 MINUTES")
-c15 = replace(J.JeuConfig(), marches=())
+c15 = replace(J.JeuConfig(), marches=(), minutes_par_barre=15, horizon_max=32,
+              partie="jour", cache="data_cache_BTCUSD_M15.pkl")
 verifie("le jeu d'un marche en M15 : 96 bougies par jour",
         c15.minutes_par_barre == 15 and c15.barres_par_jour == 96)
 import prepare_btc_m15 as P15
@@ -318,7 +321,8 @@ verifie("l'horizon est de 32 bougies, huit heures", c15.horizon_max == 32)
 
 print("\n7. LE JEU MULTI-MARCHES")
 import prepare_multi_m15 as PM
-cm = replace(J.JeuConfig(), marches=tuple(PM.MARCHES), cache="data_cache_MULTI_M15.pkl")
+cm = replace(J.JeuConfig(), marches=tuple(PM.MARCHES), cache="data_cache_MULTI_M15.pkl",
+             minutes_par_barre=15, horizon_max=32, partie="jour")
 verifie("le jeu par defaut est le BTC seul ; le multi-marches reste disponible",
         tuple(J.JeuConfig().marches) == () and tuple(cm.marches) == tuple(PM.MARCHES))
 verifie("il lit les features communes, avec une colonne par marche",
@@ -355,6 +359,41 @@ verifie("les sources du BTC s'alignent sur ses bougies, NaN avant leur debut",
         and np.isfinite(_eb[1]).any(), "" if _eb is None else str(_eb.shape))
 verifie("le drawdown suit l'ordre du TEMPS, pas celui des lignes",
         abs(bo["dd_dollars"] + 10.0) < 1e-9, "%.2f" % bo["dd_dollars"])
+
+print("\n8. LE JEU EN H1, PARTIES D'UNE SEMAINE")
+import prepare_btc_h1_binance as PH
+ch = J.JeuConfig()
+verifie("le jeu par defaut : H1, une semaine par partie, 168 bougies",
+        ch.minutes_par_barre == 60 and ch.partie == "semaine" and ch.barres_par_partie == 168)
+verifie("il lit les colonnes du H1 Binance", J.colonnes_jeu(ch) == list(PH.FEATURE_COLS_H1))
+_t = _pd.Series(_pd.date_range("2024-01-01 00:00", periods=24 * 21, freq="1h"))
+_s = J.semaines(_t, 0, len(_t), 50)
+verifie("trois semaines entieres, du lundi au lundi",
+        _s.shape == (3, 2) and _s[0].tolist() == [0, 168] and _s[2].tolist() == [336, 504],
+        str(_s.tolist()))
+verifie("une semaine coupee par la borne n'est pas une partie",
+        J.semaines(_t, 0, 400, 50).shape[0] == 2)
+verifie("parties() : des semaines en H1, des journees en M15",
+        J.parties(_t, 0, len(_t), ch).shape[0] == 3
+        and J.parties(_t, 0, len(_t), replace(ch, partie="jour", minutes_par_barre=60)).shape[0] == 21)
+eh = J.etat_jeu(np.array([3]), np.array([0.0]), np.array([84]), ch)
+verifie("la moitie de la semaine restante vaut 0.5", abs(eh[0, 2] - 0.5) < 1e-6)
+# Le swap : marche plat a 100, ATR 1, sortie au temps apres H+1 = 11 bougies H1.
+chs = replace(ch, horizon_max=10, tp_atr=(50.0,), sl_atr=(50.0,), glissement_entree_bps=0.0,
+              glissement_sortie_bps=0.0, atr_min_bps=0.0)
+_n = 40
+_o = np.full(_n, 100.0)
+Rh, Dh, Sh = J.table_coups(_o, _o, _o, np.zeros(_n), np.ones(_n), chs, 1.0)
+_att = -(20.0 / 365 * 100) / 1e4 * 100.0 * 11 * 60 / 1440.0 / 50.0
+verifie("le swap acheteur se paie au prorata de la duree",
+        abs(float(Rh[0, 0, 0, 0]) - _att) < 1e-6 and Sh[0, 0, 0, 0] == 2,
+        "%.6f contre %.6f" % (float(Rh[0, 0, 0, 0]), _att))
+verifie("aucun swap a la vente (0 chez Vantage)", abs(float(Rh[0, 1, 0, 0])) < 1e-9)
+Rz, _, _ = J.table_coups(_o, _o, _o, np.zeros(_n), np.ones(_n), chs, 0.0)
+verifie("sans cout (rampe a 0), pas de swap non plus", abs(float(Rz[0, 0, 0, 0])) < 1e-9)
+verifie("36 colonnes, dont le flux et le financement",
+        len(PH.FEATURE_COLS_H1) == 36 and "flux_4" in PH.FEATURE_COLS_H1
+        and "funding_der" in PH.FEATURE_COLS_H1)
 
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)

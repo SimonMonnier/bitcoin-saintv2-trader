@@ -110,7 +110,15 @@ N_ETAT = 5          # le bloc de position de l'observation porte l'etat du jeu
 
 @dataclass
 class JeuConfig:
-    prefixe: str = "kairos_jeu_m15_07"
+    # LE JEU EN H1, PARTIES D'UNE SEMAINE — 2026-09-28, pistes 1 et 2 des
+    # pistes non explorees (accord du proprietaire) : neuf ans d'historique
+    # Binance au lieu de deux (`prepare_btc_h1_binance`), et un horizon ou le
+    # cout pese peu (ATR H1 median 77.5 bps pour ~3.5 de cout, contre 26 en
+    # M15). Les couts restent ceux de Vantage : spread mesure par creneau,
+    # glissements, et le swap acheteur (-20 %/an) sur la duree de chaque coup.
+    # Le run M15 precedent : prefixe kairos_jeu_m15_07, cache
+    # data_cache_BTCUSD_M15.pkl, 15 min, partie "jour", horizon 32, sans swap.
+    prefixe: str = "kairos_jeu_h1_01"
     # LE JEU EN BOUGIES DE 15 MINUTES — 2026-09-27, demande du proprietaire :
     # « recommence le jeu avec des bougies de 15 minutes, et pas M1 pour
     # entrer ». Le modele voit des bougies M15 (contextes H1 et H4, voir
@@ -120,8 +128,17 @@ class JeuConfig:
     # CE QUE CELA CHANGE AU COUT : l'ATR M15 median vaut 26 bps, l'ATR M1
     # environ 6, pour le meme cout de ~3.3 bps par coup. Rapporte au
     # mouvement d'une bougie, il pese quatre fois moins.
-    cache: str = "data_cache_BTCUSD_M15.pkl"
-    minutes_par_barre: int = 15
+    cache: str = "data_cache_BTCUSD_H1_BINANCE.pkl"
+    minutes_par_barre: int = 60
+    # UNE PARTIE = UN "jour" OU UNE "semaine" (lundi 0 h -> lundi 0 h UTC).
+    # En H1 un jour ne fait que 24 decisions : la semaine en fait 168, et
+    # laisse aux coups de plusieurs jours le temps de se resoudre.
+    partie: str = "semaine"
+    # LE SWAP DU COURTIER, en bps du prix par jour de detention, compte au
+    # prorata de la duree du coup. Vantage BTC : -20 %/an a l'achat, 0 a la
+    # vente. Sans objet en M15 (coups de quelques heures) : 0 dans ces runs.
+    swap_achat_bps_jour: float = 20.0 / 365 * 100
+    swap_vente_bps_jour: float = 0.0
     # LE JEU MULTI-MARCHES — 2026-09-27, demande du proprietaire : un seul
     # jeu qui trade le BTC, l'ETH, l'or et les indices a petit spread et
     # bonne volatilite, pour maximiser le nombre de trades et le profit en
@@ -189,8 +206,8 @@ class JeuConfig:
     # En M15 : l'ATR ne descend pas sous 20 bps (p10 : 13), le plus petit
     # stop fait 20 bps et le cout ne depasse jamais ~0.17 R.
     atr_min_bps: float = 20.0
-    # EN BOUGIES : 32 bougies M15, huit heures.
-    horizon_max: int = 32
+    # EN BOUGIES : 32 bougies M15, huit heures. EN H1 : 72 bougies, trois jours.
+    horizon_max: int = 72
     # Glissements ESPERES (la moitie des bornes de `training.PPOConfig`) :
     # entree toujours, sortie au stop et au temps, jamais a l'objectif.
     glissement_entree_bps: float = 0.5
@@ -214,10 +231,11 @@ class JeuConfig:
     rampe_cout: int = 10
     parties_par_epoch: int = 256
     # --- l'expert ---
-    expert_k: int = 4
+    # EN H1, 6 coups enseignes par SEMAINE (4 par jour en M15).
+    expert_k: int = 6
     expert_R_min: float = 1.0          # l'ancien expert, qui lisait l'avenir
-    # EN M15, une bougie sur deux : il n'y en a que 96 par jour.
-    expert_pas_neg: int = 2
+    # EN M15, une bougie sur deux : il n'y en a que 96 par jour. EN H1, toutes.
+    expert_pas_neg: int = 1
     expert_poids_pos: float = 5.0
     expert_epochs: int = 3
     # L'EXPERT REALISTE : LightGBM, validation croisee par blocs purges.
@@ -306,12 +324,23 @@ class JeuConfig:
     def barres_par_jour(self) -> int:
         return 1440 // int(self.minutes_par_barre)
 
+    @property
+    def barres_par_partie(self) -> int:
+        return self.barres_par_jour * (7 if self.partie == "semaine" else 1)
+
+    @property
+    def unite(self) -> str:
+        return "semaines" if self.partie == "semaine" else "jours"
+
 
 def colonnes_jeu(cfg: "JeuConfig") -> list:
     """Les features du cache que joue ce jeu : multi-marches, M15 ou M1."""
     if tuple(getattr(cfg, "marches", ())):
         from prepare_multi_m15 import FEATURE_COLS_MULTI
         return list(FEATURE_COLS_MULTI)
+    if int(cfg.minutes_par_barre) == 60:
+        from prepare_btc_h1_binance import FEATURE_COLS_H1
+        return list(FEATURE_COLS_H1)
     if int(cfg.minutes_par_barre) == 15:
         from prepare_btc_m15 import FEATURE_COLS_M15
         return list(FEATURE_COLS_M15)
@@ -489,9 +518,15 @@ def table_coups(o, h, l, sp, atr, cfg: JeuConfig, frac: float):
                     x_sl = np.maximum(sl[:, j], oa[barre]) * (1 + sx)
                     x_to = oa[e + H] * (1 + sx)
                 x = np.where(stop, x_sl, np.where(obj, tp[:, i], x_to))
-                R[t, si, i, j] = (sens * (x - p0) / (ksl[j] * a)).astype(np.float32)
-                D[t, si, i, j] = np.where(stop, a_sl + 1,
-                                          np.where(obj, a_tp + 1, H + 1))
+                duree = np.where(stop, a_sl + 1, np.where(obj, a_tp + 1, H + 1))
+                # LE SWAP, au prorata de la duree du coup (en bougies, la
+                # bougie d'entree comprise : a peine plus que la detention
+                # reelle). Voir `swap_achat_bps_jour`.
+                sw = float(getattr(cfg, "swap_achat_bps_jour" if sens > 0
+                                   else "swap_vente_bps_jour", 0.0))
+                swap = frac * sw / 1e4 * p0 * duree * float(cfg.minutes_par_barre) / 1440.0
+                R[t, si, i, j] = ((sens * (x - p0) - swap) / (ksl[j] * a)).astype(np.float32)
+                D[t, si, i, j] = duree
                 S[t, si, i, j] = np.where(obj, 0, np.where(stop, 1, 2))
     return R, D, S
 
@@ -512,13 +547,33 @@ def journees(temps: pd.Series, debut: int, fin: int,
     return np.stack([g["min"].to_numpy(), g["max"].to_numpy() + 1], 1)
 
 
+def semaines(temps: pd.Series, debut: int, fin: int, min_barres: int) -> np.ndarray:
+    """Les semaines ENTIERES de [debut, fin), du lundi 0 h au lundi suivant :
+    (n, 2) indices [a, b). Meme regle que `journees` pour les trous."""
+    sem = pd.to_datetime(temps).dt.to_period("W-SUN").dt.start_time.to_numpy()
+    df = pd.DataFrame({"s": sem, "i": np.arange(len(sem))})
+    g = df.groupby("s")["i"].agg(["min", "max"])
+    g = g[(g["min"] >= debut) & (g["max"] < fin)]
+    g = g[(g["max"] - g["min"]) >= min_barres]
+    return np.stack([g["min"].to_numpy(), g["max"].to_numpy() + 1], 1)
+
+
+def parties(temps: pd.Series, debut: int, fin: int, cfg) -> np.ndarray:
+    """Les parties de [debut, fin) selon `cfg.partie`, avec au moins 40 % de
+    leurs bougies."""
+    mb = int(0.4 * cfg.barres_par_partie)
+    if getattr(cfg, "partie", "jour") == "semaine":
+        return semaines(temps, debut, fin, mb)
+    return journees(temps, debut, fin, mb)
+
+
 def etat_jeu(jetons, score, reste_min, cfg: JeuConfig) -> np.ndarray:
     """Les cinq colonnes du bloc de position, qui portent l'etat de la partie."""
     n = len(jetons)
     return np.stack([
         jetons / float(cfg.jetons),
         np.clip(score / cfg.vie_R, -1.0, 3.0),
-        np.clip(reste_min / float(cfg.barres_par_jour), 0.0, 1.0),
+        np.clip(reste_min / float(cfg.barres_par_partie), 0.0, 1.0),
         np.clip((score + cfg.vie_R) / cfg.vie_R, 0.0, 3.0),
         np.zeros(n),
     ], 1).astype(np.float32)
@@ -1229,7 +1284,7 @@ def ligne_detail(b, cfg: JeuConfig) -> str:
             f"(win rate {100 * b['win_rate']:.1f} %)  |  {b['longs']} longs, "
             f"{b['shorts']} shorts  |  profit factor {b['pf']:.2f}  |  drawdown max "
             f"{b['dd_dollars']:+.2f} $ ({100 * b['dd_pct']:+.1f} %)  |  total "
-            f"{b['total_dollars']:+.2f} $ sur {b['parties']} jours")
+            f"{b['total_dollars']:+.2f} $ sur {b['parties']} {cfg.unite}")
 
 
 def ligne_bilan(b, cfg: JeuConfig) -> str:
@@ -1273,7 +1328,8 @@ def main() -> int:
         json.dump(asdict(cfg), fh, indent=1, default=str)
 
     print("=" * 70)
-    print(f"  KAIROS EN JEU — BTCUSD M{cfg.minutes_par_barre} : une journee = une partie")
+    print(f"  KAIROS EN JEU — BTCUSD M{cfg.minutes_par_barre} : une "
+          f"{'semaine' if cfg.partie == 'semaine' else 'journee'} = une partie")
     print("=" * 70)
     print(f"  regles : {cfg.jetons} coups par partie, fin de partie a "
           f"-{cfg.vie_R:g} R, coup = sens + objectif {cfg.tp_atr} ATR + stop "
@@ -1363,10 +1419,9 @@ def main() -> int:
         f_te = min(a_te + n_te, N)
         suffixe = f"_wf{fold + 1}"
         # UNE PARTIE = UNE JOURNEE, et au moins 40 % de ses bougies.
-        _mb = int(0.4 * cfg.barres_par_jour)
-        j_tr = journees(d["time"], a_tr, a_va, _mb)
-        j_va = journees(d["time"], a_va, a_te, _mb)
-        j_te = journees(d["time"], a_te, f_te, _mb)
+        j_tr = parties(d["time"], a_tr, a_va, cfg)
+        j_va = parties(d["time"], a_va, a_te, cfg)
+        j_te = parties(d["time"], a_te, f_te, cfg)
         print(f"\n--- Fold {fold + 1} : train [{a_tr:,} : {a_va:,}) {len(j_tr)} parties  "
               f"validation [{a_va:,} : {a_te:,}) {len(j_va)} parties  "
               f"test {len(j_te)} parties ---", flush=True)
@@ -1399,8 +1454,8 @@ def main() -> int:
                 Df = D1 if frac >= 0.5 else D0
                 choix = rng.choice(len(j_tr), size=min(cfg.parties_par_epoch, len(j_tr)),
                                    replace=False)
-                sc, cp, tr = joue(policy, departs_tires(
-                                      j_tr[choix], rng, 240 // int(cfg.minutes_par_barre)), Xn,
+                marge = max(240 // int(cfg.minutes_par_barre), cfg.barres_par_partie // 6)
+                sc, cp, tr = joue(policy, departs_tires(j_tr[choix], rng, marge), Xn,
                                   Rf, Df, S1, a_va, cfg, device, explore=True,
                                   collecte=True, rangs=rangs_ex)
                 b_tr = bilan(sc, cp, c, atr, sp, cfg, frac=frac)
