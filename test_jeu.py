@@ -401,7 +401,7 @@ import prepare_multi_m15 as PM
 cm = replace(J.JeuConfig(), marches=tuple(PM.MARCHES), cache="data_cache_MULTI_M15.pkl",
              minutes_par_barre=15, horizon_max=32, partie="jour")
 verifie("le multi-marches M15 reste disponible a cote du multi H1 par defaut",
-        len(J.JeuConfig().marches) >= 7 and tuple(cm.marches) == tuple(PM.MARCHES))
+        tuple(cm.marches) == tuple(PM.MARCHES))
 verifie("il lit les features communes, avec une colonne par marche",
         J.colonnes_jeu(cm) == list(PM.FEATURE_COLS_MULTI)
         and all(f"m_{m}" in PM.FEATURE_COLS_MULTI for m in PM.MARCHES)
@@ -474,8 +474,13 @@ verifie("36 colonnes, dont le flux et le financement",
 
 print("\n9. LE MULTI-MARCHES H1 (le BTC et les indices)")
 import prepare_multi_h1 as PMH
-cmh = J.JeuConfig()
-verifie("par defaut : le BTC et les indices, en H1, une semaine par partie",
+cmh = replace(J.JeuConfig(), marches=tuple(PMH.MARCHES), cache=PMH.SORTIE)
+_dft = J.JeuConfig()
+verifie("par defaut : le BTC seul en H1, la configuration du run h1_01",
+        tuple(_dft.marches) == () and _dft.cache == PH.SORTIE and _dft.positions_max == 1
+        and _dft.jetons == 10 and _dft.expert_k == 6 and _dft.partie == "semaine"
+        and _dft.minutes_par_barre == 60 and _dft.horizon_max == 72)
+verifie("le multi H1 : le BTC et les indices, une semaine par partie",
         tuple(cmh.marches) == tuple(PMH.MARCHES) and len(cmh.marches) == len(PMH.MARCHES) >= 13
         and cmh.minutes_par_barre == 60 and cmh.partie == "semaine")
 verifie("la configuration du run h1_01 : une position, 10 jetons, l'expert a 6 coups",

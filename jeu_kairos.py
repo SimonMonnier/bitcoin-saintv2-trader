@@ -125,7 +125,13 @@ class JeuConfig:
     # sans chevauchement) « et ajouter des indices qui ont de la volatilite et
     # un faible spread » pour augmenter le nombre de trades et le profit.
     # Chaque marche joue sa semaine avec ses 10 jetons. Voir `prepare_multi_h1`.
-    prefixe: str = "kairos_multi_h1_03"
+    # RETOUR AU BTC SEUL — 2026-09-28, regle fixee par le proprietaire avant
+    # la fin du run multi_h1_03 : « si ce n'est pas mieux que le BTC seul au
+    # test du fold 1, relance le BTC seul pour retrouver les +400 $ ». Tests
+    # du multi a 13 marches : +130.82 $ (PF 1.02, drawdown -65.6 %), -271.67 $,
+    # -152.68 $ ; le BTC seul (h1_01) faisait +447.56 $ au fold 1 (PF 1.38,
+    # drawdown -9.1 %). Configuration de h1_01 a l'identique.
+    prefixe: str = "kairos_jeu_h1_05"
     # LE JEU EN BOUGIES DE 15 MINUTES — 2026-09-27, demande du proprietaire :
     # « recommence le jeu avec des bougies de 15 minutes, et pas M1 pour
     # entrer ». Le modele voit des bougies M15 (contextes H1 et H4, voir
@@ -135,7 +141,7 @@ class JeuConfig:
     # CE QUE CELA CHANGE AU COUT : l'ATR M15 median vaut 26 bps, l'ATR M1
     # environ 6, pour le meme cout de ~3.3 bps par coup. Rapporte au
     # mouvement d'une bougie, il pese quatre fois moins.
-    cache: str = "data_cache_MULTI_H1.pkl"
+    cache: str = "data_cache_BTCUSD_H1_BINANCE.pkl"
     minutes_par_barre: int = 60
     # UNE PARTIE = UN "jour" OU UNE "semaine" (lundi 0 h -> lundi 0 h UTC).
     # En H1 un jour ne fait que 24 decisions : la semaine en fait 168, et
@@ -167,8 +173,9 @@ class JeuConfig:
     # `marches` = () et `cache` = data_cache_BTCUSD_H1_BINANCE.pkl.
     # 7 -> 13 MARCHES LE 2026-09-28 (run kairos_multi_h1_03), demande du
     # proprietaire : « beaucoup plus d'indices, chacun avec son petit cerveau ».
-    marches: Tuple[str, ...] = ("BTCUSD", "NAS100", "GER40", "UK100", "FRA40", "HK50", "US2000",
-                                "DJ30", "SP500", "SPI200", "EU50", "ES35", "CHINA50")
+    # () LE 2026-09-28 (run h1_05) : retour au BTC seul, voir `prefixe`. Le
+    # multi a 13 marches : ces marches et `cache` = data_cache_MULTI_H1.pkl.
+    marches: Tuple[str, ...] = ()
     # UN GROS MODELE DIVISE EN PETITS MODELES — 2026-09-28, demande du
     # proprietaire (run kairos_multi_h1_02). Le tronc SAINT reste commun a tous
     # les marches ; chaque marche a SES tetes : achat, vente, objectif, stop et
