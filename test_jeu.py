@@ -34,7 +34,7 @@ def verifie(nom, cond, detail=""):
 cfg0 = replace(J.JeuConfig(), horizon_max=10, tp_atr=(2.0, 4.0),
                sl_atr=(2.0, 4.0), glissement_entree_bps=0.0,
                glissement_sortie_bps=0.0, minutes_par_barre=1, partie="jour",
-               swap_achat_bps_jour=0.0, swap_vente_bps_jour=0.0)
+               swap_achat_bps_jour=0.0, swap_vente_bps_jour=0.0, positions_max=1)
 N = 60
 
 
@@ -103,7 +103,7 @@ torch.manual_seed(0)
 # independamment de la mise du jeu (0.5 % depuis m15_05).
 cfgj = replace(J.JeuConfig(), horizon_max=10, jetons=3, lookback=4, n_expert=0,
                minutes_par_barre=1, risque_pct=1.0, marches=(), partie="jour",
-               swap_achat_bps_jour=0.0, swap_vente_bps_jour=0.0)
+               swap_achat_bps_jour=0.0, swap_vente_bps_jour=0.0, positions_max=1)
 pol = J.PolitiqueJeu(cfgj)
 g = pol.groupes_jeu()
 verifie("six groupes, dont les quatre tetes", sorted(g) ==
@@ -147,6 +147,43 @@ for gg in range(3):
     fin_vie &= bool((part[:-1] > -0.5).all()) if len(part) > 1 else True
 verifie("la partie s'arrete quand la vie est perdue", fin_vie,
         " ".join(f"{x:+.2f}" for x in sc3))
+
+# PLUSIEURS POSITIONS A LA FOIS (run h1_02).
+cfgm = replace(cfgj, positions_max=3, jetons=12)
+scm, cpm, trm = J.joue(pol, jours, Xn, R, D, S, 2800, cfgm, "cpu", explore=False,
+                       collecte=True)
+ok_places, ok_bougie = True, True
+for gg in range(3):
+    cg = sorted((c[1], c[1] + c[6]) for c in cpm if c[0] == gg)
+    for k_, (a_, _) in enumerate(cg):
+        ouverts = sum(1 for (x, y) in cg[:k_] if y > a_)
+        ok_places &= ouverts < 3
+    ok_bougie &= len({a_ for a_, _ in cg}) == len(cg)
+verifie("positions multiples : jamais plus de 3 coups ouverts a la fois", ok_places)
+verifie("positions multiples : au plus un coup ouvert par bougie", ok_bougie)
+verifie("positions multiples : des coups se chevauchent vraiment",
+        any(b_[1] < a_[1] + a_[6] for gg in range(3)
+            for a_, b_ in zip(sorted([c for c in cpm if c[0] == gg], key=lambda z: z[1]),
+                              sorted([c for c in cpm if c[0] == gg], key=lambda z: z[1])[1:])))
+verifie("positions multiples : chaque decision dure une bougie pour le PPO",
+        all(x[11] == 1 for tr_ in trm for x in tr_))
+verifie("positions multiples : le score final compte tous les coups",
+        all(abs(scm[gg] - sum(c[5] for c in cpm if c[0] == gg)) < 1e-9 for gg in range(3)))
+# Le score VU ne compte que les coups resolus : a la decision qui suit
+# l'ouverture du premier coup, l'etat montre encore un score nul.
+tr0 = trm[0]
+t_premier = [c for c in cpm if c[0] == 0][0]
+res_min = min(c[1] + c[6] for c in cpm if c[0] == 0)
+suiv = [x for x in tr0 if t_premier[1] < x[0] < res_min]
+verifie("positions multiples : un coup ouvert ne revele pas son issue",
+        len(suiv) > 0 and all(abs(x[1][1]) < 1e-9 for x in suiv))
+verifie("positions multiples : l'etat dit combien de places sont prises",
+        len(suiv) > 0 and suiv[0][1][4] > 0)
+bm = J.bilan(np.array([0.0]), [(0, 0, 0, 0, 0, -1.0, 50, 1), (0, 10, 0, 0, 0, -1.0, 5, 1),
+                              (0, 20, 0, 0, 0, +3.0, 5, 0)],
+             np.full(80, 100.0), np.full(80, 1.0), np.zeros(80), cfgm)
+verifie("positions multiples : le drawdown suit l'ordre des resolutions",
+        abs(bm["dd_dollars"] + 10.0) < 1e-9, "%.2f" % bm["dd_dollars"])
 
 cfgp = replace(cfgj, porte_rang_expert=0.9)
 rg = np.zeros((M, 2), np.float32)

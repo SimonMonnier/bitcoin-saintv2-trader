@@ -57,10 +57,14 @@
 #   powershell -ExecutionPolicy Bypass -File veille_fenetre.ps1
 #   powershell -ExecutionPolicy Bypass -File veille_fenetre.ps1 -Detail
 
-param([switch]$Detail)
+#   powershell -ExecutionPolicy Bypass -File veille_fenetre.ps1 -Journal training_btc_h1_02.log
+#   (un second run lance en parallele, avec son propre journal - 2026-09-28)
 
-$journal = Join-Path $PSScriptRoot 'training_btc.log'
-$Host.UI.RawUI.WindowTitle = if ($Detail) { 'KAIROS - veille (detail)' } else { 'KAIROS - veille' }
+param([switch]$Detail, [string]$Journal = 'training_btc.log')
+
+$journal = Join-Path $PSScriptRoot $Journal
+$titre = if ($Detail) { 'KAIROS - veille (detail)' } else { 'KAIROS - veille' }
+$Host.UI.RawUI.WindowTitle = "$titre - $Journal"
 
 # LA SORTIE EST EN UTF-8, sans quoi les accents du journal ressortent en
 # mojibake — le meme piege que `Set-Content -Encoding utf8` sur les .py.

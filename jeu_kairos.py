@@ -118,7 +118,7 @@ class JeuConfig:
     # glissements, et le swap acheteur (-20 %/an) sur la duree de chaque coup.
     # Le run M15 precedent : prefixe kairos_jeu_m15_07, cache
     # data_cache_BTCUSD_M15.pkl, 15 min, partie "jour", horizon 32, sans swap.
-    prefixe: str = "kairos_jeu_h1_01"
+    prefixe: str = "kairos_jeu_h1_02"
     # LE JEU EN BOUGIES DE 15 MINUTES — 2026-09-27, demande du proprietaire :
     # « recommence le jeu avec des bougies de 15 minutes, et pas M1 pour
     # entrer ». Le modele voit des bougies M15 (contextes H1 et H4, voir
@@ -179,6 +179,15 @@ class JeuConfig:
     # m15_02 avait aussi elargi la porte et l'expert, sans demande.
     jetons: int = 10
     vie_R: float = 3.0
+    # PLUSIEURS POSITIONS A LA FOIS — 2026-09-28, demande du proprietaire
+    # (run h1_02) : le run h1_01 n'utilisait que 2 a 3 de ses 10 jetons par
+    # semaine, parce qu'un coup de ~12 h bloquait toute autre decision. Avec
+    # `positions_max` > 1, le temps avance d'UNE bougie a chaque decision et
+    # chaque coup occupe une place jusqu'a sa resolution. Le score que voit la
+    # politique, et celui qui juge la fin de partie a -`vie_R`, ne comptent que
+    # les coups RESOLUS : les coups encore ouverts ne lui revelent rien de leur
+    # issue. 1 = le jeu d'avant, a l'identique.
+    positions_max: int = 3
     # En ATR de la barre de decision. L'ATR M1 du BTC vaut ~7 bps, un
     # mouvement de 15 minutes ~2.5 ATR : les coups vont de la demi-heure a
     # quelques heures.
@@ -567,15 +576,16 @@ def parties(temps: pd.Series, debut: int, fin: int, cfg) -> np.ndarray:
     return journees(temps, debut, fin, mb)
 
 
-def etat_jeu(jetons, score, reste_min, cfg: JeuConfig) -> np.ndarray:
-    """Les cinq colonnes du bloc de position, qui portent l'etat de la partie."""
+def etat_jeu(jetons, score, reste_min, cfg: JeuConfig, occupees=None) -> np.ndarray:
+    """Les cinq colonnes du bloc de position, qui portent l'etat de la partie.
+    La cinquieme : la part des places occupees (`positions_max`), 0 sinon."""
     n = len(jetons)
     return np.stack([
         jetons / float(cfg.jetons),
         np.clip(score / cfg.vie_R, -1.0, 3.0),
         np.clip(reste_min / float(cfg.barres_par_partie), 0.0, 1.0),
         np.clip((score + cfg.vie_R) / cfg.vie_R, 0.0, 3.0),
-        np.zeros(n),
+        np.zeros(n) if occupees is None else np.asarray(occupees, np.float64),
     ], 1).astype(np.float32)
 
 
@@ -658,13 +668,31 @@ def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
     actif = t < fin
     trans = [[] for _ in range(G)] if collecte else None
     coups = []
+    # PLUSIEURS POSITIONS : chaque place garde la fin et le R de son coup,
+    # qui n'entre dans le score VU qu'une fois resolu. Voir `positions_max`.
+    P = int(getattr(cfg, "positions_max", 1))
+    multi = P > 1
+    occ_fin = np.full((G, max(P, 1)), -1, np.int64)
+    occ_r = np.zeros((G, max(P, 1)))
+    vu = np.zeros(G, np.float64)
     policy.eval()
     while actif.any():
         g = np.flatnonzero(actif)
         tt = t[g]
-        et = etat_jeu(jet[g], score[g], fin[g] - tt, cfg)
+        if multi:
+            fait = (occ_fin[g] >= 0) & (occ_fin[g] <= tt[:, None])
+            vu[g] += (occ_r[g] * fait).sum(1)
+            occ_r[g] = np.where(fait, 0.0, occ_r[g])
+            occ_fin[g] = np.where(fait, -1, occ_fin[g])
+            libre = occ_fin[g] < 0
+            n_occ = P - libre.sum(1)
+            et = etat_jeu(jet[g], vu[g], fin[g] - tt, cfg, n_occ / float(P))
+        else:
+            et = etat_jeu(jet[g], score[g], fin[g] - tt, cfg)
         ob = observations(Xn, tt, et, L)
         peut_np = (jet[g] > 0) & (tt + 1 + H < _lim(fin_valide, tt))
+        if multi:
+            peut_np = peut_np & (n_occ < P)
         # LA PORTE DE L'EXPERT, par sens. Voir `porte_rang_expert`.
         pa_np, pv_np = portes(peut_np, tt, rangs, cfg)
         with torch.no_grad():
@@ -698,10 +726,18 @@ def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
                 coups.append((int(g[q]), int(tt[q]), int(sidx[q]), int(i[q]),
                               int(j[q]), float(r[q]), int(dur[q]),
                               int(S[tt[q], sidx[q], i[q], j[q]])))
-        t[g] = tt + dur
+                if multi:
+                    k = int(np.argmax(libre[q]))
+                    occ_fin[g[q], k] = int(tt[q] + dur[q])
+                    occ_r[g[q], k] = float(r[q])
+        # En positions multiples, le temps avance d'une bougie ; la decision
+        # dure donc une bougie pour l'actualisation du PPO.
+        pas = np.ones(len(g), np.int64) if multi else dur
+        t[g] = tt + pas
         score[g] += r
         jet[g] -= coup.astype(np.int64)
-        fini = (t[g] >= fin[g]) | (jet[g] <= 0) | (score[g] <= -cfg.vie_R)
+        juge = vu[g] if multi else score[g]
+        fini = (t[g] >= fin[g]) | (jet[g] <= 0) | (juge <= -cfg.vie_R)
         actif[g[fini]] = False
         if collecte:
             for q in range(len(g)):
@@ -711,7 +747,7 @@ def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
                                     int(a[q]), int(i[q]), int(j[q]),
                                     float(lp_e[q]), float(lp_i[q]),
                                     float(lp_j[q]), float(v[q]), float(r[q]),
-                                    int(dur[q]), bool(fini[q])))
+                                    int(pas[q]), bool(fini[q])))
     return score, coups, trans
 
 
@@ -1217,7 +1253,12 @@ def bilan(scores, coups, close, atr, sp, cfg: JeuConfig,
     # proprietaire, 2026-09-27, avec les comptes ci-dessous.
     # EN MULTI-MARCHES, l'indice d'une ligne ne suit pas le temps (les
     # marches sont empiles) : `ordre` donne l'instant de chaque ligne.
-    ordre = np.argsort(t if ordre is None else np.asarray(ordre)[t], kind="stable")
+    # EN POSITIONS MULTIPLES, les coups se chevauchent : le compte bouge a
+    # leur RESOLUTION, pas a leur ouverture.
+    t_ref = t + du.astype(np.int64) if int(getattr(cfg, "positions_max", 1)) > 1 else t
+    if ordre is not None:
+        t_ref = np.minimum(t_ref, len(ordre) - 1)
+    ordre = np.argsort(t_ref if ordre is None else np.asarray(ordre)[t_ref], kind="stable")
     eq = cfg.capital + np.cumsum(r[ordre] * cfg.risque_dollars)
     eq = np.concatenate([[cfg.capital], eq])
     pic = np.maximum.accumulate(eq)
@@ -1331,7 +1372,8 @@ def main() -> int:
     print(f"  KAIROS EN JEU — BTCUSD M{cfg.minutes_par_barre} : une "
           f"{'semaine' if cfg.partie == 'semaine' else 'journee'} = une partie")
     print("=" * 70)
-    print(f"  regles : {cfg.jetons} coups par partie, fin de partie a "
+    print(f"  regles : {cfg.jetons} coups par partie, {cfg.positions_max} position(s) a la "
+          f"fois, fin de partie a "
           f"-{cfg.vie_R:g} R, coup = sens + objectif {cfg.tp_atr} ATR + stop "
           f"{cfg.sl_atr} ATR, temps limite {cfg.horizon_max} bougies "
           f"({cfg.horizon_max * cfg.minutes_par_barre} min)")
