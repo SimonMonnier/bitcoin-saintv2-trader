@@ -557,7 +557,9 @@ verifie("le dernier bloc aussi : test a la fin, validation au milieu",
 
 print("\n11. LE MULTI-MARCHES M5 (BTC, ETH, ZEC)")
 import prepare_multi_m5 as PM5
-_mm = J.JeuConfig()
+verifie("par defaut : le BTC seul en M5 (run m5_03)",
+        J.JeuConfig().marches == () and J.JeuConfig().cache == P5.SORTIE)
+_mm = replace(J.JeuConfig(), marches=("BTCUSD", "ETHUSD"), cache=PM5.SORTIE)
 verifie("par defaut : BTC et ETH en M5 (sans le ZEC), validation en blocs",
         tuple(_mm.marches) == ("BTCUSD", "ETHUSD") and set(_mm.marches) <= set(PM5.MARCHES)
         and _mm.cache == PM5.SORTIE and _mm.minutes_par_barre == 5 and _mm.partie == "jour"

@@ -35,7 +35,7 @@ if (-not (Test-Path -LiteralPath $python)) {
 }
 
 $journal = Join-Path $PSScriptRoot 'training_btc.log'
-$prefixe = 'kairos_multi_m5_06'
+$prefixe = 'kairos_jeu_m5_03'
 # LE JEU DEPUIS LE 2026-09-26 : `jeu_kairos.py` remplace `training.py`.
 $script = 'jeu_kairos.py'
 

@@ -160,7 +160,12 @@ class JeuConfig:
     # UN MODELE APRES L'AUTRE (run multi_m5_05) : voir `main_modeles_par_marche`.
     # LES MODELES PAS A PAS, DANS UN SEUL PROCESSUS (run multi_m5_06) : voir
     # `main_pas_a_pas`.
-    prefixe: str = "kairos_multi_m5_06"
+    # RETOUR AU BTC SEUL — 2026-09-28 (run m5_03), demande du proprietaire :
+    # « l'ETH ne rapporte rien, lance que le BTC ». La configuration du run
+    # m5_02 (porte 0.85, expert a 10 coups, 10 jetons, une position). Le BTC
+    # et l'ETH pas a pas : prefixe kairos_multi_m5_06, `marches` = ("BTCUSD",
+    # "ETHUSD"), `cache` = data_cache_MULTI_M5.pkl.
+    prefixe: str = "kairos_jeu_m5_03"
     # LA VALIDATION CROISEE PURGEE — 2026-09-28, demande du proprietaire :
     # « entrainer le modele sur des periodes aleatoires pour qu'il apprenne
     # tous les types de marches ». Le walk-forward (h1_05) : +447.56, -441.18,
@@ -186,7 +191,7 @@ class JeuConfig:
     # mouvement d'une bougie, il pese quatre fois moins.
     # MULTI M5 (run multi_m5_01) : data_cache_MULTI_M5.pkl. Le BTC seul en
     # M5 : data_cache_BTCUSD_M5_BINANCE.pkl.
-    cache: str = "data_cache_MULTI_M5.pkl"
+    cache: str = "data_cache_BTCUSD_M5_BINANCE.pkl"
     minutes_par_barre: int = 5
     # UNE PARTIE = UN "jour" OU UNE "semaine" (lundi 0 h -> lundi 0 h UTC).
     # En H1 un jour ne fait que 24 decisions : la semaine en fait 168, et
@@ -229,7 +234,8 @@ class JeuConfig:
     # (correlation de l'expert du BTC au test du bloc 1 : +0.088 / +0.070 sur
     # 2019, +0.119 / +0.113 sur 2017-2018). Sans lui, BTC et ETH commencent
     # tous deux le 2017-08-24 : memes blocs que le BTC seul.
-    marches: Tuple[str, ...] = ("BTCUSD", "ETHUSD")
+    # () LE 2026-09-28 (run m5_03) : le BTC seul, voir `prefixe`.
+    marches: Tuple[str, ...] = ()
     # LE MEME POINT DE DEPART POUR TOUS LES MARCHES — 2026-09-28 (run
     # multi_m5_02), demande du proprietaire : « que les trois cryptos
     # commencent depuis le meme point de depart, qu'il n'y ait pas une crypto
