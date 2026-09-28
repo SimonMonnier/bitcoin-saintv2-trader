@@ -157,7 +157,8 @@ class JeuConfig:
     # TROIS MODELES INDEPENDANTS, UN COMPTE COMMUN (run multi_m5_03) : voir
     # `modeles_par_marche`.
     # BTC ET ETH SEULS, DEPUIS 2017 (run multi_m5_04) : voir `marches`.
-    prefixe: str = "kairos_multi_m5_04"
+    # UN MODELE APRES L'AUTRE (run multi_m5_05) : voir `main_modeles_par_marche`.
+    prefixe: str = "kairos_multi_m5_05"
     # LA VALIDATION CROISEE PURGEE — 2026-09-28, demande du proprietaire :
     # « entrainer le modele sur des periodes aleatoires pour qu'il apprenne
     # tous les types de marches ». Le walk-forward (h1_05) : +447.56, -441.18,
@@ -260,6 +261,8 @@ class JeuConfig:
     echanges: str = ""
     # Les marches du compte commun, pour leur point de depart commun.
     marches_communs: Tuple[str, ...] = ()
+    # Le seul bloc que joue ce processus (1 a `n_blocs`) ; 0 = tous.
+    bloc_seul: int = 0
     # UN GROS MODELE DIVISE EN PETITS MODELES — 2026-09-28, demande du
     # proprietaire (run kairos_multi_h1_02). Le tronc SAINT reste commun a tous
     # les marches ; chaque marche a SES tetes : achat, vente, objectif, stop et
@@ -1689,7 +1692,8 @@ def main_blocs(cfg: JeuConfig) -> int:
     rng = np.random.default_rng(cfg.graine)
     torch.manual_seed(cfg.graine)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    manifeste = f"run_{cfg.prefixe}.json"
+    seul = int(getattr(cfg, "bloc_seul", 0))
+    manifeste = f"run_{cfg.prefixe}" + (f"_bloc{seul}" if seul else "") + ".json"
     if os.path.exists(manifeste):
         raise FileExistsError(f"{manifeste} existe : nouveau prefixe, ou lancer.ps1")
     with open(manifeste, "w", encoding="utf-8") as fh:
@@ -1735,6 +1739,8 @@ def main_blocs(cfg: JeuConfig) -> int:
           f"zone tampon {purge} bougies autour du test et de la validation", flush=True)
     tests = []
     for k in range(cfg.n_blocs):
+        if seul and k + 1 != seul:
+            continue
         permis, (te0, te1), (va0, va1) = masque_blocs(N, cfg.n_blocs, k, purge)
         fin_tr = prochain_exclu(permis)
         dedans = lambda a0, a1: np.array([w for w in toutes if w[0] >= a0 and w[1] <= a1],
@@ -1827,6 +1833,9 @@ def main_blocs(cfg: JeuConfig) -> int:
         if getattr(cfg, "echanges", ""):
             ecrit_echange(cfg, f"test_bloc{k + 1:02d}", c_t, t_ns, c, atr, len(j_te), True,
                           (te0, te1), d["time"])
+    if seul:
+        print(f"\nFIN du bloc {seul}", flush=True)
+        return 0
     print("\n" + "=" * 70)
     print(f"  RESUME DES {cfg.n_blocs} BLOCS DE TEST (chacun jamais vu par son modele)")
     print("=" * 70)
@@ -1881,11 +1890,12 @@ def spec_marche(m: str, cfg: JeuConfig) -> Dict[str, float]:
                 "pas_lot": float(cfg.pas_lot)}
 
 
-def config_marche(cfg: JeuConfig, m: str) -> JeuConfig:
-    """La configuration du modele d'UN marche. Voir `modeles_par_marche`."""
+def config_marche(cfg: JeuConfig, m: str, bloc: int = 0) -> JeuConfig:
+    """La configuration du modele d'UN marche (et d'un seul bloc si `bloc`).
+    Voir `modeles_par_marche`."""
     sp = spec_marche(m, cfg)
     return replace(cfg, marches=(), marche_seul=m, modeles_par_marche=False,
-                   marches_communs=tuple(cfg.marches),
+                   marches_communs=tuple(cfg.marches), bloc_seul=int(bloc),
                    prefixe=f"{cfg.prefixe}_{m}", echanges=f"echanges_{cfg.prefixe}",
                    contrat=sp["contrat"], lot_min=sp["lot_min"], pas_lot=sp["pas_lot"])
 
@@ -2052,10 +2062,19 @@ def main_modeles_par_marche(cfg: JeuConfig) -> int:
     """Un modele par marche, en parallele, sur un compte commun. Voir
     `modeles_par_marche`.
 
-    Chaque marche tourne dans son propre processus (`python jeu_kairos.py
-    <marche>`, journal `training_<marche>.log`) ; ce processus-ci relaie
-    leurs lignes, suffixees du marche, et des que les trois ont joue la meme
-    validation (ou le meme test), rejoue leurs coups sur le compte commun."""
+    Chaque modele tourne dans son propre processus (`python jeu_kairos.py
+    <marche> <bloc>`, journal `training_<marche>.log`) ; ce processus-ci
+    relaie ses lignes, suffixees du marche, et des que tous les marches ont
+    joue la meme validation (ou le meme test), rejoue leurs coups sur le
+    compte commun.
+
+    UN MODELE APRES L'AUTRE, BLOC PAR BLOC — 2026-09-28 (run multi_m5_05),
+    demande du proprietaire. En parallele (run multi_m5_04), les deux
+    modeles se disputaient une carte graphique bridee par la chaleur (90 °C,
+    210 MHz sur 2100) : la deuxieme passe d'imitation n'avait pas fini en
+    dix minutes, contre moins d'une minute pour le BTC seul. Mesure du
+    2026-09-28, lot d'imitation de 512 : 67 ms sur la carte, 1256 ms sur le
+    processeur — la carte reste le bon endroit, un modele a la fois."""
     import re
     import shutil
     import subprocess
@@ -2084,11 +2103,9 @@ def main_modeles_par_marche(cfg: JeuConfig) -> int:
     os.makedirs(dossier, exist_ok=True)
     env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8",
                OMP_NUM_THREADS="5", MKL_NUM_THREADS="5")
-    procs, pos, reste = {}, {}, {}
+    pos, reste = {}, {}
     for m in marches:
-        fh = open(f"training_{m}.log", "wb")
-        procs[m] = (subprocess.Popen([sys.executable, "-u", os.path.abspath(__file__), m],
-                                     stdout=fh, stderr=subprocess.STDOUT, env=env), fh)
+        open(f"training_{m}.log", "wb").close()
         pos[m], reste[m] = 0, b""
     bruit = re.compile(r"Warning|^\s+(o = |d\[|creux12)")
 
@@ -2141,20 +2158,26 @@ def main_modeles_par_marche(cfg: JeuConfig) -> int:
                       f"{ligne_commune_marches(b)}", flush=True)
             faits.add(a)
 
-    while True:
+    arret = False
+    for k in range(1, cfg.n_blocs + 1):
         for m in marches:
+            print(f"\n>>> bloc {k}/{cfg.n_blocs} : le modele {m} (un modele a la fois)", flush=True)
+            with open(f"training_{m}.log", "ab") as fh:
+                p = subprocess.Popen([sys.executable, "-u", os.path.abspath(__file__), m, str(k)],
+                                     stdout=fh, stderr=subprocess.STDOUT, env=env)
+                while p.poll() is None:
+                    relaie(m)
+                    combine()
+                    time.sleep(5)
             relaie(m)
-        combine()
-        if all(p.poll() is not None for p, _ in procs.values()):
-            for m in marches:
-                relaie(m)
             combine()
+            if p.returncode != 0:
+                print(f"  ARRET du modele {m} au bloc {k} : code {p.returncode}, voir "
+                      f"training_{m}.log", flush=True)
+                arret = True
+                break
+        if arret:
             break
-        time.sleep(5)
-    for m, (p, fh) in procs.items():
-        fh.close()
-        if p.returncode != 0:
-            print(f"  ARRET du modele {m} : code {p.returncode}, voir training_{m}.log", flush=True)
     print("\n" + "=" * 70)
     print(f"  RESUME DES {cfg.n_blocs} BLOCS DE TEST, COMPTE COMMUN (chacun jamais vu par ses modeles)")
     print("=" * 70)
@@ -2408,7 +2431,8 @@ def main() -> int:
     cfg = JeuConfig()
     # LE MODELE D'UN MARCHE, lance par `main_modeles_par_marche`.
     if len(sys.argv) > 1 and tuple(cfg.marches):
-        return main_blocs(config_marche(cfg, sys.argv[1]))
+        return main_blocs(config_marche(cfg, sys.argv[1],
+                                        int(sys.argv[2]) if len(sys.argv) > 2 else 0))
     if tuple(cfg.marches) and getattr(cfg, "modeles_par_marche", False):
         return main_modeles_par_marche(cfg)
     if tuple(cfg.marches) and getattr(cfg, "validation", "walk") == "blocs":

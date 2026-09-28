@@ -608,6 +608,8 @@ verifie("le dernier bloc va jusqu'a la derniere bougie comprise",
 print("\n12. TROIS MODELES INDEPENDANTS, UN COMPTE COMMUN")
 verifie("par defaut : un modele par marche", _mm.modeles_par_marche and _mm.marche_seul == "")
 _cz = J.config_marche(_mm, "ZECUSD")
+verifie("un modele, un bloc : config_marche(m, 3) ne joue que le bloc 3",
+        J.config_marche(_mm, "BTCUSD", 3).bloc_seul == 3 and _cz.bloc_seul == 0)
 verifie("le modele du ZEC : le jeu du BTC seul, ses colonnes, son nom, son dossier d'echange",
         _cz.marches == () and _cz.marche_seul == "ZECUSD" and not _cz.modeles_par_marche
         and _cz.prefixe == _mm.prefixe + "_ZECUSD" and _cz.echanges == f"echanges_{_mm.prefixe}"
