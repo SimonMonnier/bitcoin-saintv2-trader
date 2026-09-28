@@ -1687,8 +1687,8 @@ def main() -> int:
                 Df = D1 if frac >= 0.5 else D0
                 choix = rng.choice(len(j_tr), size=min(cfg.parties_par_epoch, len(j_tr)),
                                    replace=False)
-                marge = max(240 // int(cfg.minutes_par_barre), cfg.barres_par_partie // 6)
-                sc, cp, tr = joue(policy, departs_tires(j_tr[choix], rng, marge), Xn,
+                marge_d = max(240 // int(cfg.minutes_par_barre), cfg.barres_par_partie // 6)
+                sc, cp, tr = joue(policy, departs_tires(j_tr[choix], rng, marge_d), Xn,
                                   Rf, Df, S1, a_va, cfg, device, explore=True,
                                   collecte=True, rangs=rangs_ex, marge=marge)
                 b_tr = bilan(sc, cp, c, atr, sp, cfg, frac=frac)
