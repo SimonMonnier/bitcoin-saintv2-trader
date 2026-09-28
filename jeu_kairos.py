@@ -154,7 +154,9 @@ class JeuConfig:
     # prefixe kairos_jeu_m5_02, `marches` = (), `cache` =
     # data_cache_BTCUSD_M5_BINANCE.pkl.
     # LE MEME POINT DE DEPART (run multi_m5_02) : voir `debut_commun`.
-    prefixe: str = "kairos_multi_m5_02"
+    # TROIS MODELES INDEPENDANTS, UN COMPTE COMMUN (run multi_m5_03) : voir
+    # `modeles_par_marche`.
+    prefixe: str = "kairos_multi_m5_03"
     # LA VALIDATION CROISEE PURGEE — 2026-09-28, demande du proprietaire :
     # « entrainer le modele sur des periodes aleatoires pour qu'il apprenne
     # tous les types de marches ». Le walk-forward (h1_05) : +447.56, -441.18,
@@ -228,6 +230,26 @@ class JeuConfig:
     # dans cette periode commune. Les features, calculees avant la coupe,
     # gardent leur amorce.
     debut_commun: bool = True
+    # TROIS MODELES INDEPENDANTS, UN COMPTE COMMUN — 2026-09-28 (run
+    # multi_m5_03), demande du proprietaire. Au run multi_m5_02 (un tronc
+    # commun, des tetes par marche), le BTC ne gagnait plus ce qu'il gagnait
+    # seul : le tronc, l'optimiseur de chaque role, la normalisation et le
+    # choix de la meilleure epoch etaient partages avec l'ETH et le ZEC.
+    #
+    # Avec True, CHAQUE MARCHE A SON MODELE, entraine exactement comme le BTC
+    # seul (`main_blocs`) : son tronc, ses tetes, ses optimiseurs, sa
+    # normalisation, son expert, ses parties d'entrainement. Chacun garde SON
+    # meilleur modele : a une epoch, on peut en sauvegarder un, deux, trois
+    # ou aucun, chacun seulement s'il bat son propre record en validation.
+    # Les trois tournent en parallele (`main_modeles_par_marche`), et leurs
+    # coups sont rejoues sur UN COMPTE COMMUN (`bilan_commun`) : un seul
+    # solde, la mise de chaque coup prise sur ce solde, la marge partagee, le
+    # drawdown, le win rate et le reste mesures sur ce compte.
+    modeles_par_marche: bool = True
+    # Rempli par `config_marche` pour le modele d'UN marche : son nom, et le
+    # dossier ou il depose ses coups pour le compte commun.
+    marche_seul: str = ""
+    echanges: str = ""
     # UN GROS MODELE DIVISE EN PETITS MODELES — 2026-09-28, demande du
     # proprietaire (run kairos_multi_h1_02). Le tronc SAINT reste commun a tous
     # les marches ; chaque marche a SES tetes : achat, vente, objectif, stop et
@@ -1663,7 +1685,8 @@ def main_blocs(cfg: JeuConfig) -> int:
     with open(manifeste, "w", encoding="utf-8") as fh:
         json.dump(asdict(cfg), fh, indent=1, default=str)
     print("=" * 70)
-    print(f"  KAIROS EN JEU — BTCUSD M{cfg.minutes_par_barre} : une "
+    print(f"  KAIROS EN JEU — {getattr(cfg, 'marche_seul', '') or 'BTCUSD'} "
+          f"M{cfg.minutes_par_barre} : une "
           f"{'semaine' if cfg.partie == 'semaine' else 'journee'} = une partie  |  "
           f"VALIDATION CROISEE PURGEE en {cfg.n_blocs} blocs")
     print("=" * 70)
@@ -1671,13 +1694,24 @@ def main_blocs(cfg: JeuConfig) -> int:
           f"fin de partie a -{cfg.vie_R:g} R, temps limite {cfg.horizon_max} bougies  |  un R = "
           f"{cfg.risque_dollars:.0f}$  |  {device}", flush=True)
     d = pd.read_pickle(cfg.cache)
+    if getattr(cfg, "marche_seul", ""):
+        d, cfg = donnees_marche_seul(d, cfg)
     cols = list(dict.fromkeys(["time", "open", "high", "low", "close", "atr_14",
                                "spread_bar"] + colonnes_jeu(cfg)))
     d = d[cols].reset_index(drop=True)
     N = len(d)
     o, h, l, c = (d[k].to_numpy(np.float64) for k in ("open", "high", "low", "close"))
-    atr = atr_effectif(d["atr_14"].to_numpy(np.float64), c, cfg)
     sp = d["spread_bar"].to_numpy(np.float64)
+    atr = atr_effectif(d["atr_14"].to_numpy(np.float64), c, cfg)
+    if getattr(cfg, "marche_seul", ""):
+        # LE PLANCHER DU MARCHE, comme au multi-marches : le cout reste sous
+        # ~0.2 R. Le BTC garde ses 20 bps (5 x 3.5 = 17.5 < 20).
+        cout_med = float(np.median(sp)) + cfg.glissement_entree_bps + cfg.glissement_sortie_bps
+        atr = np.maximum(atr, cfg.plancher_couts * cout_med * 1e-4 * c)
+        print(f"  {cfg.marche_seul} : cout med {cout_med:.2f} bps, ATR des barrieres >= "
+              f"{max(float(cfg.atr_min_bps), cfg.plancher_couts * cout_med):.1f} bps, swap "
+              f"{cfg.swap_achat_bps_jour:.2f} / {cfg.swap_vente_bps_jour:.2f} bps/jour, contrat "
+              f"{cfg.contrat:g}, lot min {cfg.lot_min:g}", flush=True)
     t_ns = d["time"].values.astype("int64")
     X = d[colonnes_jeu(cfg)].to_numpy(np.float32)
     marge = fraction_marge(c, atr, cfg)
@@ -1755,7 +1789,8 @@ def main_blocs(cfg: JeuConfig) -> int:
             etat = {"modele": policy.state_dict(), "config": asdict(cfg), "epoch": epoch,
                     "bloc": k + 1}
             torch.save(etat, f"last_{cfg.prefixe}{suffixe}.pth")
-            if bv["coups"] >= cfg.min_coups_val and bv["score"] > record:
+            sauve = bv["coups"] >= cfg.min_coups_val and bv["score"] > record
+            if sauve:
                 record, garde_rec = bv["score"], epoch
                 torch.save(etat, best_path)
                 print(f"  sauvegarde  NOUVEAU MEILLEUR : {bv['score']:+.3f} R/partie en "
@@ -1764,6 +1799,9 @@ def main_blocs(cfg: JeuConfig) -> int:
                 print(f"  garde  rien de sauvegarde : {bv['score']:+.3f} R/partie ne bat pas "
                       f"{record:+.3f}" + (f" (meilleur : epoch {garde_rec})"
                                           if garde_rec is not None else ""), flush=True)
+            if getattr(cfg, "echanges", ""):
+                ecrit_echange(cfg, f"val_bloc{k + 1:02d}_ep{epoch:03d}", cv, t_ns, c, atr,
+                              len(j_va), sauve, (va0, va1), d["time"])
         src = best_path if os.path.exists(best_path) else f"last_{cfg.prefixe}{suffixe}.pth"
         policy.load_state_dict(torch.load(src, map_location=device, weights_only=False)["modele"])
         gen = torch.Generator(device=device)
@@ -1776,6 +1814,9 @@ def main_blocs(cfg: JeuConfig) -> int:
         print(f"TEST fold {k + 1} bilan  {ligne_detail(bt, cfg)}", flush=True)
         with open(f"test_{cfg.prefixe}{suffixe}.json", "w", encoding="utf-8") as fh:
             json.dump({k_: v_ for k_, v_ in bt.items()}, fh, indent=1, default=str)
+        if getattr(cfg, "echanges", ""):
+            ecrit_echange(cfg, f"test_bloc{k + 1:02d}", c_t, t_ns, c, atr, len(j_te), True,
+                          (te0, te1), d["time"])
     print("\n" + "=" * 70)
     print(f"  RESUME DES {cfg.n_blocs} BLOCS DE TEST (chacun jamais vu par son modele)")
     print("=" * 70)
@@ -1813,6 +1854,315 @@ def masque_blocs_dates(t_ns: np.ndarray, t_ref: np.ndarray, K: int, k: int,
     for a, z in (te, va):
         exclu |= (t_ns >= a - purge_ns) & (t_ns < z + purge_ns)
     return ~exclu, te, va
+
+
+MT5_CRYPTO = "cache_crypto_m5_mt5.pkl"
+
+
+def spec_marche(m: str, cfg: JeuConfig) -> Dict[str, float]:
+    """Contrat, lot minimum et pas de lot du symbole Vantage, lus dans MT5
+    (`telecharge_crypto_mt5`) ; ceux de `cfg` si le symbole n'y est pas."""
+    try:
+        inf = pd.read_pickle(MT5_CRYPTO)["infos"][m]
+        return {"contrat": float(inf["contrat"]), "lot_min": float(inf["lot_min"]),
+                "pas_lot": float(inf["pas_lot"])}
+    except (FileNotFoundError, KeyError):
+        return {"contrat": float(cfg.contrat), "lot_min": float(cfg.lot_min),
+                "pas_lot": float(cfg.pas_lot)}
+
+
+def config_marche(cfg: JeuConfig, m: str) -> JeuConfig:
+    """La configuration du modele d'UN marche. Voir `modeles_par_marche`."""
+    sp = spec_marche(m, cfg)
+    return replace(cfg, marches=(), marche_seul=m, modeles_par_marche=False,
+                   prefixe=f"{cfg.prefixe}_{m}", echanges=f"echanges_{cfg.prefixe}",
+                   contrat=sp["contrat"], lot_min=sp["lot_min"], pas_lot=sp["pas_lot"])
+
+
+def donnees_marche_seul(d_all: pd.DataFrame, cfg: JeuConfig):
+    """(bougies du marche, configuration a son swap) dans le cache multi :
+    a partir du debut commun a tous les marches du cache si `debut_commun`."""
+    t0 = (d_all.groupby("marche")["time"].min().max() if getattr(cfg, "debut_commun", False)
+          else d_all["time"].min())
+    d = d_all[(d_all["marche"] == cfg.marche_seul) & (d_all["time"] >= t0)].reset_index(drop=True)
+    if "swap_achat_bps_jour" in d.columns:
+        cfg = replace(cfg, swap_achat_bps_jour=float(d["swap_achat_bps_jour"].iloc[0]),
+                      swap_vente_bps_jour=float(d["swap_vente_bps_jour"].iloc[0]))
+    return d, cfg
+
+
+def table_trades(coups, t_ns, close, atr, cfg: JeuConfig) -> pd.DataFrame:
+    """Les coups d'un marche, ce qu'il faut pour les rejouer sur le compte
+    commun : entree, sortie, R, sens, distance du stop en prix, prix."""
+    cols = ["t_entree", "t_sortie", "r", "sens", "dist", "prix"]
+    if not len(coups):
+        return pd.DataFrame(columns=cols)
+    a = np.array([q[:7] for q in coups], np.float64)
+    t = a[:, 1].astype(np.int64)
+    ts = np.minimum(t + a[:, 6].astype(np.int64), len(t_ns) - 1)
+    j = a[:, 4].astype(np.int64)
+    return pd.DataFrame({"t_entree": np.asarray(t_ns)[t], "t_sortie": np.asarray(t_ns)[ts],
+                         "r": a[:, 5], "sens": a[:, 2].astype(np.int64),
+                         "dist": np.asarray(cfg.sl_atr, np.float64)[j] * np.asarray(atr)[t],
+                         "prix": np.asarray(close)[t]})
+
+
+def ecrit_echange(cfg: JeuConfig, nom: str, coups, t_ns, close, atr, n_jours: int,
+                  sauve: bool, bornes, temps: pd.Series) -> None:
+    """Depose les coups d'une validation ou d'un test pour le compte commun.
+    Ecrit a cote puis renomme : le lecteur ne voit jamais un fichier a moitie."""
+    os.makedirs(cfg.echanges, exist_ok=True)
+    f = os.path.join(cfg.echanges, f"{nom}__{cfg.marche_seul}.pkl")
+    n = len(temps)
+    pd.to_pickle({"trades": table_trades(coups, t_ns, close, atr, cfg), "n_jours": int(n_jours),
+                  "sauve": bool(sauve), "marche": cfg.marche_seul,
+                  "debut": temps.iloc[min(int(bornes[0]), n - 1)],
+                  "fin": temps.iloc[min(int(bornes[1]) - 1, n - 1)]}, f + ".tmp")
+    os.replace(f + ".tmp", f)
+
+
+def bilan_commun(parts: Dict[str, pd.DataFrame], specs: Dict[str, Dict[str, float]],
+                 n_jours: int, cfg: JeuConfig) -> Dict:
+    """Les coups de TOUS les marches sur UN compte commun.
+
+    A mise fixe (un R = `risque_dollars`) : trades, win rate, profit factor,
+    longs et shorts, total, drawdown du compte, resultats portes a la sortie
+    de chaque coup, dans l'ordre du temps.
+
+    COMME EN LIVE : un seul solde de `capital`. Chaque coup, a son entree,
+    mise `risque_pct` du solde REALISE du moment, en lots de SON symbole ; il
+    n'est pris que si la marge libre du compte (solde moins la marge des
+    coups encore ouverts, TOUS marches confondus) couvre la sienne.
+    """
+    import heapq
+    vides = [p.assign(marche=m) for m, p in parts.items() if len(p)]
+    if not vides:
+        return {"coups": 0, "n_jours": n_jours, "par_marche": {}}
+    tout = pd.concat(vides, ignore_index=True)
+    tout = tout.sort_values(["t_entree"], kind="stable").reset_index(drop=True)
+    r = tout["r"].to_numpy(np.float64)
+    n = len(r)
+    g, pe = float(r[r > 0].sum()), float(-r[r < 0].sum())
+    b = {"coups": n, "n_jours": n_jours, "gagnants": int((r > 0).sum()),
+         "perdants": int((r < 0).sum()), "win_rate": float((r > 0).mean()),
+         "pf": g / pe if pe > 0 else float("inf"), "longs": int((tout["sens"] == 0).sum()),
+         "shorts": int((tout["sens"] == 1).sum()), "total_dollars": float(r.sum() * cfg.risque_dollars),
+         "gain_R": float(r.mean())}
+    o = np.argsort(tout["t_sortie"].to_numpy(), kind="stable")
+    eq = float(cfg.capital) + np.cumsum(r[o] * cfg.risque_dollars)
+    courbe = np.concatenate([[float(cfg.capital)], eq])
+    pic = np.maximum.accumulate(courbe)
+    b["dd_dollars"] = float((courbe - pic).min())
+    b["dd_pct"] = float(((courbe - pic) / pic).min())
+    # COMME EN LIVE, sur le solde commun
+    # LA MISE SUIT LE SOLDE : plus le solde commun grandit, plus les lots de
+    # chaque marche grossissent (et l'inverse en baisse), comme en live.
+    E = float(cfg.capital)
+    ouverts, courbe_l, pnl_m, pris, sautes, risques = [], [E], {}, 0, 0, []
+    lot_max, lot_moy, gagnes_l = {}, {}, 0
+    for k in range(n):
+        te = int(tout["t_entree"].iat[k])
+        while ouverts and ouverts[0][0] <= te:
+            _, _, pnl, _m = heapq.heappop(ouverts)
+            E += pnl
+            courbe_l.append(E)
+        if E <= 0:
+            break
+        m = tout["marche"].iat[k]
+        sp = specs[m]
+        dist = float(tout["dist"].iat[k])
+        cible = E * cfg.risque_pct / 100.0
+        lots = np.floor(cible / (dist * sp["contrat"]) / sp["pas_lot"] + 1e-9) * sp["pas_lot"]
+        lots = max(float(lots), float(sp["lot_min"]))
+        marge = lots * sp["contrat"] * float(tout["prix"].iat[k]) / float(cfg.levier)
+        if marge > E - sum(q[1] for q in ouverts):
+            sautes += 1
+            continue
+        risque = lots * sp["contrat"] * dist
+        risques.append(risque / E)
+        pnl = float(r[k]) * risque
+        pnl_m[m] = pnl_m.get(m, 0.0) + pnl
+        lot_max[m] = max(lot_max.get(m, 0.0), lots)
+        lot_moy.setdefault(m, []).append(lots)
+        gagnes_l += int(r[k] > 0)
+        heapq.heappush(ouverts, (int(tout["t_sortie"].iat[k]), marge, pnl, m))
+        pris += 1
+    while ouverts:
+        _, _, pnl, _m = heapq.heappop(ouverts)
+        E += pnl
+        courbe_l.append(E)
+    cl = np.asarray(courbe_l)
+    pl = np.maximum.accumulate(cl)
+    b.update({"live_total": float(E - cfg.capital), "live_dd_dollars": float((cl - pl).min()),
+              "live_dd_pct": float(((cl - pl) / pl).min()), "live_pris": pris,
+              "live_marge": sautes, "live_solde": float(E),
+              "live_win_rate": gagnes_l / pris if pris else float("nan"),
+              "live_risque_moy": float(np.mean(risques)) if risques else float("nan")})
+    par = {}
+    for m in parts:
+        rm = tout.loc[tout["marche"] == m, "r"].to_numpy(np.float64)
+        gm, pm = float(rm[rm > 0].sum()), float(-rm[rm < 0].sum())
+        par[m] = {"coups": len(rm), "total_dollars": float(rm.sum() * cfg.risque_dollars),
+                  "win_rate": float((rm > 0).mean()) if len(rm) else float("nan"),
+                  "pf": gm / pm if pm > 0 else float("inf"), "live": pnl_m.get(m, 0.0),
+                  "lot_max": lot_max.get(m, 0.0),
+                  "lot_moy": float(np.mean(lot_moy[m])) if m in lot_moy else 0.0}
+    b["par_marche"] = par
+    return b
+
+
+def ligne_commune(b: Dict, cfg: JeuConfig) -> str:
+    if not b.get("coups"):
+        return "aucun trade"
+    j = max(int(b["n_jours"]), 1)
+    return (f"{b['coups']} trades ({b['coups'] / j:.1f}/jour) : {b['gagnants']} gagnants, "
+            f"{b['perdants']} perdants (win rate {100 * b['win_rate']:.1f} %)  |  {b['longs']} longs, "
+            f"{b['shorts']} shorts  |  profit factor {b['pf']:.2f}  |  total {b['total_dollars']:+.2f} $ "
+            f"sur {j} jours ({b['total_dollars'] / j:+.2f} $/jour)  |  drawdown max "
+            f"{b['dd_dollars']:+.2f} $ ({100 * b['dd_pct']:+.1f} %)  |  COMME EN LIVE, un seul solde "
+            f"de {cfg.capital:.0f} $, {cfg.risque_pct:g} % du solde du moment par coup : solde final "
+            f"{b['live_solde']:.2f} $ ({b['live_total']:+.2f} $), pire baisse "
+            f"{b['live_dd_dollars']:+.2f} $ ({100 * b['live_dd_pct']:+.1f} %), win rate "
+            f"{100 * b['live_win_rate']:.1f} % sur {b['live_pris']} coups pris, risque reel moyen "
+            f"{100 * b['live_risque_moy']:.2f} %, {b['live_marge']} coups sans marge")
+
+
+def ligne_commune_marches(b: Dict) -> str:
+    return "  |  ".join(f"{m} {v['coups']} trades {v['total_dollars']:+.1f} $ WR "
+                        f"{100 * v['win_rate']:.0f} % PF {v['pf']:.2f} (live {v['live']:+.1f} $, "
+                        f"lots {v['lot_moy']:.2f} en moyenne, {v['lot_max']:.2f} au plus)"
+                        for m, v in b.get("par_marche", {}).items())
+
+
+def main_modeles_par_marche(cfg: JeuConfig) -> int:
+    """Un modele par marche, en parallele, sur un compte commun. Voir
+    `modeles_par_marche`.
+
+    Chaque marche tourne dans son propre processus (`python jeu_kairos.py
+    <marche>`, journal `training_<marche>.log`) ; ce processus-ci relaie
+    leurs lignes, suffixees du marche, et des que les trois ont joue la meme
+    validation (ou le meme test), rejoue leurs coups sur le compte commun."""
+    import re
+    import shutil
+    import subprocess
+    manifeste = f"run_{cfg.prefixe}.json"
+    if os.path.exists(manifeste):
+        raise FileExistsError(f"{manifeste} existe : nouveau prefixe, ou lancer.ps1")
+    with open(manifeste, "w", encoding="utf-8") as fh:
+        json.dump(asdict(cfg), fh, indent=1, default=str)
+    marches = tuple(cfg.marches)
+    specs = {m: spec_marche(m, cfg) for m in marches}
+    print("=" * 70)
+    print(f"  KAIROS EN JEU — {len(marches)} MODELES INDEPENDANTS M{cfg.minutes_par_barre}, "
+          f"UN COMPTE COMMUN  |  VALIDATION CROISEE PURGEE en {cfg.n_blocs} blocs")
+    print("=" * 70)
+    print(f"  marches : {', '.join(marches)}  |  chacun son tronc, ses tetes, ses optimiseurs, "
+          f"son expert, sa normalisation, SON meilleur modele", flush=True)
+    print(f"  regles de chaque modele : {cfg.jetons} coups par jour, {cfg.positions_max} position(s) "
+          f"a la fois, fin de partie a -{cfg.vie_R:g} R, porte {cfg.porte_rang_expert:g}, expert "
+          f"{cfg.expert_k} coups  |  compte commun : {cfg.capital:.0f} $, {cfg.risque_pct:g} % du "
+          f"solde commun par coup, marge partagee (levier 1:{cfg.levier:.0f})", flush=True)
+    for m in marches:
+        print(f"  {m} : contrat {specs[m]['contrat']:g}, lot min {specs[m]['lot_min']:g}, "
+              f"pas {specs[m]['pas_lot']:g}", flush=True)
+    dossier = f"echanges_{cfg.prefixe}"
+    shutil.rmtree(dossier, ignore_errors=True)
+    os.makedirs(dossier, exist_ok=True)
+    env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8",
+               OMP_NUM_THREADS="5", MKL_NUM_THREADS="5")
+    procs, pos, reste = {}, {}, {}
+    for m in marches:
+        fh = open(f"training_{m}.log", "wb")
+        procs[m] = (subprocess.Popen([sys.executable, "-u", os.path.abspath(__file__), m],
+                                     stdout=fh, stderr=subprocess.STDOUT, env=env), fh)
+        pos[m], reste[m] = 0, b""
+    bruit = re.compile(r"Warning|^\s+(o = |d\[|creux12)")
+
+    def relaie(m):
+        with open(f"training_{m}.log", "rb") as f:
+            f.seek(pos[m])
+            data = f.read()
+        pos[m] += len(data)
+        lignes = (reste[m] + data).split(b"\n")
+        reste[m] = lignes.pop()
+        for x in lignes:
+            t = x.decode("utf-8", "replace").rstrip("\r")
+            if not bruit.search(t):
+                print(f"{t}   [{m}]" if t.strip() else "", flush=True)
+
+    faits, tests = set(), {}
+
+    def combine():
+        noms = {}
+        for f in os.listdir(dossier):
+            if f.endswith(".pkl") and "__" in f:
+                a, mm = f[:-4].split("__")
+                noms.setdefault(a, set()).add(mm)
+        def cle(a):
+            ep = re.search(r"_ep(\d+)", a)
+            return (int(re.search(r"bloc(\d+)", a).group(1)), a.startswith("test_"),
+                    int(ep.group(1)) if ep else 0)
+        for a in sorted(noms, key=cle):
+            if a in faits or not set(marches) <= noms[a]:
+                continue
+            ech = {m: pd.read_pickle(os.path.join(dossier, f"{a}__{m}.pkl")) for m in marches}
+            nj = max(e["n_jours"] for e in ech.values())
+            b = bilan_commun({m: e["trades"] for m, e in ech.items()}, specs, nj, cfg)
+            sauves = [m for m in marches if ech[m]["sauve"]]
+            deb = min(e["debut"] for e in ech.values())
+            fin = max(e["fin"] for e in ech.values())
+            if a.startswith("val_"):
+                bloc, _t, ep = cle(a)
+                print(f"\nEPOCH {ep:03d}  COMPTE COMMUN  VAL bloc {bloc} ({deb:%Y-%m-%d} -> "
+                      f"{fin:%Y-%m-%d})  |  modeles sauvegardes a cette epoch : "
+                      f"{', '.join(sauves) if sauves else 'aucun'}", flush=True)
+                print(f"  bilan  COMPTE COMMUN  {ligne_commune(b, cfg)}", flush=True)
+                print(f"  bilan  COMPTE COMMUN par marche : {ligne_commune_marches(b)}", flush=True)
+            else:
+                bloc = cle(a)[0]
+                tests[bloc] = (deb, fin, b, ech)
+                print(f"\nTEST fold {bloc} bilan  COMPTE COMMUN ({deb:%Y-%m-%d} -> {fin:%Y-%m-%d}, "
+                      f"chaque marche avec SON meilleur modele)  {ligne_commune(b, cfg)}", flush=True)
+                print(f"TEST fold {bloc} bilan  COMPTE COMMUN par marche : "
+                      f"{ligne_commune_marches(b)}", flush=True)
+            faits.add(a)
+
+    while True:
+        for m in marches:
+            relaie(m)
+        combine()
+        if all(p.poll() is not None for p, _ in procs.values()):
+            for m in marches:
+                relaie(m)
+            combine()
+            break
+        time.sleep(5)
+    for m, (p, fh) in procs.items():
+        fh.close()
+        if p.returncode != 0:
+            print(f"  ARRET du modele {m} : code {p.returncode}, voir training_{m}.log", flush=True)
+    print("\n" + "=" * 70)
+    print(f"  RESUME DES {cfg.n_blocs} BLOCS DE TEST, COMPTE COMMUN (chacun jamais vu par ses modeles)")
+    print("=" * 70)
+    for k in sorted(tests):
+        deb, fin, b, _e = tests[k]
+        print(f"  bloc {k:2d}  {deb:%Y-%m-%d} -> {fin:%Y-%m-%d}  {b.get('coups', 0):5d} trades  WR "
+              f"{100 * b.get('win_rate', 0):4.1f} %  PF {b.get('pf', float('nan')):5.2f}  total "
+              f"{b.get('total_dollars', 0.0):+9.2f} $  DD {100 * b.get('dd_pct', 0.0):+.1f} %  |  "
+              f"{ligne_commune_marches(b)}", flush=True)
+    if tests:
+        positifs = sum(1 for *_x, b, _e in tests.values() if b.get("total_dollars", 0.0) > 0)
+        tous = {m: pd.concat([e[m]["trades"] for *_x, e in tests.values()], ignore_index=True)
+                for m in marches}
+        nj = sum(b.get("n_jours", 0) for *_x, b, _e in tests.values())
+        bt = bilan_commun(tous, specs, nj, cfg)
+        print(f"  blocs gagnants : {positifs}/{len(tests)}  |  total {bt.get('total_dollars', 0.0):+.2f} $  |  "
+              f"{bt.get('coups', 0)} trades  |  profit factor global {bt.get('pf', float('nan')):.2f}",
+              flush=True)
+        print(f"  tous les blocs a la suite, COMPTE COMMUN : {ligne_commune(bt, cfg)}", flush=True)
+        print(f"  tous les blocs, par marche : {ligne_commune_marches(bt)}", flush=True)
+    print("\nFIN du walk-forward", flush=True)
+    return 0
 
 
 def coupe_debut_commun(d: pd.DataFrame) -> pd.DataFrame:
@@ -2042,6 +2392,11 @@ def main_multi_blocs(cfg: JeuConfig) -> int:
 
 def main() -> int:
     cfg = JeuConfig()
+    # LE MODELE D'UN MARCHE, lance par `main_modeles_par_marche`.
+    if len(sys.argv) > 1 and tuple(cfg.marches):
+        return main_blocs(config_marche(cfg, sys.argv[1]))
+    if tuple(cfg.marches) and getattr(cfg, "modeles_par_marche", False):
+        return main_modeles_par_marche(cfg)
     if tuple(cfg.marches) and getattr(cfg, "validation", "walk") == "blocs":
         return main_multi_blocs(cfg)
     if tuple(cfg.marches):

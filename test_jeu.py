@@ -604,5 +604,54 @@ _pmd9, _ted9, _ = J.masque_blocs_dates(_tt, _t_a, 10, 9, 30 * 300 * 10**9)
 verifie("le dernier bloc va jusqu'a la derniere bougie comprise",
         _ted9[1] == int(_t_a[-1]) + 1 and not _pmd9[870:1000].any() and not _pmd9[-130:].any())
 
+print("\n12. TROIS MODELES INDEPENDANTS, UN COMPTE COMMUN")
+verifie("par defaut : un modele par marche", _mm.modeles_par_marche and _mm.marche_seul == "")
+_cz = J.config_marche(_mm, "ZECUSD")
+verifie("le modele du ZEC : le jeu du BTC seul, ses colonnes, son nom, son dossier d'echange",
+        _cz.marches == () and _cz.marche_seul == "ZECUSD" and not _cz.modeles_par_marche
+        and _cz.prefixe == _mm.prefixe + "_ZECUSD" and _cz.echanges == f"echanges_{_mm.prefixe}"
+        and J.colonnes_jeu(_cz) == list(P5.FEATURE_COLS_M5) and _cz.porte_rang_expert == 0.85)
+import os as _os
+if _os.path.exists(J.MT5_CRYPTO):
+    verifie("le ZEC garde son contrat Vantage (100), le BTC le sien (1)",
+            _cz.contrat == 100 and J.config_marche(_mm, "BTCUSD").contrat == 1)
+_dm = _pd.DataFrame({"marche": ["A"] * 4 + ["B"] * 2,
+                     "time": _pd.to_datetime(["2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04",
+                                              "2020-01-03", "2020-01-04"]),
+                     "swap_achat_bps_jour": [5.0] * 4 + [13.7] * 2,
+                     "swap_vente_bps_jour": [0.0] * 4 + [13.7] * 2})
+_dA, _cA = J.donnees_marche_seul(_dm, replace(_cz, marche_seul="A"))
+verifie("un marche seul : ses bougies depuis le debut commun, son swap",
+        len(_dA) == 2 and (_dA["marche"] == "A").all() and _cA.swap_achat_bps_jour == 5.0
+        and _dA["time"].min() == _pd.Timestamp("2020-01-03"))
+_tn = np.arange(100, dtype=np.int64) * 10
+_tr = J.table_trades([(0, 5, 1, 0, 2, 1.5, 7, 0)], _tn, np.full(100, 200.0), np.full(100, 2.0), _cz)
+verifie("un coup devient un trade : entree, sortie, R, sens, distance du stop, prix",
+        _tr["t_entree"].iat[0] == 50 and _tr["t_sortie"].iat[0] == 120 and _tr["r"].iat[0] == 1.5
+        and _tr["sens"].iat[0] == 1 and _tr["dist"].iat[0] == _cz.sl_atr[2] * 2.0
+        and _tr["prix"].iat[0] == 200.0)
+_ta = _pd.DataFrame({"t_entree": [0, 20], "t_sortie": [10, 30], "r": [1.0, -1.0], "sens": [0, 1],
+                     "dist": [10.0, 10.0], "prix": [1000.0, 1000.0]})
+_tb = _pd.DataFrame({"t_entree": [5], "t_sortie": [15], "r": [2.0], "sens": [0],
+                     "dist": [10.0], "prix": [1000.0]})
+_sp = {"A": {"contrat": 1.0, "lot_min": 0.01, "pas_lot": 0.01},
+       "B": {"contrat": 1.0, "lot_min": 0.01, "pas_lot": 0.01}}
+_bc = J.bilan_commun({"A": _ta, "B": _tb}, _sp, 3, _cz)
+verifie("le compte commun : 3 trades, win rate 2/3, PF 3, +20 $, drawdown -10 $",
+        _bc["coups"] == 3 and abs(_bc["win_rate"] - 2 / 3) < 1e-9 and abs(_bc["pf"] - 3.0) < 1e-9
+        and abs(_bc["total_dollars"] - 20.0) < 1e-9 and abs(_bc["dd_dollars"] + 10.0) < 1e-9
+        and _bc["longs"] == 2 and _bc["shorts"] == 1, str(_bc))
+verifie("comme en live : la mise suit le SOLDE COMMUN (le 3e coup mise 10.30 $ apres +30 $)",
+        abs(_bc["live_total"] - 19.70) < 1e-6 and _bc["live_pris"] == 3, f"{_bc['live_total']}")
+verifie("le lot grossit avec le solde : 1.00 lot a 1000 $, 1.03 lot a 1030 $",
+        abs(_bc["par_marche"]["A"]["lot_max"] - 1.03) < 1e-9
+        and abs(_bc["live_solde"] - 1019.70) < 1e-6 and abs(_bc["live_win_rate"] - 2 / 3) < 1e-9,
+        str(_bc["par_marche"]["A"]))
+_bm = J.bilan_commun({"A": _ta, "B": _tb}, _sp, 3, replace(_cz, levier=1.0))
+verifie("la marge est partagee : le coup du B n'entre pas pendant celui du A",
+        _bm["live_pris"] == 2 and _bm["live_marge"] == 1, str(_bm["live_pris"]))
+verifie("par marche : les trades et les dollars de chacun",
+        _bc["par_marche"]["A"]["coups"] == 2 and abs(_bc["par_marche"]["B"]["total_dollars"] - 20) < 1e-9)
+
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)
