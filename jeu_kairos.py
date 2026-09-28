@@ -153,7 +153,8 @@ class JeuConfig:
     # spread Vantage reste sous l'ATR M5) et `main_multi_blocs`. Le BTC seul :
     # prefixe kairos_jeu_m5_02, `marches` = (), `cache` =
     # data_cache_BTCUSD_M5_BINANCE.pkl.
-    prefixe: str = "kairos_multi_m5_01"
+    # LE MEME POINT DE DEPART (run multi_m5_02) : voir `debut_commun`.
+    prefixe: str = "kairos_multi_m5_02"
     # LA VALIDATION CROISEE PURGEE — 2026-09-28, demande du proprietaire :
     # « entrainer le modele sur des periodes aleatoires pour qu'il apprenne
     # tous les types de marches ». Le walk-forward (h1_05) : +447.56, -441.18,
@@ -216,6 +217,17 @@ class JeuConfig:
     # BTC, ETH, ZEC EN M5 LE 2026-09-28 (run multi_m5_01), demande du
     # proprietaire. Voir `prepare_multi_m5`.
     marches: Tuple[str, ...] = ("BTCUSD", "ETHUSD", "ZECUSD")
+    # LE MEME POINT DE DEPART POUR TOUS LES MARCHES — 2026-09-28 (run
+    # multi_m5_02), demande du proprietaire : « que les trois cryptos
+    # commencent depuis le meme point de depart, qu'il n'y ait pas une crypto
+    # qui ne fasse rien, meme si on perd un peu d'historique ». Le run
+    # multi_m5_01 testait son bloc 1 (2017-08 -> 2018-07) sans le ZEC, cote
+    # chez Binance seulement depuis mars 2019. Avec True, l'historique de
+    # TOUS les marches commence a la premiere bougie du marche le plus
+    # recent (le ZEC : 2019-03-28) ; les blocs en dates sont alors coupes
+    # dans cette periode commune. Les features, calculees avant la coupe,
+    # gardent leur amorce.
+    debut_commun: bool = True
     # UN GROS MODELE DIVISE EN PETITS MODELES — 2026-09-28, demande du
     # proprietaire (run kairos_multi_h1_02). Le tronc SAINT reste commun a tous
     # les marches ; chaque marche a SES tetes : achat, vente, objectif, stop et
@@ -1803,6 +1815,13 @@ def masque_blocs_dates(t_ns: np.ndarray, t_ref: np.ndarray, K: int, k: int,
     return ~exclu, te, va
 
 
+def coupe_debut_commun(d: pd.DataFrame) -> pd.DataFrame:
+    """Les lignes a partir de la premiere bougie du marche le plus recent :
+    tous les marches commencent au meme instant. Voir `debut_commun`."""
+    t0 = d.groupby("marche")["time"].min().max()
+    return d[d["time"] >= t0]
+
+
 def main_multi_blocs(cfg: JeuConfig) -> int:
     """Le jeu multi-marches en validation croisee purgee. Voir `validation`
     et `marches`.
@@ -1837,6 +1856,11 @@ def main_multi_blocs(cfg: JeuConfig) -> int:
           f"{cfg.expert_k} coups  |  un R = {cfg.risque_dollars:.0f}$  |  {device}", flush=True)
     d = pd.read_pickle(cfg.cache)
     d = d[d["marche"].isin(cfg.marches)].copy()
+    if getattr(cfg, "debut_commun", False):
+        d = coupe_debut_commun(d).copy()
+        print(f"  debut commun : {d['time'].min():%Y-%m-%d %H:%M} UTC, la premiere bougie du "
+              f"marche le plus recent ; tous les marches s'entrainent et se testent sur la "
+              f"meme periode", flush=True)
     d["_o"] = d["marche"].map({m: i for i, m in enumerate(cfg.marches)})
     d = d.sort_values(["_o", "time"], kind="stable").drop(columns="_o")
     _plus = [k for k in ["swap_achat_bps_jour", "swap_vente_bps_jour"] if k in d.columns]

@@ -592,6 +592,14 @@ verifie("les blocs en dates sont ceux du BTC seul, bougie pour bougie",
         and _vad == (int(_t_a[500]), int(_t_a[600])))
 verifie("l'autre marche perd les memes DATES (test, validation et tampon)",
         (_pmd[1000:] == _pmi[300:]).all())
+_dc = _pd.DataFrame({"marche": ["A"] * 5 + ["B"] * 3,
+                    "time": _pd.to_datetime(["2020-01-01", "2020-01-02", "2020-01-03",
+                                             "2020-01-04", "2020-01-05",
+                                             "2020-01-03", "2020-01-04", "2020-01-05"])})
+_dcc = J.coupe_debut_commun(_dc)
+verifie("le meme point de depart : chaque marche commence a la premiere bougie du plus recent",
+        _mm.debut_commun and len(_dcc) == 6
+        and (_dcc.groupby("marche")["time"].min() == _pd.Timestamp("2020-01-03")).all())
 _pmd9, _ted9, _ = J.masque_blocs_dates(_tt, _t_a, 10, 9, 30 * 300 * 10**9)
 verifie("le dernier bloc va jusqu'a la derniere bougie comprise",
         _ted9[1] == int(_t_a[-1]) + 1 and not _pmd9[870:1000].any() and not _pmd9[-130:].any())
