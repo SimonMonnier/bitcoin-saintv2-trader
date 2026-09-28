@@ -558,8 +558,8 @@ verifie("le dernier bloc aussi : test a la fin, validation au milieu",
 print("\n11. LE MULTI-MARCHES M5 (BTC, ETH, ZEC)")
 import prepare_multi_m5 as PM5
 _mm = J.JeuConfig()
-verifie("par defaut : BTC, ETH et ZEC en M5, validation en blocs, un cerveau par marche",
-        tuple(_mm.marches) == ("BTCUSD", "ETHUSD", "ZECUSD") == tuple(PM5.MARCHES)
+verifie("par defaut : BTC et ETH en M5 (sans le ZEC), validation en blocs",
+        tuple(_mm.marches) == ("BTCUSD", "ETHUSD") and set(_mm.marches) <= set(PM5.MARCHES)
         and _mm.cache == PM5.SORTIE and _mm.minutes_par_barre == 5 and _mm.partie == "jour"
         and _mm.validation == "blocs" and _mm.tetes_par_marche)
 verifie("les memes regles que le BTC seul du run m5_02",
@@ -567,8 +567,9 @@ verifie("les memes regles que le BTC seul du run m5_02",
         and _mm.porte_rang_expert == 0.85 and _mm.horizon_max == 96 and _mm.risque_pct == 1.0)
 verifie("EXACTEMENT les colonnes du BTC, plus une colonne par marche",
         J.colonnes_jeu(_mm) == list(P5.FEATURE_COLS_M5) + ["m_BTCUSD", "m_ETHUSD", "m_ZECUSD"])
-_pm5 = J.PolitiqueJeu(_mm)
-_xm = torch.zeros(3, _mm.lookback, len(J.colonnes_jeu(_mm)) + _mm.n_expert + J.N_ETAT)
+_mm3 = replace(_mm, marches=("BTCUSD", "ETHUSD", "ZECUSD"))
+_pm5 = J.PolitiqueJeu(_mm3)
+_xm = torch.zeros(3, _mm.lookback, len(J.colonnes_jeu(_mm3)) + _mm.n_expert + J.N_ETAT)
 _ic = J.colonnes_jeu(_mm).index("m_ETHUSD")
 _xm[1, :, _ic] = 1.0
 _ic = J.colonnes_jeu(_mm).index("m_ZECUSD")
@@ -620,7 +621,10 @@ _dm = _pd.DataFrame({"marche": ["A"] * 4 + ["B"] * 2,
                                               "2020-01-03", "2020-01-04"]),
                      "swap_achat_bps_jour": [5.0] * 4 + [13.7] * 2,
                      "swap_vente_bps_jour": [0.0] * 4 + [13.7] * 2})
-_dA, _cA = J.donnees_marche_seul(_dm, replace(_cz, marche_seul="A"))
+_dA, _cA = J.donnees_marche_seul(_dm, replace(_cz, marche_seul="A", marches_communs=("A", "B")))
+_dA1, _ = J.donnees_marche_seul(_dm, replace(_cz, marche_seul="A", marches_communs=("A",)))
+verifie("le debut commun ne regarde que les marches du compte (sans B : tout A)",
+        len(_dA1) == 4 and J.config_marche(_mm, "BTCUSD").marches_communs == ("BTCUSD", "ETHUSD"))
 verifie("un marche seul : ses bougies depuis le debut commun, son swap",
         len(_dA) == 2 and (_dA["marche"] == "A").all() and _cA.swap_achat_bps_jour == 5.0
         and _dA["time"].min() == _pd.Timestamp("2020-01-03"))

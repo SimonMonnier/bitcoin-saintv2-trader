@@ -156,7 +156,8 @@ class JeuConfig:
     # LE MEME POINT DE DEPART (run multi_m5_02) : voir `debut_commun`.
     # TROIS MODELES INDEPENDANTS, UN COMPTE COMMUN (run multi_m5_03) : voir
     # `modeles_par_marche`.
-    prefixe: str = "kairos_multi_m5_03"
+    # BTC ET ETH SEULS, DEPUIS 2017 (run multi_m5_04) : voir `marches`.
+    prefixe: str = "kairos_multi_m5_04"
     # LA VALIDATION CROISEE PURGEE — 2026-09-28, demande du proprietaire :
     # « entrainer le modele sur des periodes aleatoires pour qu'il apprenne
     # tous les types de marches ». Le walk-forward (h1_05) : +447.56, -441.18,
@@ -218,7 +219,14 @@ class JeuConfig:
     # multi a 13 marches : ces marches et `cache` = data_cache_MULTI_H1.pkl.
     # BTC, ETH, ZEC EN M5 LE 2026-09-28 (run multi_m5_01), demande du
     # proprietaire. Voir `prepare_multi_m5`.
-    marches: Tuple[str, ...] = ("BTCUSD", "ETHUSD", "ZECUSD")
+    # SANS LE ZEC LE 2026-09-28 (run multi_m5_04), demande du proprietaire :
+    # « recuperer 2017-2019 et enlever le ZECUSD ». Le ZEC n'est cote chez
+    # Binance que depuis mars 2019 : le point de depart commun (`debut_commun`)
+    # le retirait au BTC et a l'ETH, et avec lui l'historique le plus agite
+    # (correlation de l'expert du BTC au test du bloc 1 : +0.088 / +0.070 sur
+    # 2019, +0.119 / +0.113 sur 2017-2018). Sans lui, BTC et ETH commencent
+    # tous deux le 2017-08-24 : memes blocs que le BTC seul.
+    marches: Tuple[str, ...] = ("BTCUSD", "ETHUSD")
     # LE MEME POINT DE DEPART POUR TOUS LES MARCHES — 2026-09-28 (run
     # multi_m5_02), demande du proprietaire : « que les trois cryptos
     # commencent depuis le meme point de depart, qu'il n'y ait pas une crypto
@@ -250,6 +258,8 @@ class JeuConfig:
     # dossier ou il depose ses coups pour le compte commun.
     marche_seul: str = ""
     echanges: str = ""
+    # Les marches du compte commun, pour leur point de depart commun.
+    marches_communs: Tuple[str, ...] = ()
     # UN GROS MODELE DIVISE EN PETITS MODELES — 2026-09-28, demande du
     # proprietaire (run kairos_multi_h1_02). Le tronc SAINT reste commun a tous
     # les marches ; chaque marche a SES tetes : achat, vente, objectif, stop et
@@ -1875,14 +1885,18 @@ def config_marche(cfg: JeuConfig, m: str) -> JeuConfig:
     """La configuration du modele d'UN marche. Voir `modeles_par_marche`."""
     sp = spec_marche(m, cfg)
     return replace(cfg, marches=(), marche_seul=m, modeles_par_marche=False,
+                   marches_communs=tuple(cfg.marches),
                    prefixe=f"{cfg.prefixe}_{m}", echanges=f"echanges_{cfg.prefixe}",
                    contrat=sp["contrat"], lot_min=sp["lot_min"], pas_lot=sp["pas_lot"])
 
 
 def donnees_marche_seul(d_all: pd.DataFrame, cfg: JeuConfig):
     """(bougies du marche, configuration a son swap) dans le cache multi :
-    a partir du debut commun a tous les marches du cache si `debut_commun`."""
-    t0 = (d_all.groupby("marche")["time"].min().max() if getattr(cfg, "debut_commun", False)
+    a partir du debut commun aux marches du compte (`marches_communs`, tous
+    ceux du cache s'il est vide) si `debut_commun`."""
+    mc = tuple(getattr(cfg, "marches_communs", ())) or tuple(d_all["marche"].unique())
+    dc = d_all[d_all["marche"].isin(mc)]
+    t0 = (dc.groupby("marche")["time"].min().max() if getattr(cfg, "debut_commun", False)
           else d_all["time"].min())
     d = d_all[(d_all["marche"] == cfg.marche_seul) & (d_all["time"] >= t0)].reset_index(drop=True)
     if "swap_achat_bps_jour" in d.columns:
