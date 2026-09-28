@@ -22,7 +22,14 @@ import time
 import pandas as pd
 
 CACHE = "cache_h1_mt5.pkl"
-INDICES = ["NAS100", "GER40", "UK100", "FRA40", "HK50", "US2000"]
+INDICES = ["NAS100", "GER40", "UK100", "FRA40", "HK50", "US2000",
+           # 2026-09-28, demande du proprietaire : « beaucoup plus d'indices,
+           # chacun avec son petit cerveau ». Regle : tout indice d'actions de
+           # Vantage dont le spread median vaut au plus 25 % de l'ATR H1, sans
+           # les doublons « ft » (contrats a terme des memes indices) ni ce qui
+           # n'est pas un indice d'actions (VIX, USDX) ; SGP20 est trop cher.
+           "DJ30", "SP500", "SPI200", "EU50", "ES35", "TWINDEX", "BVSPX",
+           "CHINA50", "HKTECH"]
 DEBUT = pd.Timestamp("2017-01-01")
 
 try:

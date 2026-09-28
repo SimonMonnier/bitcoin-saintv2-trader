@@ -401,7 +401,7 @@ import prepare_multi_m15 as PM
 cm = replace(J.JeuConfig(), marches=tuple(PM.MARCHES), cache="data_cache_MULTI_M15.pkl",
              minutes_par_barre=15, horizon_max=32, partie="jour")
 verifie("le multi-marches M15 reste disponible a cote du multi H1 par defaut",
-        len(J.JeuConfig().marches) == 7 and tuple(cm.marches) == tuple(PM.MARCHES))
+        len(J.JeuConfig().marches) >= 7 and tuple(cm.marches) == tuple(PM.MARCHES))
 verifie("il lit les features communes, avec une colonne par marche",
         J.colonnes_jeu(cm) == list(PM.FEATURE_COLS_MULTI)
         and all(f"m_{m}" in PM.FEATURE_COLS_MULTI for m in PM.MARCHES)
@@ -472,11 +472,11 @@ verifie("36 colonnes, dont le flux et le financement",
         len(PH.FEATURE_COLS_H1) == 36 and "flux_4" in PH.FEATURE_COLS_H1
         and "funding_der" in PH.FEATURE_COLS_H1)
 
-print("\n9. LE MULTI-MARCHES H1 (le BTC et six indices)")
+print("\n9. LE MULTI-MARCHES H1 (le BTC et les indices)")
 import prepare_multi_h1 as PMH
 cmh = J.JeuConfig()
-verifie("par defaut : le BTC et six indices, en H1, une semaine par partie",
-        tuple(cmh.marches) == tuple(PMH.MARCHES) and len(cmh.marches) == 7
+verifie("par defaut : le BTC et les indices, en H1, une semaine par partie",
+        tuple(cmh.marches) == tuple(PMH.MARCHES) and len(cmh.marches) == len(PMH.MARCHES) >= 13
         and cmh.minutes_par_barre == 60 and cmh.partie == "semaine")
 verifie("la configuration du run h1_01 : une position, 10 jetons, l'expert a 6 coups",
         cmh.positions_max == 1 and cmh.jetons == 10 and cmh.expert_k == 6
@@ -488,13 +488,14 @@ verifie("il lit les colonnes communes, avec une colonne par marche",
 pmh = J.PolitiqueJeu(cmh)
 xmh = torch.zeros(2, cmh.lookback, len(PMH.FEATURE_COLS_MULTI_H1) + cmh.n_expert + J.N_ETAT)
 verifie("le modele multi H1 lit ses colonnes, l'expert et l'etat", pmh.jeu(xmh)[0].shape == (2, 3))
-verifie("un tronc commun, sept jeux de tetes (une par marche)",
-        pmh.n_marches == 7 and len(pmh.tete_achat_m) == 7 and len(pmh.critic_m) == 7)
+_nm = len(PMH.MARCHES)
+verifie("un tronc commun, un jeu de tetes par marche",
+        pmh.n_marches == _nm and len(pmh.tete_achat_m) == _nm and len(pmh.critic_m) == _nm)
 gmh = pmh.groupes_jeu()
 _ids = [id(q) for v in gmh.values() for q in v]
 verifie("les groupes restent disjoints et portent les tetes par marche",
         len(_ids) == len(set(_ids)) and sorted(gmh) == ["achat", "gain", "perte", "tronc", "valeur", "vente"]
-        and len(gmh["achat"]) == 7 * len(list(pmh.mlp_achat.parameters()) + list(pmh.tete_achat.parameters())))
+        and len(gmh["achat"]) == _nm * len(list(pmh.mlp_achat.parameters()) + list(pmh.tete_achat.parameters())))
 _colm = J.colonnes_jeu(cmh)
 _xa = torch.zeros(2, cmh.lookback, len(_colm) + cmh.n_expert + J.N_ETAT)
 _xa[0, :, _colm.index("m_BTCUSD")] = 1.0

@@ -47,7 +47,12 @@ except Exception:
 BTC_H1 = PH.SORTIE
 MT5_H1 = "cache_h1_mt5.pkl"
 SORTIE = "data_cache_MULTI_H1.pkl"
-MARCHES = ["BTCUSD", "NAS100", "GER40", "UK100", "FRA40", "HK50", "US2000"]
+# 2026-09-28 : douze indices. TWINDEX (depuis 2024-02), HKTECH (2024-07) et
+# BVSPX (2022-08) sont ecartes : il faut au moins deux ans de bougies avant
+# la premiere validation (2022-08-29), sinon leur expert et leurs tetes n'ont
+# rien pour apprendre au premier fold et jouent au hasard au test.
+MARCHES = ["BTCUSD", "NAS100", "GER40", "UK100", "FRA40", "HK50", "US2000",
+           "DJ30", "SP500", "SPI200", "EU50", "ES35", "CHINA50"]
 SWAP_BTC = (20.0 / 365 * 100, 0.0)          # cout en bps/jour : achat, vente
 
 COMMUNES = (

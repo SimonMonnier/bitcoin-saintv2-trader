@@ -125,7 +125,7 @@ class JeuConfig:
     # sans chevauchement) « et ajouter des indices qui ont de la volatilite et
     # un faible spread » pour augmenter le nombre de trades et le profit.
     # Chaque marche joue sa semaine avec ses 10 jetons. Voir `prepare_multi_h1`.
-    prefixe: str = "kairos_multi_h1_02"
+    prefixe: str = "kairos_multi_h1_03"
     # LE JEU EN BOUGIES DE 15 MINUTES — 2026-09-27, demande du proprietaire :
     # « recommence le jeu avec des bougies de 15 minutes, et pas M1 pour
     # entrer ». Le modele voit des bougies M15 (contextes H1 et H4, voir
@@ -165,7 +165,10 @@ class JeuConfig:
     # REACTIVE LE 2026-09-28 EN H1 (run kairos_multi_h1_01) : le BTC et six
     # indices a faible spread (voir `telecharge_h1_mt5`). Le BTC seul en H1 :
     # `marches` = () et `cache` = data_cache_BTCUSD_H1_BINANCE.pkl.
-    marches: Tuple[str, ...] = ("BTCUSD", "NAS100", "GER40", "UK100", "FRA40", "HK50", "US2000")
+    # 7 -> 13 MARCHES LE 2026-09-28 (run kairos_multi_h1_03), demande du
+    # proprietaire : « beaucoup plus d'indices, chacun avec son petit cerveau ».
+    marches: Tuple[str, ...] = ("BTCUSD", "NAS100", "GER40", "UK100", "FRA40", "HK50", "US2000",
+                                "DJ30", "SP500", "SPI200", "EU50", "ES35", "CHINA50")
     # UN GROS MODELE DIVISE EN PETITS MODELES — 2026-09-28, demande du
     # proprietaire (run kairos_multi_h1_02). Le tronc SAINT reste commun a tous
     # les marches ; chaque marche a SES tetes : achat, vente, objectif, stop et
