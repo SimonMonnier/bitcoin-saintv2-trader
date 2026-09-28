@@ -197,6 +197,34 @@ verifie("l'expert a une position : jamais deux coups ouverts ensemble", _ouv(_e1
 verifie("l'expert a dix positions : il enseigne ses dix coups, qui se chevauchent",
         len(_e10) == 10 and _ouv(_e10) > 1 and _ouv(_e10) <= 10, f"{len(_e10)} coups, {_ouv(_e10)} ouverts")
 
+# COMME EN LIVE (run h1_04) : la marge limite les positions ouvertes.
+cfgmg = replace(cfgj, positions_max=10, jetons=12)
+_mg = np.full((M, len(cfgmg.sl_atr)), 0.4)          # 40 % de l'equite par coup
+_, cpg, _ = J.joue(pol, jours, Xn, R, D, S, 2800, cfgmg, "cpu", explore=False, marge=_mg)
+_ouv_g = max(sum(1 for c in cpg if c[0] == gg and c[1] <= t_ < c[1] + c[6])
+             for gg in range(3) for t_ in range(100, 2800, 7))
+verifie("comme en live : jamais plus de coups que la marge n'en couvre (2 a 40 %)",
+        _ouv_g <= 2 and len(cpg) > 0, f"{_ouv_g} ouverts")
+_, cpg0, _ = J.joue(pol, jours, Xn, R, D, S, 2800, cfgmg, "cpu", explore=False)
+verifie("sans marge fournie, la contrainte ne joue pas", len(cpg0) >= len(cpg))
+cfl = replace(cfgj, capital=1000.0, risque_pct=1.0, sl_atr=(1.0, 2.0, 4.0, 8.0),
+              lot_min=0.01, pas_lot=0.01, contrat=1.0, levier=500.0)
+_cl = J.compte_live(np.array([0, 10]), np.array([0, 3]), np.array([2.0, -1.0]),
+                    np.array([5, 5]), np.full(20, 50_000.0), np.full(20, 500.0), cfl)
+verifie("comme en live : 0.02 lot au stop serre, 0.01 minimum au stop large",
+        abs(_cl["live_total"] - (20.0 - 40.0)) < 1e-6, "%.2f" % _cl["live_total"])
+verifie("comme en live : le lot minimum fait risquer plus que 1 %",
+        abs(_cl["live_risque_max"] - 40.0 / 1020.0) < 1e-9, "%.4f" % _cl["live_risque_max"])
+_cl2 = J.compte_live(np.array([0, 10]), np.array([0, 0]), np.array([10.0, 2.0]),
+                     np.array([5, 5]), np.full(20, 50_000.0), np.full(20, 100.0), cfl)
+verifie("comme en live : la mise suit l'equite (interets composes)",
+        abs(_cl2["live_total"] - 122.0) < 1e-6, "%.2f" % _cl2["live_total"])
+cfl3 = replace(cfl, levier=0.5)
+_cl3 = J.compte_live(np.array([0]), np.array([0]), np.array([1.0]),
+                     np.array([5]), np.full(20, 50_000.0), np.full(20, 500.0), cfl3)
+verifie("comme en live : un coup dont la marge depasse l'equite est refuse",
+        _cl3["live_marge"] == 1 and _cl3["live_pris"] == 0)
+
 cfgp = replace(cfgj, porte_rang_expert=0.9)
 rg = np.zeros((M, 2), np.float32)
 rg[[150, 400, 1100], 0] = 0.95          # trois minutes ou l'achat est permis
@@ -372,8 +400,8 @@ print("\n7. LE JEU MULTI-MARCHES")
 import prepare_multi_m15 as PM
 cm = replace(J.JeuConfig(), marches=tuple(PM.MARCHES), cache="data_cache_MULTI_M15.pkl",
              minutes_par_barre=15, horizon_max=32, partie="jour")
-verifie("le jeu par defaut est le BTC seul ; le multi-marches reste disponible",
-        tuple(J.JeuConfig().marches) == () and tuple(cm.marches) == tuple(PM.MARCHES))
+verifie("le multi-marches M15 reste disponible a cote du multi H1 par defaut",
+        len(J.JeuConfig().marches) == 7 and tuple(cm.marches) == tuple(PM.MARCHES))
 verifie("il lit les features communes, avec une colonne par marche",
         J.colonnes_jeu(cm) == list(PM.FEATURE_COLS_MULTI)
         and all(f"m_{m}" in PM.FEATURE_COLS_MULTI for m in PM.MARCHES)
@@ -411,8 +439,8 @@ verifie("le drawdown suit l'ordre du TEMPS, pas celui des lignes",
 
 print("\n8. LE JEU EN H1, PARTIES D'UNE SEMAINE")
 import prepare_btc_h1_binance as PH
-ch = J.JeuConfig()
-verifie("le jeu par defaut : H1, une semaine par partie, 168 bougies",
+ch = replace(J.JeuConfig(), marches=(), cache=PH.SORTIE)
+verifie("le jeu H1 : une semaine par partie, 168 bougies",
         ch.minutes_par_barre == 60 and ch.partie == "semaine" and ch.barres_par_partie == 168)
 verifie("il lit les colonnes du H1 Binance", J.colonnes_jeu(ch) == list(PH.FEATURE_COLS_H1))
 _t = _pd.Series(_pd.date_range("2024-01-01 00:00", periods=24 * 21, freq="1h"))
@@ -443,6 +471,36 @@ verifie("sans cout (rampe a 0), pas de swap non plus", abs(float(Rz[0, 0, 0, 0])
 verifie("36 colonnes, dont le flux et le financement",
         len(PH.FEATURE_COLS_H1) == 36 and "flux_4" in PH.FEATURE_COLS_H1
         and "funding_der" in PH.FEATURE_COLS_H1)
+
+print("\n9. LE MULTI-MARCHES H1 (le BTC et six indices)")
+import prepare_multi_h1 as PMH
+cmh = J.JeuConfig()
+verifie("par defaut : le BTC et six indices, en H1, une semaine par partie",
+        tuple(cmh.marches) == tuple(PMH.MARCHES) and len(cmh.marches) == 7
+        and cmh.minutes_par_barre == 60 and cmh.partie == "semaine")
+verifie("la configuration du run h1_01 : une position, 10 jetons, l'expert a 6 coups",
+        cmh.positions_max == 1 and cmh.jetons == 10 and cmh.expert_k == 6
+        and cmh.porte_rang_expert == 0.90 and cmh.risque_pct == 1.0)
+verifie("il lit les colonnes communes, avec une colonne par marche",
+        J.colonnes_jeu(cmh) == list(PMH.FEATURE_COLS_MULTI_H1)
+        and all(f"m_{m}" in PMH.FEATURE_COLS_MULTI_H1 for m in PMH.MARCHES)
+        and not any(c in PMH.FEATURE_COLS_MULTI_H1 for c in PMH.EXTRAS_BTC_H1))
+pmh = J.PolitiqueJeu(cmh)
+xmh = torch.zeros(2, cmh.lookback, len(PMH.FEATURE_COLS_MULTI_H1) + cmh.n_expert + J.N_ETAT)
+verifie("le modele multi H1 lit ses colonnes, l'expert et l'etat", pmh.jeu(xmh)[0].shape == (2, 3))
+_u = PMH.serveur_vers_utc(_pd.Series(_pd.to_datetime(["2024-07-08 16:30", "2024-01-08 16:30"])))
+verifie("l'heure du serveur MT5 passe en UTC (ouverture de New York 13h30 l'ete, 14h30 l'hiver)",
+        [x.strftime("%H:%M") for x in _u] == ["13:30", "14:30"])
+_sa, _sv = PMH.swap_bps_jour({"contrat": 1.0, "swap_long": -6.0, "swap_short": 1.0}, 20_000.0)
+verifie("le swap d'un indice : un cout a l'achat, un credit a la vente",
+        abs(_sa - 3.0) < 1e-9 and abs(_sv + 0.5) < 1e-9, f"{_sa} {_sv}")
+_tm = _pd.Series(list(_pd.date_range("2024-01-01", periods=24 * 14, freq="1h"))
+                 + list(_pd.date_range("2024-01-01", periods=24 * 14, freq="1h")))
+_bl = [("A", 0, 336), ("B", 336, 672)]
+_jm = J.journees_multi(_tm, _bl, _pd.Timestamp("2024-01-01").value,
+                       _pd.Timestamp("2024-01-15").value, 60, cmh)
+verifie("deux marches, deux semaines chacun : quatre parties, chacune dans son marche",
+        _jm.shape == (4, 2) and _jm[:2].max() <= 336 and _jm[2:].min() >= 336, str(_jm.tolist()))
 
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)

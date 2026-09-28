@@ -87,7 +87,7 @@ import math
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -118,7 +118,13 @@ class JeuConfig:
     # glissements, et le swap acheteur (-20 %/an) sur la duree de chaque coup.
     # Le run M15 precedent : prefixe kairos_jeu_m15_07, cache
     # data_cache_BTCUSD_M15.pkl, 15 min, partie "jour", horizon 32, sans swap.
-    prefixe: str = "kairos_jeu_h1_03"
+    # LE MULTI-MARCHES H1 — 2026-09-28, demande du proprietaire : « revenir a
+    # la configuration ou on a fait +400 $ au test du fold 1 » (run h1_01 :
+    # une position a la fois, 10 jetons par semaine, l'expert enseigne 6 coups
+    # sans chevauchement) « et ajouter des indices qui ont de la volatilite et
+    # un faible spread » pour augmenter le nombre de trades et le profit.
+    # Chaque marche joue sa semaine avec ses 10 jetons. Voir `prepare_multi_h1`.
+    prefixe: str = "kairos_multi_h1_01"
     # LE JEU EN BOUGIES DE 15 MINUTES — 2026-09-27, demande du proprietaire :
     # « recommence le jeu avec des bougies de 15 minutes, et pas M1 pour
     # entrer ». Le modele voit des bougies M15 (contextes H1 et H4, voir
@@ -128,7 +134,7 @@ class JeuConfig:
     # CE QUE CELA CHANGE AU COUT : l'ATR M15 median vaut 26 bps, l'ATR M1
     # environ 6, pour le meme cout de ~3.3 bps par coup. Rapporte au
     # mouvement d'une bougie, il pese quatre fois moins.
-    cache: str = "data_cache_BTCUSD_H1_BINANCE.pkl"
+    cache: str = "data_cache_MULTI_H1.pkl"
     minutes_par_barre: int = 60
     # UNE PARTIE = UN "jour" OU UNE "semaine" (lundi 0 h -> lundi 0 h UTC).
     # En H1 un jour ne fait que 24 decisions : la semaine en fait 168, et
@@ -155,7 +161,10 @@ class JeuConfig:
     # drawdown -108 % a 0.5 % de mise. Retour au BTC seul, le seul jeu positif
     # au test. Pour rejouer le multi-marches : les sept marches ici, et
     # `cache` = data_cache_MULTI_M15.pkl.
-    marches: Tuple[str, ...] = ()
+    # REACTIVE LE 2026-09-28 EN H1 (run kairos_multi_h1_01) : le BTC et six
+    # indices a faible spread (voir `telecharge_h1_mt5`). Le BTC seul en H1 :
+    # `marches` = () et `cache` = data_cache_BTCUSD_H1_BINANCE.pkl.
+    marches: Tuple[str, ...] = ("BTCUSD", "NAS100", "GER40", "UK100", "FRA40", "HK50", "US2000")
     # LE PLANCHER DES BARRIERES, PAR MARCHE : cinq fois son cout median
     # (spread + glissements), jamais sous 10 bps. Le cout ne depasse donc
     # jamais ~0.2 R, sur le BTC (17 bps) comme sur l'ETH (58) ou le Dow (10).
@@ -177,6 +186,9 @@ class JeuConfig:
     # par jour. En M15, le run m15_01 jouait ~2 coups par jour avec 3
     # jetons, rentable en validation. SEUL CE REGLAGE CHANGE dans m15_03 :
     # m15_02 avait aussi elargi la porte et l'expert, sans demande.
+    # 10 -> 1000 LE 2026-09-28 (run h1_04, jamais mene a terme) pour ouvrir
+    # autant de trades que la marge le permet. REMIS A 10 LE 2026-09-28 (run
+    # kairos_multi_h1_01) : retour a la configuration du run h1_01.
     jetons: int = 10
     vie_R: float = 3.0
     # PLUSIEURS POSITIONS A LA FOIS — 2026-09-28, demande du proprietaire
@@ -188,8 +200,21 @@ class JeuConfig:
     # les coups RESOLUS : les coups encore ouverts ne lui revelent rien de leur
     # issue. 1 = le jeu d'avant, a l'identique.
     # 3 -> 10 LE 2026-09-28 (run h1_03), demande du proprietaire : autant de
-    # positions simultanees que de jetons.
-    positions_max: int = 10
+    # positions simultanees que de jetons. 10 -> 50 (run h1_04) : une borne
+    # technique ; en pratique c'est la marge qui limite. REMIS A 1 LE
+    # 2026-09-28 (run kairos_multi_h1_01) : la configuration du run h1_01.
+    positions_max: int = 1
+    # COMME EN LIVE — le compte demo Vantage, lu dans MT5 le 2026-09-28 :
+    # levier 1:500, BTCUSD contrat 1 BTC, lot minimum 0.01, pas 0.01 (0.01
+    # lot ~ 842 $ de notionnel pour 1.69 $ de marge). Le jeu n'ouvre un coup
+    # que si la marge libre couvre sa marge (au stop le plus serre, le plus
+    # gourmand) ; le bilan rejoue les coups sur UN compte, mise de
+    # `risque_pct` de l'equite du moment arrondie aux lots de `pas_lot`, jamais
+    # sous `lot_min` : avec 1000 $, un stop large risque donc PLUS que 1 %.
+    levier: float = 500.0
+    lot_min: float = 0.01
+    pas_lot: float = 0.01
+    contrat: float = 1.0
     # En ATR de la barre de decision. L'ATR M1 du BTC vaut ~7 bps, un
     # mouvement de 15 minutes ~2.5 ATR : les coups vont de la demi-heure a
     # quelques heures.
@@ -246,8 +271,9 @@ class JeuConfig:
     # 6 -> 10 LE 2026-09-28 (run h1_03), demande du proprietaire : l'expert ne
     # jouait qu'un coup a la fois. Il enseigne desormais jusqu'a 10 coups par
     # semaine, autant que les jetons, et peut les faire se chevaucher jusqu'a
-    # `positions_max` (voir `coups_expert_predits`).
-    expert_k: int = 10
+    # `positions_max` (voir `coups_expert_predits`). REMIS A 6 LE 2026-09-28
+    # (run kairos_multi_h1_01) : la configuration du run h1_01.
+    expert_k: int = 6
     expert_R_min: float = 1.0          # l'ancien expert, qui lisait l'avenir
     # EN M15, une bougie sur deux : il n'y en a que 96 par jour. EN H1, toutes.
     expert_pas_neg: int = 1
@@ -350,6 +376,9 @@ class JeuConfig:
 
 def colonnes_jeu(cfg: "JeuConfig") -> list:
     """Les features du cache que joue ce jeu : multi-marches, M15 ou M1."""
+    if tuple(getattr(cfg, "marches", ())) and int(cfg.minutes_par_barre) == 60:
+        from prepare_multi_h1 import FEATURE_COLS_MULTI_H1
+        return list(FEATURE_COLS_MULTI_H1)
     if tuple(getattr(cfg, "marches", ())):
         from prepare_multi_m15 import FEATURE_COLS_MULTI
         return list(FEATURE_COLS_MULTI)
@@ -655,9 +684,18 @@ def _lim(fin_valide, t):
     return fin_valide[t] if isinstance(fin_valide, np.ndarray) else fin_valide
 
 
+def fraction_marge(close, atr, cfg: JeuConfig) -> np.ndarray:
+    """(N, K_sl) : la marge d'un coup en fraction de l'equite, pour chaque
+    stop : mise de `risque_pct` au stop, notionnel = mise / distance, marge =
+    notionnel / levier."""
+    dist = (np.asarray(cfg.sl_atr, np.float64)[None, :] * np.asarray(atr, np.float64)[:, None]
+            / np.asarray(close, np.float64)[:, None])
+    return (cfg.risque_pct / 100.0) / np.maximum(dist, 1e-12) / float(cfg.levier)
+
+
 def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
          cfg: JeuConfig, device, explore: bool, gen=None,
-         collecte: bool = False, rangs=None):
+         collecte: bool = False, rangs=None, marge=None):
     """Joue toutes les parties de `jours` EN PARALLELE.
 
     Rend (scores (G,), coups (liste de tuples), transitions par partie ou
@@ -680,6 +718,10 @@ def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
     multi = P > 1
     occ_fin = np.full((G, max(P, 1)), -1, np.int64)
     occ_r = np.zeros((G, max(P, 1)))
+    # LA MARGE (positions multiples) : celle de chaque coup ouvert, en
+    # fraction de l'equite. `marge` None = pas de contrainte (les tests).
+    occ_m = np.zeros((G, max(P, 1)))
+    m_max = None if marge is None else np.asarray(marge).max(1)
     vu = np.zeros(G, np.float64)
     policy.eval()
     while actif.any():
@@ -689,6 +731,7 @@ def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
             fait = (occ_fin[g] >= 0) & (occ_fin[g] <= tt[:, None])
             vu[g] += (occ_r[g] * fait).sum(1)
             occ_r[g] = np.where(fait, 0.0, occ_r[g])
+            occ_m[g] = np.where(fait, 0.0, occ_m[g])
             occ_fin[g] = np.where(fait, -1, occ_fin[g])
             libre = occ_fin[g] < 0
             n_occ = P - libre.sum(1)
@@ -699,6 +742,8 @@ def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
         peut_np = (jet[g] > 0) & (tt + 1 + H < _lim(fin_valide, tt))
         if multi:
             peut_np = peut_np & (n_occ < P)
+            if m_max is not None:
+                peut_np = peut_np & (1.0 - occ_m[g].sum(1) >= m_max[tt])
         # LA PORTE DE L'EXPERT, par sens. Voir `porte_rang_expert`.
         pa_np, pv_np = portes(peut_np, tt, rangs, cfg)
         with torch.no_grad():
@@ -736,6 +781,8 @@ def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
                     k = int(np.argmax(libre[q]))
                     occ_fin[g[q], k] = int(tt[q] + dur[q])
                     occ_r[g[q], k] = float(r[q])
+                    if marge is not None:
+                        occ_m[g[q], k] = float(marge[tt[q], j[q]])
         # En positions multiples, le temps avance d'une bougie ; la decision
         # dure donc une bougie pour l'actualisation du PPO.
         pas = np.ones(len(g), np.int64) if multi else dur
@@ -925,8 +972,10 @@ def fin_segment(t_ns: np.ndarray, blocs, t_fin_ns) -> np.ndarray:
     return out
 
 
-def journees_multi(temps: pd.Series, blocs, t0_ns, t1_ns, min_barres: int) -> np.ndarray:
-    """Les journees entieres de [t0, t1), marche par marche."""
+def journees_multi(temps: pd.Series, blocs, t0_ns, t1_ns, min_barres: int,
+                   cfg=None) -> np.ndarray:
+    """Les parties entieres de [t0, t1), marche par marche : des journees, ou
+    celles de `cfg.partie` si `cfg` est donne."""
     t_ns = temps.values.astype("int64")
     out = []
     for _, a, b in blocs:
@@ -934,7 +983,9 @@ def journees_multi(temps: pd.Series, blocs, t0_ns, t1_ns, min_barres: int) -> np
         i1 = a + int(np.searchsorted(t_ns[a:b], t1_ns, side="left"))
         if i1 - i0 < min_barres:
             continue
-        j = journees(temps.iloc[a:b].reset_index(drop=True), i0 - a, i1 - a, min_barres)
+        tb = temps.iloc[a:b].reset_index(drop=True)
+        j = (parties(tb, i0 - a, i1 - a, cfg) if cfg is not None
+             else journees(tb, i0 - a, i1 - a, min_barres))
         if len(j):
             out.append(j + a)
     return np.concatenate(out) if out else np.zeros((0, 2), np.int64)
@@ -1275,7 +1326,11 @@ def bilan(scores, coups, close, atr, sp, cfg: JeuConfig,
     # LA MISE REDUITE EN BAISSE, jouee dans le meme ordre. Voir `seuil_baisse`.
     ep = compte_prudent(r[ordre], cfg)
     pic_p = np.maximum.accumulate(ep)
-    return b | {
+    # UN SEUL MARCHE : les lots, contrats et devises des indices different de
+    # ceux du BTC, le compte « comme en live » ne vaut que pour le BTC seul.
+    live = (compte_live(t, j, r, du, close, atr, cfg)
+            if n and not tuple(getattr(cfg, "marches", ())) else {})
+    return b | live | {
         "prudent_total": float(ep[-1] - cfg.capital),
         "prudent_dd_dollars": float((ep - pic_p).min()),
         "prudent_dd_pct": float(((ep - pic_p) / pic_p).min()),
@@ -1293,6 +1348,55 @@ def bilan(scores, coups, close, atr, sp, cfg: JeuConfig,
         "t_brut": float((net + cout).mean() / ((net + cout).std(ddof=1)
                         / np.sqrt(n) + 1e-12)) if n > 1 else float("nan"),
     }
+
+
+def compte_live(t, j, r, du, close, atr, cfg: JeuConfig) -> Dict[str, float]:
+    """Les coups rejoues sur UN compte, comme en live.
+
+    Chaque coup mise `risque_pct` de l'equite REALISEE au moment d'ouvrir,
+    en lots arrondis vers le bas au `pas_lot`, jamais sous `lot_min` ; il
+    n'est pris que si la marge libre (equite - marge des coups ouverts)
+    couvre la sienne. Son resultat en dollars est son R fois le risque
+    reellement pris (lots x contrat x distance du stop). Les pertes latentes
+    des coups ouverts ne sont pas comptees dans la marge libre.
+    """
+    import heapq
+    ksl = np.asarray(cfg.sl_atr, np.float64)
+    E = float(cfg.capital)
+    courbe, ouverts, risques = [E], [], []
+    pris, sautes = 0, 0
+    for k in np.argsort(t, kind="stable"):
+        tk = int(t[k])
+        while ouverts and ouverts[0][0] <= tk:
+            _, _, pnl = heapq.heappop(ouverts)
+            E += pnl
+            courbe.append(E)
+        if E <= 0:
+            break
+        dist = ksl[int(j[k])] * float(atr[tk])
+        cible = E * cfg.risque_pct / 100.0
+        lots = np.floor(cible / (dist * cfg.contrat) / cfg.pas_lot + 1e-9) * cfg.pas_lot
+        lots = max(float(lots), float(cfg.lot_min))
+        m = lots * cfg.contrat * float(close[tk]) / float(cfg.levier)
+        if m > E - sum(o[1] for o in ouverts):
+            sautes += 1
+            continue
+        risque = lots * cfg.contrat * dist
+        risques.append(risque / E)
+        heapq.heappush(ouverts, (tk + int(du[k]), m, float(r[k]) * risque))
+        pris += 1
+    while ouverts:
+        _, _, pnl = heapq.heappop(ouverts)
+        E += pnl
+        courbe.append(E)
+    courbe = np.asarray(courbe)
+    pic = np.maximum.accumulate(courbe)
+    return {"live_total": float(E - cfg.capital),
+            "live_dd_dollars": float((courbe - pic).min()),
+            "live_dd_pct": float(((courbe - pic) / pic).min()),
+            "live_pris": pris, "live_marge": sautes,
+            "live_risque_moy": float(np.mean(risques)) if risques else float("nan"),
+            "live_risque_max": float(np.max(risques)) if risques else float("nan")}
 
 
 def compte_prudent(r_ordonnes: np.ndarray, cfg: JeuConfig) -> np.ndarray:
@@ -1333,7 +1437,13 @@ def ligne_detail(b, cfg: JeuConfig) -> str:
             f"(win rate {100 * b['win_rate']:.1f} %)  |  {b['longs']} longs, "
             f"{b['shorts']} shorts  |  profit factor {b['pf']:.2f}  |  drawdown max "
             f"{b['dd_dollars']:+.2f} $ ({100 * b['dd_pct']:+.1f} %)  |  total "
-            f"{b['total_dollars']:+.2f} $ sur {b['parties']} {cfg.unite}")
+            f"{b['total_dollars']:+.2f} $ sur {b['parties']} {cfg.unite}"
+            + (f"  |  COMME EN LIVE ({cfg.risque_pct:g} % de l'equite, lots de "
+               f"{cfg.lot_min:g}, levier 1:{cfg.levier:.0f}) : total {b['live_total']:+.2f} $, "
+               f"pire baisse {100 * b['live_dd_pct']:+.1f} %, risque reel moyen "
+               f"{100 * b['live_risque_moy']:.2f} % (max {100 * b['live_risque_max']:.1f} %)"
+               + (f", {b['live_marge']} refuses faute de marge" if b.get("live_marge") else "")
+               if "live_total" in b else ""))
 
 
 def ligne_bilan(b, cfg: JeuConfig) -> str:
@@ -1417,6 +1527,7 @@ def main() -> int:
              features=np.array(colonnes_jeu(cfg)))
     print(f"  normalisation figee sur le train du fold 1 [0 : {n_tr:,})", flush=True)
 
+    marge = fraction_marge(c, atr, cfg)
     t0 = time.time()
     R0, D0, _ = table_coups(o, h, l, sp, atr, cfg, 0.0)
     R1, D1, S1 = table_coups(o, h, l, sp, atr, cfg, 1.0)
@@ -1507,15 +1618,15 @@ def main() -> int:
                 marge = max(240 // int(cfg.minutes_par_barre), cfg.barres_par_partie // 6)
                 sc, cp, tr = joue(policy, departs_tires(j_tr[choix], rng, marge), Xn,
                                   Rf, Df, S1, a_va, cfg, device, explore=True,
-                                  collecte=True, rangs=rangs_ex)
+                                  collecte=True, rangs=rangs_ex, marge=marge)
                 b_tr = bilan(sc, cp, c, atr, sp, cfg, frac=frac)
                 st = maj_ppo(policy, optims, avantages(tr, cfg), Xn, cfg, device, rng)
                 del Rf
             gen = torch.Generator(device=device)
             gen.manual_seed(cfg.graine)
             sv, cv, _ = joue(policy, j_va, Xn, R1, D1, S1, a_te, cfg, device,
-                             explore=False, gen=gen, rangs=rangs_ex)
-            bv = bilan(sv, cv, c, atr, sp, cfg)
+                             explore=False, gen=gen, rangs=rangs_ex, marge=marge)
+            bv = bilan(sv, cv, c, atr, sp, cfg, ordre=np.arange(N))
             nom = "EXPERT IMITE" if epoch == 0 else f"cout {100 * frac:.0f}%"
             print(f"\nEPOCH {epoch:03d}  {nom:>12}  VAL  {ligne_bilan(bv, cfg)}  "
                   f"{(time.time() - t_ep) / 60:.1f} min", flush=True)
@@ -1553,8 +1664,8 @@ def main() -> int:
         gen = torch.Generator(device=device)
         gen.manual_seed(cfg.graine)
         s_t, c_t, _ = joue(policy, j_te, Xn, R1, D1, S1, f_te, cfg, device,
-                           explore=False, gen=gen, rangs=rangs_ex)
-        bt = bilan(s_t, c_t, c, atr, sp, cfg)
+                           explore=False, gen=gen, rangs=rangs_ex, marge=marge)
+        bt = bilan(s_t, c_t, c, atr, sp, cfg, ordre=np.arange(N))
         print(f"\nTEST fold {fold + 1} ({os.path.basename(src)})  {ligne_bilan(bt, cfg)}",
               flush=True)
         print(f"TEST fold {fold + 1} bilan  {ligne_detail(bt, cfg)}", flush=True)
@@ -1578,11 +1689,13 @@ def main_multi(cfg: JeuConfig) -> int:
         json.dump(asdict(cfg), fh, indent=1, default=str)
     cols = colonnes_jeu(cfg)
     print("=" * 70)
+    _u = "semaine" if cfg.partie == "semaine" else "journee"
     print(f"  KAIROS EN JEU — {len(cfg.marches)} MARCHES M{cfg.minutes_par_barre} : "
-          f"une journee = une partie par marche, le jour = leur somme")
+          f"une {_u} = une partie par marche, la {_u} = leur somme")
     print("=" * 70)
     print(f"  marches : {', '.join(cfg.marches)}")
-    print(f"  regles : {cfg.jetons} coups par marche et par jour, fin de partie a "
+    print(f"  regles : {cfg.jetons} coups par marche et par {'semaine' if cfg.partie == 'semaine' else 'jour'}, "
+          f"{cfg.positions_max} position(s) a la fois, fin de partie a "
           f"-{cfg.vie_R:g} R, coup = sens + objectif {cfg.tp_atr} ATR + stop "
           f"{cfg.sl_atr} ATR, temps limite {cfg.horizon_max} bougies "
           f"({cfg.horizon_max * cfg.minutes_par_barre} min)")
@@ -1594,13 +1707,19 @@ def main_multi(cfg: JeuConfig) -> int:
     d = d[d["marche"].isin(cfg.marches)].reset_index(drop=True)
     # SANS DOUBLON : `spread_bar` est aussi une feature. Deux colonnes du meme
     # nom feraient de `d["spread_bar"]` un tableau a deux colonnes.
+    _plus = [k for k in ["swap_achat_bps_jour", "swap_vente_bps_jour"] if k in d.columns]
+    if int(cfg.minutes_par_barre) == 60:
+        from prepare_multi_h1 import EXTRAS_BTC_H1
+        _plus += [k for k in EXTRAS_BTC_H1 if k in d.columns]
     d = d[list(dict.fromkeys(["time", "marche", "open", "high", "low", "close",
-                              "atr_14", "spread_bar"] + cols))].reset_index(drop=True)
+                              "atr_14", "spread_bar"] + cols + _plus))].reset_index(drop=True)
     N = len(d)
     marche = d["marche"].to_numpy()
     blocs = blocs_marches(marche)
     t_ns = d["time"].values.astype("int64")
-    dates = d["time"].dt.normalize().values
+    # LA PARTIE COMMUNE : le jour, ou la semaine (du lundi, en UTC).
+    dates = (d["time"].dt.to_period("W-SUN").dt.start_time.values if cfg.partie == "semaine"
+             else d["time"].dt.normalize().values)
     o, h, l, c = (d[k].to_numpy(np.float64) for k in ("open", "high", "low", "close"))
     sp = d["spread_bar"].to_numpy(np.float64)
     # LE PLANCHER PAR MARCHE. Voir `plancher_couts`.
@@ -1634,7 +1753,13 @@ def main_multi(cfg: JeuConfig) -> int:
     t_tab = time.time()
     tabs = {}
     for frac in (0.0, 1.0):
-        parts = [table_coups(o[a:b], h[a:b], l[a:b], sp[a:b], atr[a:b], cfg, frac)
+        # LE SWAP DE CHAQUE MARCHE, lu dans le cache (voir `prepare_multi_h1`).
+        def _cfg_m(a):
+            if "swap_achat_bps_jour" not in d.columns:
+                return cfg
+            return replace(cfg, swap_achat_bps_jour=float(d["swap_achat_bps_jour"].iloc[a]),
+                           swap_vente_bps_jour=float(d["swap_vente_bps_jour"].iloc[a]))
+        parts = [table_coups(o[a:b], h[a:b], l[a:b], sp[a:b], atr[a:b], _cfg_m(a), frac)
                  for _, a, b in blocs]
         tabs[frac] = tuple(np.concatenate([p_[k] for p_ in parts]) for k in range(3))
     R0, D0, _ = tabs[0.0]
@@ -1657,7 +1782,13 @@ def main_multi(cfg: JeuConfig) -> int:
     va1 = (t_ns >= bornes[0][1]) & (t_ns < bornes[0][2])
     for nom, a, b in blocs:
         Xb = Xn[a:b]
-        ex = extras_btc(d["time"].iloc[a:b]) if nom == "BTCUSD" else None
+        if nom != "BTCUSD":
+            ex = None
+        elif int(cfg.minutes_par_barre) == 60:
+            from prepare_multi_h1 import EXTRAS_BTC_H1
+            ex = d[EXTRAS_BTC_H1].iloc[a:b].to_numpy(np.float32)
+        else:
+            ex = extras_btc(d["time"].iloc[a:b])
         if ex is not None:
             Xb = np.concatenate([Xb, ex], axis=1)
         pb, ms = expert_multi(Xb, y_ex[a:b], t_ns[a:b], dans_train1[a:b],
@@ -1671,7 +1802,7 @@ def main_multi(cfg: JeuConfig) -> int:
             ic_m.append(pd.Series(pb[ok, s_]).corr(pd.Series(y_ex[a:b][ok, s_]),
                                                    method="spearman"))
         print(f"  expert  {nom:8s} correlation en validation : achat {ic_m[0]:+.3f}  "
-              f"vente {ic_m[1]:+.3f}" + ("  (+ Binance et Coinbase)" if ex is not None else ""),
+              f"vente {ic_m[1]:+.3f}" + ("  (+ flux et financement Binance)" if ex is not None else ""),
               flush=True)
     FE = np.concatenate([features_expert(pred[a:b], fenetre=10_000 // int(cfg.minutes_par_barre))
                          for _, a, b in blocs])
@@ -1689,7 +1820,7 @@ def main_multi(cfg: JeuConfig) -> int:
     for s_ in range(2):
         ok = va1 & np.isfinite(y_ex[:, s_])
         ics.append(pd.Series(pred[ok, s_]).corr(pd.Series(y_ex[ok, s_]), method="spearman"))
-    print(f"  expert  sept LightGBM appris sur le train du fold 1, {time.time() - t_ex:.0f} s ; "
+    print(f"  expert  {len(blocs)} LightGBM appris sur le train du fold 1, {time.time() - t_ex:.0f} s ; "
           f"correlation avec le R moyen en validation, tous marches : achat {ics[0]:+.3f}, "
           f"vente {ics[1]:+.3f} ; porte d'entree : rang de l'expert >= "
           f"{cfg.porte_rang_expert:g} dans le sens joue ({len(noms_entree)} entrees)",
@@ -1706,12 +1837,12 @@ def main_multi(cfg: JeuConfig) -> int:
 
     _fmt = lambda x: pd.Timestamp(x).strftime("%Y-%m-%d")
     precedent = None
-    _mb = int(0.4 * cfg.barres_par_jour)
+    _mb = int(0.4 * cfg.barres_par_partie)
     for fold, (a_, va, te, fi) in enumerate(bornes):
         suffixe = f"_wf{fold + 1}"
-        j_tr = journees_multi(d["time"], blocs, a_, va, _mb)
-        j_va = journees_multi(d["time"], blocs, va, te, _mb)
-        j_te = journees_multi(d["time"], blocs, te, fi, _mb)
+        j_tr = journees_multi(d["time"], blocs, a_, va, _mb, cfg)
+        j_va = journees_multi(d["time"], blocs, va, te, _mb, cfg)
+        j_te = journees_multi(d["time"], blocs, te, fi, _mb, cfg)
         fin_tr = fin_segment(t_ns, blocs, va)
         fin_va = fin_segment(t_ns, blocs, te)
         fin_te = fin_segment(t_ns, blocs, fi)
@@ -1745,8 +1876,8 @@ def main_multi(cfg: JeuConfig) -> int:
                 Df = D1 if frac >= 0.5 else D0
                 choix = rng.choice(len(j_tr), size=min(cfg.parties_par_epoch, len(j_tr)),
                                    replace=False)
-                sc, cp, tr = joue(policy, departs_tires(
-                                      j_tr[choix], rng, 240 // int(cfg.minutes_par_barre)),
+                marge_d = max(240 // int(cfg.minutes_par_barre), cfg.barres_par_partie // 6)
+                sc, cp, tr = joue(policy, departs_tires(j_tr[choix], rng, marge_d),
                                   Xn, Rf, Df, S1, fin_tr, cfg, device, explore=True,
                                   collecte=True, rangs=rangs_ex)
                 b_tr = bilan(sc, cp, c, atr, sp, cfg, frac=frac, ordre=t_ns)
