@@ -158,7 +158,9 @@ class JeuConfig:
     # `modeles_par_marche`.
     # BTC ET ETH SEULS, DEPUIS 2017 (run multi_m5_04) : voir `marches`.
     # UN MODELE APRES L'AUTRE (run multi_m5_05) : voir `main_modeles_par_marche`.
-    prefixe: str = "kairos_multi_m5_05"
+    # LES MODELES PAS A PAS, DANS UN SEUL PROCESSUS (run multi_m5_06) : voir
+    # `main_pas_a_pas`.
+    prefixe: str = "kairos_multi_m5_06"
     # LA VALIDATION CROISEE PURGEE — 2026-09-28, demande du proprietaire :
     # « entrainer le modele sur des periodes aleatoires pour qu'il apprenne
     # tous les types de marches ». Le walk-forward (h1_05) : +447.56, -441.18,
@@ -1422,10 +1424,20 @@ def imite_expert(policy, optims, pos, jours, Xn, fin_valide, cfg, device, rng):
     Les tetes de barrieres n'y apprennent rien : le choix a posteriori de
     l'expert est biaise vers le coup le plus risque. Voir l'en-tete.
     """
+    prep = prepare_imitation(pos, jours, fin_valide, cfg)
+    for ep in range(cfg.expert_epochs):
+        passe_imitation(policy, optims, prep, Xn, cfg, device, rng, ep)
+    policy.eval()
+
+
+def prepare_imitation(pos, jours, fin_valide, cfg, etiquette: str = ""):
+    """Les minutes de l'imitation : les coups de l'expert et les attentes.
+    Voir `imite_expert` ; `passe_imitation` en fait une passe."""
+    suf = f"   [{etiquette}]" if etiquette else ""
     n_j = max(len(jours), 1)
     print(f"  expert  {len(pos):,} coups enseignes sur {len(jours)} journees "
           f"({len(pos)/n_j:.1f} par jour), choisis sur des minutes que "
-          f"l'expert n'a pas apprises", flush=True)
+          f"l'expert n'a pas apprises{suf}", flush=True)
     t_pos = {p[0] for p in pos}
     H, L = int(cfg.horizon_max), int(cfg.lookback)
     neg = []
@@ -1445,28 +1457,34 @@ def imite_expert(policy, optims, pos, jours, Xn, fin_valide, cfg, device, rng):
     et = etat_jeu(np.full(len(tt), cfg.jetons), np.zeros(len(tt)), fin - tt, cfg)
     print(f"  expert  imitation sur {len(tt):,} minutes : {len(pos):,} coups, "
           f"{len(neg):,} attentes (une minute sur {cfg.expert_pas_neg}), "
-          f"poids des coups x{cfg.expert_poids_pos:g}", flush=True)
+          f"poids des coups x{cfg.expert_poids_pos:g}{suf}", flush=True)
+    return {"tt": tt, "act": act, "w": w, "et": et, "etiquette": etiquette}
+
+
+def passe_imitation(policy, optims, prep, Xn, cfg, device, rng, ep: int) -> None:
+    """UNE passe d'imitation sur les minutes de `prepare_imitation`."""
+    tt, act, w, et = prep["tt"], prep["act"], prep["w"], prep["et"]
+    suf = f"   [{prep['etiquette']}]" if prep.get("etiquette") else ""
+    L = int(cfg.lookback)
     T = lambda z, dt=torch.float32: torch.as_tensor(z, dtype=dt, device=device)
     policy.train()
-    for ep in range(cfg.expert_epochs):
-        perm = rng.permutation(len(tt))
-        pertes, justes_c, n_c = [], 0, 0
-        for d0 in range(0, len(perm), 512):
-            b = perm[d0:d0 + 512]
-            x = T(observations(Xn, tt[b], et[b], L))
-            le, _, ltp, lsl = policy.jeu(x)
-            ab, wb = T(act[b], torch.long), T(w[b])
-            pe = (F.cross_entropy(le, ab, reduction="none") * wb).sum() / wb.sum()
-            cb = ab != ATTENDRE
-            if bool(cb.any()):
-                justes_c += int((le[cb].argmax(-1) == ab[cb]).sum())
-                n_c += int(cb.sum())
-            _pas(policy, optims, pe, cfg)
-            pertes.append(float(pe))
-        print(f"  expert  passe {ep + 1}/{cfg.expert_epochs}  perte "
-              f"{np.mean(pertes):.4f}  coups de l'expert reconnus "
-              f"{100 * justes_c / max(n_c, 1):.1f}%", flush=True)
-    policy.eval()
+    perm = rng.permutation(len(tt))
+    pertes, justes_c, n_c = [], 0, 0
+    for d0 in range(0, len(perm), 512):
+        b = perm[d0:d0 + 512]
+        x = T(observations(Xn, tt[b], et[b], L))
+        le, _, ltp, lsl = policy.jeu(x)
+        ab, wb = T(act[b], torch.long), T(w[b])
+        pe = (F.cross_entropy(le, ab, reduction="none") * wb).sum() / wb.sum()
+        cb = ab != ATTENDRE
+        if bool(cb.any()):
+            justes_c += int((le[cb].argmax(-1) == ab[cb]).sum())
+            n_c += int(cb.sum())
+        _pas(policy, optims, pe, cfg)
+        pertes.append(float(pe))
+    print(f"  expert  passe {ep + 1}/{cfg.expert_epochs}  perte "
+          f"{np.mean(pertes):.4f}  coups de l'expert reconnus "
+          f"{100 * justes_c / max(n_c, 1):.1f}%{suf}", flush=True)
 
 
 # ======================================================================
@@ -2202,6 +2220,240 @@ def main_modeles_par_marche(cfg: JeuConfig) -> int:
     return 0
 
 
+def main_pas_a_pas(cfg: JeuConfig) -> int:
+    """Les modeles de chaque marche, entraines PAS A PAS dans UN processus.
+
+    2026-09-28 (run multi_m5_06), demande du proprietaire : « la passe un du
+    premier expert, puis la passe un du deuxieme, puis la passe deux du
+    premier... ; les modeles ensuite en meme temps, mais en sequentiel ».
+    En parallele (run multi_m5_04), deux processus se disputaient la carte
+    graphique bridee par la chaleur ; un marche apres l'autre (multi_m5_05),
+    l'ETH attendait la fin du BTC. Ici, pour chaque bloc :
+
+      1. chaque marche prepare ses donnees et son expert LightGBM, l'un
+         apres l'autre ;
+      2. l'imitation alterne : passe 1 du BTC, passe 1 de l'ETH, passe 2 du
+         BTC... ;
+      3. chaque epoch entraine et valide le BTC, puis l'ETH, puis rejoue
+         leurs coups de validation sur le COMPTE COMMUN (`bilan_commun`) ;
+      4. le test : chaque marche avec SON meilleur modele, puis le compte
+         commun.
+
+    Chaque modele reste independant (`modeles_par_marche`) : son tronc, ses
+    tetes, ses optimiseurs, sa normalisation, son expert, son hasard, et il
+    ne se sauvegarde que s'il bat SON record."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    manifeste = f"run_{cfg.prefixe}.json"
+    if os.path.exists(manifeste):
+        raise FileExistsError(f"{manifeste} existe : nouveau prefixe, ou lancer.ps1")
+    with open(manifeste, "w", encoding="utf-8") as fh:
+        json.dump(asdict(cfg), fh, indent=1, default=str)
+    marches = tuple(cfg.marches)
+    specs = {m: spec_marche(m, cfg) for m in marches}
+    print("=" * 70)
+    print(f"  KAIROS EN JEU — {len(marches)} MODELES INDEPENDANTS M{cfg.minutes_par_barre}, "
+          f"PAS A PAS, UN COMPTE COMMUN  |  VALIDATION CROISEE PURGEE en {cfg.n_blocs} blocs")
+    print("=" * 70)
+    print(f"  marches : {', '.join(marches)}  |  chacun son tronc, ses tetes, ses optimiseurs, "
+          f"son expert, sa normalisation, SON meilleur modele  |  {device}", flush=True)
+    print(f"  regles de chaque modele : {cfg.jetons} coups par jour, {cfg.positions_max} position(s) "
+          f"a la fois, fin de partie a -{cfg.vie_R:g} R, porte {cfg.porte_rang_expert:g}, expert "
+          f"{cfg.expert_k} coups  |  compte commun : {cfg.capital:.0f} $, {cfg.risque_pct:g} % du "
+          f"solde commun du moment par coup, marge partagee (levier 1:{cfg.levier:.0f})", flush=True)
+    torch.manual_seed(cfg.graine)
+    d_all = pd.read_pickle(cfg.cache)
+    M = {}
+    for m in marches:
+        cm = config_marche(cfg, m)
+        d, cm = donnees_marche_seul(d_all, cm)
+        cols = list(dict.fromkeys(["time", "open", "high", "low", "close", "atr_14",
+                                   "spread_bar"] + colonnes_jeu(cm)))
+        d = d[cols].reset_index(drop=True)
+        N = len(d)
+        o, h, l, c = (d[x].to_numpy(np.float64) for x in ("open", "high", "low", "close"))
+        sp = d["spread_bar"].to_numpy(np.float64)
+        atr = atr_effectif(d["atr_14"].to_numpy(np.float64), c, cm)
+        cout_med = float(np.median(sp)) + cm.glissement_entree_bps + cm.glissement_sortie_bps
+        atr = np.maximum(atr, cm.plancher_couts * cout_med * 1e-4 * c)
+        R0, D0, _ = table_coups(o, h, l, sp, atr, cm, 0.0)
+        R1, D1, S1 = table_coups(o, h, l, sp, atr, cm, 1.0)
+        M[m] = {"cfg": cm, "temps": d["time"], "N": N, "c": c, "atr": atr, "sp": sp,
+                "t_ns": d["time"].values.astype("int64"),
+                "X": d[colonnes_jeu(cm)].to_numpy(np.float32),
+                "marge": fraction_marge(c, atr, cm), "R0": R0, "D0": D0, "R1": R1, "D1": D1,
+                "S1": S1, "y_ex": cibles_expert(R1), "toutes": parties(d["time"], 0, N, cm),
+                "rng": np.random.default_rng(cfg.graine)}
+        print(f"  {m} : {N:,} bougies {d['time'].iloc[0]:%Y-%m-%d} -> {d['time'].iloc[-1]:%Y-%m-%d}, "
+              f"cout med {cout_med:.2f} bps, ATR des barrieres >= "
+              f"{max(float(cm.atr_min_bps), cm.plancher_couts * cout_med):.1f} bps, swap "
+              f"{cm.swap_achat_bps_jour:.2f} / {cm.swap_vente_bps_jour:.2f} bps/jour, contrat "
+              f"{cm.contrat:g}, lot min {cm.lot_min:g}", flush=True)
+    del d_all
+    purge = int(cfg.horizon_max + cfg.lookback + cfg.purge_semaines * cfg.barres_par_partie)
+    tests = {}
+    for k in range(cfg.n_blocs):
+        B = {}
+        for m in marches:
+            S, cm = M[m], M[m]["cfg"]
+            N, t_ns = S["N"], S["t_ns"]
+            permis, (te0, te1), (va0, va1) = masque_blocs(N, cfg.n_blocs, k, purge)
+            fin_tr = prochain_exclu(permis)
+            dedans = lambda a0, a1: np.array([w for w in S["toutes"] if w[0] >= a0 and w[1] <= a1],
+                                             np.int64).reshape(-1, 2)
+            j_tr = np.array([w for w in S["toutes"] if permis[w[0]:w[1]].all()],
+                            np.int64).reshape(-1, 2)
+            j_va, j_te = dedans(va0, va1), dedans(te0, te1)
+            fm = lambda i: pd.Timestamp(S["temps"].iloc[min(i, N - 1)])
+            print(f"\n--- Fold {k + 1} : test {fm(te0):%Y-%m-%d} -> {fm(te1 - 1):%Y-%m-%d} "
+                  f"({len(j_te)} parties)  validation {fm(va0):%Y-%m-%d} -> {fm(va1 - 1):%Y-%m-%d} "
+                  f"({len(j_va)} parties)  entrainement sur tout le reste ({len(j_tr)} parties) "
+                  f"---   [{m}]", flush=True)
+            X = S["X"]
+            st_m = X[permis].astype(np.float64).mean(0)
+            st_s = X[permis].astype(np.float64).std(0)
+            Xn = safe_normalize(X, {"mean": st_m.astype(np.float32),
+                                    "std": st_s.astype(np.float32)}).astype(np.float32)
+            t_ex = time.time()
+            pred, _ = expert_multi(Xn, S["y_ex"], t_ns, permis, fin_tr, cm)
+            FE = features_expert(pred, fenetre=10_000 // int(cm.minutes_par_barre))
+            rangs = FE[:, 2:4].copy()
+            m_e = FE[permis].astype(np.float64).mean(0)
+            s_e = FE[permis].astype(np.float64).std(0)
+            FEn = np.clip((FE - m_e) / (s_e + 1e-8), -5.0, 5.0).astype(np.float32)
+            Xk = np.concatenate([Xn, FEn[:, :cm.n_expert]], axis=1)
+            ics = []
+            for s_ in range(2):
+                ok = np.zeros(N, bool)
+                ok[te0:te1] = True
+                ok &= np.isfinite(S["y_ex"][:, s_])
+                ics.append(pd.Series(pred[ok, s_]).corr(pd.Series(S["y_ex"][ok, s_]),
+                                                        method="spearman"))
+            print(f"  expert  LightGBM appris sur les autres blocs, {time.time() - t_ex:.0f} s ; "
+                  f"correlation sur le bloc de test : achat {ics[0]:+.3f}, vente {ics[1]:+.3f}"
+                  f"   [{m}]", flush=True)
+            policy = PolitiqueJeu(cm).to(device)
+            optims = optimiseurs(policy, cm)
+            pos = coups_expert_predits(j_tr, pred, S["D1"], fin_tr, cm)
+            prep = prepare_imitation(pos, j_tr, fin_tr, cm, etiquette=m)
+            B[m] = {"te": (te0, te1), "va": (va0, va1), "fin_tr": fin_tr, "j_tr": j_tr,
+                    "j_va": j_va, "j_te": j_te, "Xk": Xk, "rangs": rangs, "policy": policy,
+                    "optims": optims, "prep": prep, "record": 0.0, "garde": None,
+                    "best": f"best_{cm.prefixe}_bloc{k + 1}.pth",
+                    "last": f"last_{cm.prefixe}_bloc{k + 1}.pth"}
+            del Xn, FE, FEn, pred
+        # L'IMITATION, EN ALTERNANCE : passe 1 de chacun, puis passe 2...
+        for ep in range(cfg.expert_epochs):
+            for m in marches:
+                b = B[m]
+                passe_imitation(b["policy"], b["optims"], b["prep"], b["Xk"], M[m]["cfg"],
+                                device, M[m]["rng"], ep)
+        for m in marches:
+            B[m]["policy"].eval()
+            del B[m]["prep"]
+        ref = marches[0]
+        fr = lambda i: pd.Timestamp(M[ref]["temps"].iloc[min(i, M[ref]["N"] - 1)])
+        for epoch in range(0, cfg.epochs + 1):
+            frac = min(1.0, max(0.0, (epoch - 1) / cfg.rampe_cout)) if cfg.rampe_cout > 0 else 1.0
+            parts, sauves = {}, []
+            for m in marches:
+                S, b, cm = M[m], B[m], M[m]["cfg"]
+                t_ep = time.time()
+                if epoch >= 1:
+                    Rf = (1 - frac) * S["R0"] + frac * S["R1"] if frac < 1.0 else S["R1"]
+                    Df = S["D1"] if frac >= 0.5 else S["D0"]
+                    choix = S["rng"].choice(len(b["j_tr"]),
+                                            size=min(cfg.parties_par_epoch, len(b["j_tr"])),
+                                            replace=False)
+                    marge_d = max(240 // int(cm.minutes_par_barre), cm.barres_par_partie // 6)
+                    sc, cp, tr = joue(b["policy"], departs_tires(b["j_tr"][choix], S["rng"], marge_d),
+                                      b["Xk"], Rf, Df, S["S1"], b["fin_tr"], cm, device,
+                                      explore=True, collecte=True, rangs=b["rangs"], marge=S["marge"])
+                    maj_ppo(b["policy"], b["optims"], avantages(tr, cm), b["Xk"], cm, device, S["rng"])
+                    del Rf, tr
+                gen = torch.Generator(device=device)
+                gen.manual_seed(cfg.graine)
+                sv, cv, _ = joue(b["policy"], b["j_va"], b["Xk"], S["R1"], S["D1"], S["S1"],
+                                 b["va"][1], cm, device, explore=False, gen=gen, rangs=b["rangs"],
+                                 marge=S["marge"])
+                bv = bilan(sv, cv, S["c"], S["atr"], S["sp"], cm)
+                nom = "EXPERT IMITE" if epoch == 0 else f"cout {100 * frac:.0f}%"
+                print(f"\nEPOCH {epoch:03d}  {nom:>12}  VAL  {ligne_bilan(bv, cm)}  "
+                      f"{(time.time() - t_ep) / 60:.1f} min   [{m}]", flush=True)
+                print(f"  bilan  {ligne_detail(bv, cm)}   [{m}]", flush=True)
+                etat = {"modele": b["policy"].state_dict(), "config": asdict(cm), "epoch": epoch,
+                        "bloc": k + 1}
+                torch.save(etat, b["last"])
+                if bv["coups"] >= cm.min_coups_val and bv["score"] > b["record"]:
+                    b["record"], b["garde"] = bv["score"], epoch
+                    torch.save(etat, b["best"])
+                    sauves.append(m)
+                    print(f"  sauvegarde  NOUVEAU MEILLEUR : {bv['score']:+.3f} R/partie en "
+                          f"validation, {bv['coups']} coups -> {b['best']}   [{m}]", flush=True)
+                else:
+                    print(f"  garde  rien de sauvegarde : {bv['score']:+.3f} R/partie ne bat pas "
+                          f"{b['record']:+.3f}" + (f" (meilleur : epoch {b['garde']})"
+                                                   if b["garde"] is not None else "")
+                          + f"   [{m}]", flush=True)
+                parts[m] = table_trades(cv, S["t_ns"], S["c"], S["atr"], cm)
+            nj = max(len(B[m]["j_va"]) for m in marches)
+            bc = bilan_commun(parts, specs, nj, cfg)
+            va0, va1 = B[ref]["va"]
+            print(f"\nEPOCH {epoch:03d}  COMPTE COMMUN  VAL bloc {k + 1} ({fr(va0):%Y-%m-%d} -> "
+                  f"{fr(va1 - 1):%Y-%m-%d})  |  modeles sauvegardes a cette epoch : "
+                  f"{', '.join(sauves) if sauves else 'aucun'}", flush=True)
+            print(f"  bilan  COMPTE COMMUN  {ligne_commune(bc, cfg)}", flush=True)
+            print(f"  bilan  COMPTE COMMUN par marche : {ligne_commune_marches(bc)}", flush=True)
+        parts_t = {}
+        for m in marches:
+            S, b, cm = M[m], B[m], M[m]["cfg"]
+            src = b["best"] if os.path.exists(b["best"]) else b["last"]
+            b["policy"].load_state_dict(torch.load(src, map_location=device,
+                                                   weights_only=False)["modele"])
+            gen = torch.Generator(device=device)
+            gen.manual_seed(cfg.graine)
+            s_t, c_t, _ = joue(b["policy"], b["j_te"], b["Xk"], S["R1"], S["D1"], S["S1"],
+                               b["te"][1], cm, device, explore=False, gen=gen, rangs=b["rangs"],
+                               marge=S["marge"])
+            bt = bilan(s_t, c_t, S["c"], S["atr"], S["sp"], cm)
+            print(f"\nTEST fold {k + 1} ({os.path.basename(src)})  {ligne_bilan(bt, cm)}   [{m}]",
+                  flush=True)
+            print(f"TEST fold {k + 1} bilan  {ligne_detail(bt, cm)}   [{m}]", flush=True)
+            with open(f"test_{cm.prefixe}_bloc{k + 1}.json", "w", encoding="utf-8") as fh:
+                json.dump({a: v for a, v in bt.items()}, fh, indent=1, default=str)
+            parts_t[m] = table_trades(c_t, S["t_ns"], S["c"], S["atr"], cm)
+        nj = max(len(B[m]["j_te"]) for m in marches)
+        bt = bilan_commun(parts_t, specs, nj, cfg)
+        te0, te1 = B[ref]["te"]
+        tests[k + 1] = (fr(te0), fr(te1 - 1), bt, parts_t)
+        print(f"\nTEST fold {k + 1} bilan  COMPTE COMMUN ({fr(te0):%Y-%m-%d} -> {fr(te1 - 1):%Y-%m-%d}, "
+              f"chaque marche avec SON meilleur modele)  {ligne_commune(bt, cfg)}", flush=True)
+        print(f"TEST fold {k + 1} bilan  COMPTE COMMUN par marche : {ligne_commune_marches(bt)}",
+              flush=True)
+        with open(f"test_{cfg.prefixe}_bloc{k + 1}.json", "w", encoding="utf-8") as fh:
+            json.dump({a: v for a, v in bt.items()}, fh, indent=1, default=str)
+        del B
+    print("\n" + "=" * 70)
+    print(f"  RESUME DES {cfg.n_blocs} BLOCS DE TEST, COMPTE COMMUN (chacun jamais vu par ses modeles)")
+    print("=" * 70)
+    for k in sorted(tests):
+        a, z, b, _p = tests[k]
+        print(f"  bloc {k:2d}  {a:%Y-%m-%d} -> {z:%Y-%m-%d}  {b.get('coups', 0):5d} trades  WR "
+              f"{100 * b.get('win_rate', 0):4.1f} %  PF {b.get('pf', float('nan')):5.2f}  total "
+              f"{b.get('total_dollars', 0.0):+9.2f} $  DD {100 * b.get('dd_pct', 0.0):+.1f} %  |  "
+              f"{ligne_commune_marches(b)}", flush=True)
+    positifs = sum(1 for *_x, b, _p in tests.values() if b.get("total_dollars", 0.0) > 0)
+    tous = {m: pd.concat([p[m] for *_x, p in tests.values()], ignore_index=True) for m in marches}
+    nj = sum(b.get("n_jours", 0) for *_x, b, _p in tests.values())
+    bt = bilan_commun(tous, specs, nj, cfg)
+    print(f"  blocs gagnants : {positifs}/{len(tests)}  |  total {bt.get('total_dollars', 0.0):+.2f} $  |  "
+          f"{bt.get('coups', 0)} trades  |  profit factor global {bt.get('pf', float('nan')):.2f}",
+          flush=True)
+    print(f"  tous les blocs a la suite, COMPTE COMMUN : {ligne_commune(bt, cfg)}", flush=True)
+    print(f"  tous les blocs, par marche : {ligne_commune_marches(bt)}", flush=True)
+    print("\nFIN du walk-forward", flush=True)
+    return 0
+
+
 def coupe_debut_commun(d: pd.DataFrame) -> pd.DataFrame:
     """Les lignes a partir de la premiere bougie du marche le plus recent :
     tous les marches commencent au meme instant. Voir `debut_commun`."""
@@ -2434,7 +2686,7 @@ def main() -> int:
         return main_blocs(config_marche(cfg, sys.argv[1],
                                         int(sys.argv[2]) if len(sys.argv) > 2 else 0))
     if tuple(cfg.marches) and getattr(cfg, "modeles_par_marche", False):
-        return main_modeles_par_marche(cfg)
+        return main_pas_a_pas(cfg)
     if tuple(cfg.marches) and getattr(cfg, "validation", "walk") == "blocs":
         return main_multi_blocs(cfg)
     if tuple(cfg.marches):
