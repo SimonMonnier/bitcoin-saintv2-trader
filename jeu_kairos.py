@@ -82,6 +82,7 @@ serveur qui ferme, meme si le bot s'arrete.
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -124,7 +125,7 @@ class JeuConfig:
     # sans chevauchement) « et ajouter des indices qui ont de la volatilite et
     # un faible spread » pour augmenter le nombre de trades et le profit.
     # Chaque marche joue sa semaine avec ses 10 jetons. Voir `prepare_multi_h1`.
-    prefixe: str = "kairos_multi_h1_01"
+    prefixe: str = "kairos_multi_h1_02"
     # LE JEU EN BOUGIES DE 15 MINUTES — 2026-09-27, demande du proprietaire :
     # « recommence le jeu avec des bougies de 15 minutes, et pas M1 pour
     # entrer ». Le modele voit des bougies M15 (contextes H1 et H4, voir
@@ -165,6 +166,14 @@ class JeuConfig:
     # indices a faible spread (voir `telecharge_h1_mt5`). Le BTC seul en H1 :
     # `marches` = () et `cache` = data_cache_BTCUSD_H1_BINANCE.pkl.
     marches: Tuple[str, ...] = ("BTCUSD", "NAS100", "GER40", "UK100", "FRA40", "HK50", "US2000")
+    # UN GROS MODELE DIVISE EN PETITS MODELES — 2026-09-28, demande du
+    # proprietaire (run kairos_multi_h1_02). Le tronc SAINT reste commun a tous
+    # les marches ; chaque marche a SES tetes : achat, vente, objectif, stop et
+    # valeur. Le tronc apprend ce qui vaut partout, chaque marche garde des
+    # decisions a lui. Le marche se lit dans ses colonnes `m_*`. Au run
+    # multi_h1_01 (tetes communes), le BTC tombait a PF 1.09 en validation,
+    # contre 1.43 quand il jouait seul avec son propre modele.
+    tetes_par_marche: bool = True
     # LE PLANCHER DES BARRIERES, PAR MARCHE : cinq fois son cout median
     # (spread + glissements), jamais sous 10 bps. Le cout ne depasse donc
     # jamais ~0.2 R, sur le BTC (17 bps) comme sur l'ETH (58) ou le Dow (10).
@@ -424,6 +433,33 @@ class PolitiqueJeu(SAINTPolicySingleHead):
         for m in (self.tete_objectif, self.tete_stop):
             nn.init.orthogonal_(m.weight, gain=0.01)
             nn.init.zeros_(m.bias)
+        # LES TETES PAR MARCHE. Voir `tetes_par_marche`. Chaque copie part
+        # des memes poids ; l'entrainement les separe.
+        marches = tuple(getattr(cfg, "marches", ()))
+        self.n_marches = len(marches) if (marches and getattr(cfg, "tetes_par_marche", False)) else 1
+        if self.n_marches > 1:
+            cols = colonnes_jeu(cfg)
+            self.register_buffer("idx_marche", torch.tensor(
+                [cols.index(f"m_{m}") for m in marches], dtype=torch.long), persistent=False)
+
+            def _dup(mod):
+                return nn.ModuleList([copy.deepcopy(mod) for _ in range(self.n_marches)])
+            self.mlp_achat_m, self.tete_achat_m = _dup(self.mlp_achat), _dup(self.tete_achat)
+            self.mlp_vente_m, self.tete_vente_m = _dup(self.mlp_vente), _dup(self.tete_vente)
+            self.mlp_m, self.critic_m = _dup(self.mlp), _dup(self.critic)
+            self.lecteur_objectif_m, self.tete_objectif_m = (_dup(self.lecteur_objectif),
+                                                             _dup(self.tete_objectif))
+            self.lecteur_stop_m, self.tete_stop_m = _dup(self.lecteur_stop), _dup(self.tete_stop)
+
+    def marche_de(self, x: torch.Tensor) -> torch.Tensor:
+        """(B,) : l'indice du marche de chaque ligne, lu dans ses colonnes
+        `m_*` (normalisees : la seule a 1 reste la plus grande)."""
+        return x[:, -1, self.idx_marche].argmax(-1)
+
+    @staticmethod
+    def _par_marche(k, lecteurs, tetes, z):
+        sortie = torch.stack([t(lec(z)) for lec, t in zip(lecteurs, tetes)], 1)
+        return sortie[torch.arange(len(k), device=z.device), k]
 
     def jeu(self, x: torch.Tensor):
         """(logits d'entree (B,3), valeur (B,), objectif (B,2,K), stop (B,2,K)).
@@ -433,6 +469,20 @@ class PolitiqueJeu(SAINTPolicySingleHead):
         choisisse les siennes sans second passage dans le tronc.
         """
         zn = self._lecture_tronc(x)
+        if self.n_marches > 1:
+            k = self.marche_de(x)
+            pm = self._par_marche
+            la = pm(k, self.mlp_achat_m, self.tete_achat_m, zn)
+            lv = pm(k, self.mlp_vente_m, self.tete_vente_m, zn)
+            le = torch.cat([la, lv, torch.zeros_like(la)], dim=-1)
+            v = pm(k, self.mlp_m, self.critic_m, zn).squeeze(-1)
+            un = torch.ones_like(la)
+            zl, zs = torch.cat([zn, un], -1), torch.cat([zn, -un], -1)
+            ltp = torch.stack([pm(k, self.lecteur_objectif_m, self.tete_objectif_m, zl),
+                               pm(k, self.lecteur_objectif_m, self.tete_objectif_m, zs)], 1)
+            lsl = torch.stack([pm(k, self.lecteur_stop_m, self.tete_stop_m, zl),
+                               pm(k, self.lecteur_stop_m, self.tete_stop_m, zs)], 1)
+            return le, v, ltp, lsl
         la = self.tete_achat(self.mlp_achat(zn))
         lv = self.tete_vente(self.mlp_vente(zn))
         le = torch.cat([la, lv, torch.zeros_like(la)], dim=-1)
@@ -449,6 +499,18 @@ class PolitiqueJeu(SAINTPolicySingleHead):
         """Six groupes DISJOINTS, un optimiseur chacun."""
         def _p(*mods):
             return [q for m in mods for q in m.parameters()]
+        if self.n_marches > 1:
+            g = {
+                "achat": _p(self.mlp_achat_m, self.tete_achat_m),
+                "vente": _p(self.mlp_vente_m, self.tete_vente_m),
+                "gain": _p(self.lecteur_objectif_m, self.tete_objectif_m),
+                "perte": _p(self.lecteur_stop_m, self.tete_stop_m),
+                "valeur": _p(self.mlp_m, self.critic_m),
+                "tronc": _p(self.embed, self.col_emb, *self.blocks, self.norm) + [self.cls],
+            }
+            if self.memoire is not None:
+                g["tronc"] += list(self.memoire.parameters())
+            return g
         g = {
             "achat": _p(self.mlp_achat, self.tete_achat),
             "vente": _p(self.mlp_vente, self.tete_vente),

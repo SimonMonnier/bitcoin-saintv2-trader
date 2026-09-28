@@ -488,6 +488,28 @@ verifie("il lit les colonnes communes, avec une colonne par marche",
 pmh = J.PolitiqueJeu(cmh)
 xmh = torch.zeros(2, cmh.lookback, len(PMH.FEATURE_COLS_MULTI_H1) + cmh.n_expert + J.N_ETAT)
 verifie("le modele multi H1 lit ses colonnes, l'expert et l'etat", pmh.jeu(xmh)[0].shape == (2, 3))
+verifie("un tronc commun, sept jeux de tetes (une par marche)",
+        pmh.n_marches == 7 and len(pmh.tete_achat_m) == 7 and len(pmh.critic_m) == 7)
+gmh = pmh.groupes_jeu()
+_ids = [id(q) for v in gmh.values() for q in v]
+verifie("les groupes restent disjoints et portent les tetes par marche",
+        len(_ids) == len(set(_ids)) and sorted(gmh) == ["achat", "gain", "perte", "tronc", "valeur", "vente"]
+        and len(gmh["achat"]) == 7 * len(list(pmh.mlp_achat.parameters()) + list(pmh.tete_achat.parameters())))
+_colm = J.colonnes_jeu(cmh)
+_xa = torch.zeros(2, cmh.lookback, len(_colm) + cmh.n_expert + J.N_ETAT)
+_xa[0, :, _colm.index("m_BTCUSD")] = 1.0
+_xa[1, :, _colm.index("m_GER40")] = 1.0
+verifie("le marche se lit dans ses colonnes", pmh.marche_de(_xa).tolist() == [0, 2])
+pmh.eval()                                       # sans dropout : sorties exactes
+with torch.no_grad():
+    _av = pmh.jeu(_xa)[0].clone()
+    pmh.tete_achat_m[2].bias.add_(5.0)            # on ne touche que la tete du GER40
+    _ap = pmh.jeu(_xa)[0]
+verifie("changer la tete d'un marche ne change que ce marche",
+        torch.allclose(_av[0], _ap[0]) and abs(float(_ap[1, 0] - _av[1, 0]) - 5.0) < 1e-4)
+_c1 = replace(cmh, tetes_par_marche=False)
+verifie("sans tetes par marche : le modele commun d'avant", J.PolitiqueJeu(_c1).n_marches == 1)
+verifie("le BTC seul n'a qu'un jeu de tetes", J.PolitiqueJeu(ch).n_marches == 1)
 _u = PMH.serveur_vers_utc(_pd.Series(_pd.to_datetime(["2024-07-08 16:30", "2024-01-08 16:30"])))
 verifie("l'heure du serveur MT5 passe en UTC (ouverture de New York 13h30 l'ete, 14h30 l'hiver)",
         [x.strftime("%H:%M") for x in _u] == ["13:30", "14:30"])
