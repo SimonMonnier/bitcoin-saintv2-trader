@@ -8,10 +8,19 @@ qu'en octobre 2024 ; celui-ci couvre la meme periode que Binance, pour que
 l'ecart de prix Coinbase / Binance soit une colonne sur neuf ans.
 
 API publique, 300 bougies par requete (25 heures en 5 minutes), une dizaine
-de requetes par seconde toleree : on reste sous trois. Reprise possible :
-les lots deja telecharges sont gardes dans un fichier partiel.
+de requetes par seconde toleree. Reprise possible : les lots deja
+telecharges sont gardes dans un fichier partiel, et l'instant atteint dans
+un fichier `.ou` (une crypto listee apres 2017 n'a pas de bougie a
+enregistrer avant sa cotation).
 
-    python telecharge_coinbase_5m.py
+EN PARALLELE depuis le 2026-09-28 : une requete a la fois laissait ~1 lot
+par seconde (neuf ans d'ETH : plus d'une heure). `FILS` requetes en vol,
+les lots toujours enregistres dans l'ordre.
+
+    python telecharge_coinbase_5m.py [ETH-USD]
+
+AUTRES CRYPTOS — 2026-09-28 : le produit Coinbase en argument (BTC-USD par
+defaut), le cache s'appelle alors cache_coinbase_5m_<ETHUSD>.pkl.
 """
 import datetime as dt
 import json
@@ -19,11 +28,15 @@ import os
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 
-CACHE = "cache_coinbase_5m_BTCUSD.pkl"
-PARTIEL = "cache_coinbase_5m_BTCUSD.partiel.pkl"
+PRODUIT = sys.argv[1] if len(sys.argv) > 1 else "BTC-USD"
+CACHE = f"cache_coinbase_5m_{PRODUIT.replace('-', '')}.pkl"
+PARTIEL = f"cache_coinbase_5m_{PRODUIT.replace('-', '')}.partiel.pkl"
+OU = PARTIEL.replace(".pkl", ".ou")
+FILS = 3
 DEBUT = dt.datetime(2017, 8, 1)
 FIN = dt.datetime(2026, 9, 15)
 
@@ -33,43 +46,59 @@ except Exception:
     pass
 
 
+def _lot(fenetre):
+    t, b = fenetre
+    u = (f"https://api.exchange.coinbase.com/products/{PRODUIT}/candles?"
+         f"granularity=300&start={t:%Y-%m-%dT%H:%M:%SZ}&end={b:%Y-%m-%dT%H:%M:%SZ}")
+    for essai in range(8):
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent": "kairos-mesure"})
+            lot = json.loads(urllib.request.urlopen(req, timeout=60).read())
+            time.sleep(0.35)
+            return lot, True
+        except Exception:
+            time.sleep(1 + 2 * essai)
+    return [], False
+
+
 def main() -> int:
+    cols = ["t", "low", "high", "open", "close", "volume"]
     lignes = []
     t = DEBUT
     if os.path.exists(PARTIEL):
         d0 = pd.read_pickle(PARTIEL)
         lignes = d0.values.tolist()
-        t = pd.Timestamp(d0["t"].max(), unit="s").to_pydatetime() + dt.timedelta(minutes=5)
+        if os.path.exists(OU):
+            t = dt.datetime.fromisoformat(open(OU).read().strip())
+        elif len(d0):
+            t = pd.Timestamp(d0["t"].max(), unit="s").to_pydatetime() + dt.timedelta(minutes=5)
         print(f"reprise a {t} ({len(lignes):,} bougies deja la)", flush=True)
     pas = dt.timedelta(minutes=5 * 300)
-    n = 0
+    fen = []
     while t < FIN:
-        b = min(t + pas, FIN)
-        u = ("https://api.exchange.coinbase.com/products/BTC-USD/candles?"
-             f"granularity=300&start={t:%Y-%m-%dT%H:%M:%SZ}&end={b:%Y-%m-%dT%H:%M:%SZ}")
-        lot = []
-        for essai in range(6):
-            try:
-                req = urllib.request.Request(u, headers={"User-Agent": "kairos-mesure"})
-                lot = json.loads(urllib.request.urlopen(req, timeout=60).read())
-                break
-            except Exception:
-                time.sleep(1 + 2 * essai)
-        lignes += lot
-        n += 1
-        if n % 200 == 0:
-            print(f"  {t:%Y-%m-%d}  {len(lignes):,} bougies", flush=True)
-            pd.to_pickle(pd.DataFrame(lignes, columns=["t", "low", "high", "open", "close", "volume"]),
-                         PARTIEL)
-        t = b
-        time.sleep(0.35)
-    d = pd.DataFrame(lignes, columns=["t", "low", "high", "open", "close", "volume"])
+        fen.append((t, min(t + pas, FIN)))
+        t = fen[-1][1]
+    rates = 0
+    with ThreadPoolExecutor(FILS) as ex:
+        for i0 in range(0, len(fen), 200):
+            morceau = fen[i0:i0 + 200]
+            for lot, ok in ex.map(_lot, morceau):
+                lignes += lot
+                rates += not ok
+            pd.to_pickle(pd.DataFrame(lignes, columns=cols), PARTIEL)
+            with open(OU, "w") as fh:
+                fh.write(morceau[-1][1].isoformat())
+            print(f"  {PRODUIT} {morceau[-1][1]:%Y-%m-%d}  {len(lignes):,} bougies"
+                  + (f"  ({rates} lots en echec)" if rates else ""), flush=True)
+    d = pd.DataFrame(lignes, columns=cols)
     d["time"] = pd.to_datetime(d["t"], unit="s")
     d = d.drop(columns=["t"]).drop_duplicates("time").sort_values("time").reset_index(drop=True)
     d.to_pickle(CACHE)
-    if os.path.exists(PARTIEL):
-        os.remove(PARTIEL)
-    print(f"ecrit {CACHE} : {len(d):,} bougies  {d['time'].iloc[0]} -> {d['time'].iloc[-1]}")
+    for f in (PARTIEL, OU):
+        if os.path.exists(f):
+            os.remove(f)
+    print(f"ecrit {CACHE} : {len(d):,} bougies  {d['time'].iloc[0]} -> {d['time'].iloc[-1]}"
+          + (f"  ATTENTION {rates} lots de 25 h perdus apres 8 essais" if rates else ""))
     return 0
 
 

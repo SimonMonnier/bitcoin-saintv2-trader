@@ -478,10 +478,10 @@ import prepare_multi_h1 as PMH
 cmh = replace(J.JeuConfig(), marches=tuple(PMH.MARCHES), cache=PMH.SORTIE,
               minutes_par_barre=60, partie="semaine", horizon_max=72, expert_k=6,
               expert_pas_neg=1, porte_rang_expert=0.90)
-_dft = J.JeuConfig()
 import prepare_btc_m5 as P5
-verifie("par defaut : le BTC seul en M5, une journee par partie, 10 jetons, une position",
-        tuple(_dft.marches) == () and _dft.cache == P5.SORTIE and _dft.positions_max == 1
+_dft = replace(J.JeuConfig(), marches=(), cache=P5.SORTIE)
+verifie("le BTC seul en M5 (run m5_02) : une journee par partie, 10 jetons, une position",
+        _dft.positions_max == 1
         and _dft.jetons == 10 and _dft.expert_k == 10 and _dft.partie == "jour"
         and _dft.porte_rang_expert == 0.85
         and _dft.minutes_par_barre == 5 and _dft.horizon_max == 96
@@ -554,6 +554,47 @@ verifie("un coup d'entrainement ne peut pas lire la zone exclue suivante",
 _pm9, _te9, _va9 = J.masque_blocs(1000, 10, 9, 30)
 verifie("le dernier bloc aussi : test a la fin, validation au milieu",
         _te9 == (900, 1000) and _va9 == (400, 500) and not _pm9[870:].any())
+
+print("\n11. LE MULTI-MARCHES M5 (BTC, ETH, ZEC)")
+import prepare_multi_m5 as PM5
+_mm = J.JeuConfig()
+verifie("par defaut : BTC, ETH et ZEC en M5, validation en blocs, un cerveau par marche",
+        tuple(_mm.marches) == ("BTCUSD", "ETHUSD", "ZECUSD") == tuple(PM5.MARCHES)
+        and _mm.cache == PM5.SORTIE and _mm.minutes_par_barre == 5 and _mm.partie == "jour"
+        and _mm.validation == "blocs" and _mm.tetes_par_marche)
+verifie("les memes regles que le BTC seul du run m5_02",
+        _mm.jetons == 10 and _mm.positions_max == 1 and _mm.expert_k == 10
+        and _mm.porte_rang_expert == 0.85 and _mm.horizon_max == 96 and _mm.risque_pct == 1.0)
+verifie("EXACTEMENT les colonnes du BTC, plus une colonne par marche",
+        J.colonnes_jeu(_mm) == list(P5.FEATURE_COLS_M5) + ["m_BTCUSD", "m_ETHUSD", "m_ZECUSD"])
+_pm5 = J.PolitiqueJeu(_mm)
+_xm = torch.zeros(3, _mm.lookback, len(J.colonnes_jeu(_mm)) + _mm.n_expert + J.N_ETAT)
+_ic = J.colonnes_jeu(_mm).index("m_ETHUSD")
+_xm[1, :, _ic] = 1.0
+_ic = J.colonnes_jeu(_mm).index("m_ZECUSD")
+_xm[2, :, _ic] = 1.0
+_xm[0, :, J.colonnes_jeu(_mm).index("m_BTCUSD")] = 1.0
+_pm5.eval()
+verifie("trois petits cerveaux, chaque ligne lit le sien",
+        _pm5.n_marches == 3 and _pm5.marche_de(_xm).tolist() == [0, 1, 2]
+        and _pm5.jeu(_xm)[0].shape == (3, 3))
+verifie("le swap des cryptos Vantage : -25 %/an -> 6.85 bps par jour, 0 -> rien",
+        abs(PM5.swap_bps_jour(-25) - 6.849) < 1e-2 and PM5.swap_bps_jour(0) == 0.0)
+# deux marches empiles : le premier a 1000 bougies de 5 min, le second
+# commence plus tard (a la bougie 300 du premier)
+_t_a = _pd.Timestamp("2020-01-01").value + np.arange(1000, dtype=np.int64) * 300 * 10**9
+_t_b = _t_a[300:]
+_tt = np.concatenate([_t_a, _t_b])
+_pmd, _ted, _vad = J.masque_blocs_dates(_tt, _t_a, 10, 0, 30 * 300 * 10**9)
+_pmi, _tei, _vai = J.masque_blocs(1000, 10, 0, 30)
+verifie("les blocs en dates sont ceux du BTC seul, bougie pour bougie",
+        (_pmd[:1000] == _pmi).all() and _ted == (int(_t_a[0]), int(_t_a[100]))
+        and _vad == (int(_t_a[500]), int(_t_a[600])))
+verifie("l'autre marche perd les memes DATES (test, validation et tampon)",
+        (_pmd[1000:] == _pmi[300:]).all())
+_pmd9, _ted9, _ = J.masque_blocs_dates(_tt, _t_a, 10, 9, 30 * 300 * 10**9)
+verifie("le dernier bloc va jusqu'a la derniere bougie comprise",
+        _ted9[1] == int(_t_a[-1]) + 1 and not _pmd9[870:1000].any() and not _pmd9[-130:].any())
 
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)
