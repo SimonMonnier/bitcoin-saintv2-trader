@@ -31,6 +31,18 @@ des 16 coups (la cible de l'expert), et le R net moyen des bougies qui
 passent la porte (rang glissant >= 0.85 dans le sens joue).
 
     python mesure_figures_m5.py > mesure_figures_m5.txt
+
+UNE SEULE BOUGIE — 2026-09-28, precision du proprietaire : « une seule
+bougie au temps T ; avec le lookback, le modele verrait les autres ». Le
+modele du jeu lit `lookback` = 4 lignes : la bougie T sur chaque ligne, il
+voit donc les bougies T a T-3. Versions mesurees :
+
+    A     les 40 colonnes actuelles
+    A+T   les 40 colonnes + la forme de la bougie T (5 colonnes)
+    T     la bougie T seule
+    T-3   les bougies T a T-3 (ce que le lookback de 4 lui montrerait)
+
+    python mesure_figures_m5.py une > mesure_figures_m5_une.txt
 """
 import sys
 import time
@@ -114,8 +126,20 @@ def main() -> int:
     F = figures(d)
     XC = F.to_numpy(np.float32)
     XB = np.concatenate([XA, XC], axis=1)
-    print(f"FIGURES DES CHANDELIERS, BTC M5 — {N:,} bougies ; A = {XA.shape[1]} colonnes "
-          f"actuelles, B = A + {XC.shape[1]} colonnes de figures ({K} bougies), C = figures seules")
+    versions = (("A  actuelles", XA), ("B  actuelles + figures", XB), ("C  figures seules", XC))
+    if len(sys.argv) > 1 and sys.argv[1] == "une":
+        t0c = [f"{x}_0" for x in ("corps", "haut", "bas", "taille", "ecart")]
+        t4c = [col for col in F.columns if int(col.rsplit("_", 1)[1]) <= 3]
+        XT = F[t0c].to_numpy(np.float32)
+        versions = (("A    actuelles", XA),
+                    ("A+T  actuelles + bougie T", np.concatenate([XA, XT], axis=1)),
+                    ("T    la bougie T seule", XT),
+                    ("T-3  bougies T a T-3", F[t4c].to_numpy(np.float32)))
+        print(f"UNE SEULE BOUGIE, BTC M5 — {N:,} bougies ; la bougie T = {len(t0c)} colonnes, "
+              f"T a T-3 = {len(t4c)} colonnes (ce que montre un lookback de 4)")
+    else:
+        print(f"FIGURES DES CHANDELIERS, BTC M5 — {N:,} bougies ; A = {XA.shape[1]} colonnes "
+              f"actuelles, B = A + {XC.shape[1]} colonnes de figures ({K} bougies), C = figures seules")
     print("jugement sur la VALIDATION de chaque bloc ; le bloc de test n'est pas lu\n")
     purge = int(cfg.horizon_max + cfg.lookback + cfg.purge_semaines * cfg.barres_par_partie)
     H = int(cfg.horizon_max)
@@ -129,7 +153,7 @@ def main() -> int:
         print(f"=== BLOC {k + 1} : validation {fmt(va0)} -> {fmt(va1 - 1)} ===")
         print("   version                    correlation achat / vente   R net porte >= 0.85   "
               "t (jours)   bougies/jour a la porte")
-        for nom, X in (("A  actuelles", XA), ("B  actuelles + figures", XB), ("C  figures seules", XC)):
+        for nom, X in versions:
             t0 = time.time()
             pred = expert(X, y, idx_tr, idx_va)
             ic, r, t, n = juge(pred, y[idx_va], jour[idx_va])
