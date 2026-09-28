@@ -439,7 +439,8 @@ verifie("le drawdown suit l'ordre du TEMPS, pas celui des lignes",
 
 print("\n8. LE JEU EN H1, PARTIES D'UNE SEMAINE")
 import prepare_btc_h1_binance as PH
-ch = replace(J.JeuConfig(), marches=(), cache=PH.SORTIE)
+ch = replace(J.JeuConfig(), marches=(), cache=PH.SORTIE, minutes_par_barre=60,
+             partie="semaine", horizon_max=72, expert_k=6, expert_pas_neg=1)
 verifie("le jeu H1 : une semaine par partie, 168 bougies",
         ch.minutes_par_barre == 60 and ch.partie == "semaine" and ch.barres_par_partie == 168)
 verifie("il lit les colonnes du H1 Binance", J.colonnes_jeu(ch) == list(PH.FEATURE_COLS_H1))
@@ -474,12 +475,22 @@ verifie("36 colonnes, dont le flux et le financement",
 
 print("\n9. LE MULTI-MARCHES H1 (le BTC et les indices)")
 import prepare_multi_h1 as PMH
-cmh = replace(J.JeuConfig(), marches=tuple(PMH.MARCHES), cache=PMH.SORTIE)
+cmh = replace(J.JeuConfig(), marches=tuple(PMH.MARCHES), cache=PMH.SORTIE,
+              minutes_par_barre=60, partie="semaine", horizon_max=72, expert_k=6,
+              expert_pas_neg=1)
 _dft = J.JeuConfig()
-verifie("par defaut : le BTC seul en H1, la configuration du run h1_01",
-        tuple(_dft.marches) == () and _dft.cache == PH.SORTIE and _dft.positions_max == 1
-        and _dft.jetons == 10 and _dft.expert_k == 6 and _dft.partie == "semaine"
-        and _dft.minutes_par_barre == 60 and _dft.horizon_max == 72)
+import prepare_btc_m5 as P5
+verifie("par defaut : le BTC seul en M5, une journee par partie, 10 jetons, une position",
+        tuple(_dft.marches) == () and _dft.cache == P5.SORTIE and _dft.positions_max == 1
+        and _dft.jetons == 10 and _dft.expert_k == 4 and _dft.partie == "jour"
+        and _dft.minutes_par_barre == 5 and _dft.horizon_max == 96
+        and _dft.barres_par_partie == 288)
+verifie("le M5 lit ses colonnes, dont l'ecart Coinbase / Binance",
+        J.colonnes_jeu(_dft) == list(P5.FEATURE_COLS_M5) and "prime_cb" in P5.FEATURE_COLS_M5
+        and "flux_3" in P5.FEATURE_COLS_M5)
+_p5 = J.PolitiqueJeu(_dft)
+_x5 = torch.zeros(2, _dft.lookback, len(P5.FEATURE_COLS_M5) + _dft.n_expert + J.N_ETAT)
+verifie("le modele M5 lit ses colonnes, l'expert et l'etat", _p5.jeu(_x5)[0].shape == (2, 3))
 verifie("le multi H1 : le BTC et les indices, une semaine par partie",
         tuple(cmh.marches) == tuple(PMH.MARCHES) and len(cmh.marches) == len(PMH.MARCHES) >= 13
         and cmh.minutes_par_barre == 60 and cmh.partie == "semaine")

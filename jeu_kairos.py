@@ -131,7 +131,17 @@ class JeuConfig:
     # du multi a 13 marches : +130.82 $ (PF 1.02, drawdown -65.6 %), -271.67 $,
     # -152.68 $ ; le BTC seul (h1_01) faisait +447.56 $ au fold 1 (PF 1.38,
     # drawdown -9.1 %). Configuration de h1_01 a l'identique.
-    prefixe: str = "kairos_jeu_h1_blocs_01"
+    # LE JEU EN M5, UNE JOURNEE PAR PARTIE — 2026-09-28, demande du
+    # proprietaire : « passer sur du M5, puisqu'on a des donnees M5 sur Coinbase
+    # et Binance que l'on n'a pas sur MT5 ». Prix Binance depuis 2017, ecart
+    # Coinbase / Binance, couts Vantage (voir `prepare_btc_m5`). Le reste : les
+    # regles du jeu H1 ramenees a la journee (10 jetons, une position, porte
+    # 0.90, 1 % de mise), expert a 4 coups par jour comme en M15. AVERTI : en M5
+    # l'ATR median du BTC vaut ~22 bps pour ~3.5 de cout (16 %), contre 77 en H1.
+    # Le run H1 precedent : kairos_jeu_h1_blocs_01, cache
+    # data_cache_BTCUSD_H1_BINANCE.pkl, 60 min, partie "semaine", horizon 72,
+    # expert_k 6, expert_pas_neg 1.
+    prefixe: str = "kairos_jeu_m5_01"
     # LA VALIDATION CROISEE PURGEE — 2026-09-28, demande du proprietaire :
     # « entrainer le modele sur des periodes aleatoires pour qu'il apprenne
     # tous les types de marches ». Le walk-forward (h1_05) : +447.56, -441.18,
@@ -155,12 +165,12 @@ class JeuConfig:
     # CE QUE CELA CHANGE AU COUT : l'ATR M15 median vaut 26 bps, l'ATR M1
     # environ 6, pour le meme cout de ~3.3 bps par coup. Rapporte au
     # mouvement d'une bougie, il pese quatre fois moins.
-    cache: str = "data_cache_BTCUSD_H1_BINANCE.pkl"
-    minutes_par_barre: int = 60
+    cache: str = "data_cache_BTCUSD_M5_BINANCE.pkl"
+    minutes_par_barre: int = 5
     # UNE PARTIE = UN "jour" OU UNE "semaine" (lundi 0 h -> lundi 0 h UTC).
     # En H1 un jour ne fait que 24 decisions : la semaine en fait 168, et
     # laisse aux coups de plusieurs jours le temps de se resoudre.
-    partie: str = "semaine"
+    partie: str = "jour"
     # LE SWAP DU COURTIER, en bps du prix par jour de detention, compte au
     # prorata de la duree du coup. Vantage BTC : -20 %/an a l'achat, 0 a la
     # vente. Sans objet en M15 (coups de quelques heures) : 0 dans ces runs.
@@ -276,7 +286,8 @@ class JeuConfig:
     # stop fait 20 bps et le cout ne depasse jamais ~0.17 R.
     atr_min_bps: float = 20.0
     # EN BOUGIES : 32 bougies M15, huit heures. EN H1 : 72 bougies, trois jours.
-    horizon_max: int = 72
+    # EN M5 : 96 bougies, huit heures (comme le M15).
+    horizon_max: int = 96
     # Glissements ESPERES (la moitie des bornes de `training.PPOConfig`) :
     # entree toujours, sortie au stop et au temps, jamais a l'objectif.
     glissement_entree_bps: float = 0.5
@@ -306,10 +317,12 @@ class JeuConfig:
     # semaine, autant que les jetons, et peut les faire se chevaucher jusqu'a
     # `positions_max` (voir `coups_expert_predits`). REMIS A 6 LE 2026-09-28
     # (run kairos_multi_h1_01) : la configuration du run h1_01.
-    expert_k: int = 6
+    # EN M5 : 4 coups enseignes par JOUR (comme le M15).
+    expert_k: int = 4
     expert_R_min: float = 1.0          # l'ancien expert, qui lisait l'avenir
     # EN M15, une bougie sur deux : il n'y en a que 96 par jour. EN H1, toutes.
-    expert_pas_neg: int = 1
+    # EN M5 : une bougie sur trois pour les attentes (288 par jour).
+    expert_pas_neg: int = 3
     expert_poids_pos: float = 5.0
     expert_epochs: int = 3
     # L'EXPERT REALISTE : LightGBM, validation croisee par blocs purges.
@@ -418,6 +431,9 @@ def colonnes_jeu(cfg: "JeuConfig") -> list:
     if int(cfg.minutes_par_barre) == 60:
         from prepare_btc_h1_binance import FEATURE_COLS_H1
         return list(FEATURE_COLS_H1)
+    if int(cfg.minutes_par_barre) == 5:
+        from prepare_btc_m5 import FEATURE_COLS_M5
+        return list(FEATURE_COLS_M5)
     if int(cfg.minutes_par_barre) == 15:
         from prepare_btc_m15 import FEATURE_COLS_M15
         return list(FEATURE_COLS_M15)
