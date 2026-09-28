@@ -1,0 +1,53 @@
+Binance BTCUSDT 5 min : 953,257 bougies, 2017-08-17 04:00:00 -> 2026-09-14 23:55:00 UTC
+decouverte avant 2023-01-01, confirmation apres ; frais 3.5 bps l'aller-retour, swap acheteur 5.5 bps par nuit
+
+H  LES 24 HEURES UTC (seuil de decouverte |t| >= 3.0)
+  H00 00h-01h UTC                              sens achat | decouverte n  1958   +1.37 bps t  +0.6 | confirmation n  1353   +1.23 bps t  +0.9 (48 % >0) | net   -2.27 bps  -
+  H01 01h-02h UTC                              sens vente | decouverte n  1945   +1.48 bps t  +0.7 | confirmation n  1353   +1.14 bps t  +0.8 (50 % >0) | net   -2.36 bps  -
+  H02 02h-03h UTC                              sens vente | decouverte n  1944   +3.48 bps t  +1.6 | confirmation n  1353   -0.62 bps t  -0.5 (50 % >0) | net   -4.12 bps  -
+  H03 03h-04h UTC                              sens vente | decouverte n  1944   +3.97 bps t  +2.2 | confirmation n  1353   -0.94 bps t  -0.9 (49 % >0) | net   -4.44 bps  -
+  H04 04h-05h UTC                              sens vente | decouverte n  1945   +1.10 bps t  +0.6 | confirmation n  1353   -0.44 bps t  -0.5 (50 % >0) | net   -3.94 bps  -
+  H05 05h-06h UTC                              sens achat | decouverte n  1947   +0.92 bps t  +0.5 | confirmation n  1353   +0.03 bps t  +0.0 (49 % >0) | net   -3.47 bps  -
+  H06 06h-07h UTC                              sens achat | decouverte n  1948   +3.25 bps t  +1.8 | confirmation n  1353   +0.17 bps t  +0.1 (51 % >0) | net   -3.33 bps  -
+  H07 07h-08h UTC                              sens achat | decouverte n  1951   +1.91 bps t  +1.0 | confirmation n  1353   -0.94 bps t  -0.9 (48 % >0) | net   -4.44 bps  -
+  H08 08h-09h UTC                              sens achat | decouverte n  1953   +0.01 bps t  +0.0 | confirmation n  1353   +2.37 bps t  +2.0 (52 % >0) | net   -1.13 bps  -
+  H09 09h-10h UTC                              sens vente | decouverte n  1955   +2.63 bps t  +1.4 | confirmation n  1353   -1.15 bps t  -1.1 (48 % >0) | net   -4.65 bps  -
+  H10 10h-11h UTC                              sens vente | decouverte n  1957   +0.90 bps t  +0.4 | confirmation n  1353   -0.22 bps t  -0.2 (49 % >0) | net   -3.72 bps  -
+  H11 11h-12h UTC                              sens achat | decouverte n  1956   +2.40 bps t  +1.3 | confirmation n  1353   +1.73 bps t  +1.7 (53 % >0) | net   -1.77 bps  -
+  H12 12h-13h UTC                              sens achat | decouverte n  1956   +3.06 bps t  +1.3 | confirmation n  1352   +0.85 bps t  +0.7 (50 % >0) | net   -2.65 bps  -
+  H13 13h-14h UTC                              sens achat | decouverte n  1957   +3.87 bps t  +1.7 | confirmation n  1352   -2.41 bps t  -1.5 (47 % >0) | net   -5.91 bps  -
+  H14 14h-15h UTC                              sens vente | decouverte n  1957   +2.54 bps t  +1.1 | confirmation n  1353   -0.53 bps t  -0.3 (49 % >0) | net   -4.03 bps  -
+  H15 15h-16h UTC                              sens achat | decouverte n  1957   +3.54 bps t  +1.6 | confirmation n  1353   +1.18 bps t  +0.6 (51 % >0) | net   -2.32 bps  -
+  H16 16h-17h UTC                              sens achat | decouverte n  1957   +1.19 bps t  +0.5 | confirmation n  1353   -1.08 bps t  -0.7 (47 % >0) | net   -4.58 bps  -
+  H17 17h-18h UTC                              sens vente | decouverte n  1957   +2.79 bps t  +1.4 | confirmation n  1353   -2.96 bps t  -1.9 (45 % >0) | net   -6.46 bps  -
+  H18 18h-19h UTC                              sens achat | decouverte n  1959   +0.56 bps t  +0.3 | confirmation n  1353   +0.70 bps t  +0.5 (53 % >0) | net   -2.80 bps  -
+  H19 19h-20h UTC                              sens achat | decouverte n  1959   +3.88 bps t  +2.0 | confirmation n  1353   -1.59 bps t  -1.0 (52 % >0) | net   -5.09 bps  -
+  H20 20h-21h UTC                              sens achat | decouverte n  1959   +0.72 bps t  +0.3 | confirmation n  1353   +1.45 bps t  +1.0 (51 % >0) | net   -2.05 bps  -
+  H21 21h-22h UTC                              sens achat | decouverte n  1958   +5.41 bps t  +2.6 | confirmation n  1353   +2.87 bps t  +2.2 (54 % >0) | net   -0.63 bps  -
+  H22 22h-23h UTC                              sens achat | decouverte n  1958   +4.83 bps t  +2.5 | confirmation n  1353   +4.05 bps t  +2.9 (52 % >0) | net   +0.55 bps  -
+  H23 23h-00h UTC                              sens vente | decouverte n  1960   +2.13 bps t  +1.0 | confirmation n  1352   +1.87 bps t  +1.7 (50 % >0) | net   -1.63 bps  -
+
+F  FINANCEMENT DES PERPETUELS (0 h, 8 h, 16 h UTC)
+  F1 T-1h -> T, contre le financement          sens achat | decouverte n  3284   +1.55 bps t  +1.1 | confirmation n  4016   +1.07 bps t  +1.3 (51 % >0) | net   -2.43 bps  -
+  F2 T -> T+1h, avec le financement            sens achat | decouverte n  3283   +0.59 bps t  +0.4 | confirmation n  4017   -0.64 bps t  -0.8 (49 % >0) | net   -4.14 bps  -
+
+O  EXPIRATION DES OPTIONS DERIBIT (vendredi 8 h UTC)
+  O1 jeudi 20h -> vendredi 8h                  sens vente | decouverte n   279  +26.05 bps t  +1.7 | confirmation n   193   +3.99 bps t  +0.3 (53 % >0) | net   +0.49 bps  -
+  O2 vendredi 8h -> 16h                        sens achat | decouverte n   279  +33.86 bps t  +1.9 | confirmation n   193  +11.62 bps t  +1.0 (53 % >0) | net   +8.12 bps  -
+  O3 idem, expirations mensuelles              sens vente | decouverte n    65  +31.25 bps t  +1.1 | confirmation n    44  +37.92 bps t  +1.8 (64 % >0) | net  +34.42 bps  -
+
+C  GAP DU WEEK-END DES CONTRATS A TERME CME (ecart >= 1 %)
+  C  comblement du gap CME (72 h max)          sens achat | decouverte n   178  -65.28 bps t  -1.4 | confirmation n    86  -24.63 bps t  -0.6 (65 % >0) | net  -30.99 bps  -
+     264 gaps de plus de 1 %, comble dans les 72 h : 65 % des cas (signe du rendement)
+
+U  SEANCE AMERICAINE (jours de semaine)
+  U1 8h30-9h30 New York (avant l'ouverture)    sens achat | decouverte n  1395   +0.80 bps t  +0.3 | confirmation n   965   +1.03 bps t  +0.6 (48 % >0) | net   -2.47 bps  -
+  U2 9h30-10h30 New York (1re heure)           sens achat | decouverte n  1396   +2.43 bps t  +0.8 | confirmation n   965   -3.11 bps t  -1.0 (48 % >0) | net   -6.61 bps  -
+  U3 15h-16h New York (derniere heure)         sens achat | decouverte n  1398   +3.52 bps t  +1.4 | confirmation n   966   -1.25 bps t  -0.6 (51 % >0) | net   -4.75 bps  -
+
+W  WEEK-END ET LUNDI (UTC)
+  W1 samedi 0h -> lundi 0h                     sens achat | decouverte n   280  +20.48 bps t  +0.9 | confirmation n   193  +23.34 bps t  +1.4 (53 % >0) | net   +8.88 bps  -
+  W2 lundi 0h -> mardi 0h                      sens achat | decouverte n   280  +40.49 bps t  +1.5 | confirmation n   193  +40.62 bps t  +2.0 (54 % >0) | net  +31.75 bps  -
+
+====================================================================================================
+EFFETS VALIDES (decouverte + confirmation + plus grands que les frais) : AUCUN
