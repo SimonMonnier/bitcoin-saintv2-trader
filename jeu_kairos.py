@@ -118,7 +118,7 @@ class JeuConfig:
     # glissements, et le swap acheteur (-20 %/an) sur la duree de chaque coup.
     # Le run M15 precedent : prefixe kairos_jeu_m15_07, cache
     # data_cache_BTCUSD_M15.pkl, 15 min, partie "jour", horizon 32, sans swap.
-    prefixe: str = "kairos_jeu_h1_02"
+    prefixe: str = "kairos_jeu_h1_03"
     # LE JEU EN BOUGIES DE 15 MINUTES — 2026-09-27, demande du proprietaire :
     # « recommence le jeu avec des bougies de 15 minutes, et pas M1 pour
     # entrer ». Le modele voit des bougies M15 (contextes H1 et H4, voir
@@ -187,7 +187,9 @@ class JeuConfig:
     # politique, et celui qui juge la fin de partie a -`vie_R`, ne comptent que
     # les coups RESOLUS : les coups encore ouverts ne lui revelent rien de leur
     # issue. 1 = le jeu d'avant, a l'identique.
-    positions_max: int = 3
+    # 3 -> 10 LE 2026-09-28 (run h1_03), demande du proprietaire : autant de
+    # positions simultanees que de jetons.
+    positions_max: int = 10
     # En ATR de la barre de decision. L'ATR M1 du BTC vaut ~7 bps, un
     # mouvement de 15 minutes ~2.5 ATR : les coups vont de la demi-heure a
     # quelques heures.
@@ -241,7 +243,11 @@ class JeuConfig:
     parties_par_epoch: int = 256
     # --- l'expert ---
     # EN H1, 6 coups enseignes par SEMAINE (4 par jour en M15).
-    expert_k: int = 6
+    # 6 -> 10 LE 2026-09-28 (run h1_03), demande du proprietaire : l'expert ne
+    # jouait qu'un coup a la fois. Il enseigne desormais jusqu'a 10 coups par
+    # semaine, autant que les jetons, et peut les faire se chevaucher jusqu'a
+    # `positions_max` (voir `coups_expert_predits`).
+    expert_k: int = 10
     expert_R_min: float = 1.0          # l'ancien expert, qui lisait l'avenir
     # EN M15, une bougie sur deux : il n'y en a que 96 par jour. EN H1, toutes.
     expert_pas_neg: int = 1
@@ -1108,9 +1114,11 @@ def _ref(cfg: JeuConfig):
 def coups_expert_predits(jours, pred, D, fin_valide: int, cfg: JeuConfig):
     """Chaque jour, les minutes que l'expert PREDIT les meilleures.
 
-    Au plus `expert_k`, sans chevauchement, et seulement si le R net
-    predit est positif. Meme format que `coups_expert`.
+    Au plus `expert_k`, seulement si le R net predit est positif, un seul
+    par bougie, et jamais plus de `positions_max` ouverts a la fois (1 : sans
+    chevauchement, comme avant). Meme format que `coups_expert`.
     """
+    P = max(int(getattr(cfg, "positions_max", 1)), 1)
     H, L = int(cfg.horizon_max), int(cfg.lookback)
     ri, rj = _ref(cfg)
     out = []
@@ -1126,16 +1134,16 @@ def coups_expert_predits(jours, pred, D, fin_valide: int, cfg: JeuConfig):
             continue
         sens = p_.argmax(1)
         v = p_.max(1)
-        occupe = np.zeros(b0 - a0 + H + 2, bool)
+        occupe = np.zeros(b0 - a0 + H + 2, np.int64)
         pris = 0
         for q in np.argsort(-v, kind="stable"):
             if v[q] <= 0.0 or pris >= cfg.expert_k:
                 break
             t0 = int(ts[q])
             d0 = int(D[t0, sens[q], ri, rj])
-            if occupe[t0 - a0: t0 - a0 + d0 + 1].any():
+            if occupe[t0 - a0: t0 - a0 + d0 + 1].max() >= P:
                 continue
-            occupe[t0 - a0: t0 - a0 + d0 + 1] = True
+            occupe[t0 - a0: t0 - a0 + d0 + 1] += 1
             out.append((t0, int(sens[q]), ri, rj, float(v[q]), int(b0)))
             pris += 1
     return out

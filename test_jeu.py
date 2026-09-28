@@ -185,6 +185,18 @@ bm = J.bilan(np.array([0.0]), [(0, 0, 0, 0, 0, -1.0, 50, 1), (0, 10, 0, 0, 0, -1
 verifie("positions multiples : le drawdown suit l'ordre des resolutions",
         abs(bm["dd_dollars"] + 10.0) < 1e-9, "%.2f" % bm["dd_dollars"])
 
+# L'expert enseigne des coups qui se chevauchent quand le jeu le permet.
+_pred = np.full((M, 2), -1.0)
+_pred[500:520, 0] = np.linspace(2.0, 1.0, 20)        # vingt bougies d'achat de suite
+_j1 = np.array([[400, 900]])
+_e1 = J.coups_expert_predits(_j1, _pred, D, 2800, replace(cfgj, expert_k=10, positions_max=1))
+_e10 = J.coups_expert_predits(_j1, _pred, D, 2800, replace(cfgj, expert_k=10, positions_max=10))
+_ouv = lambda e: max(sum(1 for (a, *_r) in e if a <= t_ < a + int(D[a, 0, J._ref(cfgj)[0], J._ref(cfgj)[1]]) + 1)
+                     for t_ in range(400, 900))
+verifie("l'expert a une position : jamais deux coups ouverts ensemble", _ouv(_e1) == 1, str(len(_e1)))
+verifie("l'expert a dix positions : il enseigne ses dix coups, qui se chevauchent",
+        len(_e10) == 10 and _ouv(_e10) > 1 and _ouv(_e10) <= 10, f"{len(_e10)} coups, {_ouv(_e10)} ouverts")
+
 cfgp = replace(cfgj, porte_rang_expert=0.9)
 rg = np.zeros((M, 2), np.float32)
 rg[[150, 400, 1100], 0] = 0.95          # trois minutes ou l'achat est permis
