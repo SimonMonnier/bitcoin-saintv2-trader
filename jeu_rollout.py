@@ -12,7 +12,12 @@ import torch
 
 
 def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
-         gen=None, collecte=False, rangs=None, marge=None, prix=None, atr=None):
+         gen=None, collecte=False, rangs=None, marge=None, prix=None, atr=None,
+         chainer=False, groupes=None, suivi=None):
+    """`chainer` : en collecte, les journees d'un meme groupe (`groupes`, un
+    identifiant par partie) se suivent sur UN compte, comme en evaluation :
+    c'est la collecte des MOIS (voir `note_mise_mois`). `suivi` (dict) recoit
+    alors chaque decision de mise et le solde de fin de chaque chaine."""
     import jeu_kairos as J
     from jeu_compte import taille_position
 
@@ -33,8 +38,10 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
     # Une chaine par segment en evaluation. Le train tire des episodes
     # independants, sans pretendre les rejouer sur un compte commun.
     chaines = []
+    separe = collecte and not chainer
     for g in np.argsort(jours[:, 0], kind="stable"):
-        if (collecte or not chaines
+        if (separe or not chaines
+                or (groupes is not None and groupes[g] != groupes[chaines[-1][-1]])
                 or int(J._lim(fin_valide, int(jours[g, 0]))) !=
                    int(J._lim(fin_valide, int(jours[chaines[-1][-1], 0])))):
             chaines.append([int(g)])
@@ -59,7 +66,9 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
     ouverts = [[] for _ in range(B)]  # (cloture, R, PnL$, marge$)
     coups = []
     dates_possibles = None
-    if not collecte and rangs is not None and cfg.porte_rang_expert > 0:
+    # En collecte chainee, seules les decisions de mise servent : les bougies
+    # hors de la porte de l'expert (ou aucun coup n'est permis) sont sautees.
+    if (not separe) and rangs is not None and cfg.porte_rang_expert > 0:
         dates_possibles = np.flatnonzero(np.any(rangs >= cfg.porte_rang_expert, axis=1))
 
     def realise(s, positions):
@@ -125,7 +134,7 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
             fin = int(jours[g, 1])
             if (jetons[s] <= 0 or vus[s] <= -cfg.vie_R or soldes[s] <= 0
                     or t[s] + 1 + H >= int(J._lim(fin_valide, int(t[s])))):
-                if collecte:
+                if separe:
                     termine(s)
                 else:
                     t[s] = fin
@@ -175,6 +184,9 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
             fractions = np.asarray(
                 getattr(cfg, "niveaux_risque_pct", (100.0,))
                 if getattr(cfg, "apprendre_risque", False) else (np.inf,), dtype=float) / 100.0
+            # LA SERIE NOIRE : jamais plus que ce que la pire serie de pertes
+            # du modele laisse survivre. Voir `plafond_serie_noire`.
+            fractions = np.minimum(fractions, J.plafond_serie_noire(cfg))
             plafonds = np.zeros((K, len(fractions)), dtype=float)
             for z, sl in enumerate(cfg.sl_atr):
                 distance = float(atr[t[s]]) * sl
@@ -309,6 +321,9 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
                 code += sum(int(ok) << (z + 2) for z, ok in enumerate(masques[q]))
                 code += sum(int(ok) << (z + 2 + len(cfg.sl_atr))
                             for z, ok in enumerate(masque_risque[q]))
+                if suivi is not None and a[q] != J.ATTENDRE:
+                    suivi.setdefault("decisions", []).append(
+                        (g, len(trans[g]), int(s), float(soldes[s])))
                 trans[g].append((tc, et[q], code, int(a[q]), int(i[q]), int(j[q]),
                                  float(lp[0][q]), float(lp[1][q]), float(lp[2][q]),
                                  float(v[q]), r_pondere if a[q] != J.ATTENDRE else 0.0, pas, False,
@@ -316,4 +331,10 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
                                  int(h[q]), float(lp[4][q]) if len(lp) >= 5 else 0.0,
                                  int(u[q]), float(lp[5][q]) if len(lp) >= 6 else 0.0,
                                  int(z[q]), float(lp[6][q]) if len(lp) >= 7 else 0.0))
+    if suivi is not None:
+        # LE SOLDE DE FIN DE CHAINE, positions encore ouvertes comprises :
+        # leur issue est deja ecrite dans la table des coups.
+        suivi["final"] = np.array([max(0.0, soldes[s] + sum(p[2] for p in ouverts[s]))
+                                   for s in range(B)])
+        suivi["chaines"] = [list(ch) for ch in chaines]
     return scores, coups, trans

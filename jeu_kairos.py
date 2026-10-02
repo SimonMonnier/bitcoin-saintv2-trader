@@ -179,7 +179,10 @@ class JeuConfig:
     # `note_mise_separee`, `mur_mise` et `dd_max_sauvegarde`. Le run m5_19
     # (une seule note pour les huit tetes) : prefixe
     # kairos_jeu_m5_19_thermostat_ppo_lotmin, les trois a False / 1.0.
-    prefixe: str = "kairos_jeu_m5_20_mise_separee"
+    # LA NOTE DU MOIS ET LA SERIE NOIRE (run m5_21) : voir `note_mise_mois`
+    # et `serie_noire`. Le run m5_20 : prefixe kairos_jeu_m5_20_mise_separee,
+    # les deux a False.
+    prefixe: str = "kairos_jeu_m5_21_mois_serie_noire"
     # Reproduction demandee du run M5_03, avant les corrections de deroulement
     # et de compte introduites dans la version 2.
     # La version 2 rejoue l'equite, la marge et les positions ouvertes : elle
@@ -423,6 +426,37 @@ class JeuConfig:
     # apprenant (gradient coupe). Sans lui, leur apprentissage remonterait
     # dans le tronc, donc dans le signal d'achat et de vente.
     mur_mise: bool = True
+    # LA NOTE DU MOIS — 2026-10-03 (run m5_21), demande du proprietaire. Au
+    # run m5_20, la note des tetes de mise etait donnee coup par coup, sur
+    # des journees qui repartaient toutes de 1 000 $ : une ruine pesait le
+    # poids d'un seul coup, noyee parmi des milliers de petits gains, et le
+    # compte de validation a fini vide dans 6 epochs sur 7 apres l'epoch 15.
+    #
+    # Avec True, chaque epoch joue en plus `mois_par_epoch` mois de
+    # `mois_jours` journees d'affilee, chacun sur UN compte (positions et
+    # solde gardes d'un jour a l'autre). Ces mois n'entrainent QUE les tetes
+    # de mise : chaque decision de mise y est notee sur la croissance du
+    # compte depuis cette decision jusqu'a la fin du mois (log du solde final
+    # sur le solde avant le coup). Une ruine note tres mal toutes les mises
+    # qui l'ont construite. Le signal (entree, objectif, stop, valeur)
+    # n'apprend que sur les journees, comme avant, et ne voit pas cette note.
+    note_mise_mois: bool = True
+    mois_jours: int = 30
+    mois_par_epoch: int = 12
+    # LA SERIE NOIRE — 2026-10-03 (run m5_21), demande du proprietaire.
+    # Avant chaque coup, la part du compte risquee ne depasse jamais ce que
+    # la pire serie de pertes du modele laisse survivre : si les
+    # `serie_noire_n` prochains coups perdaient tous, le compte ne perdrait
+    # pas plus de `serie_noire_perte_max`. Plafond = (1 - (1 - 0.5)^(1/N)) / k,
+    # ou k est la perte REELLE d'un coup perdant rapportee a la perte prevue
+    # au stop (gaps, spread, glissements), la plus forte observee. N et k sont
+    # remesures sur chaque validation (jamais sur le test) et suivent le
+    # modele jusqu'au live. La tete de risque garde le choix sous ce plafond.
+    serie_noire: bool = True
+    serie_noire_n: int = 10
+    serie_noire_n_min: int = 5
+    serie_noire_k: float = 1.0
+    serie_noire_perte_max: float = 0.50
     # En ATR de la barre de decision. L'ATR M1 du BTC vaut ~7 bps, un
     # mouvement de 15 minutes ~2.5 ATR : les coups vont de la demi-heure a
     # quelques heures.
@@ -1274,13 +1308,15 @@ def _joue_historique(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
 # PPO
 # ======================================================================
 def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
-         gen=None, collecte=False, rangs=None, marge=None, prix=None, atr=None):
+         gen=None, collecte=False, rangs=None, marge=None, prix=None, atr=None,
+         chainer=False, groupes=None, suivi=None):
     if int(getattr(cfg, "jeu_version", 1)) < 2:
         return _joue_historique(policy, jours, Xn, R, D, S, fin_valide, cfg,
                                device, explore, gen, collecte, rangs, marge)
     from jeu_rollout import joue as joue_continu
     return joue_continu(policy, jours, Xn, R, D, S, fin_valide, cfg, device,
-                        explore, gen, collecte, rangs, marge, prix, atr)
+                        explore, gen, collecte, rangs, marge, prix, atr,
+                        chainer=chainer, groupes=groupes, suivi=suivi)
 
 
 def avantages(trans, cfg: JeuConfig):
@@ -1329,8 +1365,93 @@ def avantage_mise(r_coups: np.ndarray, coup: np.ndarray, cfg) -> np.ndarray:
     return out
 
 
-def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng):
+def plafond_serie_noire(cfg) -> float:
+    """La part du compte qu'un coup peut risquer au plus. Voir `serie_noire`.
+    1.0 (aucune limite) si la regle est coupee."""
+    if not bool(getattr(cfg, "serie_noire", False)):
+        return 1.0
+    n = max(int(getattr(cfg, "serie_noire_n", 10)), 1)
+    k = max(float(getattr(cfg, "serie_noire_k", 1.0)), 1.0)
+    garde = 1.0 - float(getattr(cfg, "serie_noire_perte_max", 0.5))
+    return float((1.0 - garde ** (1.0 / n)) / k)
+
+
+def mesure_serie_noire(coups, cfg) -> Tuple[int, float]:
+    """(pire serie de coups perdants d'affilee, perte reelle / perte au stop
+    la plus forte) sur des coups du jeu version 2, dans l'ordre du temps."""
+    if not len(coups):
+        return 0, 1.0
+    c = np.asarray([q[:16] for q in coups], np.float64)
+    c = c[np.argsort(c[:, 1], kind="stable")]
+    pnl = c[:, 10]
+    serie = pire = 0
+    for x in pnl:
+        serie = serie + 1 if x < 0 else 0
+        pire = max(pire, serie)
+    prevue = c[:, 8] * float(cfg.contrat) * c[:, 15]
+    perd = (pnl < 0) & (prevue > 0)
+    k = float(np.max(-pnl[perd] / prevue[perd])) if perd.any() else 1.0
+    return int(pire), max(1.0, k)
+
+
+def tire_mois(jours: np.ndarray, cfg, rng) -> Tuple[np.ndarray, np.ndarray]:
+    """(journees, numero du mois) : `mois_par_epoch` mois de `mois_jours`
+    journees CONSECUTIVES, sans chevauchement, tires dans `jours` (les
+    journees d'entrainement). Voir `note_mise_mois`."""
+    n, L = len(jours), int(getattr(cfg, "mois_jours", 30))
+    if n < L:
+        return np.zeros((0, 2), np.int64), np.zeros(0, np.int64)
+    tol = max(int(cfg.barres_par_partie) // 2, 1)
+    trou = np.r_[False, (jours[1:, 0] - jours[:-1, 1]) > tol]
+    debuts = [i for i in range(n - L + 1) if not trou[i + 1:i + L].any()]
+    rng.shuffle(debuts)
+    pris, occupe = [], np.zeros(n, bool)
+    for i in debuts:
+        if not occupe[i:i + L].any():
+            occupe[i:i + L] = True
+            pris.append(i)
+        if len(pris) >= int(getattr(cfg, "mois_par_epoch", 12)):
+            break
+    if not pris:
+        return np.zeros((0, 2), np.int64), np.zeros(0, np.int64)
+    j = np.concatenate([jours[i:i + L] for i in pris])
+    g = np.repeat(np.arange(len(pris)), L)
+    return j, g
+
+
+def avantage_mois(trans, suivi, cfg) -> np.ndarray:
+    """La note du mois de chaque decision, alignee sur `avantages(trans)` :
+    log(solde de fin de mois / solde avant le coup), plancher a log(0.001)
+    pour la ruine, centree et reduite sur les decisions de mise ; 0 pour
+    les attentes. Voir `note_mise_mois`."""
+    finaux = suivi.get("final", np.zeros(0))
+    chaine_de = {}
+    for s_, ch in enumerate(suivi.get("chaines", [])):
+        for g in ch:
+            chaine_de[g] = s_
+    notes = {}
+    for g, k, s_, avant in suivi.get("decisions", []):
+        fin = float(finaux[chaine_de.get(g, s_)])
+        notes[(g, k)] = float(np.log(max(fin / max(avant, 1e-12), 1e-3)))
+    out = []
+    for g, tr in enumerate(trans or []):
+        for k in range(len(tr)):
+            out.append(notes.get((g, k), np.nan))
+    out = np.asarray(out, np.float64)
+    ok = np.isfinite(out)
+    res = np.zeros(len(out), np.float32)
+    if ok.sum() >= 2:
+        res[ok] = ((out[ok] - out[ok].mean()) / (out[ok].std() + 1e-8)).astype(np.float32)
+    return res
+
+
+def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng,
+            mode: str = "tout", adv_mise_externe=None):
     """Une mise a jour PPO, chaque groupe par son optimiseur.
+
+    `mode` : "tout" (toutes les tetes), "signal" (entree, objectif, stop,
+    valeur : les journees quand la mise apprend sur les mois) ou "mise" (les
+    seules tetes de mise, notees par `adv_mise_externe`, la note du mois).
 
     LES ATTENTES SONT SOUS-ECHANTILLONNEES, pas les coups. Une partie compte
     des centaines d'attentes pour six coups ; on garde tous les coups et un
@@ -1344,7 +1465,13 @@ def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng):
     poids = np.ones(n, np.float32)
     place = max(cfg.max_transitions - n_c, 1)
     n_att = n - n_c
-    if n_att > place:
+    if mode == "mise":
+        # Les attentes ne choisissent aucune mise.
+        if not coup.any():
+            return {"kl": float("nan"), "clip": float("nan"), "H": float("nan"),
+                    "Hb": float("nan"), "v": float("nan"), "n": 0, "n_coups": 0, "n_total": n}
+        garde = coup.copy()
+    elif n_att > place:
         f = place / n_att
         att = np.flatnonzero(~coup)
         jet = rng.random(len(att)) >= f
@@ -1386,7 +1513,9 @@ def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng):
     sd = float(np.sqrt(np.average((adv - mu) ** 2, weights=w))) + 1e-8
     advn = (adv - mu) / sd
     # LA NOTE DES TETES DE MISE, a part. Voir `note_mise_separee`.
-    if bool(getattr(cfg, "note_mise_separee", False)):
+    if adv_mise_externe is not None:
+        adv_mise = np.asarray(adv_mise_externe, np.float32)[sel]
+    elif bool(getattr(cfg, "note_mise_separee", False)):
         adv_mise = avantage_mise(np.array([lignes[k][10] for k in sel], np.float64),
                                  a_all[sel] != ATTENDRE, cfg)
     else:
@@ -1423,18 +1552,23 @@ def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng):
             lp = logp.gather(1, ab[:, None]).squeeze(1)
             ratio = torch.exp(lp - T(lpe[b]))
             pe = -torch.min(ratio * Ab, ratio.clamp(1 - cfg.clip, 1 + cfg.clip) * Ab)
-            perte = (pe * wb).sum() / wb.sum()
             ent = -(logp.exp() * logp).sum(-1)
-            perte = perte - cfg.entropie_entree * (ent * wb).sum() / wb.sum()
             pv = (v - T(ret[b])) ** 2
-            perte = perte + cfg.vf_coef * (pv * wb).sum() / wb.sum()
+            if mode == "mise":
+                perte = torch.zeros((), device=device)
+            else:
+                perte = (pe * wb).sum() / wb.sum()
+                perte = perte - cfg.entropie_entree * (ent * wb).sum() / wb.sum()
+                perte = perte + cfg.vf_coef * (pv * wb).sum() / wb.sum()
             cb = ab != ATTENDRE
             hb = torch.zeros((), device=device)
             if bool(cb.any()):
                 sidx = (ab[cb] == VENDRE).long()
                 ar = torch.arange(int(cb.sum()), device=device)
                 Am = T(adv_mise[b])[cb]
-                for lg, choisi, lp_vieux in ((ltp, i, lpi), (lsl, j, lpj)):
+                eb = torch.zeros((), device=device)
+                for lg, choisi, lp_vieux in (((ltp, i, lpi), (lsl, j, lpj))
+                                             if mode != "mise" else ()):
                     lgc = torch.log_softmax(lg[cb][ar, sidx], -1)
                     ch = T(choisi[b], torch.long)[cb]
                     lpn = lgc.gather(1, ch[:, None]).squeeze(1)
@@ -1443,6 +1577,8 @@ def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng):
                     pb = -torch.min(rb * Ac, rb.clamp(1 - cfg.clip, 1 + cfg.clip) * Ac)
                     eb = -(lgc.exp() * lgc).sum(-1)
                     perte = perte + pb.mean() - cfg.entropie_barrieres * eb.mean()
+                if mode == "signal":
+                    lal = lco = llo = lri = None
                 if lal is not None:
                     lgc = torch.log_softmax(lal[cb][ar, sidx], -1)
                     ch = T(kallocation[b], torch.long)[cb]
@@ -2627,6 +2763,26 @@ def entraine_deploiement_continu(cfg, d, X, y_ex, toutes, o, h, l, c, sp, atr,
     return path
 
 
+def config_serie_noire_folds(cfg, candidats):
+    """La serie noire du modele final : la plus prudente des dix modeles de
+    folds (la plus longue serie, la plus forte perte reelle)."""
+    if not bool(getattr(cfg, "serie_noire", False)):
+        return cfg
+    ns, ks = [], []
+    for x in candidats:
+        if os.path.isfile(x["path"]):
+            c = torch.load(x["path"], map_location="cpu", weights_only=False).get("config", {})
+            ns.append(int(c.get("serie_noire_n", cfg.serie_noire_n)))
+            ks.append(float(c.get("serie_noire_k", cfg.serie_noire_k)))
+    if not ns:
+        return cfg
+    cfg = replace(cfg, serie_noire_n=max(ns), serie_noire_k=max(ks))
+    print(f"  serie noire du modele final : {cfg.serie_noire_n} pertes d'affilee, "
+          f"perte reelle x{cfg.serie_noire_k:.2f} -> risque max {100 * plafond_serie_noire(cfg):.1f} %",
+          flush=True)
+    return cfg
+
+
 def reconstruit_deploy_ensemble(cfg: JeuConfig) -> int:
     """Relance seulement l'assemblage deploy apres un run de folds termine."""
     rng = np.random.default_rng(cfg.graine)
@@ -2654,6 +2810,7 @@ def reconstruit_deploy_ensemble(cfg: JeuConfig) -> int:
         candidats.append({"bloc": bloc, "epoch": int(ck.get("epoch", 0)), "path": path})
     print(f"[DEPLOY ENSEMBLE] reconstruction a partir de {len(candidats)} meilleurs folds, "
           "sans relancer les validations croisees.", flush=True)
+    cfg = config_serie_noire_folds(cfg, candidats)
     entraine_deploiement_continu(cfg, d, X, None, toutes, o, h, l, c, sp, atr,
                                  R0, D0, S0, R1, D1, S1, marge, candidats, [], device, rng)
     return 0
@@ -2710,6 +2867,7 @@ def main_blocs(cfg: JeuConfig) -> int:
     print(f"[CACHE] {N:,} bougies, {_fmt(0)} -> {_fmt(N - 1)} ; {len(toutes)} parties ; "
           f"zone tampon {purge} bougies autour du test et de la validation", flush=True)
     tests = []
+    cfg_depart = cfg
     candidats_deploiement = []
     transitions_oof = []
     for k in range(cfg.n_blocs):
@@ -2756,6 +2914,9 @@ def main_blocs(cfg: JeuConfig) -> int:
         print(f"  expert  LightGBM appris sur les autres blocs, {time.time() - t_ex:.0f} s ; "
               f"correlation sur le bloc de test : achat {ics[0]:+.3f}, vente {ics[1]:+.3f}",
               flush=True)
+        # LA SERIE NOIRE repart de sa valeur prudente a chaque bloc.
+        cfg = replace(cfg, serie_noire_n=cfg_depart.serie_noire_n,
+                      serie_noire_k=cfg_depart.serie_noire_k)
         policy = PolitiqueJeu(cfg).to(device)
         optims = optimiseurs(policy, cfg)
         pos = coups_expert_predits(j_tr, pred, D1, fin_tr, cfg)
@@ -2780,7 +2941,26 @@ def main_blocs(cfg: JeuConfig) -> int:
                 sc, cp, tr = joue(policy, departs_tires(j_tr[choix], rng, marge_d), Xk,
                                   Rf, Df, Sf, fin_tr, cfg, device, explore=True,
                                   collecte=True, rangs=rangs_ex, marge=marge)
-                st = maj_ppo(policy, optims, avantages(tr, cfg), Xk, cfg, device, rng)
+                mois_on = bool(getattr(cfg, "note_mise_mois", False))
+                st = maj_ppo(policy, optims, avantages(tr, cfg), Xk, cfg, device, rng,
+                             mode="signal" if mois_on else "tout")
+                if mois_on:
+                    # LES MOIS : seules les tetes de mise apprennent. Voir
+                    # `note_mise_mois`.
+                    jm, gm = tire_mois(j_tr, cfg, rng)
+                    if len(jm):
+                        suivi = {}
+                        _sm, cpm, trm = joue(policy, jm, Xk, Rf, Df, Sf, fin_tr, cfg, device,
+                                             explore=True, collecte=True, rangs=rangs_ex,
+                                             marge=marge, chainer=True, groupes=gm, suivi=suivi)
+                        am = avantage_mois(trm, suivi, cfg)
+                        maj_ppo(policy, optims, avantages(trm, cfg), Xk, cfg, device, rng,
+                                mode="mise", adv_mise_externe=am)
+                        fins = suivi.get("final", np.zeros(0))
+                        print(f"  mois  {len(fins)} mois de {cfg.mois_jours} jours, {len(cpm)} coups : "
+                              f"compte final median {np.median(fins):.0f} $, "
+                              f"{int((fins < 0.5 * cfg.capital).sum())} sous 500 $, "
+                              f"{int((fins <= 1e-6).sum())} vides", flush=True)
                 del Rf, Df, Sf
             gen = torch.Generator(device=device)
             gen.manual_seed(cfg.graine)
@@ -2796,6 +2976,16 @@ def main_blocs(cfg: JeuConfig) -> int:
             etat = {"modele": policy.state_dict(), "config": asdict(cfg), "epoch": epoch,
                     "bloc": k + 1, "pipeline": pipeline_ref}
             torch.save(etat, f"last_{cfg.prefixe}{suffixe}.pth")
+            if bool(getattr(cfg, "serie_noire", False)):
+                # LA SERIE NOIRE, remesuree sur cette validation pour la
+                # suite ; le checkpoint garde celle avec laquelle il a joue.
+                n_obs, k_obs = mesure_serie_noire(cv, cfg)
+                avant = plafond_serie_noire(cfg)
+                cfg = replace(cfg, serie_noire_n=max(int(cfg.serie_noire_n_min), n_obs),
+                              serie_noire_k=k_obs)
+                print(f"  serie noire  pire serie {n_obs} pertes d'affilee, perte reelle "
+                      f"jusqu'a {k_obs:.2f} fois le stop -> risque max par coup "
+                      f"{100 * avant:.1f} % -> {100 * plafond_serie_noire(cfg):.1f} %", flush=True)
             profit_jour = bv["total_dollars"] / max(bv["parties"], 1)
             assez = bv["coups"] >= cfg.min_coups_val
             # SANS RUINE : voir `dd_max_sauvegarde`.
@@ -2829,7 +3019,11 @@ def main_blocs(cfg: JeuConfig) -> int:
                 ecrit_echange(cfg, f"val_bloc{k + 1:02d}_ep{epoch:03d}", cv, t_ns, c, atr,
                               len(j_va), sauve, (va0, va1), d["time"])
         src = best_path if os.path.exists(best_path) else f"last_{cfg.prefixe}{suffixe}.pth"
-        policy.load_state_dict(torch.load(src, map_location=device, weights_only=False)["modele"])
+        etat_src = torch.load(src, map_location=device, weights_only=False)
+        policy.load_state_dict(etat_src["modele"])
+        # Le test joue avec la serie noire du modele garde (mesuree avant lui).
+        cfg = replace(cfg, serie_noire_n=int(etat_src["config"].get("serie_noire_n", cfg.serie_noire_n)),
+                      serie_noire_k=float(etat_src["config"].get("serie_noire_k", cfg.serie_noire_k)))
         gen = torch.Generator(device=device)
         gen.manual_seed(cfg.graine)
         s_t, c_t, tr_t = joue(policy, j_te, Xk, R1, D1, S1, te1, cfg, device,
@@ -2876,6 +3070,7 @@ def main_blocs(cfg: JeuConfig) -> int:
     print(f"  blocs gagnants : {positifs}/{cfg.n_blocs}  |  total {somme:+.2f} $  |  "
           f"{len(r)} trades  |  profit factor global {pf:.2f}", flush=True)
     if bool(getattr(cfg, "deploiement_continu", True)):
+        cfg = config_serie_noire_folds(cfg, candidats_deploiement)
         entraine_deploiement_continu(
             cfg, d, X, y_ex, toutes, o, h, l, c, sp, atr,
             R0, D0, S0, R1, D1, S1, marge, candidats_deploiement,

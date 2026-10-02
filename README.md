@@ -60,13 +60,25 @@ descend jamais sous zéro (`jeu_rollout.py`, `jeu_compte.py`).
 2. le modèle imite l'expert : 10 trades enseignés par jour, 3 passes ;
 3. 40 epochs de PPO, les frais montant de 0 à 100 % sur les 10 premières.
 
-**Deux notes séparées** (run m5_20) :
-- le signal (entrée, objectif, stop, valeur) est noté sur le gain du trade,
-  rapporté à 1 % du compte ;
-- les quatre têtes de mise sont notées sur la **croissance du compte en
-  pourcentage** (le logarithme du solde, la règle de Kelly). Miser gros paye
-  quand le signal est fort ; tout miser, jamais : la ruine est la pire note ;
+**Deux notes séparées** :
+- le signal (entrée, objectif, stop, valeur) apprend sur des journées isolées,
+  noté sur le gain de chaque trade rapporté à 1 % du compte ;
+- les quatre têtes de mise apprennent sur des **mois entiers** (12 mois de
+  30 journées d'affilée par epoch, sur un seul compte, positions et solde
+  gardés d'un jour à l'autre). Chaque décision de mise est notée sur la
+  **croissance du compte depuis cette décision jusqu'à la fin du mois**
+  (logarithme du solde, la règle de Kelly) : une ruine note très mal toutes
+  les mises qui l'ont construite (run m5_21) ;
 - un **mur** empêche les têtes de mise de modifier le tronc, donc le signal.
+
+**La série noire** — avant chaque trade, le risque ne dépasse jamais ce que
+la pire série de pertes du modèle laisse survivre : si les N prochains trades
+perdaient tous, le compte ne perdrait pas plus de 50 %. Risque maximal par
+trade = (1 − 0,5^(1/N)) / k, où N est la plus longue série de pertes
+d'affilée et k la perte réelle la plus forte rapportée à la perte prévue au
+stop (gaps, spread, glissements). N = 8 et k = 1 donnent 8,3 %. N et k sont
+remesurés à chaque validation, jamais sur le test, et la même règle s'applique
+en live.
 
 **Le modèle sauvegardé** — à chaque epoch, le modèle est rejoué sur la
 validation. On garde celui dont le compte grossit le plus, parmi les epochs
@@ -181,15 +193,17 @@ les têtes de mise en ont besoin. Les runs fournissent toujours les prix.
 | m5_09 | 1 % fixe | +2 775 $ sur 10 blocs, 7 positifs ; les 2 derniers (fin 2024 à 2026) perdent −537 $ et −889 $ |
 | m5_12 | risque libre, une seule note | +32 202 $ au total, mais 5 comptes sur 10 vidés, dont les 3 plus récents |
 | m5_19 | 8 têtes, une seule note | bloc 1 : +2 719 $, pire baisse −29 % ; en validation, compte vidé dans 19 des 20 dernières epochs |
-| m5_20 | deux notes séparées, sauvegarde sous −50 % | en cours |
+| m5_20 | deux notes séparées, sauvegarde sous −50 % | bloc 1 : sain jusqu'à l'epoch 11 (+1,41 $/jour, −31 %), puis comptes vidés après l'epoch 15 |
+| m5_21 | note du mois et série noire | en cours |
 
 Ce que les mesures ont établi :
 - le signal du BTC M5 vient du flux Binance, de l'écart Coinbase, du
   financement et de l'heure, pas de la forme des bougies ;
 - les autres cryptos de Vantage (sauf l'ETH et le ZEC) ont un spread plus
   grand que le mouvement moyen d'une bougie M5 ; l'ETH testé ne rapportait rien ;
-- une mise apprise avec la même note que le signal finit par vider le compte :
-  d'où les deux notes séparées.
+- une mise apprise avec la même note que le signal finit par vider le compte ;
+  notée trade par trade sur des journées isolées, aussi : d'où la note du mois
+  et la série noire.
 
 Les anciens moteurs (M1 et H1 sur le BTC et l'or, M15, multi-marchés, l'ancien
 live M1) et toutes les études sont dans l'historique git.

@@ -672,5 +672,36 @@ _xx = torch.randn(3, _cd.lookback, len(J.colonnes_jeu(_cd)) + _cd.n_expert + J.n
 verifie("le mur ne change aucune decision : memes sorties avec ou sans",
         all(torch.allclose(a_, b_) for a_, b_ in zip(_p1.jeu(_xx), _p0.jeu(_xx))))
 
+print("\n14. LA NOTE DU MOIS ET LA SERIE NOIRE")
+_c14 = J.JeuConfig()
+verifie("par defaut : note du mois (12 mois de 30 jours) et serie noire",
+        _c14.note_mise_mois and _c14.mois_jours == 30 and _c14.mois_par_epoch == 12
+        and _c14.serie_noire and _c14.serie_noire_perte_max == 0.50)
+_p8 = J.plafond_serie_noire(replace(_c14, serie_noire_n=8, serie_noire_k=1.0))
+_p8k = J.plafond_serie_noire(replace(_c14, serie_noire_n=8, serie_noire_k=1.5))
+verifie("8 pertes d'affilee, moitie du compte au plus : 8.3 % par coup",
+        abs(_p8 - 0.0830) < 1e-3 and (1 - _p8) ** 8 >= 0.5 - 1e-9, f"{_p8:.4f}")
+verifie("une perte reelle 1.5 fois le stop divise le plafond par 1.5",
+        abs(_p8k - _p8 / 1.5) < 1e-12 and J.plafond_serie_noire(replace(_c14, serie_noire=False)) == 1.0)
+# coups (g, t, sens, i, j, r, duree, sortie, lot, risque%, pnl, solde, ..., distance)
+_cs = [(0, t_, 0, 0, 1, 0.0, 1, 0, 0.1, 5.0, p_, 1000.0, 0, 0, 100.0, 10.0)
+       for t_, p_ in [(1, 5.0), (2, -1.0), (3, -1.2), (4, -1.0), (5, 3.0), (6, -0.5)]]
+_n, _k = J.mesure_serie_noire(_cs, _c14)
+verifie("la pire serie (3 pertes) et la pire perte reelle (1.2 fois le stop de 1 $)",
+        _n == 3 and abs(_k - 1.2) < 1e-9, f"{_n} {_k}")
+_jj = np.array([[i * 288, (i + 1) * 288] for i in range(100)], np.int64)
+_jj = np.delete(_jj, 50, axis=0)
+_mj, _mg = J.tire_mois(_jj, replace(_c14, mois_jours=10, mois_par_epoch=4), np.random.default_rng(0))
+_blocs = [_mj[_mg == g] for g in range(4)]
+verifie("des mois de jours consecutifs, sans trou ni chevauchement",
+        len(_blocs) == 4 and all(len(b) == 10 and (b[1:, 0] == b[:-1, 1]).all() for b in _blocs)
+        and len(np.unique(_mj[:, 0])) == 40, str(_mg[:12]))
+_tr = [[(0,) * 13, (0,) * 13], [], [(0,) * 13]]
+_sv = {"decisions": [(0, 1, 0, 1000.0), (2, 0, 1, 1000.0)], "final": np.array([2000.0, 0.0]),
+       "chaines": [[0, 1], [2]]}
+_am = J.avantage_mois(_tr, _sv, _c14)
+verifie("la note du mois : alignee sur les decisions, la ruine bien plus basse que le gain",
+        len(_am) == 3 and _am[0] == 0.0 and _am[1] > 0 > _am[2], str(_am))
+
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)

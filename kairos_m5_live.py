@@ -311,6 +311,9 @@ class MoteurKairosM5:
                           if signal.get("confiance_niveau") is not None else 1.0)
             plaf = min(plaf, float(ai.equity) * pct * allocation * confiance *
                        signal["gouverneur_echelle"] / perte_lot)
+        # LA SERIE NOIRE, la meme regle que le jeu (`plafond_serie_noire`),
+        # avec la serie et la perte reelle mesurees pour ce modele.
+        plaf = min(plaf, float(ai.equity) * J.plafond_serie_noire(self.cfg) / perte_lot)
         plaf = np.floor(plaf / info.volume_step + 1e-10) * info.volume_step
         if plaf + 1e-12 < info.volume_min:
             print("[KAIROS M5] lot minimum non financable par la marge ou le risque : ordre refuse")
