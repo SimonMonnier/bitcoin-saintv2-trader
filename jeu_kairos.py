@@ -627,28 +627,27 @@ class JeuConfig:
 
 
 def colonnes_jeu(cfg: "JeuConfig") -> list:
-    """Les features du cache que joue ce jeu : multi-marches, M15 ou M1."""
+    """Les features du cache que joue ce jeu : BTC M5 (la configuration
+    actuelle), BTC H1, multi-marches H1 / M5, ou M1 (les tests du moteur). Le
+    jeu M15 a ete retire du depot le 2026-10-02 ; il reste dans l'historique git."""
     if tuple(getattr(cfg, "marches", ())) and int(cfg.minutes_par_barre) == 60:
         from prepare_multi_h1 import FEATURE_COLS_MULTI_H1
         return list(FEATURE_COLS_MULTI_H1)
     if tuple(getattr(cfg, "marches", ())) and int(cfg.minutes_par_barre) == 5:
         from prepare_multi_m5 import FEATURE_COLS_MULTI_M5
         return list(FEATURE_COLS_MULTI_M5)
-    if tuple(getattr(cfg, "marches", ())):
-        from prepare_multi_m15 import FEATURE_COLS_MULTI
-        return list(FEATURE_COLS_MULTI)
-    if int(cfg.minutes_par_barre) == 60:
+    if int(cfg.minutes_par_barre) == 60 and not tuple(getattr(cfg, "marches", ())):
         from prepare_btc_h1_binance import FEATURE_COLS_H1
         return list(FEATURE_COLS_H1)
-    if int(cfg.minutes_par_barre) == 5:
+    if int(cfg.minutes_par_barre) == 5 and not tuple(getattr(cfg, "marches", ())):
         from prepare_btc_m5 import FEATURE_COLS_M5
         return list(FEATURE_COLS_M5)
-    if int(cfg.minutes_par_barre) == 15:
-        from prepare_btc_m15 import FEATURE_COLS_M15
-        return list(FEATURE_COLS_M15)
+    # Le jeu en bougies d'une minute sur les colonnes du SAINT : celui des
+    # tests du moteur (`test_jeu.py`).
     if int(cfg.minutes_par_barre) == 1:
         return list(FEATURE_COLS)
-    raise ValueError(f"pas de jeu de features pour {cfg.minutes_par_barre} min")
+    raise ValueError(f"pas de jeu de features pour {cfg.minutes_par_barre} min "
+                     f"({len(getattr(cfg, 'marches', ()))} marches)")
 
 
 # ======================================================================

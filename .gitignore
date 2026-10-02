@@ -1,93 +1,39 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
 .venv/
 venv/
 env/
-*.egg-info/
 
-# Model checkpoints (gros fichiers)
+# Donnees : reconstruites par les scripts telecharge_* et prepare_btc_m5.py
+# (plusieurs centaines de Mo, au-dela de la limite de GitHub)
+*.pkl
+.cache_binance/
+
+# Sorties des runs : modeles, pipelines, resultats, journaux
 *.pth
 *.pt
-*.ckpt
-
-# Logs / données
-*.csv
-*.log
 *.npz
+*.log
+*.csv
+run_*.json
+test_*.json
+pipeline_*.json
+deploy_*.json
+etat_*.json
+expert_*.txt
+journaux/
+echanges_*/
 
-# IDE / éditeurs
+# Etat local de l'interface live
+historique_kairos_m5/
+
+# Outils locaux
+.claude/
 .vscode/
 .idea/
 *.swp
-*.swo
 
-# OS
+# Systeme
 .DS_Store
 Thumbs.db
-
-# Journaux sauvegardés depuis la GUI
-kairos_log_*.txt
-loup_log_*.txt
-
-# Donnees lourdes — jamais versionnees
-# Le cache fusionne fait 657 Mo et les features Binance 106 Mo : au-dela de la
-# limite de 100 Mo de GitHub, et reconstructibles par prepare_btc.py et
-# build_binance_features.py.
-*.pkl
-*.bin
-*.err
-.cache_binance/
-
-# Archives de runs (2.5 Go) : checkpoints, caches et logs des configurations
-# precedentes, gardes en local pour comparaison.
-_archive_*/
-
-# Experiences locales isolees (poids, donnees, copies de sources, metriques).
-experiments/
-
-# Journaux d audit par run
-*.jsonl
-
-# Instantanes de configuration par run
-run_saintv2_*.json
-
-# Journaux et manifestes des runs precedents
-runs_archives/
-
-# Journaux et rapports generes
-analyse_epochs.md
-training_btc.err
-data_cache_BTCUSD_H1.pkl
-klines_h1_spot_BTCUSDT.pkl
-training_btc.err
-data_cache_BTCUSD_H1_complet.pkl
-lookback.log
-lookback.err
-groupes.log
-groupes.err
-meta.log
-meta.err
-conviction.log
-conviction.err
-
-# ---------------------------------------------------------------------------
-# Artefacts de run. Un run ecrit trois fichiers par checkpoint — .pth, _norm.npz
-# et _calib.json — et ils ne valent que pris ensemble : le .pth seul ne se
-# charge pas, le _calib.json seul ne decrit rien. Les .pth etant deja ignores,
-# suivre les deux autres accumulait des orphelins a chaque exec (quatorze au
-# 2026-09-16, pour des architectures qui n'existent plus).
-# ---------------------------------------------------------------------------
-*_norm.npz
-*_calib.json
-run_saintv2_*.json
-
-# Reglages locaux de la session Claude Code — propres a la machine.
-.claude/
-
-# Sauvegarde du cache faite avant sa reconstruction par prepare_or.py : 1.3 Go,
-# et `*.pkl` ne l'attrape pas a cause du suffixe.
-*.pkl.avant_reconstruction

@@ -1,9 +1,0 @@
-BTCUSD   2023-10-25 -> 2026-09-27  100000 bougies  spread med  1.99 bps (barres a zero 0 %)  amplitude M15 med  25.5 bps  (3 s)
-ETHUSD   2023-10-25 -> 2026-09-27  100000 bougies  spread med 10.15 bps (barres a zero 0 %)  amplitude M15 med  35.8 bps  (3 s)
-XAUUSD   2022-07-05 -> 2026-09-25  100000 bougies  spread med  0.64 bps (barres a zero 1 %)  amplitude M15 med  11.4 bps  (2 s)
-NAS100   2022-07-01 -> 2026-09-25  100000 bougies  spread med  0.36 bps (barres a zero 0 %)  amplitude M15 med  11.5 bps  (3 s)
-SP500    2022-07-01 -> 2026-09-25  100000 bougies  spread med  0.65 bps (barres a zero 0 %)  amplitude M15 med   8.3 bps  (3 s)
-DJ30     2022-07-01 -> 2026-09-25  100000 bougies  spread med  0.30 bps (barres a zero 0 %)  amplitude M15 med   7.6 bps  (3 s)
-GER40    2022-01-12 -> 2026-09-25  100000 bougies  spread med  0.62 bps (barres a zero 35 %)  amplitude M15 med  11.3 bps  (3 s)
-
-7 marches ecrits dans cache_m15_mt5.pkl

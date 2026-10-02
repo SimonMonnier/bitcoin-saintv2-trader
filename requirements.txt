@@ -1,14 +1,10 @@
-# Pour récupérer les wheels CUDA 12.4 de PyTorch
---extra-index-url https://download.pytorch.org/whl/cu124
-
-torch==2.5.1+cu124
+# PyTorch avec CUDA 12.1 (la version de l'environnement d'entrainement)
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.3.0+cu121
 numpy==1.26.4
 pandas==2.2.3
+lightgbm==4.7.0
+
+# Live : MetaTrader 5 (Windows uniquement) et interface graphique
 MetaTrader5==5.0.4687
-gymnasium==0.29.1
-
-# GUI live
-PySide6==6.8.0
-
-# Couleurs ANSI dans la console Windows
-colorama==0.4.6
+PySide6==6.10.1

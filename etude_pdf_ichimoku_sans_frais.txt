@@ -1,8 +1,0 @@
-SANS AUCUN FRAIS (spread, glissement et swap a zero) - BTC et or, toutes unites de temps
-  1 range bornes                    5150 trades   795 G / 4355 P  WR 15.4 %  L/S 2668/2482  PF 1.03  +0.023 R/trade (t +0.6)  total +1200.30 $  DD -2050.11 $  RENTABLE ? OUI
-  2 range + chandelier              3960 trades   634 G / 3326 P  WR 16.0 %  L/S 2048/1912  PF 0.98  -0.021 R/trade (t -0.5)  total  -827.61 $  DD -3000.60 $  RENTABLE ? NON
-  3 range + volume                  1695 trades   310 G / 1385 P  WR 18.3 %  L/S 953/742  PF 0.99  -0.008 R/trade (t -0.1)  total  -131.51 $  DD -1162.29 $  RENTABLE ? NON
-  4 repli plat Kijun                  49 trades    15 G /   34 P  WR 30.6 %  L/S 28/21  PF 1.18  +0.127 R/trade (t +0.5)  total   +62.04 $  DD   -69.63 $  RENTABLE ? OUI
-  5 repli Kijun, sortie cassure       51 trades    13 G /   38 P  WR 25.5 %  L/S 28/23  PF 1.20  +0.103 R/trade (t +0.4)  total   +52.34 $  DD  -100.01 $  RENTABLE ? OUI
-  6 cassure plus haut/bas            431 trades   151 G /  280 P  WR 35.0 %  L/S 249/182  PF 1.07  +0.048 R/trade (t +0.7)  total  +205.96 $  DD  -243.99 $  RENTABLE ? OUI
-  7 chandeliers sur S/R            16056 trades  3658 G / 12398 P  WR 22.8 %  L/S 7189/8867  PF 1.00  +0.002 R/trade (t +0.1)  total  +346.13 $  DD -3357.50 $  RENTABLE ? OUI

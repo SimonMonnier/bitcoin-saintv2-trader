@@ -1,5 +1,0 @@
-C:\Users\smonn\Desktop\ia\model saint V1\multi agent BTCUSD - filtré - avec interface graphique\saint_core.py:1672: UserWarning: 1Torch was not compiled with flash attention. (Triggered internally at ..\aten\src\ATen\native\transformers\cuda\sdp_utils.cpp:455.)
-  o = torch.nn.functional.scaled_dot_product_attention(
-kairos_jeu_m5_02 bloc 1 : test 2017-08-24 -> 2018-07-23 (332 parties), modele best_kairos_jeu_m5_02_bloc1.pth (epoch 3)
-TEST fold 1 (rejoue)  score +0.611 R/partie (+6.11$)  gagnees 49% perdues 49% sur 332  coups 2028 (6.1/partie, +0.100 R/coup)  net +4.83 bps  brut +7.95 (t +2.4)  cout 3.12  PF 1.17
-TEST fold 1 bilan  2028 trades : 815 gagnants, 1213 perdants (win rate 40.2 %)  |  1034 longs, 994 shorts  |  profit factor 1.17  |  drawdown max -378.74 $ (-31.0 %)  |  total +2027.77 $ sur 332 jours  |  COMME EN LIVE (1 % de l'equite, lots de 0.01, levier 1:500) : total +5189.89 $, pire baisse -32.0 %, risque reel moyen 0.97 % (max 1.0 %)

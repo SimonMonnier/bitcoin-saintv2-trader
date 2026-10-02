@@ -11,7 +11,7 @@ Set-Location -LiteralPath $PSScriptRoot
 
 # ON CIBLE PAR LIGNE DE COMMANDE, PAS PAR NOM. `python.exe` peut tourner
 # pour dix raisons sur cette machine — une mesure, un preparateur de cache,
-# un autre projet. Seul `training.py` dans la ligne de commande identifie
+# un autre projet. Seul `jeu_kairos.py` dans la ligne de commande identifie
 # l'entrainement.
 $procs = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
            Where-Object { $_.CommandLine -like '*training.py*' -or

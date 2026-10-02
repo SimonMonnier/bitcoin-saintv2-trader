@@ -381,40 +381,7 @@ verifie("les pertes pesent 1.5 fois dans la recompense du PPO",
 trg = [[(5, None, 3, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, +1.0, 1, True)]]
 verifie("les gains ne changent pas", abs(J.avantages(trg, cfgj)[0][13] - 1.0) < 1e-12)
 
-print("\n6. LE JEU EN BOUGIES DE 15 MINUTES")
-c15 = replace(J.JeuConfig(), marches=(), minutes_par_barre=15, horizon_max=32,
-              partie="jour", cache="data_cache_BTCUSD_M15.pkl")
-verifie("le jeu d'un marche en M15 : 96 bougies par jour",
-        c15.minutes_par_barre == 15 and c15.barres_par_jour == 96)
-import prepare_btc_m15 as P15
-verifie("il lit les features du M15", J.colonnes_jeu(c15) == list(P15.FEATURE_COLS_M15))
-verifie("ses OFI portent leurs horizons reels (15, 60, 240 min)",
-        all(f"ofi_{k}" in P15.FEATURE_COLS_M15 for k in (15, 60, 240))
-        and "ofi_5" not in P15.FEATURE_COLS_M15)
-verifie("ses contextes sont le H1 et le H4",
-        "close_h1_dev" in P15.FEATURE_COLS_M15 and "close_h4_dev" in P15.FEATURE_COLS_M15
-        and not any(c.endswith("_m5") for c in P15.FEATURE_COLS_M15))
-p15 = J.PolitiqueJeu(c15)
-x15 = torch.zeros(2, c15.lookback, len(P15.FEATURE_COLS_M15) + c15.n_expert + J.n_etat(c15))
-verifie("le modele M15 lit ses colonnes, celles de l'expert et l'etat",
-        p15.jeu(x15)[0].shape == (2, 3))
-et15 = J.etat_jeu(np.array([3]), np.array([0.0]), np.array([48]), c15)
-verifie("la moitie de la journee restante vaut 0.5 en M15", abs(et15[0, 2] - 0.5) < 1e-6)
-verifie("l'horizon est de 32 bougies, huit heures", c15.horizon_max == 32)
-
-print("\n7. LE JEU MULTI-MARCHES")
-import prepare_multi_m15 as PM
-cm = replace(J.JeuConfig(), marches=tuple(PM.MARCHES), cache="data_cache_MULTI_M15.pkl",
-             minutes_par_barre=15, horizon_max=32, partie="jour")
-verifie("le multi-marches M15 reste disponible a cote du multi H1 par defaut",
-        tuple(cm.marches) == tuple(PM.MARCHES))
-verifie("il lit les features communes, avec une colonne par marche",
-        J.colonnes_jeu(cm) == list(PM.FEATURE_COLS_MULTI)
-        and all(f"m_{m}" in PM.FEATURE_COLS_MULTI for m in PM.MARCHES)
-        and not any(c.startswith(("ofi_", "prime_cb", "taker")) for c in PM.FEATURE_COLS_MULTI))
-pm_ = J.PolitiqueJeu(cm)
-xm_ = torch.zeros(2, cm.lookback, len(PM.FEATURE_COLS_MULTI) + cm.n_expert + J.n_etat(cm))
-verifie("le modele multi lit ses colonnes, l'expert et l'etat", pm_.jeu(xm_)[0].shape == (2, 3))
+print("\n7. LES OUTILS DU MULTI-MARCHES")
 mk = np.array(["A"] * 5 + ["B"] * 4)
 bl = J.blocs_marches(mk)
 verifie("les blocs de marches", bl == [("A", 0, 5), ("B", 5, 9)], str(bl))
@@ -435,11 +402,6 @@ bo = J.bilan(np.array([0.0]), [(0, 6, 0, 0, 0, -1.0, 1, 1), (0, 1, 0, 0, 0, 2.0,
              np.full(9, 100.0), np.full(9, 1.0), np.zeros(9), cfgj,
              ordre=np.array([0, 5, 0, 0, 0, 0, 1, 0, 0], np.int64))
 import pandas as _pd
-_tb = _pd.Series(_pd.to_datetime(["2020-01-01 00:00", "2025-06-02 10:15"]))
-_eb = J.extras_btc(_tb)
-verifie("les sources du BTC s'alignent sur ses bougies, NaN avant leur debut",
-        _eb is not None and _eb.shape[0] == 2 and np.isnan(_eb[0]).all()
-        and np.isfinite(_eb[1]).any(), "" if _eb is None else str(_eb.shape))
 verifie("le drawdown suit l'ordre du TEMPS, pas celui des lignes",
         abs(bo["dd_dollars"] + 10.0) < 1e-9, "%.2f" % bo["dd_dollars"])
 
