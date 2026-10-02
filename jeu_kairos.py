@@ -185,7 +185,11 @@ class JeuConfig:
     # LA SORTIE EN DEUX TEMPS ET LE LOT MINIMUM A 0.02 (run m5_22) : voir
     # `sortie_deux_temps`. Le run m5_21 : prefixe
     # kairos_jeu_m5_21_mois_serie_noire, sortie_deux_temps False, lot_min 0.01.
-    prefixe: str = "kairos_jeu_m5_22_deux_temps"
+    # LA PORTE A 0.90 ET L'OBJECTIF PROCHE CHOISI PAR LE MODELE (run m5_23) :
+    # voir `porte_rang_expert` et `tp1_par_objectif`. Le run m5_22 : prefixe
+    # kairos_jeu_m5_22_deux_temps, porte 0.85, tp_atr (1, 2, 4, 8),
+    # tp1_par_objectif ().
+    prefixe: str = "kairos_jeu_m5_23_porte90_tp1"
     # Reproduction demandee du run M5_03, avant les corrections de deroulement
     # et de compte introduites dans la version 2.
     # La version 2 rejoue l'equite, la marge et les positions ouvertes : elle
@@ -472,7 +476,10 @@ class JeuConfig:
     # EN M15 LE MENU EST EN ATR M15, quatre fois plus grand : 1 a 8 ATR,
     # soit ~26 a ~210 bps en mediane — le meme ordre de grandeur que 4 a 32
     # ATR M1.
-    tp_atr: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
+    # LE MENU DES OBJECTIFS DEPUIS LE RUN m5_23 : chaque choix est une paire
+    # (objectif proche, objectif final), voir `tp1_par_objectif`. `tp_atr`
+    # porte l'objectif final de chaque choix.
+    tp_atr: Tuple[float, ...] = (1.0, 2.0, 2.0, 2.0, 4.0, 4.0, 4.0, 8.0, 8.0)
     sl_atr: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
     # LE PLANCHER DE VOLATILITE DES BARRIERES — 2026-09-26, run
     # kairos_jeu_btc01. L'ATR M1 du BTC tombe a 2 bps dans les 10 % de
@@ -506,6 +513,16 @@ class JeuConfig:
     sortie_deux_temps: bool = True
     tp1_atr: float = 1.0
     be_marge_bps: float = 1.0
+    # L'OBJECTIF PROCHE CHOISI PAR LE MODELE — 2026-10-03 (run m5_23),
+    # demande du proprietaire. Au run m5_22, l'objectif proche etait fixe a
+    # 1 ATR : 40 % des coups le touchaient puis ressortaient a l'entree pour
+    # +0.13 R seulement. Un objectif proche par choix du menu (`tp_atr`) :
+    # 0 = coup en une fois. Le modele choisit ainsi en un seul geste son
+    # objectif proche et son objectif final :
+    #   1 en une fois, 2 en une fois, 0.5 puis 2, 1 puis 2, 0.5 puis 4,
+    #   1 puis 4, 1.5 puis 4, 1 puis 8, 1.5 puis 8 (en ATR).
+    # Vide = `tp1_atr` pour tous les objectifs plus lointains (run m5_22).
+    tp1_par_objectif: Tuple[float, ...] = (0.0, 0.0, 0.5, 1.0, 0.5, 1.0, 1.5, 1.0, 1.5)
     # EN BOUGIES : 32 bougies M15, huit heures. EN H1 : 72 bougies, trois jours.
     # EN M5 : 96 bougies, huit heures (comme le M15).
     horizon_max: int = 96
@@ -596,7 +613,13 @@ class JeuConfig:
     #
     # La tranche 0.85 - 0.90 est a l'equilibre : le PPO peut y choisir. Sous
     # 0.85, elle perd a chaque mesure. La porte s'arrete donc a 0.85.
-    porte_rang_expert: float = 0.85
+    # 0.85 -> 0.90 LE 2026-10-03 (run m5_23), demande du proprietaire : moins
+    # de coups, mais plus forts. Mesure du 2026-09-28 (`mesure_porte_m5.py`) :
+    # la tranche 0.85 - 0.90 perdait en entrainement (-0.008 / -0.005 R) et en
+    # validation (-0.003 / -0.016 R) ; celles au-dessus de 0.90 gagnaient en
+    # entrainement. La mise suivant l'avantage (note du mois), des coups plus
+    # forts appellent des mises plus grosses.
+    porte_rang_expert: float = 0.90
     # --- PPO ---
     lr: float = 5e-4
     gamma: float = 0.9995          # par minute
@@ -924,6 +947,16 @@ def atr_effectif(atr, prix, cfg: JeuConfig) -> np.ndarray:
                       float(cfg.atr_min_bps) * 1e-4 * np.asarray(prix, np.float64))
 
 
+def tp1_objectif(cfg, i: int) -> float:
+    """L'objectif proche (en ATR) du choix `i` du menu des objectifs ; 0 si
+    le coup sort en une fois. Voir `sortie_deux_temps` et `tp1_par_objectif`."""
+    if not bool(getattr(cfg, "sortie_deux_temps", False)):
+        return 0.0
+    par = tuple(getattr(cfg, "tp1_par_objectif", ()) or ())
+    k1 = float(par[i]) if par else float(getattr(cfg, "tp1_atr", 0.0))
+    return k1 if 0.0 < k1 < float(cfg.tp_atr[i]) - 1e-9 else 0.0
+
+
 def table_coups(o, h, l, sp, atr, cfg: JeuConfig, frac: float):
     """Le resultat de CHAQUE coup possible a CHAQUE minute.
 
@@ -989,26 +1022,24 @@ def table_coups(o, h, l, sp, atr, cfg: JeuConfig, frac: float):
             t_sl[m_sl] = k
         # LA SORTIE EN DEUX TEMPS. Voir `sortie_deux_temps`.
         deux = bool(getattr(cfg, "sortie_deux_temps", False))
+        proches = {}
         if deux:
-            k1 = float(cfg.tp1_atr)
             mbe = float(getattr(cfg, "be_marge_bps", 0.0)) / 1e4
-            if sens > 0:
-                tp1 = p0 + k1 * a
-                # sortir au bid a ce niveau, glissement compris, rend au
-                # moins le prix paye (l'ask d'entree) : le spread est couvert
-                be = p0 / (1 - sx) * (1 + mbe)
-            else:
-                tp1 = p0 - k1 * a
-                be = p0 / (1 + sx) * (1 - mbe)
-            t1 = np.full(len(t), H, np.int16)
-            for k in range(H):
-                m = (t1 == H) & ((hi[e + k] >= tp1) if sens > 0 else (lo[e + k] <= tp1))
-                t1[m] = k
-            # le stop a l'entree ne vaut qu'APRES la bougie de l'objectif proche
-            t_be = np.full(len(t), H, np.int16)
-            for k in range(1, H):
-                m = (t_be == H) & (t1 < k) & ((lo[e + k] <= be) if sens > 0 else (hi[e + k] >= be))
-                t_be[m] = k
+            # sortir au bid a ce niveau, glissement compris, rend au moins le
+            # prix paye (l'ask d'entree) : le spread est couvert
+            be = p0 / (1 - sx) * (1 + mbe) if sens > 0 else p0 / (1 + sx) * (1 - mbe)
+            for k1 in sorted({tp1_objectif(cfg, i) for i in range(len(ktp))} - {0.0}):
+                tp1 = p0 + k1 * a if sens > 0 else p0 - k1 * a
+                t1 = np.full(len(t), H, np.int16)
+                for k in range(H):
+                    m = (t1 == H) & ((hi[e + k] >= tp1) if sens > 0 else (lo[e + k] <= tp1))
+                    t1[m] = k
+                # le stop a l'entree ne vaut qu'APRES la bougie de l'objectif proche
+                t_be = np.full(len(t), H, np.int16)
+                for k in range(1, H):
+                    m = (t_be == H) & (t1 < k) & ((lo[e + k] <= be) if sens > 0 else (hi[e + k] >= be))
+                    t_be[m] = k
+                proches[k1] = (tp1, t1, t_be)
         for i in range(len(ktp)):
             for j in range(len(ksl)):
                 a_tp, a_sl = t_tp[:, i], t_sl[:, j]
@@ -1032,7 +1063,9 @@ def table_coups(o, h, l, sp, atr, cfg: JeuConfig, frac: float):
                 r_ = (sens * (x - p0) - swap) / (ksl[j] * a)
                 d_ = duree
                 s_ = np.where(obj, 0, np.where(stop, 1, 2))
-                if deux and ktp[i] > k1 + 1e-9:
+                k1 = tp1_objectif(cfg, i)
+                if deux and k1 > 0.0:
+                    tp1, t1, t_be = proches[k1]
                     # l'objectif proche AVANT le stop (meme bougie : le stop)
                     tp1_ok = (t1 < a_sl) & (t1 < H)
                     d1 = t1 + 1
@@ -2244,6 +2277,8 @@ def ecrit_trades_csv(path: str, coups, temps, cfg: JeuConfig, *, epoch: int, pha
         "sortie_index": sortie, "sortie_time": dates.iloc[sortie].astype(str).to_numpy(),
         "sens": np.where(c[:, 2].astype(np.int64) == 0, "BUY", "SELL"),
         "tp_atr": np.asarray(cfg.tp_atr)[c[:, 3].astype(np.int64)],
+        "tp1_atr": np.asarray([tp1_objectif(cfg, i) for i in range(len(cfg.tp_atr))])[
+            c[:, 3].astype(np.int64)],
         "sl_atr": np.asarray(cfg.sl_atr)[c[:, 4].astype(np.int64)],
         "duree_bougies": c[:, 6].astype(np.int64), "sortie": libelle_sortie,
         "lot": c[:, 8], "risque_pct_equite": c[:, 9], "pnl_reel_usd": c[:, 10],

@@ -403,9 +403,8 @@ class MoteurKairosM5:
             # l'objectif choisi est plus loin que `tp1_atr`, la moitie sortira
             # a `tp1_atr` et le stop du reste remontera a l'entree, spread et
             # glissement de sortie compris, plus `be_marge_bps`.
-            k1 = float(getattr(self.cfg, "tp1_atr", 0.0))
-            if (bool(getattr(self.cfg, "sortie_deux_temps", False))
-                    and self.cfg.tp_atr[signal["tp"]] > k1 + 1e-9):
+            k1 = J.tp1_objectif(self.cfg, signal["tp"])
+            if k1 > 0.0:
                 p0 = float(ours[-1].price_open)
                 sx = float(self.cfg.glissement_sortie_bps) / 1e4
                 mbe = float(getattr(self.cfg, "be_marge_bps", 0.0)) / 1e4

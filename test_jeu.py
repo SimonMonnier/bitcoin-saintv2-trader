@@ -110,7 +110,7 @@ cfgj = replace(J.JeuConfig(), horizon_max=10, jetons=3, lookback=4, n_expert=0,
                apprendre_lot=False, apprendre_risque=False, apprendre_allocation=False,
                apprendre_confiance=False, observe_compte=False, observe_calibration=False,
                note_mise_separee=False, mur_mise=False, sortie_deux_temps=False,
-               lot_min=0.01)
+               lot_min=0.01, tp_atr=(1.0, 2.0, 4.0, 8.0), tp1_par_objectif=())
 pol = J.PolitiqueJeu(cfgj)
 g = pol.groupes_jeu()
 verifie("six groupes, dont les quatre tetes", sorted(g) ==
@@ -450,13 +450,14 @@ cmh = replace(J.JeuConfig(), marches=tuple(PMH.MARCHES), cache=PMH.SORTIE,
               # le multi H1 historique : sans les tetes de mise ni l'etat du compte
               apprendre_lot=False, apprendre_risque=False, apprendre_allocation=False,
               apprendre_confiance=False, observe_compte=False, observe_calibration=False,
-              sortie_deux_temps=False, lot_min=0.01)
+              sortie_deux_temps=False, lot_min=0.01, tp_atr=(1.0, 2.0, 4.0, 8.0),
+              tp1_par_objectif=())
 import prepare_btc_m5 as P5
 _dft = replace(J.JeuConfig(), marches=(), cache=P5.SORTIE)
 verifie("le BTC seul en M5 (run m5_02) : une journee par partie, 10 jetons, une position",
         _dft.positions_max == 1
         and _dft.jetons == 10 and _dft.expert_k == 10 and _dft.partie == "jour"
-        and _dft.porte_rang_expert == 0.85
+        and _dft.porte_rang_expert == 0.90
         and _dft.minutes_par_barre == 5 and _dft.horizon_max == 96
         and _dft.barres_par_partie == 288)
 verifie("le M5 lit ses colonnes, dont l'ecart Coinbase / Binance",
@@ -539,7 +540,7 @@ verifie("par defaut : BTC et ETH en M5 (sans le ZEC), validation en blocs",
         and _mm.validation == "blocs" and _mm.tetes_par_marche)
 verifie("les memes regles que le BTC seul du run m5_02",
         _mm.jetons == 10 and _mm.positions_max == 1 and _mm.expert_k == 10
-        and _mm.porte_rang_expert == 0.85 and _mm.horizon_max == 96 and _mm.risque_pct == 1.0)
+        and _mm.porte_rang_expert == 0.90 and _mm.horizon_max == 96 and _mm.risque_pct == 1.0)
 verifie("EXACTEMENT les colonnes du BTC, plus une colonne par marche",
         J.colonnes_jeu(_mm) == list(P5.FEATURE_COLS_M5) + ["m_BTCUSD", "m_ETHUSD", "m_ZECUSD"])
 _mm3 = replace(_mm, marches=("BTCUSD", "ETHUSD", "ZECUSD"))
@@ -588,7 +589,7 @@ verifie("un modele, un bloc : config_marche(m, 3) ne joue que le bloc 3",
 verifie("le modele du ZEC : le jeu du BTC seul, ses colonnes, son nom, son dossier d'echange",
         _cz.marches == () and _cz.marche_seul == "ZECUSD" and not _cz.modeles_par_marche
         and _cz.prefixe == _mm.prefixe + "_ZECUSD" and _cz.echanges == f"echanges_{_mm.prefixe}"
-        and J.colonnes_jeu(_cz) == list(P5.FEATURE_COLS_M5) and _cz.porte_rang_expert == 0.85)
+        and J.colonnes_jeu(_cz) == list(P5.FEATURE_COLS_M5) and _cz.porte_rang_expert == 0.90)
 import os as _os
 if _os.path.exists(J.MT5_CRYPTO):
     verifie("le ZEC garde son contrat Vantage (100), le BTC le sien (1)",
@@ -706,9 +707,11 @@ verifie("la note du mois : alignee sur les decisions, la ruine bien plus basse q
         len(_am) == 3 and _am[0] == 0.0 and _am[1] > 0 > _am[2], str(_am))
 
 print("\n15. LA SORTIE EN DEUX TEMPS")
-_c15 = replace(J.JeuConfig(), horizon_max=8, swap_achat_bps_jour=0.0, swap_vente_bps_jour=0.0)
-verifie("par defaut : sortie en deux temps a 1 ATR, lot minimum 0.02",
-        _c15.sortie_deux_temps and _c15.tp1_atr == 1.0 and _c15.lot_min == 0.02)
+_c15 = replace(J.JeuConfig(), horizon_max=8, swap_achat_bps_jour=0.0, swap_vente_bps_jour=0.0,
+               tp_atr=(1.0, 2.0, 4.0, 8.0), tp1_par_objectif=())
+verifie("la sortie en deux temps du run m5_22 : 1 ATR pour tous, lot minimum 0.02",
+        _c15.sortie_deux_temps and _c15.tp1_atr == 1.0 and _c15.lot_min == 0.02
+        and [J.tp1_objectif(_c15, i) for i in range(4)] == [0.0, 1.0, 1.0, 1.0])
 
 
 def _table(bougies, cfg, sp_bps=2.0):
@@ -742,6 +745,24 @@ verifie("un objectif a 1 ATR reste un coup en une fois, identique a l'ancienne s
         and np.array_equal(_Sa[:, :, 0], _S1[:, :, 0]))
 verifie("sans le stop remonte, le meme coup en une fois finit perdant",
         float(_R1[0, 0, 3, 1]) <= -1.0 and _r_be > 0, f"{float(_R1[0, 0, 3, 1]):+.3f}")
+
+print("\n16. LA PORTE A 0.90 ET L'OBJECTIF PROCHE CHOISI")
+_c16 = J.JeuConfig()
+verifie("par defaut : porte 0.90, neuf objectifs (proche, final)",
+        _c16.porte_rang_expert == 0.90 and len(_c16.tp_atr) == len(_c16.tp1_par_objectif) == 9
+        and [J.tp1_objectif(_c16, i) for i in range(9)] == [0, 0, 0.5, 1, 0.5, 1, 1.5, 1, 1.5])
+_c16s = replace(_c16, horizon_max=8, swap_achat_bps_jour=0.0, swap_vente_bps_jour=0.0)
+_p0b = 10000 * (1 + 2e-4 + _c16s.glissement_entree_bps / 1e4)
+# monte a +0.7 ATR puis retombe au stop de 2 ATR
+_R16, _D16, _S16 = _table([(10000, _p0b + 7, 9998), (10003, 10004, 9978)], _c16s)
+verifie("objectif proche a 0.5 ATR touche puis retour : gagnant ; a 1 ATR non touche : stop",
+        int(_S16[0, 0, 4, 1]) == 3 and float(_R16[0, 0, 4, 1]) > 0
+        and int(_S16[0, 0, 5, 1]) == 1 and float(_R16[0, 0, 5, 1]) < -1.0,
+        f"{float(_R16[0, 0, 4, 1]):+.3f} {float(_R16[0, 0, 5, 1]):+.3f}")
+verifie("les choix en une fois ne sont pas coupes",
+        int(_S16[0, 0, 1, 1]) in (1, 2) and int(_S16[0, 0, 0, 1]) in (0, 1, 2))
+_pol16 = J.PolitiqueJeu(_c16)
+verifie("la tete d'objectif a neuf choix", _pol16.tete_objectif.out_features == 9)
 
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)

@@ -29,7 +29,7 @@ et 1 bps à la sortie, swap de −20 %/an sur les achats.
   8 ATR (ATR jamais sous 20 bps), fermé au plus tard après 96 bougies (8 h) ;
 - la journée s'arrête si elle perd 3 R ;
 - un trade n'est permis que si l'expert LightGBM classe la bougie dans ses
-  15 % les plus prometteuses dans ce sens (`porte_rang_expert` = 0,85).
+  10 % les plus prometteuses dans ce sens (`porte_rang_expert` = 0,90).
 
 **La mise** — le modèle choisit aussi combien il risque, à chaque trade :
 - le **risque** : la part du compte perdue si le stop est touché, de 1 à 100 % ;
@@ -38,12 +38,14 @@ et 1 bps à la sortie, swap de −20 %/an sur les achats.
 - le **lot** : 20 tailles entre 0,01 et le maximum permis par le solde, la
   marge (levier 1:500) et le courtier.
 
-**La sortie en deux temps** — quand l'objectif choisi est plus loin que
-1 ATR, la moitié du trade sort à 1 ATR ; le stop de l'autre moitié remonte
+**La sortie en deux temps** — le menu des objectifs est fait de paires
+(objectif proche, objectif final) : 1 ou 2 ATR en une fois, ou 0,5 / 1 puis
+2 ATR, 0,5 / 1 / 1,5 puis 4 ATR, 1 / 1,5 puis 8 ATR. Le modèle choisit sa
+paire. La moitié du trade sort à l'objectif proche ; le stop de l'autre moitié remonte
 alors au prix d'entrée, **spread et glissement de sortie compris** (plus
 1 bps), et elle court vers l'objectif choisi. Un trade qui touche l'objectif
-proche ne peut plus finir perdant, sauf trou de cotation. Un objectif à 1 ATR
-reste un trade en une fois : le modèle choisit lui-même son mélange de styles.
+proche ne peut plus finir perdant, sauf trou de cotation. Le modèle choisit
+lui-même son mélange de styles.
 Le lot minimum est de 0,02, pour pouvoir couper un trade en deux.
 
 **Un vrai compte** — en validation et en test, les journées se suivent sur un
@@ -203,7 +205,8 @@ les têtes de mise en ont besoin. Les runs fournissent toujours les prix.
 | m5_19 | 8 têtes, une seule note | bloc 1 : +2 719 $, pire baisse −29 % ; en validation, compte vidé dans 19 des 20 dernières epochs |
 | m5_20 | deux notes séparées, sauvegarde sous −50 % | bloc 1 : sain jusqu'à l'epoch 11 (+1,41 $/jour, −31 %), puis comptes vidés après l'epoch 15 |
 | m5_21 | note du mois et série noire | win rate tombé à 20 % (objectif à 6-8 ATR, stop à 1 ATR), sans compte vidé |
-| m5_22 | sortie en deux temps, lot minimum 0,02 | en cours |
+| m5_22 | sortie en deux temps, lot minimum 0,02 | bloc 1, epochs 5-9 : win rate 64-68 %, profit factor 1,02-1,07, mise réelle 0,5 % du compte |
+| m5_23 | porte 0,90, objectif proche choisi par le modèle | en cours |
 
 Ce que les mesures ont établi :
 - le signal du BTC M5 vient du flux Binance, de l'écart Coinbase, du
