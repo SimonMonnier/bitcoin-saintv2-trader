@@ -94,6 +94,11 @@ class MoteurKairosM5:
         self.etat_path = f"etat_{self.prefixe}_deploy_ensemble_validation_ddsafe_demo.json"
         self.risques_positions, self.valeurs_positions, self.deals_comptes = {}, {}, set()
         self.memoire_r, self.surprise, self.serie_pertes = 0.0, 0.0, 0.0
+        # LA SERIE NOIRE DU LIVE, mesuree sur les vrais trades : la serie de
+        # pertes en cours, la plus longue, la pire perte reelle rapportee a
+        # la perte prevue au stop. Voir `serie_noire_live`.
+        self.pertes_prevues = {}
+        self.serie_live, self.serie_live_max, self.k_live = 0, 0, 1.0
         self._charge_etat()
         self._charge()
 
@@ -115,6 +120,10 @@ class MoteurKairosM5:
             self.surprise = float(e.get("surprise", self.surprise))
             self.serie_pertes = float(e.get("serie_pertes", self.serie_pertes))
             self.deals_comptes = {int(x) for x in e.get("deals_comptes", [])}
+            self.pertes_prevues = {str(k): float(v) for k, v in e.get("pertes_prevues", {}).items()}
+            self.serie_live = int(e.get("serie_live", 0))
+            self.serie_live_max = int(e.get("serie_live_max", 0))
+            self.k_live = float(e.get("k_live", 1.0))
         except (OSError, ValueError, TypeError, KeyError):
             pass
 
@@ -128,7 +137,10 @@ class MoteurKairosM5:
              "valeurs_positions": self.valeurs_positions,
              "memoire_r": self.memoire_r, "surprise": self.surprise,
              "serie_pertes": self.serie_pertes,
-             "deals_comptes": sorted(self.deals_comptes)[-200:]}
+             "deals_comptes": sorted(self.deals_comptes)[-200:],
+             "pertes_prevues": self.pertes_prevues,
+             "serie_live": self.serie_live, "serie_live_max": self.serie_live_max,
+             "k_live": self.k_live}
         with open(self.etat_path, "w", encoding="utf-8") as fh:
             json.dump(e, fh, indent=1)
 
@@ -145,6 +157,14 @@ class MoteurKairosM5:
             self.deals_comptes.add(ticket)
             reference_r = self.risques_positions.pop(str(int(d.position_id)), 0.0)
             valeur_prevue = self.valeurs_positions.pop(str(int(d.position_id)), 0.0)
+            prevue = self.pertes_prevues.pop(str(int(d.position_id)), 0.0)
+            if prevue > 0:
+                # LA SERIE NOIRE DU LIVE, sur le resultat reel du trade.
+                pnl_s = float(d.profit) + float(d.swap) + float(d.commission) + float(d.fee)
+                self.serie_live = self.serie_live + 1 if pnl_s < 0 else 0
+                self.serie_live_max = max(self.serie_live_max, self.serie_live)
+                if pnl_s < 0:
+                    self.k_live = max(self.k_live, -pnl_s / prevue)
             if reference_r > 0:
                 pnl = float(d.profit) + float(d.swap) + float(d.commission) + float(d.fee)
                 r_reel = pnl / reference_r
@@ -315,8 +335,9 @@ class MoteurKairosM5:
             plaf = min(plaf, float(ai.equity) * pct * allocation * confiance *
                        signal["gouverneur_echelle"] / perte_lot)
         # LA SERIE NOIRE, la meme regle que le jeu (`plafond_serie_noire`),
-        # avec la serie et la perte reelle mesurees pour ce modele.
-        plaf = min(plaf, float(ai.equity) * J.plafond_serie_noire(self.cfg) / perte_lot)
+        # avec la serie et la perte reelle les plus prudentes entre celles
+        # de l'entrainement et celles du live. Voir `serie_noire_live`.
+        plaf = min(plaf, float(ai.equity) * J.plafond_serie_noire(self.serie_noire_live()) / perte_lot)
         plaf = np.floor(plaf / info.volume_step + 1e-10) * info.volume_step
         if plaf + 1e-12 < info.volume_min:
             print("[KAIROS M5] lot minimum non financable par la marge ou le risque : ordre refuse")
@@ -337,6 +358,7 @@ class MoteurKairosM5:
             print(f"[KAIROS M5] ordre refuse: {None if r is None else r.retcode}")
             return
         self.jetons -= 1
+        perte_prevue = float(vol) * perte_lot
         # Le ticket de position est la cle stable qui relie une future sortie
         # MT5 a son risque initial. Le score est donc en R, comme dans le jeu.
         positions = mt5.positions_get(symbol=symbol) or ()
@@ -347,12 +369,22 @@ class MoteurKairosM5:
             self.risques_positions[str(int(ours[-1].ticket))] = (
                 float(ai.equity) * self.cfg.risque_pct / 100.0)
             self.valeurs_positions[str(int(ours[-1].ticket))] = float(signal.get("valeur", 0.0))
+            self.pertes_prevues[str(int(ours[-1].ticket))] = perte_prevue
         self._sauve_etat()
         print(f"[KAIROS M5] {'BUY' if buy else 'SELL'} {vol:g} BTCUSD, TP {tp_dist:.2f}, "
               f"SL {sl_dist:.2f}, budget "
               f"{(self.cfg.niveaux_allocation_pct[signal['allocation_niveau']] if signal['allocation_niveau'] is not None else 100):g} %, "
               f"thermostat {(self.cfg.niveaux_confiance_pct[signal['confiance_niveau']] if signal.get('confiance_niveau') is not None else 100):g} %, "
               f"jetons restants {self.jetons}")
+
+    def serie_noire_live(self):
+        """La configuration du jeu avec la serie noire la plus prudente entre
+        l'entrainement (N et k du modele) et le live (la plus longue serie de
+        pertes et la pire perte reelle des vrais trades). Elle ne peut que
+        se resserrer : le live n'assouplit jamais la regle apprise."""
+        n = max(int(self.cfg.serie_noire_n), int(self.serie_live_max))
+        k = max(float(self.cfg.serie_noire_k), float(self.k_live))
+        return J.replace(self.cfg, serie_noire_n=n, serie_noire_k=k)
 
     def ferme_si_expiree(self):
         """Reproduit la sortie au temps limite du jeu pour les positions KAIROS.
