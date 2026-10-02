@@ -196,15 +196,18 @@ class MoteurKairosM5:
         ouvertes = [p for p in positions if int(p.magic) == MAGIC]
         if len(ouvertes) >= int(self.cfg.positions_max):
             return None
-        # Une journee de jeu ne peut ouvrir un coup que s'il a le temps de se
-        # resoudre avant minuit UTC. Cela reproduit `t + 1 + horizon < fin`
-        # dans le rollout, plutot que de reporter une nouvelle entree au jour
-        # suivant.
-        barre_jour = horodatage.hour * (60 // self.cfg.minutes_par_barre) + \
-                      horodatage.minute // self.cfg.minutes_par_barre
-        reste_barres = self.cfg.barres_par_partie - barre_jour
-        if reste_barres <= self.cfg.horizon_max + 1:
-            return None
+        # LE JEU HISTORIQUE (version 1) fermait la journee : un coup devait se
+        # resoudre avant minuit UTC. LE JEU VERSION 2 garde les positions
+        # d'un jour a l'autre et permet d'entrer jusqu'a la derniere bougie
+        # du jour (`jeu_rollout.py`) : 25 % des coups de validation du run
+        # m5_20 entraient dans les 8 h avant minuit. Corrige le 2026-10-03 :
+        # le live les bloquait encore.
+        if int(getattr(self.cfg, "jeu_version", 1)) < 2:
+            barre_jour = horodatage.hour * (60 // self.cfg.minutes_par_barre) + \
+                          horodatage.minute // self.cfg.minutes_par_barre
+            reste_barres = self.cfg.barres_par_partie - barre_jour
+            if reste_barres <= self.cfg.horizon_max + 1:
+                return None
         st = self.pipe["normalisation_marche"]
         x = d[self.pipe["colonnes"]].to_numpy(np.float32)
         xn = np.clip((x - np.asarray(st["mean"], np.float32)) /
