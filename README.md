@@ -38,6 +38,14 @@ et 1 bps à la sortie, swap de −20 %/an sur les achats.
 - le **lot** : 20 tailles entre 0,01 et le maximum permis par le solde, la
   marge (levier 1:500) et le courtier.
 
+**La sortie en deux temps** — quand l'objectif choisi est plus loin que
+1 ATR, la moitié du trade sort à 1 ATR ; le stop de l'autre moitié remonte
+alors au prix d'entrée, **spread et glissement de sortie compris** (plus
+1 bps), et elle court vers l'objectif choisi. Un trade qui touche l'objectif
+proche ne peut plus finir perdant, sauf trou de cotation. Un objectif à 1 ATR
+reste un trade en une fois : le modèle choisit lui-même son mélange de styles.
+Le lot minimum est de 0,02, pour pouvoir couper un trade en deux.
+
 **Un vrai compte** — en validation et en test, les journées se suivent sur un
 seul solde de 1 000 $ qui grossit ou fond avec les gains et les pertes. Les
 trades restent ouverts après minuit, la marge est comptée, et le solde ne
@@ -194,7 +202,8 @@ les têtes de mise en ont besoin. Les runs fournissent toujours les prix.
 | m5_12 | risque libre, une seule note | +32 202 $ au total, mais 5 comptes sur 10 vidés, dont les 3 plus récents |
 | m5_19 | 8 têtes, une seule note | bloc 1 : +2 719 $, pire baisse −29 % ; en validation, compte vidé dans 19 des 20 dernières epochs |
 | m5_20 | deux notes séparées, sauvegarde sous −50 % | bloc 1 : sain jusqu'à l'epoch 11 (+1,41 $/jour, −31 %), puis comptes vidés après l'epoch 15 |
-| m5_21 | note du mois et série noire | en cours |
+| m5_21 | note du mois et série noire | win rate tombé à 20 % (objectif à 6-8 ATR, stop à 1 ATR), sans compte vidé |
+| m5_22 | sortie en deux temps, lot minimum 0,02 | en cours |
 
 Ce que les mesures ont établi :
 - le signal du BTC M5 vient du flux Binance, de l'écart Coinbase, du

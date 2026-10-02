@@ -65,6 +65,14 @@ def _cfg(brut):
                           for k, v in brut.items() if k in noms})
 
 
+class _Sortie:
+    """Le resultat total d'une position fermee, au format d'un deal MT5."""
+
+    def __init__(self, position_id, pnl):
+        self.position_id, self.profit = position_id, pnl
+        self.swap = self.commission = self.fee = 0.0
+
+
 class MoteurKairosM5:
     def __init__(self, live_cfg):
         self.live_cfg = live_cfg
@@ -99,6 +107,10 @@ class MoteurKairosM5:
         # la perte prevue au stop. Voir `serie_noire_live`.
         self.pertes_prevues = {}
         self.serie_live, self.serie_live_max, self.k_live = 0, 0, 1.0
+        # LA SORTIE EN DEUX TEMPS : par position, l'objectif proche, le stop
+        # a l'entree (spread compris) et si la moitie est deja sortie ; et le
+        # resultat cumule des sorties partielles d'une position encore ouverte.
+        self.deux_temps, self.pnl_positions = {}, {}
         self._charge_etat()
         self._charge()
 
@@ -124,6 +136,8 @@ class MoteurKairosM5:
             self.serie_live = int(e.get("serie_live", 0))
             self.serie_live_max = int(e.get("serie_live_max", 0))
             self.k_live = float(e.get("k_live", 1.0))
+            self.deux_temps = {str(k): dict(v) for k, v in e.get("deux_temps", {}).items()}
+            self.pnl_positions = {str(k): float(v) for k, v in e.get("pnl_positions", {}).items()}
         except (OSError, ValueError, TypeError, KeyError):
             pass
 
@@ -140,7 +154,8 @@ class MoteurKairosM5:
              "deals_comptes": sorted(self.deals_comptes)[-200:],
              "pertes_prevues": self.pertes_prevues,
              "serie_live": self.serie_live, "serie_live_max": self.serie_live_max,
-             "k_live": self.k_live}
+             "k_live": self.k_live,
+             "deux_temps": self.deux_temps, "pnl_positions": self.pnl_positions}
         with open(self.etat_path, "w", encoding="utf-8") as fh:
             json.dump(e, fh, indent=1)
 
@@ -155,6 +170,18 @@ class MoteurKairosM5:
                     or ticket in self.deals_comptes):
                 continue
             self.deals_comptes.add(ticket)
+            # UNE POSITION PEUT SORTIR EN DEUX FOIS (sortie en deux temps) :
+            # on cumule ses sorties, et on ne la compte qu'une fois fermee.
+            pid = str(int(d.position_id))
+            self.pnl_positions[pid] = (self.pnl_positions.get(pid, 0.0) + float(d.profit)
+                                       + float(d.swap) + float(d.commission) + float(d.fee))
+            change = True
+        encore = {str(int(q.ticket)) for q in (mt5.positions_get(symbol=self.live_cfg.symbol) or ())}
+        for pid in [x for x in self.pnl_positions if x not in encore]:
+            pnl_total = self.pnl_positions.pop(pid)
+            self.deux_temps.pop(pid, None)
+            d = _Sortie(int(pid), pnl_total)
+            change = True
             reference_r = self.risques_positions.pop(str(int(d.position_id)), 0.0)
             valeur_prevue = self.valeurs_positions.pop(str(int(d.position_id)), 0.0)
             prevue = self.pertes_prevues.pop(str(int(d.position_id)), 0.0)
@@ -174,7 +201,6 @@ class MoteurKairosM5:
                 self.serie_pertes = (min(1.0, 0.75 * self.serie_pertes + 0.25)
                                       if r_reel < 0.0 else 0.50 * self.serie_pertes)
                 print(f"[KAIROS M5] sortie MT5 {pnl:+.2f} $ = {r_reel:+.2f} R ; score jour {self.score:+.2f} R")
-            change = True
         if change:
             self._sauve_etat()
 
@@ -339,15 +365,18 @@ class MoteurKairosM5:
         # de l'entrainement et celles du live. Voir `serie_noire_live`.
         plaf = min(plaf, float(ai.equity) * J.plafond_serie_noire(self.serie_noire_live()) / perte_lot)
         plaf = np.floor(plaf / info.volume_step + 1e-10) * info.volume_step
-        if plaf + 1e-12 < info.volume_min:
+        # LE LOT MINIMUM DU JEU (0.02 : un coup doit pouvoir etre coupe en
+        # deux), jamais sous celui du courtier.
+        vmin = max(float(info.volume_min), float(getattr(self.cfg, "lot_min", info.volume_min)))
+        if plaf + 1e-12 < vmin:
             print("[KAIROS M5] lot minimum non financable par la marge ou le risque : ordre refuse")
             return
         # Meme grille geometrique que `jeu_rollout.py` ; sans tete de lot,
         # le comportement historique est le premier niveau, soit le minimum.
         niveaux = int(self.cfg.niveaux_lot)
-        grille = np.geomspace(float(info.volume_min), plaf, niveaux)
+        grille = np.geomspace(vmin, plaf, niveaux)
         grille = np.floor(grille / info.volume_step + 1e-10) * info.volume_step
-        grille[0], grille[-1] = float(info.volume_min), plaf
+        grille[0], grille[-1] = vmin, plaf
         vol = float(grille[min(signal["lot_niveau"], niveaux - 1)])
         req = {"action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": float(vol),
                "type": ordre_type, "price": price,
@@ -370,6 +399,21 @@ class MoteurKairosM5:
                 float(ai.equity) * self.cfg.risque_pct / 100.0)
             self.valeurs_positions[str(int(ours[-1].ticket))] = float(signal.get("valeur", 0.0))
             self.pertes_prevues[str(int(ours[-1].ticket))] = perte_prevue
+            # LA SORTIE EN DEUX TEMPS, comme le jeu (`sortie_deux_temps`) : si
+            # l'objectif choisi est plus loin que `tp1_atr`, la moitie sortira
+            # a `tp1_atr` et le stop du reste remontera a l'entree, spread et
+            # glissement de sortie compris, plus `be_marge_bps`.
+            k1 = float(getattr(self.cfg, "tp1_atr", 0.0))
+            if (bool(getattr(self.cfg, "sortie_deux_temps", False))
+                    and self.cfg.tp_atr[signal["tp"]] > k1 + 1e-9):
+                p0 = float(ours[-1].price_open)
+                sx = float(self.cfg.glissement_sortie_bps) / 1e4
+                mbe = float(getattr(self.cfg, "be_marge_bps", 0.0)) / 1e4
+                self.deux_temps[str(int(ours[-1].ticket))] = {
+                    "achat": bool(buy),
+                    "tp1": p0 + k1 * signal["atr"] if buy else p0 - k1 * signal["atr"],
+                    "be": p0 / (1 - sx) * (1 + mbe) if buy else p0 / (1 + sx) * (1 - mbe),
+                    "fait": False}
         self._sauve_etat()
         print(f"[KAIROS M5] {'BUY' if buy else 'SELL'} {vol:g} BTCUSD, TP {tp_dist:.2f}, "
               f"SL {sl_dist:.2f}, budget "
@@ -385,6 +429,47 @@ class MoteurKairosM5:
         n = max(int(self.cfg.serie_noire_n), int(self.serie_live_max))
         k = max(float(self.cfg.serie_noire_k), float(self.k_live))
         return J.replace(self.cfg, serie_noire_n=n, serie_noire_k=k)
+
+    def gere_deux_temps(self):
+        """Sort la moitie a l'objectif proche et remonte le stop du reste a
+        l'entree, spread compris. Voir `sortie_deux_temps`."""
+        if not any(not v.get("fait") for v in self.deux_temps.values()):
+            return
+        symbol = self.live_cfg.symbol
+        tick, info = mt5.symbol_info_tick(symbol), mt5.symbol_info(symbol)
+        if tick is None or info is None:
+            return
+        change = False
+        for p in mt5.positions_get(symbol=symbol) or ():
+            e = self.deux_temps.get(str(int(p.ticket)))
+            if int(p.magic) != MAGIC or not e or e.get("fait"):
+                continue
+            achat = p.type == mt5.POSITION_TYPE_BUY
+            prix = tick.bid if achat else tick.ask
+            if not (prix >= e["tp1"] if achat else prix <= e["tp1"]):
+                continue
+            moitie = np.floor(float(p.volume) / 2 / info.volume_step + 1e-9) * info.volume_step
+            if moitie + 1e-12 >= float(info.volume_min):
+                r = mt5.order_send({
+                    "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": float(moitie),
+                    "position": int(p.ticket),
+                    "type": mt5.ORDER_TYPE_SELL if achat else mt5.ORDER_TYPE_BUY,
+                    "price": prix, "deviation": 50, "magic": MAGIC,
+                    "comment": "KAIROS_M5_TP1", "type_filling": mt5.ORDER_FILLING_IOC})
+                if r is None or r.retcode != mt5.TRADE_RETCODE_DONE:
+                    print(f"[KAIROS M5] sortie de la moitie refusee : {None if r is None else r.retcode}")
+                    continue
+            be = round(float(e["be"]), int(info.digits))
+            r2 = mt5.order_send({"action": mt5.TRADE_ACTION_SLTP, "symbol": symbol,
+                                 "position": int(p.ticket), "sl": be, "tp": float(p.tp),
+                                 "magic": MAGIC})
+            ok = r2 is not None and r2.retcode == mt5.TRADE_RETCODE_DONE
+            e["fait"] = True
+            change = True
+            print(f"[KAIROS M5] objectif proche : moitie sortie ({moitie:g} lot), stop a l'entree "
+                  f"spread compris {be} : " + ("fait" if ok else f"REFUSE ({None if r2 is None else r2.retcode})"))
+        if change:
+            self._sauve_etat()
 
     def ferme_si_expiree(self):
         """Reproduit la sortie au temps limite du jeu pour les positions KAIROS.
@@ -418,6 +503,7 @@ def live_loop(cfg, doit_continuer):
         moteur = MoteurKairosM5(cfg)
         while doit_continuer():
             moteur.reconcilie()
+            moteur.gere_deux_temps()
             moteur.ferme_si_expiree()
             signal = moteur.decision()
             if signal is not None:

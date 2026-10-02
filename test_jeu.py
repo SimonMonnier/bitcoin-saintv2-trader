@@ -31,7 +31,7 @@ def verifie(nom, cond, detail=""):
 
 
 # Un marche plat a 100, ATR 1, sans cout : chaque coup se lit a la main.
-cfg0 = replace(J.JeuConfig(), horizon_max=10, tp_atr=(2.0, 4.0),
+cfg0 = replace(J.JeuConfig(), sortie_deux_temps=False, horizon_max=10, tp_atr=(2.0, 4.0),
                sl_atr=(2.0, 4.0), glissement_entree_bps=0.0,
                glissement_sortie_bps=0.0, minutes_par_barre=1, partie="jour",
                swap_achat_bps_jour=0.0, swap_vente_bps_jour=0.0, positions_max=1)
@@ -109,7 +109,8 @@ cfgj = replace(J.JeuConfig(), horizon_max=10, jetons=3, lookback=4, n_expert=0,
                # l'etat du compte, ajoutes par defaut depuis le run m5_12.
                apprendre_lot=False, apprendre_risque=False, apprendre_allocation=False,
                apprendre_confiance=False, observe_compte=False, observe_calibration=False,
-               note_mise_separee=False, mur_mise=False)
+               note_mise_separee=False, mur_mise=False, sortie_deux_temps=False,
+               lot_min=0.01)
 pol = J.PolitiqueJeu(cfgj)
 g = pol.groupes_jeu()
 verifie("six groupes, dont les quatre tetes", sorted(g) ==
@@ -448,7 +449,8 @@ cmh = replace(J.JeuConfig(), marches=tuple(PMH.MARCHES), cache=PMH.SORTIE,
               expert_pas_neg=1, porte_rang_expert=0.90,
               # le multi H1 historique : sans les tetes de mise ni l'etat du compte
               apprendre_lot=False, apprendre_risque=False, apprendre_allocation=False,
-              apprendre_confiance=False, observe_compte=False, observe_calibration=False)
+              apprendre_confiance=False, observe_compte=False, observe_calibration=False,
+              sortie_deux_temps=False, lot_min=0.01)
 import prepare_btc_m5 as P5
 _dft = replace(J.JeuConfig(), marches=(), cache=P5.SORTIE)
 verifie("le BTC seul en M5 (run m5_02) : une journee par partie, 10 jetons, une position",
@@ -702,6 +704,44 @@ _sv = {"decisions": [(0, 1, 0, 1000.0), (2, 0, 1, 1000.0)], "final": np.array([2
 _am = J.avantage_mois(_tr, _sv, _c14)
 verifie("la note du mois : alignee sur les decisions, la ruine bien plus basse que le gain",
         len(_am) == 3 and _am[0] == 0.0 and _am[1] > 0 > _am[2], str(_am))
+
+print("\n15. LA SORTIE EN DEUX TEMPS")
+_c15 = replace(J.JeuConfig(), horizon_max=8, swap_achat_bps_jour=0.0, swap_vente_bps_jour=0.0)
+verifie("par defaut : sortie en deux temps a 1 ATR, lot minimum 0.02",
+        _c15.sortie_deux_temps and _c15.tp1_atr == 1.0 and _c15.lot_min == 0.02)
+
+
+def _table(bougies, cfg, sp_bps=2.0):
+    """La decision a la bougie 0 (prix 10 000, ATR 10) ; `bougies` = les
+    (ouverture, haut, bas) des bougies 1, 2, ... ; le reste est plat."""
+    b = [(10000.0, 10000.0, 10000.0)] + list(bougies)
+    b += [b[-1]] * (cfg.horizon_max + 3)
+    o_, h_, l_ = (np.array([x[q] for x in b]) for q in range(3))
+    return J.table_coups(o_, h_, l_, np.full(len(b), sp_bps), np.full(len(b), 10.0), cfg, 1.0)
+
+
+_p0 = 10000 * (1 + 2e-4 + _c15.glissement_entree_bps / 1e4)
+# monte a l'objectif proche (+1 ATR) puis revient sous l'entree
+_Ra, _Da, _Sa = _table([(10000, 10005, 9998), (10006, _p0 + 12, 10003), (10006, 10007, 9980)], _c15)
+# monte a l'objectif proche puis a +8 ATR
+_Rb, _Db, _Sb = _table([(10000, 10005, 9998), (10006, _p0 + 12, 10003), (10010, _p0 + 85, 10008)], _c15)
+# tombe au stop de 2 ATR avant l'objectif proche
+_Rc, _Dc, _Sc = _table([(10000, 10005, 9975)], _c15)
+_r_be = float(_Ra[0, 0, 3, 1])
+verifie("objectif proche puis retour : la moitie restante sort a l'entree, spread compris, le coup gagne",
+        int(_Sa[0, 0, 3, 1]) == 3 and 0.25 <= _r_be < 0.30, f"R {_r_be:+.4f}")
+verifie("objectif proche puis objectif a 8 ATR : la moitie a 1 ATR, la moitie a 8 ATR",
+        int(_Sb[0, 0, 3, 1]) == 0 and abs(float(_Rb[0, 0, 3, 1]) - (0.5 * 10 + 0.5 * 80) / 20) < 1e-3,
+        f"R {float(_Rb[0, 0, 3, 1]):+.4f}")
+verifie("le stop avant l'objectif proche : le coup entier perd, comme avant",
+        int(_Sc[0, 0, 3, 1]) == 1 and float(_Rc[0, 0, 3, 1]) < -1.0)
+_R1, _D1, _S1 = _table([(10000, 10005, 9998), (10006, _p0 + 12, 10003), (10006, 10007, 9980)],
+                       replace(_c15, sortie_deux_temps=False))
+verifie("un objectif a 1 ATR reste un coup en une fois, identique a l'ancienne sortie",
+        np.array_equal(_Ra[:, :, 0], _R1[:, :, 0], equal_nan=True)
+        and np.array_equal(_Sa[:, :, 0], _S1[:, :, 0]))
+verifie("sans le stop remonte, le meme coup en une fois finit perdant",
+        float(_R1[0, 0, 3, 1]) <= -1.0 and _r_be > 0, f"{float(_R1[0, 0, 3, 1]):+.3f}")
 
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)

@@ -182,7 +182,10 @@ class JeuConfig:
     # LA NOTE DU MOIS ET LA SERIE NOIRE (run m5_21) : voir `note_mise_mois`
     # et `serie_noire`. Le run m5_20 : prefixe kairos_jeu_m5_20_mise_separee,
     # les deux a False.
-    prefixe: str = "kairos_jeu_m5_21_mois_serie_noire"
+    # LA SORTIE EN DEUX TEMPS ET LE LOT MINIMUM A 0.02 (run m5_22) : voir
+    # `sortie_deux_temps`. Le run m5_21 : prefixe
+    # kairos_jeu_m5_21_mois_serie_noire, sortie_deux_temps False, lot_min 0.01.
+    prefixe: str = "kairos_jeu_m5_22_deux_temps"
     # Reproduction demandee du run M5_03, avant les corrections de deroulement
     # et de compte introduites dans la version 2.
     # La version 2 rejoue l'equite, la marge et les positions ouvertes : elle
@@ -372,7 +375,9 @@ class JeuConfig:
     # `risque_pct` de l'equite du moment arrondie aux lots de `pas_lot`, jamais
     # sous `lot_min` : avec 1000 $, un stop large risque donc PLUS que 1 %.
     levier: float = 500.0
-    lot_min: float = 0.01
+    # 0.01 -> 0.02 LE 2026-10-03 (run m5_22), demande du proprietaire : un
+    # coup doit pouvoir etre coupe en deux. Voir `sortie_deux_temps`.
+    lot_min: float = 0.02
     pas_lot: float = 0.01
     lot_max: float = 100.0
     contrat: float = 1.0
@@ -484,6 +489,23 @@ class JeuConfig:
     # En M15 : l'ATR ne descend pas sous 20 bps (p10 : 13), le plus petit
     # stop fait 20 bps et le cout ne depasse jamais ~0.17 R.
     atr_min_bps: float = 20.0
+    # LA SORTIE EN DEUX TEMPS — 2026-10-03 (run m5_22), demande du
+    # proprietaire : un compromis entre l'ancien style (objectif proche,
+    # win rate de 66 %) et celui du run m5_21 (objectif a 6-8 ATR, stop a
+    # 1 ATR, win rate de 20 %). Quand l'objectif choisi est plus loin que
+    # `tp1_atr` :
+    #   1. la moitie du coup sort a l'objectif proche (`tp1_atr` ATR) ;
+    #   2. le stop de l'autre moitie remonte alors au prix d'entree, SPREAD ET
+    #      GLISSEMENT DE SORTIE COMPRIS, plus `be_marge_bps` : ressortir a ce
+    #      stop ne fait pas perdre (sauf trou de cotation) ;
+    #   3. cette moitie court vers l'objectif choisi, au plus `horizon_max`.
+    # Un objectif choisi a `tp1_atr` ou moins reste un coup en une fois : le
+    # modele choisit lui-meme son melange des deux styles. Codes de sortie :
+    # 0 objectif, 1 stop, 2 temps, 3 objectif proche puis entree, 4 objectif
+    # proche puis temps.
+    sortie_deux_temps: bool = True
+    tp1_atr: float = 1.0
+    be_marge_bps: float = 1.0
     # EN BOUGIES : 32 bougies M15, huit heures. EN H1 : 72 bougies, trois jours.
     # EN M5 : 96 bougies, huit heures (comme le M15).
     horizon_max: int = 96
@@ -965,6 +987,28 @@ def table_coups(o, h, l, sp, atr, cfg: JeuConfig, frac: float):
                 m_sl = (t_sl == H) & (hk >= sl)
             t_tp[m_tp] = k
             t_sl[m_sl] = k
+        # LA SORTIE EN DEUX TEMPS. Voir `sortie_deux_temps`.
+        deux = bool(getattr(cfg, "sortie_deux_temps", False))
+        if deux:
+            k1 = float(cfg.tp1_atr)
+            mbe = float(getattr(cfg, "be_marge_bps", 0.0)) / 1e4
+            if sens > 0:
+                tp1 = p0 + k1 * a
+                # sortir au bid a ce niveau, glissement compris, rend au
+                # moins le prix paye (l'ask d'entree) : le spread est couvert
+                be = p0 / (1 - sx) * (1 + mbe)
+            else:
+                tp1 = p0 - k1 * a
+                be = p0 / (1 + sx) * (1 - mbe)
+            t1 = np.full(len(t), H, np.int16)
+            for k in range(H):
+                m = (t1 == H) & ((hi[e + k] >= tp1) if sens > 0 else (lo[e + k] <= tp1))
+                t1[m] = k
+            # le stop a l'entree ne vaut qu'APRES la bougie de l'objectif proche
+            t_be = np.full(len(t), H, np.int16)
+            for k in range(1, H):
+                m = (t_be == H) & (t1 < k) & ((lo[e + k] <= be) if sens > 0 else (hi[e + k] >= be))
+                t_be[m] = k
         for i in range(len(ktp)):
             for j in range(len(ksl)):
                 a_tp, a_sl = t_tp[:, i], t_sl[:, j]
@@ -985,9 +1029,33 @@ def table_coups(o, h, l, sp, atr, cfg: JeuConfig, frac: float):
                 sw = float(getattr(cfg, "swap_achat_bps_jour" if sens > 0
                                    else "swap_vente_bps_jour", 0.0))
                 swap = frac * sw / 1e4 * p0 * duree * float(cfg.minutes_par_barre) / 1440.0
-                R[t, si, i, j] = ((sens * (x - p0) - swap) / (ksl[j] * a)).astype(np.float32)
-                D[t, si, i, j] = duree
-                S[t, si, i, j] = np.where(obj, 0, np.where(stop, 1, 2))
+                r_ = (sens * (x - p0) - swap) / (ksl[j] * a)
+                d_ = duree
+                s_ = np.where(obj, 0, np.where(stop, 1, 2))
+                if deux and ktp[i] > k1 + 1e-9:
+                    # l'objectif proche AVANT le stop (meme bougie : le stop)
+                    tp1_ok = (t1 < a_sl) & (t1 < H)
+                    d1 = t1 + 1
+                    # moitie 2 : l'objectif choisi (meme bougie que l'objectif
+                    # proche : il est atteint, le prix y passe en montant),
+                    # sinon le stop a l'entree, sinon le temps
+                    loin = (a_tp < H) & ((a_tp == t1) | (a_tp < t_be))
+                    entree = ~loin & (t_be < H)
+                    b_be = e + np.minimum(t_be, H - 1)
+                    if sens > 0:
+                        x_be = np.minimum(be, o[b_be]) * (1 - sx)
+                    else:
+                        x_be = np.maximum(be, oa[b_be]) * (1 + sx)
+                    x2 = np.where(loin, tp[:, i], np.where(entree, x_be, x_to))
+                    d2 = np.where(loin, a_tp + 1, np.where(entree, t_be + 1, H + 1))
+                    gain = 0.5 * sens * (tp1 - p0) + 0.5 * sens * (x2 - p0)
+                    sw2 = frac * sw / 1e4 * p0 * (0.5 * d1 + 0.5 * d2) * float(cfg.minutes_par_barre) / 1440.0
+                    r_ = np.where(tp1_ok, (gain - sw2) / (ksl[j] * a), r_)
+                    d_ = np.where(tp1_ok, np.maximum(d1, d2), d_)
+                    s_ = np.where(tp1_ok, np.where(loin, 0, np.where(entree, 3, 4)), s_)
+                R[t, si, i, j] = r_.astype(np.float32)
+                D[t, si, i, j] = d_
+                S[t, si, i, j] = s_
     return R, D, S
 
 
@@ -2144,7 +2212,7 @@ def bilan(scores, coups, close, atr, sp, cfg: JeuConfig,
             "risque_moy_choisi": float(risques_choisis.mean()),
             "risque_max_choisi": float(risques_choisis.max())}
            if risques_choisis is not None and np.isfinite(risques_choisis).any() else {}),
-        "sorties": tuple(float(np.mean(so == k)) for k in range(3)),
+        "sorties": tuple(float(np.mean(so == k)) for k in range(5)),
         "tp": tuple(float(np.mean(i == k)) for k in range(len(cfg.tp_atr))),
         "sl": tuple(float(np.mean(j == k)) for k in range(len(cfg.sl_atr))),
         "duree": float(np.median(du)), "gain_R": float(r.mean()),
@@ -2168,7 +2236,8 @@ def ecrit_trades_csv(path: str, coups, temps, cfg: JeuConfig, *, epoch: int, pha
     entree = c[:, 1].astype(np.int64)
     sortie = np.minimum(entree + c[:, 6].astype(np.int64), len(temps) - 1)
     dates = pd.Series(temps).reset_index(drop=True)
-    libelle_sortie = np.array(["TP", "SL", "TEMPS"], dtype=object)[c[:, 7].astype(np.int64)]
+    libelle_sortie = np.array(["TP", "SL", "TEMPS", "TP1+ENTREE", "TP1+TEMPS"],
+                              dtype=object)[c[:, 7].astype(np.int64)]
     frame = pd.DataFrame({
         "epoch": int(epoch), "phase": str(phase), "partie": c[:, 0].astype(np.int64),
         "entree_index": entree, "entree_time": dates.iloc[entree].astype(str).to_numpy(),
@@ -2973,6 +3042,11 @@ def main_blocs(cfg: JeuConfig) -> int:
             print(f"\nEPOCH {epoch:03d}  {nom:>12}  VAL  {ligne_bilan(bv, cfg)}  "
                   f"{(time.time() - t_ep) / 60:.1f} min", flush=True)
             print(f"  bilan  {ligne_detail(bv, cfg)}", flush=True)
+            if bool(getattr(cfg, "sortie_deux_temps", False)) and bv["coups"]:
+                so = bv["sorties"]
+                print(f"  sorties  objectif final {100 * so[0]:.0f} %  |  objectif proche puis "
+                      f"entree {100 * so[3]:.0f} %  |  objectif proche puis temps {100 * so[4]:.0f} %  |  "
+                      f"stop {100 * so[1]:.0f} %  |  temps {100 * so[2]:.0f} %", flush=True)
             etat = {"modele": policy.state_dict(), "config": asdict(cfg), "epoch": epoch,
                     "bloc": k + 1, "pipeline": pipeline_ref}
             torch.save(etat, f"last_{cfg.prefixe}{suffixe}.pth")
