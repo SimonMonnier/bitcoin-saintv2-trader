@@ -34,8 +34,8 @@ if (-not (Test-Path -LiteralPath $python)) {
     exit 1
 }
 
-$journal = Join-Path $PSScriptRoot 'training_btc.log'
-$prefixe = 'kairos_jeu_m5_03'
+$journal = Join-Path $PSScriptRoot 'training_thermostat_confiance.log'
+$prefixe = 'kairos_jeu_m5_19_thermostat_ppo_lotmin'
 # LE JEU DEPUIS LE 2026-09-26 : `jeu_kairos.py` remplace `training.py`.
 $script = 'jeu_kairos.py'
 
@@ -63,8 +63,10 @@ if (-not (Test-Path -LiteralPath $dossier)) {
     New-Item -ItemType Directory -Path $dossier | Out-Null
 }
 if (Test-Path -LiteralPath $journal) {
-    $nom = 'training_btc_{0:yyyyMMdd_HHmm}.log' -f (Get-Date)
-    Move-Item -LiteralPath $journal -Destination (Join-Path $dossier $nom) -Force
+    # Les secondes evitent qu'une relance rapide ecrase le journal archive de
+    # la minute precedente. Un journal est une preuve de run, pas un cache.
+    $nom = 'training_btc_{0:yyyyMMdd_HHmmss}.log' -f (Get-Date)
+    Move-Item -LiteralPath $journal -Destination (Join-Path $dossier $nom)
     Write-Host "  journal precedent archive : journaux\$nom" -ForegroundColor DarkGray
 }
 
@@ -73,11 +75,14 @@ if (Test-Path -LiteralPath $journal) {
 # deja — c'est une protection contre l'ecrasement silencieux d'un run.
 # Elle fait donc echouer toute relance tant qu'on ne l'a pas levee.
 $n = 0
-foreach ($motif in @("run_$prefixe*.json", "best_$prefixe*.pth",
+foreach ($motif in @("run_$prefixe*.json", "best_$prefixe*.pth", "bestR_$prefixe*.pth",
                      "last_$prefixe*.pth", "bestprofit_$prefixe*.pth",
-                     "test_$prefixe*.json")) {
+                     "deploy_$prefixe*.pth", "deploy_$prefixe*.json",
+                     "test_$prefixe*.json", "pipeline_$prefixe*.json",
+                     "pipeline_$prefixe*_predictions.npz", "trades_$prefixe*.csv")) {
     foreach ($f in @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter $motif -ErrorAction SilentlyContinue)) {
-        Move-Item -LiteralPath $f.FullName -Destination (Join-Path $dossier $f.Name) -Force
+        $archive = '{0:yyyyMMdd_HHmmss}_{1}' -f (Get-Date), $f.Name
+        Move-Item -LiteralPath $f.FullName -Destination (Join-Path $dossier $archive)
         $n++
     }
 }
@@ -117,7 +122,7 @@ $env:PYTHONIOENCODING = 'utf-8'
 $cmd = "`$env:PYTHONUNBUFFERED='1'; `$env:PYTHONIOENCODING='utf-8'; " +
        "Write-Host '  entrainement en cours - la lecture se fait dans la veille' -ForegroundColor Green; " +
        "Write-Host '  NE PAS FERMER cette fenetre' -ForegroundColor Yellow; " +
-       "cmd /c '$python $script > training_btc.log 2>&1'"
+       "cmd /c '$python $script > training_thermostat_confiance.log 2>&1'"
 # SANS GUILLEMETS INTERIEURS, et le journal en chemin RELATIF - 2026-09-26.
 # La version precedente citait l'interpreteur et le journal : PowerShell 5.1
 # a retire ces guillemets en passant la commande a `cmd`, et le chemin du
@@ -138,7 +143,7 @@ foreach ($v in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
     Stop-Process -Id $v.ProcessId -Force -ErrorAction SilentlyContinue
 }
 Start-Sleep -Seconds 3
-Start-Process powershell -ArgumentList '-NoExit','-ExecutionPolicy','Bypass','-File','veille_fenetre.ps1' `
+Start-Process powershell -ArgumentList '-NoExit','-ExecutionPolicy','Bypass','-File','veille_fenetre.ps1','-Journal','training_thermostat_confiance.log' `
     -WorkingDirectory $PSScriptRoot
 Write-Host '  veille ouverte dans sa fenetre' -ForegroundColor Green
 

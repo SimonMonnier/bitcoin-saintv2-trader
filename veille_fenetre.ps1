@@ -158,7 +158,7 @@ function Verdict([string]$nu) {
     $u = $script:unite
     $vus = if ($u -eq 'semaine') { 'semaines jamais vues' } else { 'jours jamais vus' }
     $gagn = if ($u -eq 'semaine') { 'semaines gagnantes' } else { 'jours gagnants' }
-    if ($nu -match '^EPOCH (\d+)\s+(.+?)\s+VAL\s+score ([+-][0-9.]+) R/partie \(([+-][0-9.]+)\$\)\s+gagnees (\d+)% perdues \d+% sur (\d+)\s+coups (\d+) \(([0-9.]+)/partie') {
+    if ($nu -match '^EPOCH (\d+)\s+(.+?)\s+VAL\s+score ([+-][0-9.]+) R/partie \(([+-][0-9.]+)\$\)(?:\s+ajuste DD [+-][0-9.]+)?\s+gagnees (\d+)% perdues \d+% sur (\d+)\s+coups (\d+) \(([0-9.]+)/partie') {
         # COPIE D'ABORD : un -match reussi plus bas ecraserait $Matches.
         $m = $Matches.Clone()
         $dol = [double]::Parse($m[4], $inv)

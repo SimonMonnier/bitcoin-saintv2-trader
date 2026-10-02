@@ -1,8 +1,11 @@
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
+import subprocess
+import sys
 import time
 import threading
+import json
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timedelta
@@ -178,6 +181,20 @@ MULTI_AGENT_MAGICS: Dict[str, int] = {
 
 @dataclass
 class LiveConfig:
+    # Le moteur historique reste la valeur par defaut pour les appels hors GUI.
+    # L'interface KAIROS choisit explicitement ``kairos_m5`` ci-dessous.
+    engine: str = "saint"
+    # Le checkpoint M5_12 du bloc 1 est le premier disponible avec les huit
+    # etats de compte et les six tetes. Il est remplace apres validation des
+    # autres blocs, jamais pendant l'execution d'un agent deja lance.
+    kairos_prefixe: str = "kairos_jeu_m5_19_thermostat_ppo_lotmin"
+    kairos_bloc: int = 1
+    # KAIROS M5 respecte les dix jetons du jeu a chaque journee UTC.
+    # Ce champ est conserve pour compatibilite avec les anciens reglages ; le
+    # moteur l'ignore deliberement.
+    kairos_limite_jetons: bool = True
+    # Fuseau de l'horloge des graphiques Vantage/MT5 (EEST l'ete, EET l'hiver).
+    kairos_tz_mt5: str = "Europe/Helsinki"
     symbol: str = "XAUUSD"
 
     # ------------------------------------------------------------------
@@ -1729,6 +1746,11 @@ class TradingAgent:
 
     def _run(self):
         try:
+            if getattr(self.cfg, "engine", "saint") == "kairos_m5":
+                from kairos_m5_live import live_loop as kairos_m5_loop
+                print("[AGENT] KAIROS M5 : moteur aligne au jeu")
+                kairos_m5_loop(self.cfg, self._should_continue)
+                return
             if getattr(self.cfg, "multi_agent", False):
                 print("[AGENT] Mode MULTI-AGENT (wf1 + wf2 + wf3)")
                 live_loop_multi(self.cfg, self._should_continue)
@@ -1750,3 +1772,68 @@ class TradingAgent:
         if self._thread is not None:
             self._thread.join(timeout=10.0)
         print("[AGENT] Bot arrêté.")
+
+
+# ============================================================
+# POINT D'ENTREE CONSOLE KAIROS M5
+# ============================================================
+def verifie_deploy_kairos(prefixe: str) -> tuple[str, str]:
+    """Refuse tout demarrage console sans l'artefact final complet.
+
+    Le GUI peut, pendant un entrainement, afficher un checkpoint de fold pour
+    diagnostic. La commande simple `python kairos_live.py`, elle, ne doit
+    jamais trader un tel checkpoint : elle attend obligatoirement le modele
+    final distille et son pipeline associe.
+    """
+    checkpoint = f"deploy_{prefixe}_ensemble_validation_ddsafe.pth"
+    pipeline = f"pipeline_{prefixe}_deploy_ensemble_validation_ddsafe.json"
+    manquants = [p for p in (checkpoint, pipeline) if not os.path.isfile(p)]
+    if manquants:
+        raise FileNotFoundError(
+            "Modele deploy KAIROS pas encore pret : " + ", ".join(manquants) +
+            ". Lancer `python jeu_kairos.py --rebuild-deploy-ensemble`.")
+    # Lecture minimale avant MT5 : un fichier incomplet ou une mauvaise paire
+    # est refuse avant toute connexion au compte demo.
+    ck = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if not isinstance(ck, dict) or "modele" not in ck or "config" not in ck:
+        raise ValueError(f"Checkpoint deploy invalide : {checkpoint}")
+    if ck.get("type") != "deploiement_ensemble_10_folds" or len(ck.get("folds", [])) != 10:
+        raise ValueError(f"Checkpoint deploy incomplet ou non-ensemble : {checkpoint}")
+    with open(pipeline, encoding="utf-8") as fh:
+        pipe = json.load(fh)
+    if pipe.get("meta", {}).get("type") != "deploiement_ensemble_10_folds":
+        raise ValueError(f"Pipeline deploy invalide ou non final : {pipeline}")
+    return checkpoint, pipeline
+
+
+def main_kairos_m5() -> int:
+    """`python kairos_live.py` : GUI + moteur M5 BTCUSD deploy."""
+    cfg = LiveConfig(engine="kairos_m5", symbol="BTCUSD", side="both")
+    try:
+        checkpoint, pipeline = verifie_deploy_kairos(cfg.kairos_prefixe)
+    except Exception as e:
+        print(f"[KAIROS M5] Demarrage refuse : {e}", file=sys.stderr)
+        return 2
+    if "--check" in sys.argv:
+        print(f"[KAIROS M5] DEPLOY pret : {checkpoint} | {pipeline}")
+        return 0
+    # La commande courte demandee ouvre l'interface et demarre l'agent. Le
+    # moteur reste celui de `kairos_m5_live`, pas l'ancien moteur SAINT qui
+    # partage ce fichier pour compatibilite historique.
+    if "--console" not in sys.argv:
+        gui = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kairos_gui.py")
+        print("[KAIROS M5] Ouverture du live avec interface graphique.")
+        return subprocess.call([sys.executable, gui, "--start"])
+    print("[KAIROS M5] Demarrage console du moteur aligne au jeu.")
+    print(f"[KAIROS M5] modele : {checkpoint}")
+    print("[KAIROS M5] Ctrl+C pour arreter proprement.")
+    from kairos_m5_live import live_loop as kairos_m5_loop
+    try:
+        kairos_m5_loop(cfg, lambda: True)
+    except KeyboardInterrupt:
+        print("\n[KAIROS M5] Arret demande par l'utilisateur.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main_kairos_m5())

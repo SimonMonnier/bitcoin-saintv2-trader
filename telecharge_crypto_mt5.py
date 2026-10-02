@@ -67,7 +67,7 @@ def main() -> int:
         d["spread_bps"] = d["spread"] * i.point / d["close"] * 1e4
         barres[s] = d
         infos[s] = {"actif": CRYPTOS[s], "point": i.point, "contrat": i.trade_contract_size,
-                    "lot_min": i.volume_min, "pas_lot": i.volume_step,
+                    "lot_min": i.volume_min, "pas_lot": i.volume_step, "lot_max": i.volume_max,
                     "swap_long": i.swap_long, "swap_short": i.swap_short,
                     "swap_mode": int(i.swap_mode)}
         pc = d["close"].shift(1)

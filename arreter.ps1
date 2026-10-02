@@ -14,7 +14,8 @@ Set-Location -LiteralPath $PSScriptRoot
 # un autre projet. Seul `training.py` dans la ligne de commande identifie
 # l'entrainement.
 $procs = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-           Where-Object { $_.CommandLine -like '*training.py*' })
+           Where-Object { $_.CommandLine -like '*training.py*' -or
+                          $_.CommandLine -like '*jeu_kairos.py*' })
 
 Write-Host ''
 if ($procs.Count -eq 0) {

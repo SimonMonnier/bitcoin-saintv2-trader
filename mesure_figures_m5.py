@@ -43,6 +43,14 @@ voit donc les bougies T a T-3. Versions mesurees :
     T-3   les bougies T a T-3 (ce que le lookback de 4 lui montrerait)
 
     python mesure_figures_m5.py une > mesure_figures_m5_une.txt
+
+FILTRES D'ECHANGES SEULS — les signaux que MT5 ne reconstruit pas a partir
+de ses propres bougies : flux, volume et nombre de transactions Binance,
+funding Binance Futures, et prime Coinbase / Binance. Les indicateurs de
+prix, le calendrier et les autres colonnes sont retires.
+
+    python mesure_figures_m5.py echanges > mesure_echanges_m5.txt
+
 """
 import sys
 import time
@@ -58,6 +66,12 @@ except Exception:
     pass
 
 K = 16
+
+# Ces colonnes ont besoin des flux Binance ou du prix Coinbase. Elles ne sont
+# pas reconstituables depuis les seules bougies d'un courtier MT5.
+BINANCE_FLUX = ("flux_1", "flux_3", "flux_12", "vol_z", "trades_z")
+COINBASE_PRIME = ("prime_cb", "prime_cb_chg", "prime_cb_dispo")
+BINANCE_FUNDING = ("funding_der", "funding_moy3", "funding_dispo")
 
 
 def figures(d: pd.DataFrame) -> pd.DataFrame:
@@ -119,7 +133,7 @@ def main() -> int:
     atr = J.atr_effectif(d["atr_14"].to_numpy(np.float64), c, cfg)
     sp = d["spread_bar"].to_numpy(np.float64)
     R1, _, _ = J.table_coups(o, h, l, sp, atr, cfg, 1.0)
-    y = J.cibles_expert(R1)
+    y = J.cibles_expert(R1, cfg)
     del R1
     jour = d["time"].dt.floor("D").values.astype("int64")
     XA = d[cols].to_numpy(np.float32)
@@ -127,7 +141,8 @@ def main() -> int:
     XC = F.to_numpy(np.float32)
     XB = np.concatenate([XA, XC], axis=1)
     versions = (("A  actuelles", XA), ("B  actuelles + figures", XB), ("C  figures seules", XC))
-    if len(sys.argv) > 1 and sys.argv[1] == "une":
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode == "une":
         t0c = [f"{x}_0" for x in ("corps", "haut", "bas", "taille", "ecart")]
         t4c = [col for col in F.columns if int(col.rsplit("_", 1)[1]) <= 3]
         XT = F[t0c].to_numpy(np.float32)
@@ -137,11 +152,23 @@ def main() -> int:
                     ("T-3  bougies T a T-3", F[t4c].to_numpy(np.float32)))
         print(f"UNE SEULE BOUGIE, BTC M5 — {N:,} bougies ; la bougie T = {len(t0c)} colonnes, "
               f"T a T-3 = {len(t4c)} colonnes (ce que montre un lookback de 4)")
+    elif mode == "echanges":
+        cols_b = list(BINANCE_FLUX)
+        cols_c = list(COINBASE_PRIME)
+        cols_f = list(BINANCE_FUNDING)
+        cols_x = cols_b + cols_c + cols_f
+        versions = (("A  40 signaux actuels", XA),
+                    ("B  echanges seuls", d[cols_x].to_numpy(np.float32)),
+                    ("C  flux Binance seul", d[cols_b].to_numpy(np.float32)),
+                    ("D  prime Coinbase seule", d[cols_c].to_numpy(np.float32)),
+                    ("E  funding Binance seul", d[cols_f].to_numpy(np.float32)))
+        print(f"FILTRES BINANCE / COINBASE SEULS, BTC M5 — {N:,} bougies ; "
+              f"B = {len(cols_x)} signaux exclusifs aux echanges")
     else:
         print(f"FIGURES DES CHANDELIERS, BTC M5 — {N:,} bougies ; A = {XA.shape[1]} colonnes "
               f"actuelles, B = A + {XC.shape[1]} colonnes de figures ({K} bougies), C = figures seules")
     print("jugement sur la VALIDATION de chaque bloc ; le bloc de test n'est pas lu\n")
-    purge = int(cfg.horizon_max + cfg.lookback + cfg.purge_semaines * cfg.barres_par_partie)
+    purge = J.purge_barres(cfg)
     H = int(cfg.horizon_max)
     fmt = lambda i: pd.Timestamp(d["time"].iloc[min(i, N - 1)]).strftime("%Y-%m-%d")
     for k in (0, 1):

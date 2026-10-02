@@ -74,7 +74,7 @@ def main() -> int:
     jour = d["time"].dt.floor("D").values.astype("int64")
     X = d[J.colonnes_jeu(cfg)].to_numpy(np.float32)
     R1, D1, _ = J.table_coups(o, h, l, sp, atr, cfg, 1.0)
-    y = J.cibles_expert(R1)
+    y = J.cibles_expert(R1, cfg)
     ri, rj = J._ref(cfg)
     Rref, Dref = R1[:, :, ri, rj], D1[:, :, ri, rj].astype(np.float64)
     purge = int(cfg.horizon_max + cfg.lookback + cfg.purge_semaines * cfg.barres_par_partie)

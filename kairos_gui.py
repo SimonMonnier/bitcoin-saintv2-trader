@@ -7,14 +7,16 @@ Cette fenetre ne fait qu'observer, afficher et demarrer/arreter.
 
 Organisation de l'ecran, du plus urgent au moins urgent :
   1. barre haute   — l'agent tourne-t-il, et comment l'arreter
-  2. mesures       — equity, PnL de session, winrate contre le point mort
+  2. mesures       — equity, PnL realise et flottant
   3. courbe        — la FORME de la session, pas ses valeurs
   4. tableau       — achat / vente / total, la ou se lit l'asymetrie
   5. console       — le detail, filtrable, en bas parce qu'on y descend
 """
 
 import sys
+import csv
 import io
+import json
 import re
 import datetime as dt
 from pathlib import Path
@@ -24,13 +26,10 @@ import MetaTrader5 as mt5
 
 from kairos_live import LiveConfig, TradingAgent
 from kairos_theme import C, LEVEL_COLORS, font_ui, font_mono, stylesheet
-from kairos_widgets import (StatusOrb, Sparkline, WinrateArc, MetricTile,
+from kairos_widgets import (StatusOrb, Sparkline, MetricTile,
                             Card, filet)
 
-# Winrate a partir duquel la strategie couvre ses frais, mesure sur BTCUSD
-# avec AvgW +13.97 $ / AvgL -10.83 $. C'est le seul repere qui compte : un
-# winrate brut ne dit rien sans lui.
-SEUIL_EQUILIBRE = 0.437
+MAGIC_KAIROS = 909510
 
 
 # ============================================================
@@ -103,12 +102,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.cfg = LiveConfig(side="both")
+        self.cfg = LiveConfig(engine="kairos_m5", symbol="BTCUSD", side="both")
         self.agent = TradingAgent(self.cfg)
 
         # Le titre vient de la config, jamais d'une constante : un titre ecrit
         # en dur finit par annoncer un symbole que l'agent ne trade pas.
-        self.setWindowTitle(f"KAIROS — {getattr(self.cfg, 'symbol', '?')} M1")
+        self.setWindowTitle(f"KAIROS — {getattr(self.cfg, 'symbol', '?')} M5")
         self.setMinimumSize(1080, 700)
         self.resize(1320, 880)
 
@@ -125,6 +124,10 @@ class MainWindow(QtWidgets.QMainWindow):
         sys.stderr = QtLogStream(self.log_emitter, "ERR")
 
         # ---------- Etat de session ----------
+        self.history_dir = Path(__file__).with_name("historique_kairos_m5")
+        self.history_state_path = self.history_dir / "etat_gui.json"
+        self.history_trades_path = self.history_dir / "trades.csv"
+        self.history_equity_path = self.history_dir / "equity.csv"
         self.session_start = dt.datetime.now()
         self.session_balance_start: float | None = None
         self._stats_seen_deal_tickets: set = set()
@@ -132,6 +135,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "long":  {"wins": [], "losses": []},
             "short": {"wins": [], "losses": []},
         }
+        self._charge_historique()
 
         # ---------- Echafaudage ----------
         racine = QtWidgets.QWidget()
@@ -146,6 +150,7 @@ class MainWindow(QtWidgets.QMainWindow):
         col.addWidget(self._bati_courbe())
         col.addWidget(self._bati_tableau())
         col.addWidget(self._bati_console(), stretch=1)
+        self._restaure_courbe_equity()
 
         # ---------- Rythmes de rafraichissement ----------
         # L'etat toutes les secondes (c'est ce qu'on regarde), le compte et les
@@ -170,7 +175,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_equity()
         self.update_stats()
         self._update_stats_display()
-        self._append_log("Interface prête. L'agent est à l'arrêt.", LogLevel.INFO)
+        self._append_log("Interface prête. Historique persistant chargé ; l'agent est à l'arrêt.",
+                         LogLevel.INFO)
 
     # --------------------------------------------------------
     # Construction
@@ -218,13 +224,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         h.addStretch()
 
-        # Dimensionnement courant
+        # TP, SL, lot et plafond de risque sont choisis par le modele au
+        # signal : afficher un risque fixe par trade serait trompeur.
         lot = QtWidgets.QVBoxLayout()
         lot.setSpacing(1)
-        self.lot_title = QtWidgets.QLabel("VOLUME")
+        self.lot_title = QtWidgets.QLabel("GESTION")
         self.lot_title.setFont(font_ui(8, QtGui.QFont.DemiBold, spacing=1.3))
         self.lot_title.setStyleSheet(f"color: {C['dim']};")
-        self.lot_label = QtWidgets.QLabel("—")
+        self.lot_label = QtWidgets.QLabel("MODÈLE")
         self.lot_label.setFont(font_mono(13, QtGui.QFont.DemiBold))
         self.lot_label.setStyleSheet(f"color: {C['kairos']};")
         lot.addWidget(self.lot_title)
@@ -263,15 +270,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for t in (self.tile_equity, self.tile_pnl, self.tile_flot, self.tile_trades):
             rang.addWidget(t, stretch=1)
 
-        jauge = Card("Winrate")
-        self.arc = WinrateArc(SEUIL_EQUILIBRE)
-        jauge.ajoute(self.arc)
-        jauge.setMinimumWidth(180)
-        rang.addWidget(jauge)
         return rang
 
     def _bati_courbe(self) -> QtWidgets.QWidget:
-        carte = Card("Equity de la session")
+        carte = Card("Historique d'equity")
         self.equity_label = QtWidgets.QLabel("—")      # nom conserve
         self.equity_label.setFont(font_mono(9))
         self.equity_label.setStyleSheet(f"color: {C['muted']};")
@@ -291,18 +293,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session_info_lbl.setStyleSheet(f"color: {C['dim']};")
         carte.entete.addWidget(self.session_info_lbl)
 
-        self.reset_stats_btn = QtWidgets.QPushButton("Réinitialiser")
-        self.reset_stats_btn.setFont(font_ui(9))
-        self.reset_stats_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.reset_stats_btn.clicked.connect(self.on_reset_stats)
-        carte.entete.addWidget(self.reset_stats_btn)
-
         g = QtWidgets.QGridLayout()
         g.setHorizontalSpacing(0)
         g.setVerticalSpacing(7)
 
-        colonnes = ["", "Trades", "Gagnants", "Perdants", "Winrate",
-                    "Profit factor", "PnL", "Gain moyen", "Perte moyenne"]
+        colonnes = ["", "Trades", "Gagnants", "Perdants", "Profit factor",
+                    "PnL", "Gain moyen", "Perte moyenne"]
         for j, titre in enumerate(colonnes):
             lbl = QtWidgets.QLabel(titre.upper())
             lbl.setFont(font_ui(7.8, QtGui.QFont.DemiBold, spacing=1.0))
@@ -330,14 +326,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.long_trades_lbl = cellule()
         self.long_wins_lbl   = cellule(C["win"])
         self.long_losses_lbl = cellule(C["loss"])
-        self.long_wr_lbl     = cellule()
         self.long_pf_lbl     = cellule()
         self.long_pnl_lbl    = cellule(gras=True)
         self.long_avgw_lbl   = cellule(C["win"])
         self.long_avgl_lbl   = cellule(C["loss"])
         for j, w in enumerate((self.long_trades_lbl, self.long_wins_lbl,
-                               self.long_losses_lbl, self.long_wr_lbl,
-                               self.long_pf_lbl, self.long_pnl_lbl,
+                               self.long_losses_lbl, self.long_pf_lbl, self.long_pnl_lbl,
                                self.long_avgw_lbl, self.long_avgl_lbl), start=1):
             g.addWidget(w, 1, j)
 
@@ -346,30 +340,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.short_trades_lbl = cellule()
         self.short_wins_lbl   = cellule(C["win"])
         self.short_losses_lbl = cellule(C["loss"])
-        self.short_wr_lbl     = cellule()
         self.short_pf_lbl     = cellule()
         self.short_pnl_lbl    = cellule(gras=True)
         self.short_avgw_lbl   = cellule(C["win"])
         self.short_avgl_lbl   = cellule(C["loss"])
         for j, w in enumerate((self.short_trades_lbl, self.short_wins_lbl,
-                               self.short_losses_lbl, self.short_wr_lbl,
-                               self.short_pf_lbl, self.short_pnl_lbl,
+                               self.short_losses_lbl, self.short_pf_lbl, self.short_pnl_lbl,
                                self.short_avgw_lbl, self.short_avgl_lbl), start=1):
             g.addWidget(w, 2, j)
 
-        g.addWidget(filet(), 3, 0, 1, 9)
+        g.addWidget(filet(), 3, 0, 1, 8)
 
         # TOTAL
         g.addWidget(intitule("Σ  TOTAL", C["ink"]), 4, 0)
         self.total_trades_lbl = cellule(gras=True)
         self.total_wins_lbl   = cellule(C["win"], gras=True)
         self.total_losses_lbl = cellule(C["loss"], gras=True)
-        self.total_wr_lbl     = cellule(gras=True)
         self.total_pf_lbl     = cellule(gras=True)
         self.total_pnl_lbl    = cellule(gras=True)
         for j, w in enumerate((self.total_trades_lbl, self.total_wins_lbl,
-                               self.total_losses_lbl, self.total_wr_lbl,
-                               self.total_pf_lbl, self.total_pnl_lbl), start=1):
+                               self.total_losses_lbl, self.total_pf_lbl,
+                               self.total_pnl_lbl), start=1):
             g.addWidget(w, 4, j)
 
         carte.ajoute_layout(g)
@@ -490,6 +481,94 @@ class MainWindow(QtWidgets.QMainWindow):
         self._level_filters[level] = checked
 
     # --------------------------------------------------------
+    # Historique durable
+    # --------------------------------------------------------
+
+    @staticmethod
+    def _float_csv(value, default=0.0):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _append_csv(self, path: Path, fields, row):
+        self.history_dir.mkdir(parents=True, exist_ok=True)
+        nouveau = not path.exists()
+        with path.open("a", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields)
+            if nouveau:
+                writer.writeheader()
+            writer.writerow(row)
+
+    def _sauve_etat_historique(self):
+        self.history_dir.mkdir(parents=True, exist_ok=True)
+        contenu = {
+            "schema": 1,
+            "session_start": self.session_start.isoformat(),
+            "session_balance_start": self.session_balance_start,
+        }
+        temporaire = self.history_state_path.with_suffix(".tmp")
+        temporaire.write_text(json.dumps(contenu, indent=1), encoding="utf-8")
+        temporaire.replace(self.history_state_path)
+
+    def _charge_historique(self):
+        """Retrouve l'etat d'affichage et les statistiques, sans MT5."""
+        self.history_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            contenu = json.loads(self.history_state_path.read_text(encoding="utf-8"))
+            self.session_start = dt.datetime.fromisoformat(contenu["session_start"])
+            solde = contenu.get("session_balance_start")
+            self.session_balance_start = None if solde is None else float(solde)
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+        if not self.history_trades_path.exists():
+            return
+        try:
+            with self.history_trades_path.open(newline="", encoding="utf-8") as fh:
+                for ligne in csv.DictReader(fh):
+                    ticket = ligne.get("ticket")
+                    side = ligne.get("side")
+                    if not ticket or side not in self.session_stats:
+                        continue
+                    self._stats_seen_deal_tickets.add(str(ticket))
+                    pnl = self._float_csv(ligne.get("pnl"))
+                    self.session_stats[side]["wins" if pnl > 0 else "losses"].append(pnl)
+        except OSError:
+            pass
+
+    def _restaure_courbe_equity(self):
+        """La courbe recharge ses derniers points ; le CSV garde l'integrale."""
+        if not self.history_equity_path.exists():
+            return
+        points = []
+        try:
+            with self.history_equity_path.open(newline="", encoding="utf-8") as fh:
+                for ligne in csv.DictReader(fh):
+                    points.append(self._float_csv(ligne.get("equity")))
+        except OSError:
+            return
+        for equity in points[-self.spark._pts.maxlen:]:
+            self.spark.ajoute(equity)
+
+    def _enregistre_trade(self, deal, side: str, pnl: float):
+        fields = ("time", "ticket", "position_id", "symbol", "side", "pnl",
+                  "profit", "swap", "commission", "fee", "volume", "price",
+                  "magic", "entry")
+        instant = getattr(deal, "time", dt.datetime.now())
+        if isinstance(instant, (int, float)):
+            instant = dt.datetime.fromtimestamp(instant)
+        self._append_csv(self.history_trades_path, fields, {
+            "time": str(instant), "ticket": str(deal.ticket),
+            "position_id": str(getattr(deal, "position_id", "")),
+            "symbol": str(getattr(deal, "symbol", self.cfg.symbol)), "side": side,
+            "pnl": pnl, "profit": getattr(deal, "profit", 0.0),
+            "swap": getattr(deal, "swap", 0.0), "commission": getattr(deal, "commission", 0.0),
+            "fee": getattr(deal, "fee", 0.0), "volume": getattr(deal, "volume", 0.0),
+            "price": getattr(deal, "price", 0.0), "magic": getattr(deal, "magic", 0),
+            "entry": getattr(deal, "entry", ""),
+        })
+
+    # --------------------------------------------------------
     # Journal
     # --------------------------------------------------------
 
@@ -540,36 +619,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def update_status(self):
         running = self.agent._running
 
-        # Ce qui est affiche doit etre ce que l'agent applique reellement.
-        # En mode risque, le lot n'existe pas a l'avance : il depend de la
-        # distance au stop, connue seulement a l'entree. La grandeur fixe,
-        # elle, c'est le budget de risque — c'est donc elle qu'on montre.
-        if getattr(self.cfg, "risk_volume", True):
-            self.lot_title.setText("RISQUE / TRADE")
-            try:
-                info = mt5.account_info()
-                equity = float(info.equity) if info is not None else 0.0
-                frac = float(getattr(self.cfg, "risk_per_trade", 0.012))
-                self.lot_label.setText(
-                    f"{equity * frac:.2f}$" if equity > 0 else f"{frac*100:.1f}%")
-                self.lot_label.setToolTip(
-                    f"{frac*100:.2f} % de l'equity par trade — le lot est déduit "
-                    f"de la distance au stop à l'entrée")
-            except Exception:
-                self.lot_label.setText("—")
-        elif getattr(self.cfg, "dynamic_volume", False):
-            self.lot_title.setText("VOLUME AUTO")
-            try:
-                info = mt5.account_info()
-                equity = float(info.equity) if info is not None else 0.0
-                from kairos_live import compute_dynamic_volume
-                lot = compute_dynamic_volume(equity, getattr(self.cfg, "max_lot", 100.0))
-            except Exception:
-                lot = 0.01
-            self.lot_label.setText(f"{lot:.2f}")
-        else:
-            self.lot_title.setText("VOLUME")
-            self.lot_label.setText(f"{float(self.cfg.position_size):.2f}")
+        self.lot_title.setText("GESTION")
+        self.lot_label.setText("MODÈLE")
+        self.lot_label.setToolTip(
+            "Le modèle choisit TP, SL, lot et plafond de risque au moment du signal.")
 
         self.orb.set_actif(running)
         if running:
@@ -619,18 +672,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
             _OUT_ENTRIES = (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT,
                             mt5.DEAL_ENTRY_OUT_BY)
-            BOT_MAGICS = {424241, 424242, 424243}
+            BOT_MAGICS = {MAGIC_KAIROS}
 
             for d in deals:
                 if d.entry not in _OUT_ENTRIES:
                     continue
                 if int(getattr(d, "magic", 0)) not in BOT_MAGICS:
                     continue
-                if d.ticket in self._stats_seen_deal_tickets:
+                ticket = str(d.ticket)
+                if ticket in self._stats_seen_deal_tickets:
                     continue
-                self._stats_seen_deal_tickets.add(d.ticket)
+                self._stats_seen_deal_tickets.add(ticket)
 
-                pnl = float(d.profit)
+                pnl = (float(d.profit) + float(getattr(d, "swap", 0.0))
+                       + float(getattr(d, "commission", 0.0)) + float(getattr(d, "fee", 0.0)))
                 if d.type == mt5.DEAL_TYPE_SELL:
                     side = "long"      # une vente de sortie ferme un achat
                 elif d.type == mt5.DEAL_TYPE_BUY:
@@ -642,6 +697,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.session_stats[side]["wins"].append(pnl)
                 else:
                     self.session_stats[side]["losses"].append(pnl)
+                self._enregistre_trade(d, side, pnl)
 
                 self._append_log(
                     f"[STATS] deal #{d.ticket} {side.upper()} "
@@ -666,34 +722,30 @@ class MainWindow(QtWidgets.QMainWindow):
             l = self.session_stats[side]["losses"]
             nw, nl = len(w), len(l)
             n = nw + nl
-            wr = (nw / n) if n > 0 else 0.0
             tot_w, tot_l = sum(w), abs(sum(l))
             pf = (tot_w / tot_l) if tot_l > 1e-8 else 0.0
-            return (n, nw, nl, wr, pf, tot_w - tot_l,
+            return (n, nw, nl, pf, tot_w - tot_l,
                     (tot_w / nw) if nw else 0.0, (sum(l) / nl) if nl else 0.0)
 
-        n, nw, nl, wr, pf, pnl, aw, al = _cote("long")
+        n, nw, nl, pf, pnl, aw, al = _cote("long")
         self.long_trades_lbl.setText(str(n))
         self.long_wins_lbl.setText(str(nw))
         self.long_losses_lbl.setText(str(nl))
-        self.long_wr_lbl.setText(f"{wr*100:.1f}%" if n else "—")
         self.long_pf_lbl.setText(f"{pf:.2f}" if n else "—")
         self._set_money_label(self.long_pnl_lbl, pnl, bold=True)
         self.long_avgw_lbl.setText(f"+{aw:.2f}$" if nw else "—")
         self.long_avgl_lbl.setText(f"{al:.2f}$" if nl else "—")
 
-        n2, nw2, nl2, wr2, pf2, pnl2, aw2, al2 = _cote("short")
+        n2, nw2, nl2, pf2, pnl2, aw2, al2 = _cote("short")
         self.short_trades_lbl.setText(str(n2))
         self.short_wins_lbl.setText(str(nw2))
         self.short_losses_lbl.setText(str(nl2))
-        self.short_wr_lbl.setText(f"{wr2*100:.1f}%" if n2 else "—")
         self.short_pf_lbl.setText(f"{pf2:.2f}" if n2 else "—")
         self._set_money_label(self.short_pnl_lbl, pnl2, bold=True)
         self.short_avgw_lbl.setText(f"+{aw2:.2f}$" if nw2 else "—")
         self.short_avgl_lbl.setText(f"{al2:.2f}$" if nl2 else "—")
 
         tot_n, tot_w, tot_l = n + n2, nw + nw2, nl + nl2
-        tot_wr = (tot_w / tot_n) if tot_n else 0.0
         gw = sum(self.session_stats["long"]["wins"]) + sum(self.session_stats["short"]["wins"])
         gl = abs(sum(self.session_stats["long"]["losses"]) + sum(self.session_stats["short"]["losses"]))
         tot_pf = (gw / gl) if gl > 1e-8 else 0.0
@@ -701,21 +753,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.total_trades_lbl.setText(str(tot_n))
         self.total_wins_lbl.setText(str(tot_w))
         self.total_losses_lbl.setText(str(tot_l))
-        self.total_wr_lbl.setText(f"{tot_wr*100:.1f}%" if tot_n else "—")
         self.total_pf_lbl.setText(f"{tot_pf:.2f}" if tot_n else "—")
         self._set_money_label(self.total_pnl_lbl, pnl + pnl2, bold=True)
 
-        # Jauge et compteur de trades
-        self.arc.set_valeur(tot_wr if tot_n else None, tot_n)
-        ecart = (tot_wr - SEUIL_EQUILIBRE) * 100 if tot_n else 0.0
         self.tile_trades.set(
             str(tot_n),
             f"{tot_w} gagnants · {tot_l} perdants" if tot_n else "aucun trade fermé",
         )
-        if tot_n:
-            self.arc.setToolTip(
-                f"{tot_wr*100:.1f} % contre {SEUIL_EQUILIBRE*100:.1f} % requis "
-                f"pour couvrir les frais ({ecart:+.1f} points)")
 
         ecoule = dt.datetime.now() - self.session_start
         h = int(ecoule.total_seconds() // 3600)
@@ -748,6 +792,13 @@ class MainWindow(QtWidgets.QMainWindow):
             pl_total   = pl_session + pl_flot
 
             self.spark.ajoute(equity)
+            self._append_csv(
+                self.history_equity_path,
+                ("time", "equity", "balance", "margin", "margin_free", "floating", "pnl_session", "pnl_total"),
+                {"time": dt.datetime.now().isoformat(), "equity": equity, "balance": balance,
+                 "margin": margin, "margin_free": free, "floating": pl_flot,
+                 "pnl_session": pl_session, "pnl_total": pl_total})
+            self._sauve_etat_historique()
 
             def teinte(x):
                 return C["win"] if x > 0 else (C["loss"] if x < 0 else C["dim"])
@@ -793,6 +844,10 @@ def main():
     app.setFont(font_ui(10))
     w = MainWindow()
     w.show()
+    # Lancement explicite par l'orchestrateur : conserve la vraie GUI tout en
+    # redemarrant le moteur apres une fermeture ou une mise a jour.
+    if "--start" in sys.argv:
+        QtCore.QTimer.singleShot(0, w.on_start)
     sys.exit(app.exec())
 
 

@@ -55,7 +55,7 @@ def main() -> int:
     del X
     t0 = time.time()
     R1, D1, S1 = J.table_coups(o, h, l, sp, atr, cfg, 1.0)
-    y = J.cibles_expert(R1)
+    y = J.cibles_expert(R1, cfg)
     pred = J.expert_realiste(Xn, y, a_va, a_te, cfg)
     print(f"table et expert : {time.time() - t0:.0f} s ; validation "
           f"[{a_va:,} : {a_te:,}), le test n'est pas lu", flush=True)

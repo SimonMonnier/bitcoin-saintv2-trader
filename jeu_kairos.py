@@ -106,7 +106,14 @@ try:
 except Exception:
     pass
 
-N_ETAT = 5          # le bloc de position de l'observation porte l'etat du jeu
+N_ETAT = 5          # taille historique ; les nouveaux runs ajoutent des etats causaux
+
+
+def n_etat(cfg) -> int:
+    """Conserve les 5 etats historiques et active les extensions par run."""
+    return (N_ETAT
+            + 3 * int(bool(getattr(cfg, "observe_compte", False)))
+            + 3 * int(bool(getattr(cfg, "observe_calibration", False))))
 
 
 @dataclass
@@ -165,7 +172,19 @@ class JeuConfig:
     # m5_02 (porte 0.85, expert a 10 coups, 10 jetons, une position). Le BTC
     # et l'ETH pas a pas : prefixe kairos_multi_m5_06, `marches` = ("BTCUSD",
     # "ETHUSD"), `cache` = data_cache_MULTI_M5.pkl.
-    prefixe: str = "kairos_jeu_m5_03"
+    # Run distinct : le M5_09 reste le modele actuellement branche en demo.
+    # M5_19 rejoue strictement la version PPO precedente, sous un prefixe
+    # neuf afin de conserver l'audit du run interrompu M5_17.
+    prefixe: str = "kairos_jeu_m5_19_thermostat_ppo_lotmin"
+    # Reproduction demandee du run M5_03, avant les corrections de deroulement
+    # et de compte introduites dans la version 2.
+    # La version 2 rejoue l'equite, la marge et les positions ouvertes : elle
+    # est necessaire pour que la tete de lot recoive une recompense reelle.
+    jeu_version: int = 2
+    # Le modele voit enfin la situation de son compte : equite relative,
+    # drawdown depuis le plus haut et part de marge libre. Les checkpoints
+    # precedents restent a 5 etats et ne sont donc jamais incompatibles.
+    observe_compte: bool = True
     # LA VALIDATION CROISEE PURGEE — 2026-09-28, demande du proprietaire :
     # « entrainer le modele sur des periodes aleatoires pour qu'il apprenne
     # tous les types de marches ». Le walk-forward (h1_05) : +447.56, -441.18,
@@ -173,13 +192,33 @@ class JeuConfig:
     # bloc est teste a son tour par un modele NEUF entraine sur TOUS les
     # autres (passe et avenir), la validation etant le bloc le plus eloigne,
     # avec une zone tampon de `purge_semaines` + l'horizon + la memoire
+    # (ou `purge_barres_fixes` lorsqu'une reproduction historique est demandee)
     # retiree de l'entrainement autour du test et de la validation.
     # UN RESULTAT NEGATIF EST DEFINITIF (meme en voyant l'avenir des autres
     # blocs, pas d'avantage) ; un resultat positif est un PLAFOND, a confirmer
     # en walk-forward et en demo. "walk" = le walk-forward d'avant.
     validation: str = "blocs"
     n_blocs: int = 10
+    # APRES LA MESURE CROISEE, le modele destine au live ne repart pas de
+    # zero. Il part du champion de validation et traverse les dix regimes
+    # dans l'ordre, en rejouant equitablement les regimes precedents. Les
+    # folds restent independants : transmettre leurs poids entre eux ferait
+    # fuir leur zone de test dans le fold suivant et rendrait les resultats
+    # de validation mensongers.
+    deploiement_continu: bool = True
+    # 0 = une duree robuste, la mediane des epoques championnes des folds.
+    # Au minimum dix epoques afin que chaque regime soit le regime courant
+    # au moins une fois dans le curriculum.
+    epochs_deploiement: int = 0
+    # Le deploy apprend aussi les decisions des dix enseignants, mais chaque
+    # decision provient exclusivement du bloc de test que son enseignant
+    # n'avait jamais vu : distillation OOF, sans fuite de validation.
+    distillation_oof_epochs: int = 2
     purge_semaines: int = 1
+    # Compatibilite avec les resultats historiques M5 : l'utilisateur demande
+    # explicitement de revenir a la zone tampon de 388 bougies (un jour +
+    # horizon et memoire), au lieu de la purge hebdomadaire complete.
+    purge_barres_fixes: int = 388
     # LE JEU EN BOUGIES DE 15 MINUTES — 2026-09-27, demande du proprietaire :
     # « recommence le jeu avec des bougies de 15 minutes, et pas M1 pour
     # entrer ». Le modele voit des bougies M15 (contextes H1 et H4, voir
@@ -328,7 +367,38 @@ class JeuConfig:
     levier: float = 500.0
     lot_min: float = 0.01
     pas_lot: float = 0.01
+    lot_max: float = 100.0
     contrat: float = 1.0
+    # Tete de taille : elle choisit un des niveaux entre le minimum et le lot
+    # maximum calcule a l'entree (equite, stop et marge). Le lot envoye reste
+    # toujours un multiple de 0.01 ; aucun plafond fixe en lots n'est impose.
+    apprendre_lot: bool = True
+    niveaux_lot: int = 20
+    # Sixieme tete : part de l'equite que le coup a le droit de perdre au
+    # stop. Ce n'est pas une limite fixe a 1 % : la politique choisit elle
+    # meme l'un de ces pourcentages pour chaque occasion. 100 % est le
+    # plafond de solvabilite theorique ; le courtier, la marge et le pas de
+    # lot restent des bornes dures.
+    apprendre_risque: bool = True
+    niveaux_risque_pct: Tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 20.0,
+                                               35.0, 50.0, 75.0, 100.0)
+    # TETE D'ARBITRAGE : budget commun qui pilote les deux propositions
+    # (lot et risque). Ce n'est pas un plafond fixe par trade : 100 % est la
+    # capacite sure calculee avec equite, stop, marge et limites MT5 ; la
+    # tete choisit quelle part de cette capacite est justifiee par le signal.
+    apprendre_allocation: bool = True
+    niveaux_allocation_pct: Tuple[float, ...] = (10.0, 25.0, 45.0, 70.0, 100.0)
+    allocation_aux_coef: float = 0.35
+    # HUITIEME TETE — thermostat de confiance. Elle ne touche ni au sens ni
+    # aux barrieres : elle convertit l'historique CAUSAL des erreurs recentes
+    # du modele en un multiplicateur de l'enveloppe lot/risque. Le minimum
+    # reste 20 %, donc elle ne peut pas apprendre a se refugier a zero.
+    apprendre_confiance: bool = True
+    niveaux_confiance_pct: Tuple[float, ...] = (20.0, 40.0, 65.0, 85.0, 100.0)
+    # Trois etats bornes : R recent, surprise negative (valeur predite moins
+    # R realise), et serie de pertes. Ils ne lisent que des positions deja
+    # cloturees ; jeu, validation et live les mettent a jour de la meme facon.
+    observe_calibration: bool = True
     # En ATR de la barre de decision. L'ATR M1 du BTC vaut ~7 bps, un
     # mouvement de 15 minutes ~2.5 ATR : les coups vont de la demi-heure a
     # quelques heures.
@@ -372,6 +442,9 @@ class JeuConfig:
     # REMISE A 1 % LE 2026-09-27, demande du proprietaire : retrouver les gains
     # en dollars d'avant. Le drawdown redouble avec eux (~-7 a -15 % en
     # validation, -13.6 % au test du fold 1).
+    # Reference de 1 R (et non plus un plafond par trade quand `apprendre_lot`
+    # est actif) : le lot est alors choisi par la tete sous seule contrainte de
+    # marge/equite et des bornes MT5.
     risque_pct: float = 1.0
     # --- le walk-forward : les memes proportions que le run PPO ---
     part_train: float = 0.55
@@ -405,6 +478,9 @@ class JeuConfig:
     # EN M15, toutes les bougies : 34 000 lignes d'apprentissage.
     expert_pas_app: int = 1
     expert_arbres: int = 300
+    # RETOUR AUX 16 COUPLES, demande du proprietaire : aucune exclusion.
+    # Ce champ ne sert plus qu'a reproduire la cible historique du run m5_04.
+    expert_ratio_min: float = 0.0
     # Les colonnes de l'expert ajoutees a l'observation. Voir `features_expert`.
     n_expert: int = 4
     # LA PORTE D'ENTREE — 2026-09-26, run kairos_jeu_btc05.
@@ -475,6 +551,15 @@ class JeuConfig:
     # Reduire la mise (`risque_pct`) divise le drawdown sans toucher ce
     # rapport : c'est ce levier qui est garde.
     poids_pertes: float = 1.0
+    # GOUVERNEUR D'EXPOSITION — il ne modifie jamais le signal ni la
+    # recompense PPO. Il reduit seulement le plafond de lot disponible a la
+    # tete de risque quand le compte recule depuis son plus haut. A 20 % de
+    # drawdown, une nouvelle degradation bloque les entrees jusqu'au prochain
+    # jour ; le lendemain repart avec l'exposition minimale, pas a 100 %.
+    gouverneur_exposition: bool = False
+    gouverneur_dd_frein: float = 0.05
+    gouverneur_dd_stop: float = 0.20
+    gouverneur_exposition_min: float = 0.25
     # 2. LA MISE REDUITE EN BAISSE — la regle des gerants : quand le compte
     #    est a plus de `seuil_baisse` sous son plus haut, chaque coup ne
     #    risque plus que `mise_en_baisse` fois la mise ; elle revient
@@ -544,7 +629,7 @@ class PolitiqueJeu(SAINTPolicySingleHead):
 
     def __init__(self, cfg: JeuConfig):
         super().__init__(
-            n_features=len(colonnes_jeu(cfg)) + cfg.n_expert + N_ETAT,
+            n_features=len(colonnes_jeu(cfg)) + cfg.n_expert + n_etat(cfg),
             d_model=cfg.d_model,
             num_blocks=cfg.num_blocks, heads=cfg.heads, n_freq=cfg.n_freq,
             mlp_dim=cfg.mlp_dim, lecture="colonnes", dropout=0.05, ff_mult=2,
@@ -558,11 +643,31 @@ class PolitiqueJeu(SAINTPolicySingleHead):
         self.tete_objectif = nn.Linear(64, len(cfg.tp_atr))
         self.lecteur_stop = _lecteur()
         self.tete_stop = nn.Linear(64, len(cfg.sl_atr))
+        self.apprendre_lot = bool(getattr(cfg, "apprendre_lot", False))
+        if self.apprendre_lot:
+            self.lecteur_lot = _lecteur()
+            self.tete_lot = nn.Linear(64, int(cfg.niveaux_lot))
+        self.apprendre_risque = bool(getattr(cfg, "apprendre_risque", False))
+        if self.apprendre_risque:
+            self.lecteur_risque = _lecteur()
+            self.tete_risque = nn.Linear(64, len(cfg.niveaux_risque_pct))
+        self.apprendre_allocation = bool(getattr(cfg, "apprendre_allocation", False))
+        if self.apprendre_allocation:
+            self.lecteur_allocation = _lecteur()
+            self.tete_allocation = nn.Linear(64, len(cfg.niveaux_allocation_pct))
+        self.apprendre_confiance = bool(getattr(cfg, "apprendre_confiance", False))
+        if self.apprendre_confiance:
+            self.lecteur_confiance = _lecteur()
+            self.tete_confiance = nn.Linear(64, len(cfg.niveaux_confiance_pct))
         for m in list(self.lecteur_objectif) + list(self.lecteur_stop):
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
                 nn.init.zeros_(m.bias)
-        for m in (self.tete_objectif, self.tete_stop):
+        for m in (self.tete_objectif, self.tete_stop,
+                  *((self.tete_lot,) if self.apprendre_lot else ()),
+                  *((self.tete_risque,) if self.apprendre_risque else ()),
+                  *((self.tete_allocation,) if self.apprendre_allocation else ()),
+                  *((self.tete_confiance,) if self.apprendre_confiance else ())):
             nn.init.orthogonal_(m.weight, gain=0.01)
             nn.init.zeros_(m.bias)
         # LES TETES PAR MARCHE. Voir `tetes_par_marche`. Chaque copie part
@@ -582,6 +687,14 @@ class PolitiqueJeu(SAINTPolicySingleHead):
             self.lecteur_objectif_m, self.tete_objectif_m = (_dup(self.lecteur_objectif),
                                                              _dup(self.tete_objectif))
             self.lecteur_stop_m, self.tete_stop_m = _dup(self.lecteur_stop), _dup(self.tete_stop)
+            if self.apprendre_lot:
+                self.lecteur_lot_m, self.tete_lot_m = _dup(self.lecteur_lot), _dup(self.tete_lot)
+            if self.apprendre_risque:
+                self.lecteur_risque_m, self.tete_risque_m = _dup(self.lecteur_risque), _dup(self.tete_risque)
+            if self.apprendre_allocation:
+                self.lecteur_allocation_m, self.tete_allocation_m = _dup(self.lecteur_allocation), _dup(self.tete_allocation)
+            if self.apprendre_confiance:
+                self.lecteur_confiance_m, self.tete_confiance_m = _dup(self.lecteur_confiance), _dup(self.tete_confiance)
 
     def marche_de(self, x: torch.Tensor) -> torch.Tensor:
         """(B,) : l'indice du marche de chaque ligne, lu dans ses colonnes
@@ -614,6 +727,22 @@ class PolitiqueJeu(SAINTPolicySingleHead):
                                pm(k, self.lecteur_objectif_m, self.tete_objectif_m, zs)], 1)
             lsl = torch.stack([pm(k, self.lecteur_stop_m, self.tete_stop_m, zl),
                                pm(k, self.lecteur_stop_m, self.tete_stop_m, zs)], 1)
+            if self.apprendre_lot:
+                llo = torch.stack([pm(k, self.lecteur_lot_m, self.tete_lot_m, zl),
+                                   pm(k, self.lecteur_lot_m, self.tete_lot_m, zs)], 1)
+                if self.apprendre_risque:
+                    lri = torch.stack([pm(k, self.lecteur_risque_m, self.tete_risque_m, zl),
+                                       pm(k, self.lecteur_risque_m, self.tete_risque_m, zs)], 1)
+                    if self.apprendre_allocation:
+                        lal = torch.stack([pm(k, self.lecteur_allocation_m, self.tete_allocation_m, zl),
+                                           pm(k, self.lecteur_allocation_m, self.tete_allocation_m, zs)], 1)
+                        if self.apprendre_confiance:
+                            lco = torch.stack([pm(k, self.lecteur_confiance_m, self.tete_confiance_m, zl),
+                                               pm(k, self.lecteur_confiance_m, self.tete_confiance_m, zs)], 1)
+                            return le, v, ltp, lsl, llo, lri, lal, lco
+                        return le, v, ltp, lsl, llo, lri, lal
+                    return le, v, ltp, lsl, llo, lri
+                return le, v, ltp, lsl, llo
             return le, v, ltp, lsl
         la = self.tete_achat(self.mlp_achat(zn))
         lv = self.tete_vente(self.mlp_vente(zn))
@@ -625,6 +754,22 @@ class PolitiqueJeu(SAINTPolicySingleHead):
                            self.tete_objectif(self.lecteur_objectif(zs))], 1)
         lsl = torch.stack([self.tete_stop(self.lecteur_stop(zl)),
                            self.tete_stop(self.lecteur_stop(zs))], 1)
+        if self.apprendre_lot:
+            llo = torch.stack([self.tete_lot(self.lecteur_lot(zl)),
+                               self.tete_lot(self.lecteur_lot(zs))], 1)
+            if self.apprendre_risque:
+                lri = torch.stack([self.tete_risque(self.lecteur_risque(zl)),
+                                   self.tete_risque(self.lecteur_risque(zs))], 1)
+                if self.apprendre_allocation:
+                    lal = torch.stack([self.tete_allocation(self.lecteur_allocation(zl)),
+                                       self.tete_allocation(self.lecteur_allocation(zs))], 1)
+                    if self.apprendre_confiance:
+                        lco = torch.stack([self.tete_confiance(self.lecteur_confiance(zl)),
+                                           self.tete_confiance(self.lecteur_confiance(zs))], 1)
+                        return le, v, ltp, lsl, llo, lri, lal, lco
+                    return le, v, ltp, lsl, llo, lri, lal
+                return le, v, ltp, lsl, llo, lri
+            return le, v, ltp, lsl, llo
         return le, v, ltp, lsl
 
     def groupes_jeu(self) -> Dict[str, list]:
@@ -637,6 +782,10 @@ class PolitiqueJeu(SAINTPolicySingleHead):
                 "vente": _p(self.mlp_vente_m, self.tete_vente_m),
                 "gain": _p(self.lecteur_objectif_m, self.tete_objectif_m),
                 "perte": _p(self.lecteur_stop_m, self.tete_stop_m),
+                **({"lot": _p(self.lecteur_lot_m, self.tete_lot_m)} if self.apprendre_lot else {}),
+                **({"risque": _p(self.lecteur_risque_m, self.tete_risque_m)} if self.apprendre_risque else {}),
+                **({"allocation": _p(self.lecteur_allocation_m, self.tete_allocation_m)} if self.apprendre_allocation else {}),
+                **({"confiance": _p(self.lecteur_confiance_m, self.tete_confiance_m)} if self.apprendre_confiance else {}),
                 "valeur": _p(self.mlp_m, self.critic_m),
                 "tronc": _p(self.embed, self.col_emb, *self.blocks, self.norm) + [self.cls],
             }
@@ -648,6 +797,10 @@ class PolitiqueJeu(SAINTPolicySingleHead):
             "vente": _p(self.mlp_vente, self.tete_vente),
             "gain": _p(self.lecteur_objectif, self.tete_objectif),
             "perte": _p(self.lecteur_stop, self.tete_stop),
+            **({"lot": _p(self.lecteur_lot, self.tete_lot)} if self.apprendre_lot else {}),
+            **({"risque": _p(self.lecteur_risque, self.tete_risque)} if self.apprendre_risque else {}),
+            **({"allocation": _p(self.lecteur_allocation, self.tete_allocation)} if self.apprendre_allocation else {}),
+            **({"confiance": _p(self.lecteur_confiance, self.tete_confiance)} if self.apprendre_confiance else {}),
             "valeur": _p(self.mlp, self.critic),
             "tronc": _p(self.embed, self.col_emb, *self.blocks, self.norm)
                      + [self.cls],
@@ -769,6 +922,25 @@ def table_coups(o, h, l, sp, atr, cfg: JeuConfig, frac: float):
     return R, D, S
 
 
+def table_a_cout(frac, sans_cout, cout_reel, calcule):
+    """Une execution coherente au cout demande : resultat, duree ET sortie.
+
+    Le spread deplace les niveaux touches. Interpoler les R de deux
+    executions peut donc inventer un gain qui ne correspond ni a la duree
+    ni au type de sortie. Les extremites reutilisent leurs tables ; chaque
+    cout intermediaire est simule exactement, sans garder toute la rampe
+    en memoire. ``calcule`` preserve les frontieres et swaps par marche.
+    """
+    frac = float(frac)
+    if not np.isfinite(frac) or not 0.0 <= frac <= 1.0:
+        raise ValueError("la fraction de cout doit etre finie et comprise entre 0 et 1")
+    if frac == 0.0:
+        return sans_cout
+    if frac == 1.0:
+        return cout_reel
+    return calcule(frac)
+
+
 # ======================================================================
 # LES PARTIES
 # ======================================================================
@@ -805,17 +977,76 @@ def parties(temps: pd.Series, debut: int, fin: int, cfg) -> np.ndarray:
     return journees(temps, debut, fin, mb)
 
 
-def etat_jeu(jetons, score, reste_min, cfg: JeuConfig, occupees=None) -> np.ndarray:
-    """Les cinq colonnes du bloc de position, qui portent l'etat de la partie.
-    La cinquieme : la part des places occupees (`positions_max`), 0 sinon."""
+def etat_jeu(jetons, score, reste_min, cfg: JeuConfig, occupees=None,
+              equite=None, pic_equite=None, marge_libre=None,
+              calibration=None) -> np.ndarray:
+    """Etat de jeu, avec le compte pour les runs qui le demandent.
+
+    Les cinq premieres colonnes restent exactement celles des checkpoints
+    historiques. M5_12 ajoute equite/capital, drawdown depuis le pic et marge
+    libre/equite ; ce sont des donnees deja disponibles au moment de decider.
+    """
     n = len(jetons)
-    return np.stack([
+    base = np.stack([
         jetons / float(cfg.jetons),
         np.clip(score / cfg.vie_R, -1.0, 3.0),
         np.clip(reste_min / float(cfg.barres_par_partie), 0.0, 1.0),
         np.clip((score + cfg.vie_R) / cfg.vie_R, 0.0, 3.0),
         np.zeros(n) if occupees is None else np.asarray(occupees, np.float64),
     ], 1).astype(np.float32)
+    morceaux = [base]
+    if bool(getattr(cfg, "observe_compte", False)):
+        capital = max(float(cfg.capital), 1e-12)
+        eq = np.full(n, capital) if equite is None else np.asarray(equite, np.float64)
+        pic = (np.maximum(eq, capital) if pic_equite is None else
+               np.maximum(np.asarray(pic_equite, np.float64), eq))
+        libre = eq if marge_libre is None else np.asarray(marge_libre, np.float64)
+        morceaux.append(np.stack([
+            np.clip(eq / capital, 0.0, 10.0),
+            np.clip((pic - eq) / np.maximum(pic, 1e-12), 0.0, 1.0),
+            np.clip(libre / np.maximum(eq, 1e-12), 0.0, 1.0),
+        ], 1).astype(np.float32))
+    if bool(getattr(cfg, "observe_calibration", False)):
+        # Colonnes deja normalisees : R recent dans [-1,1], surprise et
+        # serie de pertes dans [0,1]. Une partie sans historique commence
+        # neutre, sans information venue du futur.
+        cal = np.zeros((n, 3), np.float32) if calibration is None else np.asarray(calibration, np.float32)
+        if cal.shape != (n, 3):
+            raise ValueError("calibration doit etre de forme (n, 3)")
+        morceaux.append(np.column_stack([
+            np.clip(cal[:, 0], -1.0, 1.0),
+            np.clip(cal[:, 1], 0.0, 1.0),
+            np.clip(cal[:, 2], 0.0, 1.0),
+        ]).astype(np.float32))
+    return np.concatenate(morceaux, axis=1)
+
+
+def gouverneur_exposition(equite, pic_equite, dd_debut_jour, cfg: JeuConfig):
+    """(echelle, bloque, dd) du garde-fou commun jeu/live.
+
+    La tete conserve le choix du niveau de risque et du lot. Cette echelle
+    borne seulement l'enveloppe qu'elle peut convertir en volume. Le blocage
+    ne se declenche que si le drawdown GLOBAL se degrade durant la journee ;
+    une journee nouvelle peut donc reprendre, mais a l'exposition reduite.
+    """
+    eq = max(float(equite), 0.0)
+    pic = max(float(pic_equite), eq, 1e-12)
+    dd = float(np.clip((pic - eq) / pic, 0.0, 1.0))
+    if not bool(getattr(cfg, "gouverneur_exposition", False)):
+        return 1.0, False, dd
+    frein = max(0.0, float(getattr(cfg, "gouverneur_dd_frein", 0.05)))
+    stop = max(frein + 1e-9, float(getattr(cfg, "gouverneur_dd_stop", 0.20)))
+    minimum = float(np.clip(getattr(cfg, "gouverneur_exposition_min", 0.25), 0.0, 1.0))
+    if dd <= frein:
+        echelle = 1.0
+    else:
+        progression = min(1.0, (dd - frein) / (stop - frein))
+        echelle = 1.0 - progression * (1.0 - minimum)
+    # On ne bloque pas une nouvelle journee qui commence deja sous le pic :
+    # elle ne peut reprendre qu'au plafond reduit. En revanche, une perte
+    # supplementaire sous le seuil stop coupe les nouvelles entrees du jour.
+    bloque = dd >= stop and dd > float(dd_debut_jour) + 1e-9
+    return float(echelle), bool(bloque), dd
 
 
 def observations(Xn: np.ndarray, t: np.ndarray, etat: np.ndarray, L: int):
@@ -878,16 +1109,22 @@ def _lim(fin_valide, t):
     return fin_valide[t] if isinstance(fin_valide, np.ndarray) else fin_valide
 
 
+class DonneesMarge(np.ndarray):
+    """Marge avec prix/ATR causaux pour appliquer le meme budget au jeu."""
+
+
 def fraction_marge(close, atr, cfg: JeuConfig) -> np.ndarray:
     """(N, K_sl) : la marge d'un coup en fraction de l'equite, pour chaque
     stop : mise de `risque_pct` au stop, notionnel = mise / distance, marge =
     notionnel / levier."""
     dist = (np.asarray(cfg.sl_atr, np.float64)[None, :] * np.asarray(atr, np.float64)[:, None]
             / np.asarray(close, np.float64)[:, None])
-    return (cfg.risque_pct / 100.0) / np.maximum(dist, 1e-12) / float(cfg.levier)
+    m = ((cfg.risque_pct / 100.0) / np.maximum(dist, 1e-12) / float(cfg.levier)).view(DonneesMarge)
+    m.prix, m.atr = np.asarray(close), np.asarray(atr)
+    return m
 
 
-def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
+def _joue_historique(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
          cfg: JeuConfig, device, explore: bool, gen=None,
          collecte: bool = False, rangs=None, marge=None):
     """Joue toutes les parties de `jours` EN PARALLELE.
@@ -944,7 +1181,7 @@ def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
             x = torch.from_numpy(ob).to(device)
             pa_t = torch.from_numpy(pa_np).to(device)
             pv_t = torch.from_numpy(pv_np).to(device)
-            le, v, ltp, lsl = policy.jeu(x)
+            le, v, ltp, lsl = policy.jeu(x)[:4]
             le = _masque_logits(le, pa_t, pv_t)
             a = _choix(le, explore, gen)
             sidx = (a == VENDRE).long()
@@ -1001,6 +1238,16 @@ def joue(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
 # ======================================================================
 # PPO
 # ======================================================================
+def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
+         gen=None, collecte=False, rangs=None, marge=None, prix=None, atr=None):
+    if int(getattr(cfg, "jeu_version", 1)) < 2:
+        return _joue_historique(policy, jours, Xn, R, D, S, fin_valide, cfg,
+                               device, explore, gen, collecte, rangs, marge)
+    from jeu_rollout import joue as joue_continu
+    return joue_continu(policy, jours, Xn, R, D, S, fin_valide, cfg, device,
+                        explore, gen, collecte, rangs, marge, prix, atr)
+
+
 def avantages(trans, cfg: JeuConfig):
     """GAE semi-markovien : l'actualisation suit la DUREE de chaque decision."""
     lignes = []
@@ -1011,7 +1258,7 @@ def avantages(trans, cfg: JeuConfig):
         adv = np.zeros(n)
         prochain_v, prochain_a = 0.0, 0.0
         for k in range(n - 1, -1, -1):
-            (_, _, _, _, _, _, _, _, _, vk, rk, dk, fk) = tr[k]
+            vk, rk, dk, fk = tr[k][9:13]
             # LES PERTES PESENT PLUS. Voir `poids_pertes`.
             if rk < 0.0:
                 rk = rk * float(getattr(cfg, "poids_pertes", 1.0))
@@ -1058,8 +1305,26 @@ def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng):
     lpe = np.array([lignes[k][6] for k in sel], np.float32)
     lpi = np.array([lignes[k][7] for k in sel], np.float32)
     lpj = np.array([lignes[k][8] for k in sel], np.float32)
-    adv = np.array([lignes[k][13] for k in sel], np.float32)
-    ret = np.array([lignes[k][14] for k in sel], np.float32)
+    avec_lot = bool(getattr(cfg, "apprendre_lot", False))
+    avec_risque = bool(getattr(cfg, "apprendre_risque", False))
+    avec_allocation = bool(getattr(cfg, "apprendre_allocation", False))
+    avec_confiance = bool(getattr(cfg, "apprendre_confiance", False))
+    klot = np.array([lignes[k][13] for k in sel]) if avec_lot else None
+    lpk = np.array([lignes[k][14] for k in sel], np.float32) if avec_lot else None
+    krisque = np.array([lignes[k][15] for k in sel]) if avec_risque else None
+    lprisque = np.array([lignes[k][16] for k in sel], np.float32) if avec_risque else None
+    kallocation = np.array([lignes[k][17] for k in sel]) if avec_allocation else None
+    lpallocation = np.array([lignes[k][18] for k in sel], np.float32) if avec_allocation else None
+    kconfiance = np.array([lignes[k][19] for k in sel]) if avec_confiance else None
+    lpconfiance = np.array([lignes[k][20] for k in sel], np.float32) if avec_confiance else None
+    # Cible auxiliaire : resultat immediat du coup. Elle n'entre jamais dans
+    # la recompense PPO des signaux ; elle apprend seulement a l'arbitre a
+    # reserver le budget fort aux contextes dont la queue de perte est faible.
+    r_allocation = np.array([lignes[k][10] for k in sel], np.float32) if avec_allocation else None
+    dec = (2 * int(avec_lot) + 2 * int(avec_risque) +
+           2 * int(avec_allocation) + 2 * int(avec_confiance))
+    adv = np.array([lignes[k][13 + dec] for k in sel], np.float32)
+    ret = np.array([lignes[k][14 + dec] for k in sel], np.float32)
     w = poids[sel]
     mu = float(np.average(adv, weights=w))
     sd = float(np.sqrt(np.average((adv - mu) ** 2, weights=w))) + 1e-8
@@ -1072,7 +1337,22 @@ def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng):
         for d0 in range(0, len(perm), cfg.minibatch):
             b = perm[d0:d0 + cfg.minibatch]
             x = T(observations(Xn, tt[b], et[b], L))
-            le, v, ltp, lsl = policy.jeu(x)
+            sortie = policy.jeu(x)
+            le, v, ltp, lsl = sortie[:4]
+            llo = sortie[4] if len(sortie) >= 5 else None
+            lri = sortie[5] if len(sortie) >= 6 else None
+            lal = sortie[6] if len(sortie) >= 7 else None
+            lco = sortie[7] if len(sortie) >= 8 else None
+            if int(getattr(cfg, "jeu_version", 1)) >= 2:
+                # Rejouer exactement les stops permis lors de la collecte.
+                ms = ((peut[b, None] >> (np.arange(len(cfg.sl_atr)) + 2)) & 1) > 0
+                lsl = lsl.masked_fill(~T(ms[:, None, :], torch.bool), _NEG)
+                if lri is not None:
+                    # Le pourcentage de risque etait lui aussi masque selon
+                    # le stop choisi, le solde, la marge et le lot minimum.
+                    mr = ((peut[b, None] >> (np.arange(len(cfg.niveaux_risque_pct))
+                                               + 2 + len(cfg.sl_atr))) & 1) > 0
+                    lri = lri.masked_fill(~T(mr[:, None, :], torch.bool), _NEG)
             le = _masque_logits(le, T((peut[b] & 1) > 0, torch.bool),
                                 T((peut[b] & 2) > 0, torch.bool))
             ab = T(a[b], torch.long)
@@ -1100,7 +1380,50 @@ def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng):
                     pb = -torch.min(rb * Ac, rb.clamp(1 - cfg.clip, 1 + cfg.clip) * Ac)
                     eb = -(lgc.exp() * lgc).sum(-1)
                     perte = perte + pb.mean() - cfg.entropie_barrieres * eb.mean()
+                if lal is not None:
+                    lgc = torch.log_softmax(lal[cb][ar, sidx], -1)
+                    ch = T(kallocation[b], torch.long)[cb]
+                    lpn = lgc.gather(1, ch[:, None]).squeeze(1)
+                    rb = torch.exp(lpn - T(lpallocation[b])[cb])
+                    pb = -torch.min(rb * Ac, rb.clamp(1 - cfg.clip, 1 + cfg.clip) * Ac)
+                    perte = perte + pb.mean() - cfg.entropie_barrieres * (-(lgc.exp() * lgc).sum(-1)).mean()
+                    # Classes ordonnees : perte nette -> budget 10 %, petit
+                    # gain -> prudent, forte opportunite -> budget maximal.
+                    cible = torch.bucketize(T(r_allocation[b])[cb],
+                                             T(np.array([-0.25, 0.0, 0.20, 0.75], np.float32)))
+                    perte = perte + float(cfg.allocation_aux_coef) * F.cross_entropy(lgc, cible)
                     hb = hb + eb.mean().detach() / 2
+                if lco is not None:
+                    # Le thermostat apprend par PPO, donc uniquement de la
+                    # consequence economique de son propre niveau. Il ne
+                    # modifie jamais la recompense des signaux d'entree.
+                    lgc = torch.log_softmax(lco[cb][ar, sidx], -1)
+                    ch = T(kconfiance[b], torch.long)[cb]
+                    lpn = lgc.gather(1, ch[:, None]).squeeze(1)
+                    rb = torch.exp(lpn - T(lpconfiance[b])[cb])
+                    pb = -torch.min(rb * Ac, rb.clamp(1 - cfg.clip, 1 + cfg.clip) * Ac)
+                    eb = -(lgc.exp() * lgc).sum(-1)
+                    perte = perte + pb.mean() - cfg.entropie_barrieres * eb.mean()
+                    hb = hb + eb.mean().detach() / 2
+                # Un minibatch peut ne contenir que des HOLD. Dans ce cas il
+                # n'existe ni sens, ni lot, ni niveau de risque a rejouer :
+                # les trois tetes de coup doivent donc etre sautees ensemble.
+                if llo is not None:
+                    lgc = torch.log_softmax(llo[cb][ar, sidx], -1)
+                    ch = T(klot[b], torch.long)[cb]
+                    lpn = lgc.gather(1, ch[:, None]).squeeze(1)
+                    rb = torch.exp(lpn - T(lpk[b])[cb])
+                    pb = -torch.min(rb * Ac, rb.clamp(1 - cfg.clip, 1 + cfg.clip) * Ac)
+                    eb = -(lgc.exp() * lgc).sum(-1)
+                    perte = perte + pb.mean() - cfg.entropie_barrieres * eb.mean()
+                if lri is not None:
+                    lgc = torch.log_softmax(lri[cb][ar, sidx], -1)
+                    ch = T(krisque[b], torch.long)[cb]
+                    lpn = lgc.gather(1, ch[:, None]).squeeze(1)
+                    rb = torch.exp(lpn - T(lprisque[b])[cb])
+                    pb = -torch.min(rb * Ac, rb.clamp(1 - cfg.clip, 1 + cfg.clip) * Ac)
+                    eb = -(lgc.exp() * lgc).sum(-1)
+                    perte = perte + pb.mean() - cfg.entropie_barrieres * eb.mean()
             _pas(policy, optims, perte, cfg)
             with torch.no_grad():
                 st["kl"].append(float(((ratio - 1) - torch.log(ratio)).mean()))
@@ -1229,6 +1552,33 @@ def expert_multi(Xn, y, t_ns, dans_train: np.ndarray, fin_tr: np.ndarray,
     return pred, ms
 
 
+def expert_deploiement(Xn, y, cfg: JeuConfig):
+    """Expert du modele de deploiement, appris sur tout l'historique.
+
+    Il ne sert jamais a mesurer un fold : les experts des folds conservent
+    leurs predictions OOF. Cette version finale est donc libre d'apprendre
+    toutes les periodes, comme la politique continue qui l'accompagne.
+    """
+    import lightgbm as lgb
+
+    pred = np.full((len(Xn), 2), np.nan, np.float32)
+    idx = np.arange(0, len(Xn), max(int(cfg.expert_pas_app), 1), dtype=np.int64)
+    modeles = []
+    for s_ in range(2):
+        ok = idx[np.isfinite(y[idx, s_])]
+        if len(ok) < 2:
+            raise ValueError("Pas assez de cibles pour l'expert de deploiement")
+        m = lgb.LGBMRegressor(
+            n_estimators=cfg.expert_arbres, learning_rate=0.03,
+            num_leaves=31, min_child_samples=400, subsample=0.7,
+            subsample_freq=1, colsample_bytree=0.7, reg_lambda=5.0,
+            n_jobs=4, verbose=-1)
+        m.fit(Xn[ok], y[ok, s_])
+        pred[:, s_] = m.predict(Xn).astype(np.float32)
+        modeles.append(m)
+    return pred, modeles
+
+
 def extras_btc(temps_bloc: pd.Series):
     """Les features Binance et Coinbase du BTC M15, alignees sur ses bougies.
 
@@ -1270,17 +1620,24 @@ def ligne_marches(coups, marche: np.ndarray, cfg: JeuConfig) -> str:
     return "par marche : " + "  |  ".join(parts)
 
 
-def cibles_expert(R: np.ndarray) -> np.ndarray:
-    """(N, 2) : le R net MOYEN de tous les coups d'un sens, a chaque minute.
+def cibles_expert(R: np.ndarray, cfg: Optional[JeuConfig] = None) -> np.ndarray:
+    """Moyenne des R nets de TOUS les couples TP/SL de chaque sens.
 
-    C'est la valeur d'acheter (ou de vendre) maintenant, toutes barrieres
-    confondues — plus lisse que le meilleur coup, et sans choisir a la
-    place du PPO les barrieres qu'il doit apprendre.
+    Un ancien manifeste portant explicitement un ratio positif conserve sa
+    cible pour une relecture historique. Les nouveaux runs ne filtrent rien.
     """
+    valeurs = R.reshape(R.shape[0], 2, -1)
+    if cfg is not None and float(getattr(cfg, "expert_ratio_min", 0.0)) > 0:
+        tp = np.asarray(cfg.tp_atr, np.float64)[:, None]
+        sl = np.asarray(cfg.sl_atr, np.float64)[None, :]
+        garde = tp / sl >= cfg.expert_ratio_min
+        if not garde.any():
+            raise ValueError("expert_ratio_min exclut toutes les barrieres")
+        valeurs = R[:, :, garde]
     import warnings
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        y = np.nanmean(R.reshape(R.shape[0], 2, -1), axis=2)
+        y = np.nanmean(valeurs, axis=2)
     return np.clip(y, -3.0, 5.0).astype(np.float32)
 
 
@@ -1479,7 +1836,7 @@ def passe_imitation(policy, optims, prep, Xn, cfg, device, rng, ep: int) -> None
     for d0 in range(0, len(perm), 512):
         b = perm[d0:d0 + 512]
         x = T(observations(Xn, tt[b], et[b], L))
-        le, _, ltp, lsl = policy.jeu(x)
+        le, _, ltp, lsl = policy.jeu(x)[:4]
         ab, wb = T(act[b], torch.long), T(w[b])
         pe = (F.cross_entropy(le, ab, reduction="none") * wb).sum() / wb.sum()
         cb = ab != ATTENDRE
@@ -1497,7 +1854,7 @@ def passe_imitation(policy, optims, prep, Xn, cfg, device, rng, ep: int) -> None
 # LE BILAN D'UNE SERIE DE PARTIES
 # ======================================================================
 def bilan(scores, coups, close, atr, sp, cfg: JeuConfig,
-          frac: float = 1.0, ordre=None) -> Dict[str, float]:
+          frac: float = 1.0, ordre=None, *, open_=None, temps=None) -> Dict[str, float]:
     ksl = np.asarray(cfg.sl_atr)
     n = len(coups)
     b = {"parties": len(scores), "score": float(np.mean(scores)) if len(scores) else 0.0,
@@ -1512,11 +1869,20 @@ def bilan(scores, coups, close, atr, sp, cfg: JeuConfig,
     c = np.array(coups)
     t, s, i, j = (c[:, k].astype(np.int64) for k in (1, 2, 3, 4))
     r, du, so = c[:, 5], c[:, 6], c[:, 7].astype(np.int64)
+    lots = c[:, 8] if c.shape[1] > 8 else None
+    risques_choisis = c[:, 9] if c.shape[1] > 9 else None
+    # Depuis M5_11, le rollout conserve le PnL dollar reel de chaque lot.
+    # Le multiplier par un R fixe de 10 $ faussait le solde des que l'equite
+    # evoluait et pouvait faire apparaitre des drawdowns impossibles.
+    pnl_reels = c[:, 10] if c.shape[1] > 10 else r * cfg.risque_dollars
+    total_reel = float(pnl_reels.sum())
+    compose = bool(getattr(cfg, "recompense_composee", False))
     net = r * ksl[j] * atr[t] / close[t] * 1e4
     # LE COUT REELLEMENT PAYE : pendant la rampe, une part seulement.
     cout = frac * (sp[t] + cfg.glissement_entree_bps
                    + np.where(so != 0, cfg.glissement_sortie_bps, 0.0))
-    g, p = r[r > 0].sum(), -r[r < 0].sum()
+    mesure_pf = pnl_reels if compose else r
+    g, p = mesure_pf[mesure_pf > 0].sum(), -mesure_pf[mesure_pf < 0].sum()
     # LE DRAWDOWN — la pire baisse du compte, sommet a creux, en dollars et
     # en % du capital, les coups joues dans l'ordre du temps. Demande du
     # proprietaire, 2026-09-27, avec les comptes ci-dessous.
@@ -1524,33 +1890,61 @@ def bilan(scores, coups, close, atr, sp, cfg: JeuConfig,
     # marches sont empiles) : `ordre` donne l'instant de chaque ligne.
     # EN POSITIONS MULTIPLES, les coups se chevauchent : le compte bouge a
     # leur RESOLUTION, pas a leur ouverture.
-    t_ref = t + du.astype(np.int64) if int(getattr(cfg, "positions_max", 1)) > 1 else t
+    t_ref = (t + du.astype(np.int64) if int(getattr(cfg, "jeu_version", 1)) >= 2
+             or int(getattr(cfg, "positions_max", 1)) > 1 else t)
     if ordre is not None:
         t_ref = np.minimum(t_ref, len(ordre) - 1)
-    ordre = np.argsort(t_ref if ordre is None else np.asarray(ordre)[t_ref], kind="stable")
-    eq = cfg.capital + np.cumsum(r[ordre] * cfg.risque_dollars)
-    eq = np.concatenate([[cfg.capital], eq])
+    tri = np.argsort(t_ref if ordre is None else np.asarray(ordre)[t_ref], kind="stable")
+    # Plusieurs positions peuvent se resoudre sur la meme bougie. Le jeu
+    # realise alors leur PnL ensemble et ne laisse jamais le solde devenir
+    # negatif. L'ancien cumsum additionnait chaque perte brute sans ce
+    # plancher : il pouvait afficher un drawdown de -678 %, impossible dans
+    # le moteur qui a produit les trades.
+    sorties = t_ref[tri] if ordre is None else np.asarray(ordre)[t_ref[tri]]
+    eq = [float(cfg.capital)]
+    debut = 0
+    while debut < len(tri):
+        fin_groupe = debut + 1
+        while fin_groupe < len(tri) and sorties[fin_groupe] == sorties[debut]:
+            fin_groupe += 1
+        eq.append(max(0.0, eq[-1] + float(pnl_reels[tri[debut:fin_groupe]].sum())))
+        debut = fin_groupe
+    eq = np.asarray(eq, dtype=np.float64)
     pic = np.maximum.accumulate(eq)
     dd_d = float((eq - pic).min())
-    dd_p = float(((eq - pic) / pic).min())
+    dd_p = float(np.clip(((eq - pic) / np.maximum(pic, 1e-12)).min(), -1.0, 0.0))
     # LA MISE REDUITE EN BAISSE, jouee dans le meme ordre. Voir `seuil_baisse`.
-    ep = compte_prudent(r[ordre], cfg)
+    ep = compte_prudent(r[tri], cfg)
     pic_p = np.maximum.accumulate(ep)
     # UN SEUL MARCHE : les lots, contrats et devises des indices different de
     # ceux du BTC, le compte « comme en live » ne vaut que pour le BTC seul.
-    live = (compte_live(t, j, r, du, close, atr, cfg)
-            if n and not tuple(getattr(cfg, "marches", ())) else {})
+    # Ce replay historique recalcule un lot a 1 % et ne connait pas encore
+    # le lot reel choisi par la nouvelle tete. L'afficher ici produirait des
+    # « refus par risque » fictifs ; le bilan PPO reste la source de verite.
+    live = (compte_live(t, j, r, du, close, atr, cfg, sens=s, open_=open_,
+                        spread=sp, sorties=so, temps=temps)
+            if n and not tuple(getattr(cfg, "marches", ()))
+            and not bool(getattr(cfg, "apprendre_lot", False)) else {})
     return b | live | {
         "prudent_total": float(ep[-1] - cfg.capital),
         "prudent_dd_dollars": float((ep - pic_p).min()),
-        "prudent_dd_pct": float(((ep - pic_p) / pic_p).min()),
+        "prudent_dd_pct": float(np.clip(((ep - pic_p) / np.maximum(pic_p, 1e-12)).min(), -1.0, 0.0)),
         "gagnants": int((r > 0).sum()), "perdants": int((r < 0).sum()),
         "longs": int((s == 0).sum()), "shorts": int((s == 1).sum()),
         "win_rate": float((r > 0).mean()), "dd_dollars": dd_d, "dd_pct": dd_p,
-        "total_dollars": float(r.sum() * cfg.risque_dollars),
+        # Le total du bilan est le solde realisable. La somme brute des PnL
+        # des positions ne peut pas faire passer un compte sous zero.
+        "total_dollars": float(eq[-1] - cfg.capital),
         "net": float(net.mean()), "brut": float((net + cout).mean()),
         "cout": float(cout.mean()), "pf": float(g / p) if p > 0 else float("inf"),
         "achat": float(np.mean(s == 0)),
+        **({"lot_min_choisi": float(lots.min()), "lot_moy_choisi": float(lots.mean()),
+            "lot_max_choisi": float(lots.max()), "lot_min_pct": float(np.mean(lots == cfg.lot_min))}
+           if lots is not None else {}),
+        **({"risque_min_choisi": float(risques_choisis.min()),
+            "risque_moy_choisi": float(risques_choisis.mean()),
+            "risque_max_choisi": float(risques_choisis.max())}
+           if risques_choisis is not None and np.isfinite(risques_choisis).any() else {}),
         "sorties": tuple(float(np.mean(so == k)) for k in range(3)),
         "tp": tuple(float(np.mean(i == k)) for k in range(len(cfg.tp_atr))),
         "sl": tuple(float(np.mean(j == k)) for k in range(len(cfg.sl_atr))),
@@ -1560,7 +1954,61 @@ def bilan(scores, coups, close, atr, sp, cfg: JeuConfig,
     }
 
 
-def compte_live(t, j, r, du, close, atr, cfg: JeuConfig) -> Dict[str, float]:
+def ecrit_trades_csv(path: str, coups, temps, cfg: JeuConfig, *, epoch: int, phase: str) -> None:
+    """Ajoute les executions d'une epoch au CSV d'audit du jeu M5_11.
+
+    Ce journal est volontairement en dollars reels : il permet de controler
+    tout lot, notamment 100.00, contre l'equite et la marge qui l'ont rendu
+    possible au moment de l'entree.
+    """
+    if not coups:
+        return
+    c = np.asarray(coups, dtype=float)
+    if c.ndim != 2 or c.shape[1] < 17:
+        return
+    entree = c[:, 1].astype(np.int64)
+    sortie = np.minimum(entree + c[:, 6].astype(np.int64), len(temps) - 1)
+    dates = pd.Series(temps).reset_index(drop=True)
+    libelle_sortie = np.array(["TP", "SL", "TEMPS"], dtype=object)[c[:, 7].astype(np.int64)]
+    frame = pd.DataFrame({
+        "epoch": int(epoch), "phase": str(phase), "partie": c[:, 0].astype(np.int64),
+        "entree_index": entree, "entree_time": dates.iloc[entree].astype(str).to_numpy(),
+        "sortie_index": sortie, "sortie_time": dates.iloc[sortie].astype(str).to_numpy(),
+        "sens": np.where(c[:, 2].astype(np.int64) == 0, "BUY", "SELL"),
+        "tp_atr": np.asarray(cfg.tp_atr)[c[:, 3].astype(np.int64)],
+        "sl_atr": np.asarray(cfg.sl_atr)[c[:, 4].astype(np.int64)],
+        "duree_bougies": c[:, 6].astype(np.int64), "sortie": libelle_sortie,
+        "lot": c[:, 8], "risque_pct_equite": c[:, 9], "pnl_reel_usd": c[:, 10],
+        "equite_avant_usd": c[:, 11], "marge_libre_avant_usd": c[:, 12],
+        "marge_requise_usd": c[:, 13], "prix_entree": c[:, 14],
+        "distance_stop": c[:, 15], "lot_plafond_selection": c[:, 16],
+        "gouverneur_exposition": c[:, 17] if c.shape[1] > 17 else 1.0,
+        "drawdown_entree": c[:, 18] if c.shape[1] > 18 else 0.0,
+        "allocation_budget": c[:, 19] if c.shape[1] > 19 else 1.0,
+        "thermostat_confiance": c[:, 20] if c.shape[1] > 20 else 1.0,
+        "equite_apres_usd": np.maximum(0.0, c[:, 11] + c[:, 10]),
+        "score_R": c[:, 5],
+    })
+    # Un CSV historique peut ne pas posseder les deux colonnes du gouverneur.
+    # On le preserve et on ecrit alors un journal homonyme separe, plutot que
+    # d'ajouter des lignes decalees sous son ancien en-tete.
+    cible = path
+    if os.path.exists(cible):
+        ancien = pd.read_csv(cible, nrows=0).columns
+        if "gouverneur_exposition" not in ancien:
+            racine, extension = os.path.splitext(cible)
+            cible = racine + "_gouverneur" + extension
+    frame.to_csv(cible, mode="a", index=False, header=not os.path.exists(cible), encoding="utf-8")
+
+
+def compte_live(t, j, r, du, close, atr, cfg: JeuConfig, **kwargs) -> Dict[str, float]:
+    if int(getattr(cfg, "jeu_version", 1)) < 2:
+        return _compte_live_historique(t, j, r, du, close, atr, cfg)
+    from jeu_compte import compte_live as compte_verifie
+    return compte_verifie(t, j, r, du, close, atr, cfg, **kwargs)
+
+
+def _compte_live_historique(t, j, r, du, close, atr, cfg: JeuConfig) -> Dict[str, float]:
     """Les coups rejoues sur UN compte, comme en live.
 
     Chaque coup mise `risque_pct` de l'equite REALISEE au moment d'ouvrir,
@@ -1579,7 +2027,7 @@ def compte_live(t, j, r, du, close, atr, cfg: JeuConfig) -> Dict[str, float]:
         tk = int(t[k])
         while ouverts and ouverts[0][0] <= tk:
             _, _, pnl = heapq.heappop(ouverts)
-            E += pnl
+            E = max(0.0, E + pnl)
             courbe.append(E)
         if E <= 0:
             break
@@ -1597,13 +2045,13 @@ def compte_live(t, j, r, du, close, atr, cfg: JeuConfig) -> Dict[str, float]:
         pris += 1
     while ouverts:
         _, _, pnl = heapq.heappop(ouverts)
-        E += pnl
+        E = max(0.0, E + pnl)
         courbe.append(E)
     courbe = np.asarray(courbe)
     pic = np.maximum.accumulate(courbe)
     return {"live_total": float(E - cfg.capital),
             "live_dd_dollars": float((courbe - pic).min()),
-            "live_dd_pct": float(((courbe - pic) / pic).min()),
+            "live_dd_pct": float(np.clip(((courbe - pic) / np.maximum(pic, 1e-12)).min(), -1.0, 0.0)),
             "live_pris": pris, "live_marge": sautes,
             "live_risque_moy": float(np.mean(risques)) if risques else float("nan"),
             "live_risque_max": float(np.max(risques)) if risques else float("nan")}
@@ -1621,7 +2069,7 @@ def compte_prudent(r_ordonnes: np.ndarray, cfg: JeuConfig) -> np.ndarray:
     for r in r_ordonnes:
         baisse = (pic - eq[-1]) / pic
         m = float(cfg.mise_en_baisse) if baisse >= float(cfg.seuil_baisse) else 1.0
-        eq.append(eq[-1] + float(r) * cfg.risque_dollars * m)
+        eq.append(max(0.0, eq[-1] + float(r) * cfg.risque_dollars * m))
         pic = max(pic, eq[-1])
     return np.asarray(eq)
 
@@ -1648,18 +2096,29 @@ def ligne_detail(b, cfg: JeuConfig) -> str:
             f"{b['shorts']} shorts  |  profit factor {b['pf']:.2f}  |  drawdown max "
             f"{b['dd_dollars']:+.2f} $ ({100 * b['dd_pct']:+.1f} %)  |  total "
             f"{b['total_dollars']:+.2f} $ sur {b['parties']} {cfg.unite}"
-            + (f"  |  COMME EN LIVE ({cfg.risque_pct:g} % de l'equite, lots de "
+            + (f"  |  lots choisis {b['lot_min_choisi']:.2f}/{b['lot_moy_choisi']:.2f}/"
+               f"{b['lot_max_choisi']:.2f} (min {100 * b['lot_min_pct']:.0f} %)"
+               if 'lot_moy_choisi' in b else '')
+            + (f"  |  risque choisi {b['risque_min_choisi']:.0f}/"
+               f"{b['risque_moy_choisi']:.1f}/{b['risque_max_choisi']:.0f} % de l'equite"
+               if 'risque_moy_choisi' in b else '')
+            + (f"  |  COMME EN LIVE ({cfg.risque_pct:g} % du solde, lots de "
                f"{cfg.lot_min:g}, levier 1:{cfg.levier:.0f}) : total {b['live_total']:+.2f} $, "
-               f"pire baisse {100 * b['live_dd_pct']:+.1f} %, risque reel moyen "
+               f"baisse du solde {100 * b['live_dd_pct']:+.1f} %, risque nominal moyen "
                f"{100 * b['live_risque_moy']:.2f} % (max {100 * b['live_risque_max']:.1f} %)"
                + (f", {b['live_marge']} refuses faute de marge" if b.get("live_marge") else "")
+               + (f", {b['live_risque_refuses']} refuses par le risque" if b.get("live_risque_refuses") else "")
+               + (f", {b['live_positions']} refuses par la capacite" if b.get("live_positions") else "")
+               + (f", drawdown equity aux clotures {100 * b['live_equity_dd_pct']:+.1f} %"
+                  if b.get("live_equity_disponible") else "")
                if "live_total" in b else ""))
 
 
 def ligne_bilan(b, cfg: JeuConfig) -> str:
     if b["coups"] == 0:
         return (f"parties {b['parties']}  AUCUN COUP JOUE  score +0.000 R/partie")
-    return (f"score {b['score']:+.3f} R/partie ({b['score'] * cfg.risque_dollars:+.2f}$)  "
+    dollars_partie = b["total_dollars"] / max(b["parties"], 1)
+    return (f"score {b['score']:+.3f} R/partie ({dollars_partie:+.2f}$)  "
             f"gagnees {100 * b['gagnees']:.0f}% perdues {100 * b['perdues']:.0f}% "
             f"sur {b['parties']}  coups {b['coups']} ({b['coups'] / max(b['parties'], 1):.1f}"
             f"/partie, {b['gain_R']:+.3f} R/coup)  net {b['net']:+.2f} bps  "
@@ -1683,6 +2142,14 @@ def ligne_style(b, cfg: JeuConfig) -> str:
 # ======================================================================
 # LE WALK-FORWARD
 # ======================================================================
+def purge_barres(cfg):
+    fixe = int(getattr(cfg, "purge_barres_fixes", 0))
+    if fixe > 0:
+        return fixe
+    unite = cfg.barres_par_partie if int(getattr(cfg, "jeu_version", 1)) < 2 else 7 * cfg.barres_par_jour
+    return int(cfg.horizon_max + cfg.lookback + cfg.purge_semaines * unite)
+
+
 def masque_blocs(N: int, K: int, k: int, purge: int):
     """(entrainement permis (N,), (debut, fin) du test, (debut, fin) de la
     validation) pour le bloc de test `k` : la validation est le bloc le plus
@@ -1709,6 +2176,424 @@ def prochain_exclu(permis: np.ndarray) -> np.ndarray:
             prochain = i
         out[i] = prochain
     return out
+
+
+def _jours_par_regime(jours: np.ndarray, N: int, n_regimes: int):
+    """Decoupe les parties entieres en regimes chronologiques non melanges."""
+    bornes = np.linspace(0, N, n_regimes + 1).astype(np.int64)
+    out = []
+    for a, z in zip(bornes[:-1], bornes[1:]):
+        g = jours[(jours[:, 0] >= a) & (jours[:, 1] <= z)]
+        if len(g):
+            out.append(g)
+    if not out:
+        raise ValueError("Aucune partie entiere pour le curriculum de deploiement")
+    return out
+
+
+def _rejoue_regimes(regimes, courant: int, n: int, rng):
+    """Nouvelles parties du regime courant + rappel egal de son passe.
+
+    Cela evite qu'un passage sur une phase recente efface les tendances,
+    crises ou ranges deja appris. Aucun tirage ne vient d'un regime futur.
+    """
+    groupes = regimes[:courant + 1]
+    par_groupe = max(1, int(np.ceil(n / len(groupes))))
+    tires = []
+    for g in groupes:
+        tires.append(g[rng.choice(len(g), size=par_groupe,
+                                  replace=len(g) < par_groupe)])
+    out = np.concatenate(tires, axis=0)
+    return out[rng.permutation(len(out))[:n]]
+
+
+def distille_decisions_oof(policy, optims, transitions, Xn, cfg, device, rng):
+    """Transfere les decisions des dix professeurs dans un seul eleve.
+
+    `transitions` ne contient que les trajectoires de TEST des folds. Pour
+    chaque date, le professeur qui donne le label ne l'a donc jamais utilisee
+    pour apprendre. L'eleve peut assimiler tous les regimes sans invalider le
+    resultat croise deja mesure. Les cinq tetes de decision sont copiees :
+    entree, TP, SL, lot et risque.
+    """
+    lignes = [x for episode in transitions for x in episode]
+    if not lignes:
+        print("  OOF distillation ignoree : aucune decision de test", flush=True)
+        return
+    # Toutes les entrees sont conservees ; les HOLD sont echantillonnes au
+    # meme pas que l'imitation de l'expert afin de ne pas noyer les trades.
+    actions = np.asarray([x[3] for x in lignes], np.int64)
+    garde = actions != ATTENDRE
+    attente = np.flatnonzero(~garde)
+    if len(attente):
+        garde[attente[::max(int(cfg.expert_pas_neg), 1)]] = True
+    lignes = [x for x, ok in zip(lignes, garde) if ok]
+    tt = np.asarray([x[0] for x in lignes], np.int64)
+    et = np.stack([x[1] for x in lignes]).astype(np.float32)
+    act = np.asarray([x[3] for x in lignes], np.int64)
+    tp = np.asarray([x[4] for x in lignes], np.int64)
+    sl = np.asarray([x[5] for x in lignes], np.int64)
+    lot = np.asarray([x[13] for x in lignes], np.int64)
+    risque = np.asarray([x[15] for x in lignes], np.int64)
+    confiance = np.asarray([x[19] for x in lignes], np.int64)
+    poids = np.where(act == ATTENDRE, 1.0, float(cfg.expert_poids_pos)).astype(np.float32)
+    T = lambda z, dt=torch.float32: torch.as_tensor(z, dtype=dt, device=device)
+    print(f"  OOF distillation : {len(lignes):,} decisions de test croisees, "
+          f"{int((act != ATTENDRE).sum()):,} trades, {cfg.distillation_oof_epochs} passe(s)",
+          flush=True)
+    policy.train()
+    for ep in range(int(cfg.distillation_oof_epochs)):
+        pertes = []
+        ordre = rng.permutation(len(lignes))
+        for d0 in range(0, len(lignes), 512):
+            b = ordre[d0:d0 + 512]
+            x = T(observations(Xn, tt[b], et[b], int(cfg.lookback)))
+            sortie = policy.jeu(x)
+            le, _v, ltp, lsl = sortie[:4]
+            wb, ab = T(poids[b]), T(act[b], torch.long)
+            loss = (F.cross_entropy(le, ab, reduction="none") * wb).sum() / wb.sum()
+            cb = act[b] != ATTENDRE
+            if bool(cb.any()):
+                ar = torch.arange(int(cb.sum()), device=device)
+                sens = (ab[cb] == VENDRE).long()
+                for logits, cible in ((ltp, tp[b]), (lsl, sl[b])):
+                    loss = loss + F.cross_entropy(logits[cb][ar, sens],
+                                                   T(cible[cb], torch.long))
+                if len(sortie) >= 5:
+                    loss = loss + F.cross_entropy(sortie[4][cb][ar, sens],
+                                                   T(lot[b][cb], torch.long))
+                if len(sortie) >= 6:
+                    loss = loss + F.cross_entropy(sortie[5][cb][ar, sens],
+                                                   T(risque[b][cb], torch.long))
+                if len(sortie) >= 8:
+                    loss = loss + F.cross_entropy(sortie[7][cb][ar, sens],
+                                                   T(confiance[b][cb], torch.long))
+            _pas(policy, optims, loss, cfg)
+            pertes.append(float(loss.detach()))
+        print(f"  OOF distillation passe {ep + 1}/{cfg.distillation_oof_epochs} "
+              f"perte {np.mean(pertes):.4f}", flush=True)
+    policy.eval()
+
+
+def entraine_deploiement_continu_ancien(cfg, d, X, y_ex, toutes, o, h, l, c, sp, atr,
+                                 R0, D0, S0, R1, D1, S1, marge, candidats,
+                                 transitions_oof, device, rng):
+    """Ancienne recette mono-fold, desactivee.
+
+    Les folds sont un banc de mesure, jamais une chaine de poids. Une fois
+    cette mesure terminee, le champion de validation devient la graine d'un
+    unique modele qui avance chronologiquement, sans remise a zero, tout en
+    rejouant les regimes passes. C'est cette phase -- et non un dernier fit
+    neuf -- qui transmet l'apprentissage des dix periodes au live.
+    """
+    raise RuntimeError("La recette DEPLOY mono-fold est desactivee : utiliser l'ensemble des 10 folds")
+    if not candidats:
+        print("  DEPLOY ignore : aucun checkpoint de fold disponible", flush=True)
+        return None
+    # Le test ne participe jamais a ce choix. Les candidats sont classes par
+    # leur profit de VALIDATION, la zone reservee du fold.
+    champion = max(candidats, key=lambda x: x["profit_jour"])
+    print("\n" + "=" * 70)
+    print(f"  DEPLOY CONTINU : graine fold {champion['bloc']} epoch {champion['epoch']} "
+          f"({champion['profit_jour']:+.2f}$/jour en validation)", flush=True)
+    print("  parcours chronologique des regimes, avec rappel equilibre du passe ; "
+          "aucun reset entre regimes", flush=True)
+    N = len(d)
+    st_m = {"mean": X.astype(np.float64).mean(0).astype(np.float32),
+            "std": X.astype(np.float64).std(0).astype(np.float32)}
+    Xn = safe_normalize(X, st_m).astype(np.float32)
+    t_ex = time.time()
+    pred, modeles_expert = expert_deploiement(Xn, y_ex, cfg)
+    FE = features_expert(pred, fenetre=10_000 // int(cfg.minutes_par_barre))
+    rangs_ex = FE[:, 2:4].copy()
+    st_e = {"mean": FE.astype(np.float64).mean(0), "std": FE.astype(np.float64).std(0)}
+    FEn = np.clip((FE - st_e["mean"]) / (st_e["std"] + 1e-8), -5.0, 5.0).astype(np.float32)
+    Xk = np.concatenate([Xn, FEn[:, :cfg.n_expert]], axis=1)
+    print(f"  expert final sur tout l'historique : {time.time() - t_ex:.0f} s", flush=True)
+
+    from jeu_artifacts import sauvegarde_pipeline_bloc, empreinte_fichier
+    pipeline_path = f"pipeline_{cfg.prefixe}_deploy.json"
+    sauvegarde_pipeline_bloc(
+        pipeline_path, cfg=cfg, donnees=d, colonnes=colonnes_jeu(cfg),
+        normalisation_marche=st_m, normalisation_expert=st_e,
+        modeles_expert=modeles_expert, predictions_expert=pred,
+        meta={"type": "deploiement_continu", "graine_fold": champion["bloc"],
+              "graine_epoch": champion["epoch"],
+              "selection": "profit_validation", "regimes": int(cfg.n_blocs),
+              "rejeu": "egal_des_regimes_precedents"})
+    pipeline_ref = {"fichier": pipeline_path, "sha256": empreinte_fichier(pipeline_path)}
+
+    ck = torch.load(champion["path"], map_location=device, weights_only=False)
+    policy = PolitiqueJeu(cfg).to(device)
+    policy.load_state_dict(ck["modele"])
+    optims = optimiseurs(policy, cfg)
+    fin = np.full(N, N, np.int64)
+    pos = coups_expert_predits(toutes, pred, D1, fin, cfg)
+    imite_expert(policy, optims, pos, toutes, Xk, fin, cfg, device, rng)
+    distille_decisions_oof(policy, optims, transitions_oof, Xk, cfg, device, rng)
+    regimes = _jours_par_regime(toutes, N, int(cfg.n_blocs))
+    epochs_candidats = [int(x["epoch"]) for x in candidats if x["epoch"] is not None]
+    n_ep = int(cfg.epochs_deploiement) if int(cfg.epochs_deploiement) > 0 else \
+        int(np.median(epochs_candidats)) if epochs_candidats else int(cfg.epochs)
+    n_ep = max(len(regimes), n_ep, 1)
+    marge_d = max(240 // int(cfg.minutes_par_barre), cfg.barres_par_partie // 6)
+    for epoch in range(1, n_ep + 1):
+        courant = min(len(regimes) - 1, (epoch - 1) * len(regimes) // n_ep)
+        n_jours = min(cfg.parties_par_epoch, sum(len(x) for x in regimes[:courant + 1]))
+        jours = _rejoue_regimes(regimes, courant, n_jours, rng)
+        frac = min(1.0, max(0.0, (epoch - 1) / cfg.rampe_cout)) if cfg.rampe_cout > 0 else 1.0
+        Rf, Df, Sf = table_a_cout(frac, (R0, D0, S0), (R1, D1, S1),
+                                  lambda f: table_coups(o, h, l, sp, atr, cfg, f))
+        _sc, _cp, tr = joue(policy, departs_tires(jours, rng, marge_d), Xk,
+                             Rf, Df, Sf, fin, cfg, device, explore=True,
+                             collecte=True, rangs=rangs_ex, marge=marge)
+        stats = maj_ppo(policy, optims, avantages(tr, cfg), Xk, cfg, device, rng)
+        del Rf, Df, Sf
+        print(f"DEPLOY {epoch:03d}/{n_ep:03d}  regime {courant + 1}/{len(regimes)}  "
+              f"cout {100 * frac:.0f}%  {len(jours)} parties  "
+              f"PPO kl {stats['kl']:+.4f}  v {stats['v']:.4f}",
+              flush=True)
+
+    etat = {"modele": policy.state_dict(), "config": asdict(cfg), "epoch": n_ep,
+            "type": "deploiement_continu", "pipeline": pipeline_ref,
+            "graine": {"bloc": champion["bloc"], "epoch": champion["epoch"],
+                       "profit_jour_validation": champion["profit_jour"]},
+            "regimes": len(regimes), "rejeu": "egal_des_regimes_precedents",
+            "distillation": "decisions_oof_des_10_folds"}
+    path = f"deploy_{cfg.prefixe}.pth"
+    torch.save(etat, path)
+    with open(f"deploy_{cfg.prefixe}.json", "w", encoding="utf-8") as fh:
+        json.dump({k: v for k, v in etat.items() if k != "modele"}, fh,
+                  indent=1, default=str)
+    print(f"  DEPLOY pret : {path} + {pipeline_path}", flush=True)
+    return path
+
+
+def _compacte_decisions_enseignant(transitions, cfg, rng, maximum_attentes=20_000):
+    """Conserve tous les coups et un echantillon equilibre des attentes.
+
+    Un professeur rejoue tout le cache, soit plusieurs centaines de milliers
+    de decisions. Garder chaque attente des dix professeurs consommerait de
+    la memoire sans apporter dix fois plus de signal. Tous les trades restent
+    presents ; les attentes sont tirees sur toute la periode et plafonnees.
+    """
+    lignes = [x for episode in (transitions or []) for x in episode]
+    if not lignes:
+        return None
+    action = np.asarray([x[3] for x in lignes], dtype=np.int64)
+    coups = np.flatnonzero(action != ATTENDRE)
+    attentes = np.flatnonzero(action == ATTENDRE)
+    n_att = min(len(attentes), max(int(maximum_attentes), len(coups)))
+    if len(attentes) > n_att:
+        attentes = rng.choice(attentes, size=n_att, replace=False)
+    garde = np.sort(np.concatenate([coups, attentes]))
+    lignes = [lignes[i] for i in garde]
+    action = action[garde]
+    return {
+        "t": np.asarray([x[0] for x in lignes], dtype=np.int64),
+        "etat": np.stack([x[1] for x in lignes]).astype(np.float32),
+        "action": action,
+        "tp": np.asarray([x[4] for x in lignes], dtype=np.int64),
+        "sl": np.asarray([x[5] for x in lignes], dtype=np.int64),
+        "lot": np.asarray([x[13] for x in lignes], dtype=np.int64),
+        "risque": np.asarray([x[15] for x in lignes], dtype=np.int64),
+        "allocation": np.asarray([x[17] for x in lignes], dtype=np.int64),
+        "confiance": np.asarray([x[19] for x in lignes], dtype=np.int64),
+    }
+
+
+def distille_ensemble_folds(policy, optims, paquets, Xn, cfg, device, rng):
+    """Imite a parts egales les dix meilleurs folds dans le modele final."""
+    paquets = [p for p in paquets if p is not None and len(p["t"])]
+    if not paquets:
+        raise ValueError("Aucune decision des professeurs a distiller")
+    noms = ("t", "etat", "action", "tp", "sl", "lot", "risque", "allocation", "confiance")
+    data = {nom: np.concatenate([p[nom] for p in paquets], axis=0) for nom in noms}
+    act = data["action"]
+    poids = np.where(act == ATTENDRE, 1.0, float(cfg.expert_poids_pos)).astype(np.float32)
+    T = lambda z, dt=torch.float32: torch.as_tensor(z, dtype=dt, device=device)
+    n_passes = max(1, int(cfg.distillation_oof_epochs))
+    print(f"  distillation ensemble : {len(act):,} decisions equilibrees de "
+          f"{len(paquets)} meilleurs folds, {int((act != ATTENDRE).sum()):,} coups, "
+          f"{n_passes} passe(s)", flush=True)
+    policy.train()
+    for ep in range(n_passes):
+        pertes = []
+        # Un ordre unique et melange : aucun fold final ne prend le dessus.
+        ordre = rng.permutation(len(act))
+        for d0 in range(0, len(ordre), 512):
+            b = ordre[d0:d0 + 512]
+            x = T(observations(Xn, data["t"][b], data["etat"][b], int(cfg.lookback)))
+            sortie = policy.jeu(x)
+            le, _v, ltp, lsl = sortie[:4]
+            wb, ab = T(poids[b]), T(act[b], torch.long)
+            loss = (F.cross_entropy(le, ab, reduction="none") * wb).sum() / wb.sum()
+            cb = act[b] != ATTENDRE
+            if bool(cb.any()):
+                ar = torch.arange(int(cb.sum()), device=device)
+                sens = (ab[cb] == VENDRE).long()
+                for logits, cible in ((ltp, data["tp"][b]), (lsl, data["sl"][b])):
+                    loss = loss + F.cross_entropy(logits[cb][ar, sens],
+                                                   T(cible[cb], torch.long))
+                loss = loss + F.cross_entropy(sortie[4][cb][ar, sens],
+                                               T(data["lot"][b][cb], torch.long))
+                loss = loss + F.cross_entropy(sortie[5][cb][ar, sens],
+                                               T(data["risque"][b][cb], torch.long))
+                if len(sortie) >= 7:
+                    loss = loss + F.cross_entropy(sortie[6][cb][ar, sens],
+                                                   T(data["allocation"][b][cb], torch.long))
+                if len(sortie) >= 8:
+                    loss = loss + F.cross_entropy(sortie[7][cb][ar, sens],
+                                                   T(data["confiance"][b][cb], torch.long))
+            _pas(policy, optims, loss, cfg)
+            pertes.append(float(loss.detach()))
+        print(f"  distillation ensemble passe {ep + 1}/{n_passes} "
+              f"perte {np.mean(pertes):.4f}", flush=True)
+    policy.eval()
+
+
+def entraine_deploiement_continu(cfg, d, X, y_ex, toutes, o, h, l, c, sp, atr,
+                                 R0, D0, S0, R1, D1, S1, marge, candidats,
+                                 transitions_oof, device, rng):
+    """Construit le deploy par ensemble des dix folds, jamais par champion.
+
+    Les mesures de validation/test restent celles des folds independants. La
+    phase qui suit ne les selectionne ni ne les remplace : elle utilise les
+    dix meilleurs checkpoints comme professeurs, chacun uniquement sur SA
+    validation -- la periode ou il a gagne sa place. L'eleve apprend donc les
+    meilleurs coups valides, sans diluer ce signal sur des dates etrangeres.
+    """
+    del R0, D0, S0, transitions_oof
+    if len(candidats) != int(cfg.n_blocs):
+        raise ValueError(f"DEPLOY ensemble : {len(candidats)}/{cfg.n_blocs} checkpoints disponibles")
+    candidats = sorted(candidats, key=lambda x: int(x["bloc"]))
+    manquants = [x["path"] for x in candidats if not os.path.isfile(x["path"])]
+    if manquants:
+        raise FileNotFoundError("Checkpoint de fold absent : " + ", ".join(manquants))
+    print("\n" + "=" * 70)
+    print("  DEPLOY ENSEMBLE : les 10 meilleurs folds enseignent un eleve neuf", flush=True)
+    print("  chaque professeur enseigne uniquement sa periode de validation ; "
+          "les validations et tests deja ecrits ne sont pas modifies.", flush=True)
+    N = len(d)
+    st_m = {"mean": X.astype(np.float64).mean(0).astype(np.float32),
+            "std": X.astype(np.float64).std(0).astype(np.float32)}
+    Xn = safe_normalize(X, st_m).astype(np.float32)
+    t_ex = time.time()
+    pred, modeles_expert = expert_deploiement(Xn, cibles_expert(R1, cfg), cfg)
+    FE = features_expert(pred, fenetre=10_000 // int(cfg.minutes_par_barre))
+    rangs_ex = FE[:, 2:4].copy()
+    st_e = {"mean": FE.astype(np.float64).mean(0), "std": FE.astype(np.float64).std(0)}
+    FEn = np.clip((FE - st_e["mean"]) / (st_e["std"] + 1e-8), -5.0, 5.0).astype(np.float32)
+    X_final = np.concatenate([Xn, FEn[:, :cfg.n_expert]], axis=1)
+    print(f"  pipeline final appris sur tout l'historique : {time.time() - t_ex:.0f} s", flush=True)
+
+    from jeu_artifacts import (charge_pipeline_bloc, empreinte_fichier,
+                               predit_pipeline_bloc, sauvegarde_pipeline_bloc)
+    pipeline_path = f"pipeline_{cfg.prefixe}_deploy_ensemble_validation_ddsafe.json"
+    if os.path.exists(pipeline_path):
+        raise FileExistsError(f"{pipeline_path} existe deja : il est volontairement conserve")
+    sauvegarde_pipeline_bloc(
+        pipeline_path, cfg=cfg, donnees=d, colonnes=colonnes_jeu(cfg),
+        normalisation_marche=st_m, normalisation_expert=st_e,
+        modeles_expert=modeles_expert, predictions_expert=pred,
+        meta={"type": "deploiement_ensemble_10_folds", "folds": [int(x["bloc"]) for x in candidats],
+              "professeurs": "meilleur_checkpoint_par_fold_sur_sa_validation",
+              "selection": "aucune_selection_de_champion", "ppo": "une_passe_complete"})
+    pipeline_ref = {"fichier": pipeline_path, "sha256": empreinte_fichier(pipeline_path)}
+
+    fin = np.full(N, N, np.int64)
+    paquets = []
+    for candidat in candidats:
+        bloc = int(candidat["bloc"])
+        chemin_pipe = f"pipeline_{cfg.prefixe}_bloc{bloc}.json"
+        pipe = charge_pipeline_bloc(chemin_pipe, donnees=d, colonnes=colonnes_jeu(cfg))
+        validation = pipe.get("meta", {}).get("validation")
+        if not isinstance(validation, list) or len(validation) != 2:
+            raise ValueError(f"Fenetre de validation absente du pipeline du fold {bloc}")
+        va0, va1 = (int(validation[0]), int(validation[1]))
+        jours_prof = np.asarray([j for j in toutes if int(j[0]) >= va0 and int(j[1]) <= va1],
+                                dtype=np.int64).reshape(-1, 2)
+        if not len(jours_prof):
+            raise ValueError(f"Aucune partie complete dans la validation du fold {bloc}")
+        X_prof, rangs_prof, _ = predit_pipeline_bloc(pipe, d)
+        professeur = PolitiqueJeu(cfg).to(device)
+        etat_prof = torch.load(candidat["path"], map_location=device, weights_only=False)
+        professeur.load_state_dict(etat_prof["modele"])
+        gen = torch.Generator(device=device)
+        gen.manual_seed(int(cfg.graine) + bloc)
+        fin_validation = np.full(N, va1, np.int64)
+        _score, coups, transitions = joue(professeur, jours_prof, X_prof, R1, D1, S1, fin_validation,
+                                           cfg, device, explore=False, gen=gen,
+                                           collecte=True, rangs=rangs_prof, marge=marge)
+        paquet = _compacte_decisions_enseignant(transitions, cfg, rng)
+        paquets.append(paquet)
+        print(f"  professeur fold {bloc:2d} : {len(coups):,} coups sur sa validation "
+              f"({len(jours_prof)} parties), {len(paquet['t']):,} decisions retenues", flush=True)
+        del professeur, transitions, X_prof, rangs_prof, fin_validation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    policy = PolitiqueJeu(cfg).to(device)
+    optims = optimiseurs(policy, cfg)
+    pos = coups_expert_predits(toutes, pred, D1, fin, cfg)
+    imite_expert(policy, optims, pos, toutes, X_final, fin, cfg, device, rng)
+    distille_ensemble_folds(policy, optims, paquets, X_final, cfg, device, rng)
+
+    # Une passe PPO qui couvre toutes les journees : contrairement a l'ancien
+    # curriculum, aucun regime final ni fold n'a de privilege.
+    marge_d = max(240 // int(cfg.minutes_par_barre), cfg.barres_par_partie // 6)
+    fragments = np.array_split(toutes, max(1, int(np.ceil(len(toutes) / cfg.parties_par_epoch))))
+    for numero, jours in enumerate(fragments, 1):
+        _sc, _cp, tr = joue(policy, departs_tires(jours, rng, marge_d), X_final,
+                             R1, D1, S1, fin, cfg, device, explore=True,
+                             collecte=True, rangs=rangs_ex, marge=marge)
+        stats = maj_ppo(policy, optims, avantages(tr, cfg), X_final, cfg, device, rng)
+        print(f"DEPLOY ENSEMBLE PPO {numero:02d}/{len(fragments):02d}  "
+              f"{len(jours)} parties  kl {stats['kl']:+.4f}  v {stats['v']:.4f}", flush=True)
+
+    etat = {"modele": policy.state_dict(), "config": asdict(cfg), "epoch": len(fragments),
+            "type": "deploiement_ensemble_10_folds", "pipeline": pipeline_ref,
+            "folds": [{"bloc": int(x["bloc"]), "epoch": int(x["epoch"])} for x in candidats],
+            "distillation": "10_professeurs_sur_leur_validation",
+            "ppo": "une_passe_complete_toutes_les_parties"}
+    path = f"deploy_{cfg.prefixe}_ensemble_validation_ddsafe.pth"
+    torch.save(etat, path)
+    with open(f"deploy_{cfg.prefixe}_ensemble_validation_ddsafe.json", "w", encoding="utf-8") as fh:
+        json.dump({k: v for k, v in etat.items() if k != "modele"}, fh, indent=1, default=str)
+    print(f"  DEPLOY ENSEMBLE pret : {path} + {pipeline_path}", flush=True)
+    return path
+
+
+def reconstruit_deploy_ensemble(cfg: JeuConfig) -> int:
+    """Relance seulement l'assemblage deploy apres un run de folds termine."""
+    rng = np.random.default_rng(cfg.graine)
+    torch.manual_seed(cfg.graine)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    d = pd.read_pickle(cfg.cache)
+    cols = list(dict.fromkeys(["time", "open", "high", "low", "close", "atr_14", "spread_bar"] +
+                              colonnes_jeu(cfg)))
+    d = d[cols].reset_index(drop=True)
+    N = len(d)
+    o, h, l, c = (d[k].to_numpy(np.float64) for k in ("open", "high", "low", "close"))
+    sp = d["spread_bar"].to_numpy(np.float64)
+    atr = atr_effectif(d["atr_14"].to_numpy(np.float64), c, cfg)
+    X = d[colonnes_jeu(cfg)].to_numpy(np.float32)
+    marge = fraction_marge(c, atr, cfg)
+    R0, D0, S0 = table_coups(o, h, l, sp, atr, cfg, 0.0)
+    R1, D1, S1 = table_coups(o, h, l, sp, atr, cfg, 1.0)
+    toutes = parties(d["time"], 0, N, cfg)
+    candidats = []
+    for bloc in range(1, int(cfg.n_blocs) + 1):
+        path = f"best_{cfg.prefixe}_bloc{bloc}.pth"
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Meilleur checkpoint absent : {path}")
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+        candidats.append({"bloc": bloc, "epoch": int(ck.get("epoch", 0)), "path": path})
+    print(f"[DEPLOY ENSEMBLE] reconstruction a partir de {len(candidats)} meilleurs folds, "
+          "sans relancer les validations croisees.", flush=True)
+    entraine_deploiement_continu(cfg, d, X, None, toutes, o, h, l, c, sp, atr,
+                                 R0, D0, S0, R1, D1, S1, marge, candidats, [], device, rng)
+    return 0
 
 
 def main_blocs(cfg: JeuConfig) -> int:
@@ -1753,15 +2638,17 @@ def main_blocs(cfg: JeuConfig) -> int:
     t_ns = d["time"].values.astype("int64")
     X = d[colonnes_jeu(cfg)].to_numpy(np.float32)
     marge = fraction_marge(c, atr, cfg)
-    R0, D0, _ = table_coups(o, h, l, sp, atr, cfg, 0.0)
+    R0, D0, S0 = table_coups(o, h, l, sp, atr, cfg, 0.0)
     R1, D1, S1 = table_coups(o, h, l, sp, atr, cfg, 1.0)
-    y_ex = cibles_expert(R1)
+    y_ex = cibles_expert(R1, cfg)
     toutes = parties(d["time"], 0, N, cfg)
-    purge = int(cfg.horizon_max + cfg.lookback + cfg.purge_semaines * cfg.barres_par_partie)
+    purge = purge_barres(cfg)
     _fmt = lambda i: pd.Timestamp(d["time"].iloc[min(i, N - 1)]).strftime("%Y-%m-%d")
     print(f"[CACHE] {N:,} bougies, {_fmt(0)} -> {_fmt(N - 1)} ; {len(toutes)} parties ; "
           f"zone tampon {purge} bougies autour du test et de la validation", flush=True)
     tests = []
+    candidats_deploiement = []
+    transitions_oof = []
     for k in range(cfg.n_blocs):
         if seul and k + 1 != seul:
             continue
@@ -1779,13 +2666,24 @@ def main_blocs(cfg: JeuConfig) -> int:
         Xn = safe_normalize(X, {"mean": st_m.astype(np.float32),
                                 "std": st_s.astype(np.float32)}).astype(np.float32)
         t_ex = time.time()
-        pred, _ = expert_multi(Xn, y_ex, t_ns, permis, fin_tr, cfg)
+        pred, modeles_expert = expert_multi(Xn, y_ex, t_ns, permis, fin_tr, cfg)
         FE = features_expert(pred, fenetre=10_000 // int(cfg.minutes_par_barre))
         rangs_ex = FE[:, 2:4].copy()
         m_e = FE[permis].astype(np.float64).mean(0)
         s_e = FE[permis].astype(np.float64).std(0)
         FEn = np.clip((FE - m_e) / (s_e + 1e-8), -5.0, 5.0).astype(np.float32)
         Xk = np.concatenate([Xn, FEn[:, :cfg.n_expert]], axis=1)
+        from jeu_artifacts import sauvegarde_pipeline_bloc, empreinte_fichier
+        pipeline_path = f"pipeline_{cfg.prefixe}_bloc{k + 1}.json"
+        sauvegarde_pipeline_bloc(
+            pipeline_path, cfg=cfg, donnees=d, colonnes=colonnes_jeu(cfg),
+            normalisation_marche={"mean": st_m.astype(np.float32), "std": st_s.astype(np.float32)},
+            normalisation_expert={"mean": m_e, "std": s_e},
+            modeles_expert=modeles_expert, predictions_expert=pred,
+            meta={"bloc": k + 1, "test": [te0, te1], "validation": [va0, va1],
+                  "purge_barres": purge, "validation_mode": "croisee_purgee"})
+        pipeline_ref = {"fichier": pipeline_path, "sha256": empreinte_fichier(pipeline_path)}
+        print(f"  pipeline fige : {pipeline_path} (expert, normalisations, predictions)", flush=True)
         ics = []
         for s_ in range(2):
             ok = np.zeros(N, bool)
@@ -1800,45 +2698,64 @@ def main_blocs(cfg: JeuConfig) -> int:
         pos = coups_expert_predits(j_tr, pred, D1, fin_tr, cfg)
         imite_expert(policy, optims, pos, j_tr, Xk, fin_tr, cfg, device, rng)
         suffixe = f"_bloc{k + 1}"
+        # Le checkpoint principal est choisi sur le resultat reel du compte
+        # (lots et marge inclus), sans changer la recompense PPO en R.
         best_path = f"best_{cfg.prefixe}{suffixe}.pth"
-        record, garde_rec = 0.0, None
+        best_r_path = f"bestR_{cfg.prefixe}{suffixe}.pth"
+        record_profit, garde_profit = 0.0, None
+        record_r, garde_r = 0.0, None
         for epoch in range(0, cfg.epochs + 1):
             t_ep = time.time()
             frac = min(1.0, max(0.0, (epoch - 1) / cfg.rampe_cout)) if cfg.rampe_cout > 0 else 1.0
             st = None
             if epoch >= 1:
-                Rf = (1 - frac) * R0 + frac * R1 if frac < 1.0 else R1
-                Df = D1 if frac >= 0.5 else D0
+                Rf, Df, Sf = table_a_cout(frac, (R0, D0, S0), (R1, D1, S1),
+                                         lambda f: table_coups(o, h, l, sp, atr, cfg, f))
                 choix = rng.choice(len(j_tr), size=min(cfg.parties_par_epoch, len(j_tr)),
                                    replace=False)
                 marge_d = max(240 // int(cfg.minutes_par_barre), cfg.barres_par_partie // 6)
                 sc, cp, tr = joue(policy, departs_tires(j_tr[choix], rng, marge_d), Xk,
-                                  Rf, Df, S1, fin_tr, cfg, device, explore=True,
+                                  Rf, Df, Sf, fin_tr, cfg, device, explore=True,
                                   collecte=True, rangs=rangs_ex, marge=marge)
                 st = maj_ppo(policy, optims, avantages(tr, cfg), Xk, cfg, device, rng)
-                del Rf
+                del Rf, Df, Sf
             gen = torch.Generator(device=device)
             gen.manual_seed(cfg.graine)
             sv, cv, _ = joue(policy, j_va, Xk, R1, D1, S1, va1, cfg, device,
                              explore=False, gen=gen, rangs=rangs_ex, marge=marge)
-            bv = bilan(sv, cv, c, atr, sp, cfg)
+            bv = bilan(sv, cv, c, atr, sp, cfg, open_=o, temps=d["time"])
+            ecrit_trades_csv(f"trades_{cfg.prefixe}{suffixe}.csv", cv, d["time"], cfg,
+                              epoch=epoch, phase="validation")
             nom = "EXPERT IMITE" if epoch == 0 else f"cout {100 * frac:.0f}%"
             print(f"\nEPOCH {epoch:03d}  {nom:>12}  VAL  {ligne_bilan(bv, cfg)}  "
                   f"{(time.time() - t_ep) / 60:.1f} min", flush=True)
             print(f"  bilan  {ligne_detail(bv, cfg)}", flush=True)
             etat = {"modele": policy.state_dict(), "config": asdict(cfg), "epoch": epoch,
-                    "bloc": k + 1}
+                    "bloc": k + 1, "pipeline": pipeline_ref}
             torch.save(etat, f"last_{cfg.prefixe}{suffixe}.pth")
-            sauve = bv["coups"] >= cfg.min_coups_val and bv["score"] > record
+            profit_jour = bv["total_dollars"] / max(bv["parties"], 1)
+            admissible = bv["coups"] >= cfg.min_coups_val
+            sauve = admissible and profit_jour > record_profit
+            sauve_r = admissible and bv["score"] > record_r
             if sauve:
-                record, garde_rec = bv["score"], epoch
+                record_profit, garde_profit = profit_jour, epoch
                 torch.save(etat, best_path)
-                print(f"  sauvegarde  NOUVEAU MEILLEUR : {bv['score']:+.3f} R/partie en "
+                print(f"  sauvegarde  MEILLEUR PROFIT : {profit_jour:+.2f}$/jour en "
                       f"validation, {bv['coups']} coups -> {best_path}", flush=True)
             else:
-                print(f"  garde  rien de sauvegarde : {bv['score']:+.3f} R/partie ne bat pas "
-                      f"{record:+.3f}" + (f" (meilleur : epoch {garde_rec})"
-                                          if garde_rec is not None else ""), flush=True)
+                raison = (f"{bv['coups']} coups, il en faut {cfg.min_coups_val}"
+                          if not admissible else
+                          f"{profit_jour:+.2f}$/jour ne bat pas {record_profit:+.2f}$")
+                print(f"  garde  meilleur profit inchange : {raison}"
+                      + (f" (meilleur : epoch {garde_profit})"
+                         if garde_profit is not None else ""), flush=True)
+            # Le meilleur score R est garde pour comparaison, mais ne pilote
+            # plus le test final ni le checkpoint principal.
+            if sauve_r:
+                record_r, garde_r = bv["score"], epoch
+                torch.save(etat, best_r_path)
+                print(f"  repere  meilleur R : {record_r:+.3f} R/partie "
+                      f"(epoch {garde_r}) -> {best_r_path}", flush=True)
             if getattr(cfg, "echanges", ""):
                 ecrit_echange(cfg, f"val_bloc{k + 1:02d}_ep{epoch:03d}", cv, t_ns, c, atr,
                               len(j_va), sauve, (va0, va1), d["time"])
@@ -1846,10 +2763,24 @@ def main_blocs(cfg: JeuConfig) -> int:
         policy.load_state_dict(torch.load(src, map_location=device, weights_only=False)["modele"])
         gen = torch.Generator(device=device)
         gen.manual_seed(cfg.graine)
-        s_t, c_t, _ = joue(policy, j_te, Xk, R1, D1, S1, te1, cfg, device,
-                           explore=False, gen=gen, rangs=rangs_ex, marge=marge)
-        bt = bilan(s_t, c_t, c, atr, sp, cfg)
+        s_t, c_t, tr_t = joue(policy, j_te, Xk, R1, D1, S1, te1, cfg, device,
+                              explore=False, gen=gen, collecte=True,
+                              rangs=rangs_ex, marge=marge)
+        bt = bilan(s_t, c_t, c, atr, sp, cfg, open_=o, temps=d["time"])
+        ecrit_trades_csv(f"trades_{cfg.prefixe}{suffixe}.csv", c_t, d["time"], cfg,
+                          epoch=-1, phase="test")
         tests.append((k + 1, _fmt(te0), _fmt(te1 - 1), bt, c_t))
+        # Ce sont les seules trajectoires qui alimentent l'eleve final :
+        # chacune a ete generee par un modele qui ignorait ce bloc de test.
+        transitions_oof.extend(tr_t or [])
+        # Seule la validation, jamais le test, peut choisir une graine pour
+        # l'apprentissage continu final.
+        candidats_deploiement.append({
+            "bloc": k + 1,
+            "epoch": garde_profit if garde_profit is not None else cfg.epochs,
+            "profit_jour": record_profit if garde_profit is not None else float("-inf"),
+            "path": src,
+        })
         print(f"\nTEST fold {k + 1} ({os.path.basename(src)})  {ligne_bilan(bt, cfg)}", flush=True)
         print(f"TEST fold {k + 1} bilan  {ligne_detail(bt, cfg)}", flush=True)
         with open(f"test_{cfg.prefixe}{suffixe}.json", "w", encoding="utf-8") as fh:
@@ -1875,7 +2806,12 @@ def main_blocs(cfg: JeuConfig) -> int:
     pf = r[r > 0].sum() / -r[r < 0].sum() if (r < 0).any() else float("inf")
     print(f"  blocs gagnants : {positifs}/{cfg.n_blocs}  |  total {somme:+.2f} $  |  "
           f"{len(r)} trades  |  profit factor global {pf:.2f}", flush=True)
-    print("\nFIN du walk-forward", flush=True)
+    if bool(getattr(cfg, "deploiement_continu", True)):
+        entraine_deploiement_continu(
+            cfg, d, X, y_ex, toutes, o, h, l, c, sp, atr,
+            R0, D0, S0, R1, D1, S1, marge, candidats_deploiement,
+            transitions_oof, device, rng)
+    print("\nFIN de la validation croisee purgee", flush=True)
     return 0
 
 
@@ -1908,10 +2844,10 @@ def spec_marche(m: str, cfg: JeuConfig) -> Dict[str, float]:
     try:
         inf = pd.read_pickle(MT5_CRYPTO)["infos"][m]
         return {"contrat": float(inf["contrat"]), "lot_min": float(inf["lot_min"]),
-                "pas_lot": float(inf["pas_lot"])}
+                "pas_lot": float(inf["pas_lot"]), "lot_max": float(inf.get("lot_max", cfg.lot_max))}
     except (FileNotFoundError, KeyError):
         return {"contrat": float(cfg.contrat), "lot_min": float(cfg.lot_min),
-                "pas_lot": float(cfg.pas_lot)}
+                "pas_lot": float(cfg.pas_lot), "lot_max": float(cfg.lot_max)}
 
 
 def config_marche(cfg: JeuConfig, m: str, bloc: int = 0) -> JeuConfig:
@@ -1921,7 +2857,8 @@ def config_marche(cfg: JeuConfig, m: str, bloc: int = 0) -> JeuConfig:
     return replace(cfg, marches=(), marche_seul=m, modeles_par_marche=False,
                    marches_communs=tuple(cfg.marches), bloc_seul=int(bloc),
                    prefixe=f"{cfg.prefixe}_{m}", echanges=f"echanges_{cfg.prefixe}",
-                   contrat=sp["contrat"], lot_min=sp["lot_min"], pas_lot=sp["pas_lot"])
+                   contrat=sp["contrat"], lot_min=sp["lot_min"], pas_lot=sp["pas_lot"],
+                   lot_max=sp["lot_max"])
 
 
 def donnees_marche_seul(d_all: pd.DataFrame, cfg: JeuConfig):
@@ -1996,12 +2933,21 @@ def bilan_commun(parts: Dict[str, pd.DataFrame], specs: Dict[str, Dict[str, floa
          "pf": g / pe if pe > 0 else float("inf"), "longs": int((tout["sens"] == 0).sum()),
          "shorts": int((tout["sens"] == 1).sum()), "total_dollars": float(r.sum() * cfg.risque_dollars),
          "gain_R": float(r.mean())}
-    o = np.argsort(tout["t_sortie"].to_numpy(), kind="stable")
-    eq = float(cfg.capital) + np.cumsum(r[o] * cfg.risque_dollars)
-    courbe = np.concatenate([[float(cfg.capital)], eq])
+    sorties_t = tout["t_sortie"].to_numpy()
+    o = np.argsort(sorties_t, kind="stable")
+    courbe = [float(cfg.capital)]
+    debut = 0
+    while debut < len(o):
+        fin_groupe = debut + 1
+        while fin_groupe < len(o) and sorties_t[o[fin_groupe]] == sorties_t[o[debut]]:
+            fin_groupe += 1
+        courbe.append(max(0.0, courbe[-1] + float((r[o[debut:fin_groupe]] * cfg.risque_dollars).sum())))
+        debut = fin_groupe
+    courbe = np.asarray(courbe, dtype=np.float64)
     pic = np.maximum.accumulate(courbe)
     b["dd_dollars"] = float((courbe - pic).min())
-    b["dd_pct"] = float(((courbe - pic) / pic).min())
+    b["dd_pct"] = float(np.clip(((courbe - pic) / np.maximum(pic, 1e-12)).min(), -1.0, 0.0))
+    b["total_dollars"] = float(courbe[-1] - cfg.capital)
     # COMME EN LIVE, sur le solde commun
     # LA MISE SUIT LE SOLDE : plus le solde commun grandit, plus les lots de
     # chaque marche grossissent (et l'inverse en baisse), comme en live.
@@ -2012,7 +2958,7 @@ def bilan_commun(parts: Dict[str, pd.DataFrame], specs: Dict[str, Dict[str, floa
         te = int(tout["t_entree"].iat[k])
         while ouverts and ouverts[0][0] <= te:
             _, _, pnl, _m = heapq.heappop(ouverts)
-            E += pnl
+            E = max(0.0, E + pnl)
             courbe_l.append(E)
         if E <= 0:
             break
@@ -2037,12 +2983,12 @@ def bilan_commun(parts: Dict[str, pd.DataFrame], specs: Dict[str, Dict[str, floa
         pris += 1
     while ouverts:
         _, _, pnl, _m = heapq.heappop(ouverts)
-        E += pnl
+        E = max(0.0, E + pnl)
         courbe_l.append(E)
     cl = np.asarray(courbe_l)
     pl = np.maximum.accumulate(cl)
     b.update({"live_total": float(E - cfg.capital), "live_dd_dollars": float((cl - pl).min()),
-              "live_dd_pct": float(((cl - pl) / pl).min()), "live_pris": pris,
+              "live_dd_pct": float(np.clip(((cl - pl) / np.maximum(pl, 1e-12)).min(), -1.0, 0.0)), "live_pris": pris,
               "live_marge": sautes, "live_solde": float(E),
               "live_win_rate": gagnes_l / pris if pris else float("nan"),
               "live_risque_moy": float(np.mean(risques)) if risques else float("nan")})
@@ -2281,13 +3227,15 @@ def main_pas_a_pas(cfg: JeuConfig) -> int:
         atr = atr_effectif(d["atr_14"].to_numpy(np.float64), c, cm)
         cout_med = float(np.median(sp)) + cm.glissement_entree_bps + cm.glissement_sortie_bps
         atr = np.maximum(atr, cm.plancher_couts * cout_med * 1e-4 * c)
-        R0, D0, _ = table_coups(o, h, l, sp, atr, cm, 0.0)
+        R0, D0, S0 = table_coups(o, h, l, sp, atr, cm, 0.0)
         R1, D1, S1 = table_coups(o, h, l, sp, atr, cm, 1.0)
         M[m] = {"cfg": cm, "temps": d["time"], "N": N, "c": c, "atr": atr, "sp": sp,
+                "o": o, "h": h, "l": l,
                 "t_ns": d["time"].values.astype("int64"),
                 "X": d[colonnes_jeu(cm)].to_numpy(np.float32),
                 "marge": fraction_marge(c, atr, cm), "R0": R0, "D0": D0, "R1": R1, "D1": D1,
-                "S1": S1, "y_ex": cibles_expert(R1), "toutes": parties(d["time"], 0, N, cm),
+                "S0": S0, "S1": S1, "y_ex": cibles_expert(R1, cm),
+                "toutes": parties(d["time"], 0, N, cm),
                 "rng": np.random.default_rng(cfg.graine)}
         print(f"  {m} : {N:,} bougies {d['time'].iloc[0]:%Y-%m-%d} -> {d['time'].iloc[-1]:%Y-%m-%d}, "
               f"cout med {cout_med:.2f} bps, ATR des barrieres >= "
@@ -2295,7 +3243,7 @@ def main_pas_a_pas(cfg: JeuConfig) -> int:
               f"{cm.swap_achat_bps_jour:.2f} / {cm.swap_vente_bps_jour:.2f} bps/jour, contrat "
               f"{cm.contrat:g}, lot min {cm.lot_min:g}", flush=True)
     del d_all
-    purge = int(cfg.horizon_max + cfg.lookback + cfg.purge_semaines * cfg.barres_par_partie)
+    purge = purge_barres(cfg)
     tests = {}
     for k in range(cfg.n_blocs):
         B = {}
@@ -2365,17 +3313,18 @@ def main_pas_a_pas(cfg: JeuConfig) -> int:
                 S, b, cm = M[m], B[m], M[m]["cfg"]
                 t_ep = time.time()
                 if epoch >= 1:
-                    Rf = (1 - frac) * S["R0"] + frac * S["R1"] if frac < 1.0 else S["R1"]
-                    Df = S["D1"] if frac >= 0.5 else S["D0"]
+                    Rf, Df, Sf = table_a_cout(
+                        frac, (S["R0"], S["D0"], S["S0"]), (S["R1"], S["D1"], S["S1"]),
+                        lambda f: table_coups(S["o"], S["h"], S["l"], S["sp"], S["atr"], cm, f))
                     choix = S["rng"].choice(len(b["j_tr"]),
                                             size=min(cfg.parties_par_epoch, len(b["j_tr"])),
                                             replace=False)
                     marge_d = max(240 // int(cm.minutes_par_barre), cm.barres_par_partie // 6)
                     sc, cp, tr = joue(b["policy"], departs_tires(b["j_tr"][choix], S["rng"], marge_d),
-                                      b["Xk"], Rf, Df, S["S1"], b["fin_tr"], cm, device,
+                                      b["Xk"], Rf, Df, Sf, b["fin_tr"], cm, device,
                                       explore=True, collecte=True, rangs=b["rangs"], marge=S["marge"])
                     maj_ppo(b["policy"], b["optims"], avantages(tr, cm), b["Xk"], cm, device, S["rng"])
-                    del Rf, tr
+                    del Rf, Df, Sf, tr
                 gen = torch.Generator(device=device)
                 gen.manual_seed(cfg.graine)
                 sv, cv, _ = joue(b["policy"], b["j_va"], b["Xk"], S["R1"], S["D1"], S["S1"],
@@ -2535,22 +3484,20 @@ def main_multi_blocs(cfg: JeuConfig) -> int:
             return cfg
         return replace(cfg, swap_achat_bps_jour=float(d["swap_achat_bps_jour"].iloc[a]),
                        swap_vente_bps_jour=float(d["swap_vente_bps_jour"].iloc[a]))
-    t_tab = time.time()
-    tabs = {}
-    for frac in (0.0, 1.0):
+    def _calcule_table(frac):
         parts = [table_coups(o[a:b], h[a:b], l[a:b], sp[a:b], atr[a:b], _cfg_m(a), frac)
                  for _, a, b in blocs]
-        tabs[frac] = tuple(np.concatenate([p_[k] for p_ in parts]) for k in range(3))
-        del parts
-    R0, D0, _ = tabs[0.0]
-    R1, D1, S1 = tabs[1.0]
-    del tabs
-    y_ex = cibles_expert(R1)
+        return tuple(np.concatenate([p_[k] for p_ in parts]) for k in range(3))
+
+    t_tab = time.time()
+    R0, D0, S0 = _calcule_table(0.0)
+    R1, D1, S1 = _calcule_table(1.0)
+    y_ex = cibles_expert(R1, cfg)
     print(f"  table des coups : {N:,} bougies x {R1[0].size} coups, marche par marche, "
           f"{time.time() - t_tab:.0f} s", flush=True)
     toutes = journees_multi(d["time"], blocs, int(t_ns.min()), int(t_ns.max()) + 1,
                             int(0.4 * cfg.barres_par_partie), cfg)
-    purge = int(cfg.horizon_max + cfg.lookback + cfg.purge_semaines * cfg.barres_par_partie)
+    purge = purge_barres(cfg)
     purge_ns = purge * int(cfg.minutes_par_barre) * 60 * 10**9
     _, a_ref, b_ref = blocs[0]
     _fmt = lambda x: pd.Timestamp(x).strftime("%Y-%m-%d")
@@ -2618,20 +3565,19 @@ def main_multi_blocs(cfg: JeuConfig) -> int:
             t_ep = time.time()
             frac = min(1.0, max(0.0, (epoch - 1) / cfg.rampe_cout)) if cfg.rampe_cout > 0 else 1.0
             if epoch >= 1:
-                Rf = (1 - frac) * R0 + frac * R1 if frac < 1.0 else R1
-                Df = D1 if frac >= 0.5 else D0
+                Rf, Df, Sf = table_a_cout(frac, (R0, D0, S0), (R1, D1, S1), _calcule_table)
                 choix = rng.choice(len(j_tr), size=min(cfg.parties_par_epoch, len(j_tr)),
                                    replace=False)
                 marge_d = max(240 // int(cfg.minutes_par_barre), cfg.barres_par_partie // 6)
                 sc, cp, tr = joue(policy, departs_tires(j_tr[choix], rng, marge_d), Xk,
-                                  Rf, Df, S1, fin_tr, cfg, device, explore=True,
-                                  collecte=True, rangs=rangs_ex)
+                                  Rf, Df, Sf, fin_tr, cfg, device, explore=True,
+                                  collecte=True, rangs=rangs_ex, prix=c, atr=atr)
                 maj_ppo(policy, optims, avantages(tr, cfg), Xk, cfg, device, rng)
-                del Rf
+                del Rf, Df, Sf
             gen = torch.Generator(device=device)
             gen.manual_seed(cfg.graine)
             sv, cv, _ = joue(policy, j_va, Xk, R1, D1, S1, fin_va, cfg, device,
-                             explore=False, gen=gen, rangs=rangs_ex)
+                             explore=False, gen=gen, rangs=rangs_ex, prix=c, atr=atr)
             bv = _bilan(sv, j_va, cv)
             nom = "EXPERT IMITE" if epoch == 0 else f"cout {100 * frac:.0f}%"
             print(f"\nEPOCH {epoch:03d}  {nom:>12}  VAL  {ligne_bilan(bv, cfg)}  "
@@ -2655,7 +3601,7 @@ def main_multi_blocs(cfg: JeuConfig) -> int:
         gen = torch.Generator(device=device)
         gen.manual_seed(cfg.graine)
         s_t, c_t, _ = joue(policy, j_te, Xk, R1, D1, S1, fin_te, cfg, device,
-                           explore=False, gen=gen, rangs=rangs_ex)
+                           explore=False, gen=gen, rangs=rangs_ex, prix=c, atr=atr)
         bt = _bilan(s_t, j_te, c_t)
         tests.append((k + 1, _fmt(te0), _fmt(te1 - 1), bt, c_t))
         print(f"\nTEST fold {k + 1} ({os.path.basename(src)})  {ligne_bilan(bt, cfg)}", flush=True)
@@ -2687,6 +3633,8 @@ def main_multi_blocs(cfg: JeuConfig) -> int:
 
 def main() -> int:
     cfg = JeuConfig()
+    if "--rebuild-deploy-ensemble" in sys.argv:
+        return reconstruit_deploy_ensemble(cfg)
     # LE MODELE D'UN MARCHE, lance par `main_modeles_par_marche`.
     if len(sys.argv) > 1 and tuple(cfg.marches):
         return main_blocs(config_marche(cfg, sys.argv[1],
@@ -2751,14 +3699,14 @@ def main() -> int:
 
     marge = fraction_marge(c, atr, cfg)
     t0 = time.time()
-    R0, D0, _ = table_coups(o, h, l, sp, atr, cfg, 0.0)
+    R0, D0, S0 = table_coups(o, h, l, sp, atr, cfg, 0.0)
     R1, D1, S1 = table_coups(o, h, l, sp, atr, cfg, 1.0)
     print(f"  table des coups : {N:,} bougies x {R1[0].size} coups, sans cout et "
           f"au cout reel, {time.time() - t0:.0f} s", flush=True)
 
     # L'EXPERT, APPRIS SUR LE TRAIN DU FOLD 1 SEULEMENT. Voir l'en-tete.
     t_ex = time.time()
-    y_ex = cibles_expert(R1)
+    y_ex = cibles_expert(R1, cfg)
     pred, modeles_expert = expert_realiste(Xn, y_ex, n_tr, N, cfg)
     for s_, nom in enumerate(("achat", "vente")):
         modeles_expert[s_].booster_.save_model(f"expert_{cfg.prefixe}_{nom}.txt")
@@ -2833,17 +3781,17 @@ def main() -> int:
             st = None
             b_tr = None
             if epoch >= 1:
-                Rf = (1 - frac) * R0 + frac * R1 if frac < 1.0 else R1
-                Df = D1 if frac >= 0.5 else D0
+                Rf, Df, Sf = table_a_cout(frac, (R0, D0, S0), (R1, D1, S1),
+                                         lambda f: table_coups(o, h, l, sp, atr, cfg, f))
                 choix = rng.choice(len(j_tr), size=min(cfg.parties_par_epoch, len(j_tr)),
                                    replace=False)
                 marge_d = max(240 // int(cfg.minutes_par_barre), cfg.barres_par_partie // 6)
                 sc, cp, tr = joue(policy, departs_tires(j_tr[choix], rng, marge_d), Xn,
-                                  Rf, Df, S1, a_va, cfg, device, explore=True,
+                                  Rf, Df, Sf, a_va, cfg, device, explore=True,
                                   collecte=True, rangs=rangs_ex, marge=marge)
                 b_tr = bilan(sc, cp, c, atr, sp, cfg, frac=frac)
                 st = maj_ppo(policy, optims, avantages(tr, cfg), Xn, cfg, device, rng)
-                del Rf
+                del Rf, Df, Sf
             gen = torch.Generator(device=device)
             gen.manual_seed(cfg.graine)
             sv, cv, _ = joue(policy, j_va, Xn, R1, D1, S1, a_te, cfg, device,
@@ -2972,27 +3920,27 @@ def main_multi(cfg: JeuConfig) -> int:
     Xn = safe_normalize(X, stats).astype(np.float32)
     del X
 
-    t_tab = time.time()
-    tabs = {}
-    for frac in (0.0, 1.0):
-        # LE SWAP DE CHAQUE MARCHE, lu dans le cache (voir `prepare_multi_h1`).
-        def _cfg_m(a):
-            if "swap_achat_bps_jour" not in d.columns:
-                return cfg
-            return replace(cfg, swap_achat_bps_jour=float(d["swap_achat_bps_jour"].iloc[a]),
-                           swap_vente_bps_jour=float(d["swap_vente_bps_jour"].iloc[a]))
+    # LE SWAP DE CHAQUE MARCHE, lu dans le cache (voir `prepare_multi_h1`).
+    def _cfg_m(a):
+        if "swap_achat_bps_jour" not in d.columns:
+            return cfg
+        return replace(cfg, swap_achat_bps_jour=float(d["swap_achat_bps_jour"].iloc[a]),
+                       swap_vente_bps_jour=float(d["swap_vente_bps_jour"].iloc[a]))
+
+    def _calcule_table(frac):
         parts = [table_coups(o[a:b], h[a:b], l[a:b], sp[a:b], atr[a:b], _cfg_m(a), frac)
                  for _, a, b in blocs]
-        tabs[frac] = tuple(np.concatenate([p_[k] for p_ in parts]) for k in range(3))
-    R0, D0, _ = tabs[0.0]
-    R1, D1, S1 = tabs[1.0]
-    del tabs
+        return tuple(np.concatenate([p_[k] for p_ in parts]) for k in range(3))
+
+    t_tab = time.time()
+    R0, D0, S0 = _calcule_table(0.0)
+    R1, D1, S1 = _calcule_table(1.0)
     print(f"  table des coups : {N:,} bougies x {R1[0].size} coups, marche par "
           f"marche, {time.time() - t_tab:.0f} s", flush=True)
 
     t_ex = time.time()
     fin_tr1 = fin_segment(t_ns, blocs, bornes[0][1])
-    y_ex = cibles_expert(R1)
+    y_ex = cibles_expert(R1, cfg)
     # UN EXPERT PAR MARCHE — 2026-09-27, run kairos_multi_m15_02. Le run
     # m15_01 n'en avait qu'un pour les sept : correlation +0.019 a l'achat
     # et +0.010 a la vente en validation, contre +0.088 et +0.043 pour
@@ -3094,21 +4042,20 @@ def main_multi(cfg: JeuConfig) -> int:
                     if (depart_zero and cfg.rampe_cout > 0) else 1.0)
             st = b_tr = None
             if epoch >= 1:
-                Rf = (1 - frac) * R0 + frac * R1 if frac < 1.0 else R1
-                Df = D1 if frac >= 0.5 else D0
+                Rf, Df, Sf = table_a_cout(frac, (R0, D0, S0), (R1, D1, S1), _calcule_table)
                 choix = rng.choice(len(j_tr), size=min(cfg.parties_par_epoch, len(j_tr)),
                                    replace=False)
                 marge_d = max(240 // int(cfg.minutes_par_barre), cfg.barres_par_partie // 6)
                 sc, cp, tr = joue(policy, departs_tires(j_tr[choix], rng, marge_d),
-                                  Xn, Rf, Df, S1, fin_tr, cfg, device, explore=True,
-                                  collecte=True, rangs=rangs_ex)
+                                  Xn, Rf, Df, Sf, fin_tr, cfg, device, explore=True,
+                                  collecte=True, rangs=rangs_ex, prix=c, atr=atr)
                 b_tr = bilan(sc, cp, c, atr, sp, cfg, frac=frac, ordre=t_ns)
                 st = maj_ppo(policy, optims, avantages(tr, cfg), Xn, cfg, device, rng)
-                del Rf
+                del Rf, Df, Sf
             gen = torch.Generator(device=device)
             gen.manual_seed(cfg.graine)
             sv, cv, _ = joue(policy, j_va, Xn, R1, D1, S1, fin_va, cfg, device,
-                             explore=False, gen=gen, rangs=rangs_ex)
+                             explore=False, gen=gen, rangs=rangs_ex, prix=c, atr=atr)
             bv = _bilan(sv, j_va, cv)
             nom = "EXPERT IMITE" if epoch == 0 else f"cout {100 * frac:.0f}%"
             print(f"\nEPOCH {epoch:03d}  {nom:>12}  VAL  {ligne_bilan(bv, cfg)}  "
@@ -3143,7 +4090,7 @@ def main_multi(cfg: JeuConfig) -> int:
         gen = torch.Generator(device=device)
         gen.manual_seed(cfg.graine)
         s_t, c_t, _ = joue(policy, j_te, Xn, R1, D1, S1, fin_te, cfg, device,
-                           explore=False, gen=gen, rangs=rangs_ex)
+                           explore=False, gen=gen, rangs=rangs_ex, prix=c, atr=atr)
         bt = _bilan(s_t, j_te, c_t)
         print(f"\nTEST fold {fold + 1} ({os.path.basename(src)})  {ligne_bilan(bt, cfg)}",
               flush=True)

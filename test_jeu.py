@@ -103,7 +103,8 @@ torch.manual_seed(0)
 # independamment de la mise du jeu (0.5 % depuis m15_05).
 cfgj = replace(J.JeuConfig(), horizon_max=10, jetons=3, lookback=4, n_expert=0,
                minutes_par_barre=1, risque_pct=1.0, marches=(), partie="jour",
-               swap_achat_bps_jour=0.0, swap_vente_bps_jour=0.0, positions_max=1)
+               swap_achat_bps_jour=0.0, swap_vente_bps_jour=0.0, positions_max=1,
+               jeu_version=1)
 pol = J.PolitiqueJeu(cfgj)
 g = pol.groupes_jeu()
 verifie("six groupes, dont les quatre tetes", sorted(g) ==
@@ -268,8 +269,8 @@ verifie("l'expert ne lit pas au-dela de la fenetre",
         all(e[0] + 1 + cfge.horizon_max < 2800 for e in ex))
 
 print("\n4b. L'EXPERT REALISTE")
-yx = J.cibles_expert(R)
-verifie("la cible est le R moyen de tous les coups d'un sens",
+yx = J.cibles_expert(R, cfge)
+verifie("la cible expert moyenne les 16 barrieres, comme demande",
         abs(yx[500, 0] - np.clip(np.nanmean(R[500, 0]), -3, 5)) < 1e-5)
 pred_s = np.full((M, 2), np.nan, np.float32)
 pred_s[:, 0] = -1.0

@@ -73,7 +73,7 @@ def main() -> int:
     Xn = safe_normalize(X, st).astype(np.float32)
     del X
     R1, D1, S1 = J.table_coups(o, h, l, sp, atr, cfg, 1.0)
-    y = J.cibles_expert(R1)
+    y = J.cibles_expert(R1, cfg)
     pred, _ = J.expert_realiste(Xn, y, n_tr, N, cfg)
     vmax = np.nanmax(pred, axis=1)
     rang = pd.Series(vmax).rolling(10_000, min_periods=2_000).rank(pct=True).to_numpy()
