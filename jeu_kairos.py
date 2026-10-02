@@ -175,7 +175,11 @@ class JeuConfig:
     # Run distinct : le M5_09 reste le modele actuellement branche en demo.
     # M5_19 rejoue strictement la version PPO precedente, sous un prefixe
     # neuf afin de conserver l'audit du run interrompu M5_17.
-    prefixe: str = "kairos_jeu_m5_19_thermostat_ppo_lotmin"
+    # DEUX NOTES SEPAREES ET SAUVEGARDE SANS RUINE (run m5_20) : voir
+    # `note_mise_separee`, `mur_mise` et `dd_max_sauvegarde`. Le run m5_19
+    # (une seule note pour les huit tetes) : prefixe
+    # kairos_jeu_m5_19_thermostat_ppo_lotmin, les trois a False / 1.0.
+    prefixe: str = "kairos_jeu_m5_20_mise_separee"
     # Reproduction demandee du run M5_03, avant les corrections de deroulement
     # et de compte introduites dans la version 2.
     # La version 2 rejoue l'equite, la marge et les positions ouvertes : elle
@@ -399,6 +403,26 @@ class JeuConfig:
     # R realise), et serie de pertes. Ils ne lisent que des positions deja
     # cloturees ; jeu, validation et live les mettent a jour de la meme facon.
     observe_calibration: bool = True
+    # DEUX NOTES SEPAREES — 2026-10-02 (run m5_20), demande du proprietaire :
+    # garder le signal d'achat et de vente, et la prise de risque au-dela de
+    # 1 %, sans que le compte finisse ruine. Au run m5_19, une seule note (le
+    # gain en dollars rapporte a 1 % du compte) entrainait les huit tetes :
+    # miser plus rapportait toujours plus en moyenne, le risque choisi montait
+    # a 63-78 % du compte par coup et la validation du bloc 1 finissait a
+    # -87 / -100 % dans 19 epochs sur les 20 dernieres.
+    #
+    # Avec True : l'entree, l'objectif, le stop et la valeur gardent EXACTEMENT
+    # leur note. Les quatre tetes de mise (lot, risque, allocation, confiance)
+    # sont notees sur la croissance du compte en pourcentage, le logarithme du
+    # solde apres le coup sur le solde avant (`avantage_mise`) : la regle qui
+    # mene a la mise de Kelly. Un gain de +5 % vaut +0.049, une perte de 50 %
+    # vaut -0.69, la ruine vaut -6.9. Miser gros reste possible et paye quand
+    # le signal est fort ; tout miser ne paye jamais.
+    note_mise_separee: bool = True
+    # LE MUR : les tetes de mise LISENT le tronc mais ne le modifient pas en
+    # apprenant (gradient coupe). Sans lui, leur apprentissage remonterait
+    # dans le tronc, donc dans le signal d'achat et de vente.
+    mur_mise: bool = True
     # En ATR de la barre de decision. L'ATR M1 du BTC vaut ~7 bps, un
     # mouvement de 15 minutes ~2.5 ATR : les coups vont de la demi-heure a
     # quelques heures.
@@ -531,6 +555,14 @@ class JeuConfig:
     max_grad_norm: float = 0.6
     # --- la sauvegarde ---
     min_coups_val: int = 30
+    # LA SAUVEGARDE SANS RUINE — 2026-10-02 (run m5_20), demande du
+    # proprietaire. Le modele garde est celui dont le compte de validation
+    # grossit le plus (sur un seul compte, c'est le meme classement que le
+    # profit par jour), parmi les epochs dont la pire baisse en validation
+    # reste au-dessus de -`dd_max_sauvegarde`. Au run m5_19, l'epoch gardee
+    # au bloc 1 (la 18, -35.7 %) etait entouree d'epochs a -84 et -100 %.
+    # 1.0 = pas de limite, comme avant.
+    dd_max_sauvegarde: float = 0.50
     # --- LE DRAWDOWN — 2026-09-27, run kairos_jeu_m15_04, demande du
     # proprietaire : « tres bons resultats, a part le drawdown ». Le run m15_03
     # (10 jetons) gagnait +0.3 a +3.6 $/jour en validation, pour un drawdown
@@ -659,6 +691,8 @@ class PolitiqueJeu(SAINTPolicySingleHead):
         if self.apprendre_confiance:
             self.lecteur_confiance = _lecteur()
             self.tete_confiance = nn.Linear(64, len(cfg.niveaux_confiance_pct))
+        # LE MUR des tetes de mise. Voir `mur_mise`.
+        self.mur_mise = bool(getattr(cfg, "mur_mise", False))
         for m in list(self.lecteur_objectif) + list(self.lecteur_stop):
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
@@ -723,22 +757,23 @@ class PolitiqueJeu(SAINTPolicySingleHead):
             v = pm(k, self.mlp_m, self.critic_m, zn).squeeze(-1)
             un = torch.ones_like(la)
             zl, zs = torch.cat([zn, un], -1), torch.cat([zn, -un], -1)
+            zlm, zsm = (zl.detach(), zs.detach()) if self.mur_mise else (zl, zs)
             ltp = torch.stack([pm(k, self.lecteur_objectif_m, self.tete_objectif_m, zl),
                                pm(k, self.lecteur_objectif_m, self.tete_objectif_m, zs)], 1)
             lsl = torch.stack([pm(k, self.lecteur_stop_m, self.tete_stop_m, zl),
                                pm(k, self.lecteur_stop_m, self.tete_stop_m, zs)], 1)
             if self.apprendre_lot:
-                llo = torch.stack([pm(k, self.lecteur_lot_m, self.tete_lot_m, zl),
-                                   pm(k, self.lecteur_lot_m, self.tete_lot_m, zs)], 1)
+                llo = torch.stack([pm(k, self.lecteur_lot_m, self.tete_lot_m, zlm),
+                                   pm(k, self.lecteur_lot_m, self.tete_lot_m, zsm)], 1)
                 if self.apprendre_risque:
-                    lri = torch.stack([pm(k, self.lecteur_risque_m, self.tete_risque_m, zl),
-                                       pm(k, self.lecteur_risque_m, self.tete_risque_m, zs)], 1)
+                    lri = torch.stack([pm(k, self.lecteur_risque_m, self.tete_risque_m, zlm),
+                                       pm(k, self.lecteur_risque_m, self.tete_risque_m, zsm)], 1)
                     if self.apprendre_allocation:
-                        lal = torch.stack([pm(k, self.lecteur_allocation_m, self.tete_allocation_m, zl),
-                                           pm(k, self.lecteur_allocation_m, self.tete_allocation_m, zs)], 1)
+                        lal = torch.stack([pm(k, self.lecteur_allocation_m, self.tete_allocation_m, zlm),
+                                           pm(k, self.lecteur_allocation_m, self.tete_allocation_m, zsm)], 1)
                         if self.apprendre_confiance:
-                            lco = torch.stack([pm(k, self.lecteur_confiance_m, self.tete_confiance_m, zl),
-                                               pm(k, self.lecteur_confiance_m, self.tete_confiance_m, zs)], 1)
+                            lco = torch.stack([pm(k, self.lecteur_confiance_m, self.tete_confiance_m, zlm),
+                                               pm(k, self.lecteur_confiance_m, self.tete_confiance_m, zsm)], 1)
                             return le, v, ltp, lsl, llo, lri, lal, lco
                         return le, v, ltp, lsl, llo, lri, lal
                     return le, v, ltp, lsl, llo, lri
@@ -750,22 +785,23 @@ class PolitiqueJeu(SAINTPolicySingleHead):
         v = self.critic(self.mlp(zn)).squeeze(-1)
         un = torch.ones_like(la)
         zl, zs = torch.cat([zn, un], -1), torch.cat([zn, -un], -1)
+        zlm, zsm = (zl.detach(), zs.detach()) if self.mur_mise else (zl, zs)
         ltp = torch.stack([self.tete_objectif(self.lecteur_objectif(zl)),
                            self.tete_objectif(self.lecteur_objectif(zs))], 1)
         lsl = torch.stack([self.tete_stop(self.lecteur_stop(zl)),
                            self.tete_stop(self.lecteur_stop(zs))], 1)
         if self.apprendre_lot:
-            llo = torch.stack([self.tete_lot(self.lecteur_lot(zl)),
-                               self.tete_lot(self.lecteur_lot(zs))], 1)
+            llo = torch.stack([self.tete_lot(self.lecteur_lot(zlm)),
+                               self.tete_lot(self.lecteur_lot(zsm))], 1)
             if self.apprendre_risque:
-                lri = torch.stack([self.tete_risque(self.lecteur_risque(zl)),
-                                   self.tete_risque(self.lecteur_risque(zs))], 1)
+                lri = torch.stack([self.tete_risque(self.lecteur_risque(zlm)),
+                                   self.tete_risque(self.lecteur_risque(zsm))], 1)
                 if self.apprendre_allocation:
-                    lal = torch.stack([self.tete_allocation(self.lecteur_allocation(zl)),
-                                       self.tete_allocation(self.lecteur_allocation(zs))], 1)
+                    lal = torch.stack([self.tete_allocation(self.lecteur_allocation(zlm)),
+                                       self.tete_allocation(self.lecteur_allocation(zsm))], 1)
                     if self.apprendre_confiance:
-                        lco = torch.stack([self.tete_confiance(self.lecteur_confiance(zl)),
-                                           self.tete_confiance(self.lecteur_confiance(zs))], 1)
+                        lco = torch.stack([self.tete_confiance(self.lecteur_confiance(zlm)),
+                                           self.tete_confiance(self.lecteur_confiance(zsm))], 1)
                         return le, v, ltp, lsl, llo, lri, lal, lco
                     return le, v, ltp, lsl, llo, lri, lal
                 return le, v, ltp, lsl, llo, lri
@@ -1273,6 +1309,27 @@ def avantages(trans, cfg: JeuConfig):
     return lignes
 
 
+def avantage_mise(r_coups: np.ndarray, coup: np.ndarray, cfg) -> np.ndarray:
+    """La note des tetes de mise : la croissance du compte, normalisee.
+
+    `r_coups` est le resultat de chaque coup en unites de `risque_pct` du
+    solde a l'entree (le R du jeu version 2), donc le coup a change le solde
+    de r x risque_pct %. Sa note est log(solde apres / solde avant), plancher
+    a log(0.001) pour la ruine, centree et reduite sur les coups du lot. Les
+    attentes ne choisissent pas de mise : leur note vaut 0. Voir
+    `note_mise_separee`.
+    """
+    r = np.asarray(r_coups, np.float64)
+    coup = np.asarray(coup, bool)
+    g = np.log(np.maximum(1.0 + r * float(cfg.risque_pct) / 100.0, 1e-3))
+    out = np.zeros(len(r), np.float32)
+    if coup.sum() >= 2:
+        mg = float(g[coup].mean())
+        sg = float(g[coup].std()) + 1e-8
+        out[coup] = ((g[coup] - mg) / sg).astype(np.float32)
+    return out
+
+
 def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng):
     """Une mise a jour PPO, chaque groupe par son optimiseur.
 
@@ -1329,6 +1386,12 @@ def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng):
     mu = float(np.average(adv, weights=w))
     sd = float(np.sqrt(np.average((adv - mu) ** 2, weights=w))) + 1e-8
     advn = (adv - mu) / sd
+    # LA NOTE DES TETES DE MISE, a part. Voir `note_mise_separee`.
+    if bool(getattr(cfg, "note_mise_separee", False)):
+        adv_mise = avantage_mise(np.array([lignes[k][10] for k in sel], np.float64),
+                                 a_all[sel] != ATTENDRE, cfg)
+    else:
+        adv_mise = advn
     st = {"kl": [], "clip": [], "H": [], "Hb": [], "v": []}
     policy.eval()   # le dropout rendrait le rapport de PPO inexact
     T = lambda z, dt=torch.float32: torch.as_tensor(z, dtype=dt, device=device)
@@ -1371,6 +1434,7 @@ def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng):
             if bool(cb.any()):
                 sidx = (ab[cb] == VENDRE).long()
                 ar = torch.arange(int(cb.sum()), device=device)
+                Am = T(adv_mise[b])[cb]
                 for lg, choisi, lp_vieux in ((ltp, i, lpi), (lsl, j, lpj)):
                     lgc = torch.log_softmax(lg[cb][ar, sidx], -1)
                     ch = T(choisi[b], torch.long)[cb]
@@ -1385,7 +1449,7 @@ def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng):
                     ch = T(kallocation[b], torch.long)[cb]
                     lpn = lgc.gather(1, ch[:, None]).squeeze(1)
                     rb = torch.exp(lpn - T(lpallocation[b])[cb])
-                    pb = -torch.min(rb * Ac, rb.clamp(1 - cfg.clip, 1 + cfg.clip) * Ac)
+                    pb = -torch.min(rb * Am, rb.clamp(1 - cfg.clip, 1 + cfg.clip) * Am)
                     perte = perte + pb.mean() - cfg.entropie_barrieres * (-(lgc.exp() * lgc).sum(-1)).mean()
                     # Classes ordonnees : perte nette -> budget 10 %, petit
                     # gain -> prudent, forte opportunite -> budget maximal.
@@ -1401,7 +1465,7 @@ def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng):
                     ch = T(kconfiance[b], torch.long)[cb]
                     lpn = lgc.gather(1, ch[:, None]).squeeze(1)
                     rb = torch.exp(lpn - T(lpconfiance[b])[cb])
-                    pb = -torch.min(rb * Ac, rb.clamp(1 - cfg.clip, 1 + cfg.clip) * Ac)
+                    pb = -torch.min(rb * Am, rb.clamp(1 - cfg.clip, 1 + cfg.clip) * Am)
                     eb = -(lgc.exp() * lgc).sum(-1)
                     perte = perte + pb.mean() - cfg.entropie_barrieres * eb.mean()
                     hb = hb + eb.mean().detach() / 2
@@ -1413,7 +1477,7 @@ def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng):
                     ch = T(klot[b], torch.long)[cb]
                     lpn = lgc.gather(1, ch[:, None]).squeeze(1)
                     rb = torch.exp(lpn - T(lpk[b])[cb])
-                    pb = -torch.min(rb * Ac, rb.clamp(1 - cfg.clip, 1 + cfg.clip) * Ac)
+                    pb = -torch.min(rb * Am, rb.clamp(1 - cfg.clip, 1 + cfg.clip) * Am)
                     eb = -(lgc.exp() * lgc).sum(-1)
                     perte = perte + pb.mean() - cfg.entropie_barrieres * eb.mean()
                 if lri is not None:
@@ -1421,7 +1485,7 @@ def maj_ppo(policy, optims, lignes, Xn, cfg: JeuConfig, device, rng):
                     ch = T(krisque[b], torch.long)[cb]
                     lpn = lgc.gather(1, ch[:, None]).squeeze(1)
                     rb = torch.exp(lpn - T(lprisque[b])[cb])
-                    pb = -torch.min(rb * Ac, rb.clamp(1 - cfg.clip, 1 + cfg.clip) * Ac)
+                    pb = -torch.min(rb * Am, rb.clamp(1 - cfg.clip, 1 + cfg.clip) * Am)
                     eb = -(lgc.exp() * lgc).sum(-1)
                     perte = perte + pb.mean() - cfg.entropie_barrieres * eb.mean()
             _pas(policy, optims, perte, cfg)
@@ -2734,9 +2798,12 @@ def main_blocs(cfg: JeuConfig) -> int:
                     "bloc": k + 1, "pipeline": pipeline_ref}
             torch.save(etat, f"last_{cfg.prefixe}{suffixe}.pth")
             profit_jour = bv["total_dollars"] / max(bv["parties"], 1)
-            admissible = bv["coups"] >= cfg.min_coups_val
+            assez = bv["coups"] >= cfg.min_coups_val
+            # SANS RUINE : voir `dd_max_sauvegarde`.
+            sans_ruine = bv["dd_pct"] >= -float(getattr(cfg, "dd_max_sauvegarde", 1.0))
+            admissible = assez and sans_ruine
             sauve = admissible and profit_jour > record_profit
-            sauve_r = admissible and bv["score"] > record_r
+            sauve_r = assez and bv["score"] > record_r
             if sauve:
                 record_profit, garde_profit = profit_jour, epoch
                 torch.save(etat, best_path)
@@ -2744,7 +2811,10 @@ def main_blocs(cfg: JeuConfig) -> int:
                       f"validation, {bv['coups']} coups -> {best_path}", flush=True)
             else:
                 raison = (f"{bv['coups']} coups, il en faut {cfg.min_coups_val}"
-                          if not admissible else
+                          if not assez else
+                          f"pire baisse {100 * bv['dd_pct']:+.1f} %, au-dela de la limite de "
+                          f"-{100 * float(cfg.dd_max_sauvegarde):.0f} %"
+                          if not sans_ruine else
                           f"{profit_jour:+.2f}$/jour ne bat pas {record_profit:+.2f}$")
                 print(f"  garde  meilleur profit inchange : {raison}"
                       + (f" (meilleur : epoch {garde_profit})"

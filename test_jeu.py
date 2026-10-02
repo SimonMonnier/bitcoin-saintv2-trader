@@ -104,7 +104,12 @@ torch.manual_seed(0)
 cfgj = replace(J.JeuConfig(), horizon_max=10, jetons=3, lookback=4, n_expert=0,
                minutes_par_barre=1, risque_pct=1.0, marches=(), partie="jour",
                swap_achat_bps_jour=0.0, swap_vente_bps_jour=0.0, positions_max=1,
-               jeu_version=1)
+               jeu_version=1,
+               # LE JEU HISTORIQUE (version 1) : sans les tetes de mise ni
+               # l'etat du compte, ajoutes par defaut depuis le run m5_12.
+               apprendre_lot=False, apprendre_risque=False, apprendre_allocation=False,
+               apprendre_confiance=False, observe_compte=False, observe_calibration=False,
+               note_mise_separee=False, mur_mise=False)
 pol = J.PolitiqueJeu(cfgj)
 g = pol.groupes_jeu()
 verifie("six groupes, dont les quatre tetes", sorted(g) ==
@@ -390,7 +395,7 @@ verifie("ses contextes sont le H1 et le H4",
         "close_h1_dev" in P15.FEATURE_COLS_M15 and "close_h4_dev" in P15.FEATURE_COLS_M15
         and not any(c.endswith("_m5") for c in P15.FEATURE_COLS_M15))
 p15 = J.PolitiqueJeu(c15)
-x15 = torch.zeros(2, c15.lookback, len(P15.FEATURE_COLS_M15) + c15.n_expert + J.N_ETAT)
+x15 = torch.zeros(2, c15.lookback, len(P15.FEATURE_COLS_M15) + c15.n_expert + J.n_etat(c15))
 verifie("le modele M15 lit ses colonnes, celles de l'expert et l'etat",
         p15.jeu(x15)[0].shape == (2, 3))
 et15 = J.etat_jeu(np.array([3]), np.array([0.0]), np.array([48]), c15)
@@ -408,7 +413,7 @@ verifie("il lit les features communes, avec une colonne par marche",
         and all(f"m_{m}" in PM.FEATURE_COLS_MULTI for m in PM.MARCHES)
         and not any(c.startswith(("ofi_", "prime_cb", "taker")) for c in PM.FEATURE_COLS_MULTI))
 pm_ = J.PolitiqueJeu(cm)
-xm_ = torch.zeros(2, cm.lookback, len(PM.FEATURE_COLS_MULTI) + cm.n_expert + J.N_ETAT)
+xm_ = torch.zeros(2, cm.lookback, len(PM.FEATURE_COLS_MULTI) + cm.n_expert + J.n_etat(cm))
 verifie("le modele multi lit ses colonnes, l'expert et l'etat", pm_.jeu(xm_)[0].shape == (2, 3))
 mk = np.array(["A"] * 5 + ["B"] * 4)
 bl = J.blocs_marches(mk)
@@ -478,7 +483,10 @@ print("\n9. LE MULTI-MARCHES H1 (le BTC et les indices)")
 import prepare_multi_h1 as PMH
 cmh = replace(J.JeuConfig(), marches=tuple(PMH.MARCHES), cache=PMH.SORTIE,
               minutes_par_barre=60, partie="semaine", horizon_max=72, expert_k=6,
-              expert_pas_neg=1, porte_rang_expert=0.90)
+              expert_pas_neg=1, porte_rang_expert=0.90,
+              # le multi H1 historique : sans les tetes de mise ni l'etat du compte
+              apprendre_lot=False, apprendre_risque=False, apprendre_allocation=False,
+              apprendre_confiance=False, observe_compte=False, observe_calibration=False)
 import prepare_btc_m5 as P5
 _dft = replace(J.JeuConfig(), marches=(), cache=P5.SORTIE)
 verifie("le BTC seul en M5 (run m5_02) : une journee par partie, 10 jetons, une position",
@@ -491,7 +499,7 @@ verifie("le M5 lit ses colonnes, dont l'ecart Coinbase / Binance",
         J.colonnes_jeu(_dft) == list(P5.FEATURE_COLS_M5) and "prime_cb" in P5.FEATURE_COLS_M5
         and "flux_3" in P5.FEATURE_COLS_M5)
 _p5 = J.PolitiqueJeu(_dft)
-_x5 = torch.zeros(2, _dft.lookback, len(P5.FEATURE_COLS_M5) + _dft.n_expert + J.N_ETAT)
+_x5 = torch.zeros(2, _dft.lookback, len(P5.FEATURE_COLS_M5) + _dft.n_expert + J.n_etat(_dft))
 verifie("le modele M5 lit ses colonnes, l'expert et l'etat", _p5.jeu(_x5)[0].shape == (2, 3))
 verifie("le multi H1 : le BTC et les indices, une semaine par partie",
         tuple(cmh.marches) == tuple(PMH.MARCHES) and len(cmh.marches) == len(PMH.MARCHES) >= 13
@@ -504,7 +512,7 @@ verifie("il lit les colonnes communes, avec une colonne par marche",
         and all(f"m_{m}" in PMH.FEATURE_COLS_MULTI_H1 for m in PMH.MARCHES)
         and not any(c in PMH.FEATURE_COLS_MULTI_H1 for c in PMH.EXTRAS_BTC_H1))
 pmh = J.PolitiqueJeu(cmh)
-xmh = torch.zeros(2, cmh.lookback, len(PMH.FEATURE_COLS_MULTI_H1) + cmh.n_expert + J.N_ETAT)
+xmh = torch.zeros(2, cmh.lookback, len(PMH.FEATURE_COLS_MULTI_H1) + cmh.n_expert + J.n_etat(cmh))
 verifie("le modele multi H1 lit ses colonnes, l'expert et l'etat", pmh.jeu(xmh)[0].shape == (2, 3))
 _nm = len(PMH.MARCHES)
 verifie("un tronc commun, un jeu de tetes par marche",
@@ -515,7 +523,7 @@ verifie("les groupes restent disjoints et portent les tetes par marche",
         len(_ids) == len(set(_ids)) and sorted(gmh) == ["achat", "gain", "perte", "tronc", "valeur", "vente"]
         and len(gmh["achat"]) == _nm * len(list(pmh.mlp_achat.parameters()) + list(pmh.tete_achat.parameters())))
 _colm = J.colonnes_jeu(cmh)
-_xa = torch.zeros(2, cmh.lookback, len(_colm) + cmh.n_expert + J.N_ETAT)
+_xa = torch.zeros(2, cmh.lookback, len(_colm) + cmh.n_expert + J.n_etat(cmh))
 _xa[0, :, _colm.index("m_BTCUSD")] = 1.0
 _xa[1, :, _colm.index("m_GER40")] = 1.0
 verifie("le marche se lit dans ses colonnes", pmh.marche_de(_xa).tolist() == [0, 2])
@@ -572,7 +580,7 @@ verifie("EXACTEMENT les colonnes du BTC, plus une colonne par marche",
         J.colonnes_jeu(_mm) == list(P5.FEATURE_COLS_M5) + ["m_BTCUSD", "m_ETHUSD", "m_ZECUSD"])
 _mm3 = replace(_mm, marches=("BTCUSD", "ETHUSD", "ZECUSD"))
 _pm5 = J.PolitiqueJeu(_mm3)
-_xm = torch.zeros(3, _mm.lookback, len(J.colonnes_jeu(_mm3)) + _mm.n_expert + J.N_ETAT)
+_xm = torch.zeros(3, _mm.lookback, len(J.colonnes_jeu(_mm3)) + _mm.n_expert + J.n_etat(_mm3))
 _ic = J.colonnes_jeu(_mm).index("m_ETHUSD")
 _xm[1, :, _ic] = 1.0
 _ic = J.colonnes_jeu(_mm).index("m_ZECUSD")
@@ -661,6 +669,46 @@ verifie("la marge est partagee : le coup du B n'entre pas pendant celui du A",
         _bm["live_pris"] == 2 and _bm["live_marge"] == 1, str(_bm["live_pris"]))
 verifie("par marche : les trades et les dollars de chacun",
         _bc["par_marche"]["A"]["coups"] == 2 and abs(_bc["par_marche"]["B"]["total_dollars"] - 20) < 1e-9)
+
+print("\n13. DEUX NOTES SEPAREES ET SAUVEGARDE SANS RUINE")
+_cd = J.JeuConfig()
+verifie("par defaut : note de la mise a part, mur, sauvegarde sous -50 %",
+        _cd.note_mise_separee and _cd.mur_mise and _cd.dd_max_sauvegarde == 0.50
+        and _cd.apprendre_risque and max(_cd.niveaux_risque_pct) == 100.0)
+_am = J.avantage_mise(np.array([5.0, -50.0, 0.0, -100.0, 0.0]),
+                      np.array([True, True, False, True, True]), _cd)
+verifie("la note de la mise suit la croissance du compte : +5 % > 0 > -50 % > ruine, attente a 0",
+        _am[0] > _am[4] > _am[1] > _am[3] and _am[2] == 0.0, str(_am))
+_g = np.log(1 + np.array([40.0, -40.0]) / 100.0)
+verifie("+40 % puis -40 % : nul en dollars, perdant en croissance (la regle de Kelly)",
+        _g.sum() < 0)
+
+
+def _grad_tronc(mur):
+    torch.manual_seed(0)
+    _c = replace(J.JeuConfig(), mur_mise=mur)
+    _p = J.PolitiqueJeu(_c)
+    _p.eval()
+    _x = torch.randn(4, _c.lookback, len(J.colonnes_jeu(_c)) + _c.n_expert + J.n_etat(_c))
+    _s = _p.jeu(_x)
+    sum(o.sum() for o in _s[4:8]).backward()
+    _tr = J.PolitiqueJeu.groupes_jeu(_p)["tronc"]
+    _mi = _p.groupes_jeu()["risque"]
+    return (sum(float(q.grad.abs().sum()) for q in _tr if q.grad is not None),
+            sum(float(q.grad.abs().sum()) for q in _mi if q.grad is not None))
+
+
+_avec, _sans = _grad_tronc(True), _grad_tronc(False)
+verifie("le mur : les tetes de mise apprennent, mais ne touchent pas le tronc (le signal)",
+        _avec[0] == 0.0 and _avec[1] > 0.0 and _sans[0] > 0.0, f"{_avec} {_sans}")
+_p1 = J.PolitiqueJeu(replace(J.JeuConfig(), mur_mise=True))
+_p0 = J.PolitiqueJeu(replace(J.JeuConfig(), mur_mise=False))
+_p0.load_state_dict(_p1.state_dict())
+_p0.eval()
+_p1.eval()
+_xx = torch.randn(3, _cd.lookback, len(J.colonnes_jeu(_cd)) + _cd.n_expert + J.n_etat(_cd))
+verifie("le mur ne change aucune decision : memes sorties avec ou sans",
+        all(torch.allclose(a_, b_) for a_, b_ in zip(_p1.jeu(_xx), _p0.jeu(_xx))))
 
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)
