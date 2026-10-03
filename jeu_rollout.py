@@ -223,6 +223,7 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
             lri = sortie[5] if len(sortie) >= 6 else None
             lal = sortie[6] if len(sortie) >= 7 else None
             lco = sortie[7] if len(sortie) >= 8 else None
+            les = sortie[8] if len(sortie) >= 9 else None
             le = J._masque_logits(le, torch.as_tensor(pa, device=device),
                                  torch.as_tensor(pv, device=device))
             a = J._choix(le, explore, gen)
@@ -244,6 +245,10 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
             confiance = (np.asarray(getattr(cfg, "niveaux_confiance_pct", (100.0,)), dtype=float) /
                           100.0)
             budget *= confiance[z.cpu().numpy()] if lc is not None else 1.0
+            if les is not None:
+                # LA TETE D'ESPERANCE : l'allocation et la confiance deviennent
+                # des multiplicateurs de la mise de base, plus des plafonds.
+                budget = np.ones(len(ix))
             masque_risque = np.ones((len(ix), 1), dtype=bool)
             if lr is not None:
                 plafonds_np = np.asarray(plafonds_lots)
@@ -281,6 +286,9 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
                 lp.append(torch.log_softmax(la, -1).gather(1, u[:, None]).squeeze(1).cpu().numpy())
             if lc is not None:
                 lp.append(torch.log_softmax(lc, -1).gather(1, z[:, None]).squeeze(1).cpu().numpy())
+        if les is not None:
+            pe = les[torch.arange(len(ix), device=device), sens, i, j].float().cpu().numpy()
+            base = J.fraction_esperance(pe[:, 0], pe[:, 1], cfg)
         a, sens, i, j, k, h, u, z, v = [q.cpu().numpy() for q in (a, sens, i, j, k, h, u, z, v)]
         for q, s in enumerate(ix):
             g, tc = int(gg[q]), int(tt[q])
@@ -292,6 +300,16 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
                 if not np.isfinite(r):
                     raise ValueError("coup non fini a l'interieur du segment")
                 lot = grille[q, k[q]]
+                if les is not None:
+                    # LA MISE DE BASE (tete d'esperance) x les multiplicateurs
+                    # des tetes de mise, dans les bornes dures.
+                    mult = (float(cfg.multiplicateurs_lot[k[q]])
+                            * float(cfg.multiplicateurs_allocation[u[q]])
+                            * float(cfg.multiplicateurs_confiance[z[q]]))
+                    voulu = soldes[s] * base[q] * mult / max(
+                        float(atr[tc]) * cfg.sl_atr[j[q]] * cfg.contrat, 1e-12)
+                    voulu = np.floor(voulu / cfg.pas_lot + 1e-10) * cfg.pas_lot
+                    lot = float(min(maximum[q], max(cfg.lot_min, voulu)))
                 risque = lot * cfg.contrat * float(atr[tc]) * cfg.sl_atr[j[q]]
                 nominal = soldes[s] * cfg.risque_pct / 100.0
                 # Un gap ne peut pas faire descendre la simulation sous zero.
@@ -310,7 +328,9 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
                                float(maximum[q]), float(echelles[q]),
                                float((pics[s] - soldes[s]) / max(pics[s], 1e-12)),
                                float(budget[q]),
-                               float(confiance[z[q]] if lc is not None else 1.0)))
+                               float(confiance[z[q]] if lc is not None else 1.0))
+                             + ((float(pe[q, 0]), float(np.exp(0.5 * np.clip(pe[q, 1], -8, 6))),
+                                 float(base[q])) if les is not None else ()))
                 ouverts[s].append((tc + duree, r_pondere, pnl,
                                    marge_requise, float(v[q])))
                 scores[g] += r_pondere

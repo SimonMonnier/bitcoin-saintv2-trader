@@ -767,5 +767,28 @@ verifie("les choix en une fois ne sont pas coupes",
 _pol16 = J.PolitiqueJeu(_c16)
 verifie("la tete d'objectif a douze choix", _pol16.tete_objectif.out_features == 12)
 
+print("\n17. LA TETE D'ESPERANCE")
+_c17 = J.JeuConfig()
+verifie("par defaut : tete d'esperance, demi-Kelly, multiplicateurs de x0.25 a x2",
+        _c17.apprendre_esperance and _c17.kelly_fraction == 0.5
+        and abs(_c17.multiplicateurs_lot[0] - 0.25) < 1e-9 and abs(_c17.multiplicateurs_lot[-1] - 2.0) < 1e-9
+        and len(_c17.multiplicateurs_lot) == _c17.niveaux_lot)
+_f = J.fraction_esperance(np.array([0.1, -0.2, 0.3]), np.log(np.array([1.0, 1.0, 0.5])), _c17)
+verifie("la mise de base : demi-Kelly = 0.5 x moyenne / (moyenne^2 + variance), jamais negative",
+        abs(_f[0] - 0.5 * 0.1 / 1.01) < 1e-9 and _f[1] == 0.0 and abs(_f[2] - 0.5 * 0.3 / 0.59) < 1e-9,
+        str(_f))
+torch.manual_seed(0)
+_p17 = J.PolitiqueJeu(_c17)
+_p17.eval()
+_x17 = torch.randn(3, _c17.lookback, len(J.colonnes_jeu(_c17)) + _c17.n_expert + J.n_etat(_c17))
+_s17 = _p17.jeu(_x17)
+verifie("neuf sorties ; l'esperance par sens, paire d'objectifs, stop, (moyenne, log-variance)",
+        len(_s17) == 9 and tuple(_s17[8].shape) == (3, 2, len(_c17.tp_atr), len(_c17.sl_atr), 2))
+_s17[8].sum().backward()
+_gt = sum(float(q.grad.abs().sum()) for q in _p17.groupes_jeu()["tronc"] if q.grad is not None)
+_ge = sum(float(q.grad.abs().sum()) for q in _p17.groupes_jeu()["esperance"] if q.grad is not None)
+verifie("le mur : la tete d'esperance apprend sans toucher le tronc (le signal)",
+        _gt == 0.0 and _ge > 0.0, f"{_gt} {_ge}")
+
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)

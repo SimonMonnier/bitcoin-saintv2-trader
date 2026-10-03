@@ -299,6 +299,7 @@ class MoteurKairosM5:
             lri = sortie[5] if len(sortie) >= 6 else None
             lal = sortie[6] if len(sortie) >= 7 else None
             lco = sortie[7] if len(sortie) >= 8 else None
+            les = sortie[8] if len(sortie) >= 9 else None
         le = J._masque_logits(le, torch.tensor([achat_ok], device=self.device),
                                torch.tensor([vente_ok], device=self.device))
         a = int(le[0].argmax().cpu())
@@ -317,6 +318,11 @@ class MoteurKairosM5:
         risque_niveau = int(lri[0, sens].argmax().cpu()) if lri is not None else None
         allocation_niveau = int(lal[0, sens].argmax().cpu()) if lal is not None else None
         confiance_niveau = int(lco[0, sens].argmax().cpu()) if lco is not None else None
+        # LA MISE DE BASE de la tete d'esperance, comme le jeu.
+        base = None
+        if les is not None:
+            pe = les[0, sens, tp, sl].float().cpu().numpy()
+            base = float(J.fraction_esperance(pe[0], pe[1], self.cfg))
         # Le jeu applique ce plancher avant de construire TP et SL.
         atr = float(J.atr_effectif(np.array([d["atr_14"].iloc[t]]),
                                    np.array([d["close"].iloc[t]]), self.cfg)[0])
@@ -324,6 +330,7 @@ class MoteurKairosM5:
                 "atr": atr, "lot_niveau": lot_niveau, "risque_niveau": risque_niveau,
                 "allocation_niveau": allocation_niveau,
                 "confiance_niveau": confiance_niveau, "valeur": float(valeur[0].cpu()),
+                "mise_base": base,
                 "gouverneur_echelle": float(echelle), "drawdown": float(dd_courant)}
 
     def execute_demo(self, signal):
@@ -358,6 +365,10 @@ class MoteurKairosM5:
                           if signal["allocation_niveau"] is not None else 1.0)
             confiance = (float(self.cfg.niveaux_confiance_pct[signal["confiance_niveau"]]) / 100.0
                           if signal.get("confiance_niveau") is not None else 1.0)
+            if signal.get("mise_base") is not None:
+                # avec la tete d'esperance, l'allocation et la confiance
+                # multiplient la mise de base : la tete de risque seule plafonne
+                allocation = confiance = 1.0
             plaf = min(plaf, float(ai.equity) * pct * allocation * confiance *
                        signal["gouverneur_echelle"] / perte_lot)
         # LA SERIE NOIRE, la meme regle que le jeu (`plafond_serie_noire`),
@@ -378,6 +389,14 @@ class MoteurKairosM5:
         grille = np.floor(grille / info.volume_step + 1e-10) * info.volume_step
         grille[0], grille[-1] = vmin, plaf
         vol = float(grille[min(signal["lot_niveau"], niveaux - 1)])
+        if signal.get("mise_base") is not None:
+            # LA MISE DE BASE x les multiplicateurs, comme `jeu_rollout.py`.
+            mult = (float(self.cfg.multiplicateurs_lot[signal["lot_niveau"]])
+                    * float(self.cfg.multiplicateurs_allocation[signal["allocation_niveau"]])
+                    * float(self.cfg.multiplicateurs_confiance[signal["confiance_niveau"]]))
+            voulu = float(ai.equity) * signal["mise_base"] * mult / perte_lot
+            voulu = np.floor(voulu / info.volume_step + 1e-10) * info.volume_step
+            vol = float(min(plaf, max(vmin, voulu)))
         req = {"action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": float(vol),
                "type": ordre_type, "price": price,
                "sl": sl, "tp": tp, "deviation": 50, "magic": MAGIC,

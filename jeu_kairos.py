@@ -194,7 +194,9 @@ class JeuConfig:
     # paires.
     # DOUZE PAIRES, SANS « 4 ATR EN UNE FOIS » (run m5_25). Le run m5_24 :
     # prefixe kairos_jeu_m5_24_paires, treize paires.
-    prefixe: str = "kairos_jeu_m5_25_paires12"
+    # LA TETE D'ESPERANCE (run m5_26) : voir `apprendre_esperance`. Le run
+    # m5_25 : prefixe kairos_jeu_m5_25_paires12, apprendre_esperance False.
+    prefixe: str = "kairos_jeu_m5_26_esperance"
     # Reproduction demandee du run M5_03, avant les corrections de deroulement
     # et de compte introduites dans la version 2.
     # La version 2 rejoue l'equite, la marge et les positions ouvertes : elle
@@ -420,6 +422,31 @@ class JeuConfig:
     # R realise), et serie de pertes. Ils ne lisent que des positions deja
     # cloturees ; jeu, validation et live les mettent a jour de la meme facon.
     observe_calibration: bool = True
+    # LA TETE D'ESPERANCE — 2026-10-03 (run m5_26), demande du proprietaire :
+    # « miser plus, avec une tete en plus ». Au run m5_25, les quatre tetes de
+    # mise, apprises par la seule note du mois (douze mois par epoch, tres
+    # bruitee), restaient collees au lot minimum : 0.5 % du compte risque par
+    # coup, quand la regle de Kelly en aurait permis ~6.7 %.
+    #
+    # Avec True, une NEUVIEME tete predit, pour chaque coup possible (sens,
+    # paire d'objectifs, stop), son resultat en multiples du risque pris :
+    # moyenne et dispersion. Elle apprend comme un eleve avec un corrige —
+    # apres chaque coup joue, on lui montre le vrai resultat (`entraine_esperance`),
+    # sur des milliers de coups par epoch. Elle est derriere le mur (`mur_mise`).
+    # Sa prediction donne la MISE DE BASE du coup : `kelly_fraction` fois la
+    # mise de Kelly, moyenne / (moyenne^2 + variance). Les quatre tetes de mise
+    # AJUSTENT autour de cette base au lieu de partir du lot minimum : le lot
+    # choisit un multiplicateur `multiplicateurs_lot` (x0.25 a x2), l'allocation
+    # et la confiance aussi (`multiplicateurs_allocation`, `..._confiance`), la
+    # tete de risque reste un plafond. Serie noire, marge et lot minimum
+    # restent des bornes dures.
+    apprendre_esperance: bool = True
+    kelly_fraction: float = 0.5
+    multiplicateurs_lot: Tuple[float, ...] = tuple(
+        float(x) for x in np.round(np.geomspace(0.25, 2.0, 20), 4))
+    multiplicateurs_allocation: Tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5)
+    multiplicateurs_confiance: Tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5)
+    esperance_passes: int = 2
     # DEUX NOTES SEPAREES — 2026-10-02 (run m5_20), demande du proprietaire :
     # garder le signal d'achat et de vente, et la prise de risque au-dela de
     # 1 %, sans que le compte finisse ruine. Au run m5_19, une seule note (le
@@ -794,6 +821,17 @@ class PolitiqueJeu(SAINTPolicySingleHead):
         if self.apprendre_confiance:
             self.lecteur_confiance = _lecteur()
             self.tete_confiance = nn.Linear(64, len(cfg.niveaux_confiance_pct))
+        # LA TETE D'ESPERANCE. Voir `apprendre_esperance`.
+        # Elle ne sert qu'avec les quatre tetes de mise, qu'elle remet au centre.
+        self.apprendre_esperance = (bool(getattr(cfg, "apprendre_esperance", False))
+                                    and self.apprendre_lot and self.apprendre_risque
+                                    and self.apprendre_allocation and self.apprendre_confiance)
+        self.k_objectifs, self.k_stops = len(cfg.tp_atr), len(cfg.sl_atr)
+        if self.apprendre_esperance:
+            self.lecteur_esperance = _lecteur()
+            self.tete_esperance = nn.Linear(64, 2 * self.k_objectifs * self.k_stops)
+            nn.init.zeros_(self.tete_esperance.weight)
+            nn.init.zeros_(self.tete_esperance.bias)
         # LE MUR des tetes de mise. Voir `mur_mise`.
         self.mur_mise = bool(getattr(cfg, "mur_mise", False))
         for m in list(self.lecteur_objectif) + list(self.lecteur_stop):
@@ -905,6 +943,12 @@ class PolitiqueJeu(SAINTPolicySingleHead):
                     if self.apprendre_confiance:
                         lco = torch.stack([self.tete_confiance(self.lecteur_confiance(zlm)),
                                            self.tete_confiance(self.lecteur_confiance(zsm))], 1)
+                        if self.apprendre_esperance:
+                            # (B, sens, objectif, stop, [moyenne, log-variance])
+                            les = torch.stack([self.tete_esperance(self.lecteur_esperance(zlm)),
+                                               self.tete_esperance(self.lecteur_esperance(zsm))], 1)
+                            les = les.view(len(les), 2, self.k_objectifs, self.k_stops, 2)
+                            return le, v, ltp, lsl, llo, lri, lal, lco, les
                         return le, v, ltp, lsl, llo, lri, lal, lco
                     return le, v, ltp, lsl, llo, lri, lal
                 return le, v, ltp, lsl, llo, lri
@@ -940,6 +984,8 @@ class PolitiqueJeu(SAINTPolicySingleHead):
             **({"risque": _p(self.lecteur_risque, self.tete_risque)} if self.apprendre_risque else {}),
             **({"allocation": _p(self.lecteur_allocation, self.tete_allocation)} if self.apprendre_allocation else {}),
             **({"confiance": _p(self.lecteur_confiance, self.tete_confiance)} if self.apprendre_confiance else {}),
+            **({"esperance": _p(self.lecteur_esperance, self.tete_esperance)}
+               if getattr(self, "apprendre_esperance", False) else {}),
             "valeur": _p(self.mlp, self.critic),
             "tronc": _p(self.embed, self.col_emb, *self.blocks, self.norm)
                      + [self.cls],
@@ -1490,6 +1536,72 @@ def avantage_mise(r_coups: np.ndarray, coup: np.ndarray, cfg) -> np.ndarray:
         sg = float(g[coup].std()) + 1e-8
         out[coup] = ((g[coup] - mg) / sg).astype(np.float32)
     return out
+
+
+def fraction_esperance(moyenne, log_variance, cfg) -> np.ndarray:
+    """La mise de base d'un coup, en part du compte risquee au stop : la
+    fraction de Kelly (`kelly_fraction`) de moyenne / (moyenne^2 + variance),
+    jamais negative. Voir `apprendre_esperance`."""
+    m = np.asarray(moyenne, np.float64)
+    var = np.exp(np.clip(np.asarray(log_variance, np.float64), -8.0, 6.0))
+    f = m / np.maximum(m * m + var, 1e-6)
+    return float(getattr(cfg, "kelly_fraction", 0.5)) * np.clip(f, 0.0, 1.0)
+
+
+def entraine_esperance(policy, optims, trans, Xn, R, cfg, device, rng) -> Dict[str, float]:
+    """La tete d'esperance apprend le vrai resultat des coups joues.
+
+    Cible : le resultat net du coup en multiples du risque au stop, a cout
+    plein (`R`), pour le sens, la paire d'objectifs et le stop choisis.
+    Perte : vraisemblance gaussienne (moyenne et log-variance). Seul le
+    groupe « esperance » apprend : le reste du modele n'est pas touche."""
+    if not getattr(policy, "apprendre_esperance", False) or "esperance" not in optims:
+        return {}
+    lignes = [x for ep in (trans or []) for x in ep if x[3] != ATTENDRE]
+    if len(lignes) < 32:
+        return {}
+    tt = np.asarray([x[0] for x in lignes], np.int64)
+    et = np.stack([x[1] for x in lignes]).astype(np.float32)
+    sens = (np.asarray([x[3] for x in lignes]) == VENDRE).astype(np.int64)
+    ii = np.asarray([x[4] for x in lignes], np.int64)
+    jj = np.asarray([x[5] for x in lignes], np.int64)
+    y = np.asarray(R[tt, sens, ii, jj], np.float32)
+    ok = np.isfinite(y)
+    tt, et, sens, ii, jj, y = tt[ok], et[ok], sens[ok], ii[ok], jj[ok], np.clip(y[ok], -3.0, 10.0)
+    T = lambda z, dt=torch.float32: torch.as_tensor(z, dtype=dt, device=device)
+    opt = optims["esperance"]
+    params = list(policy.groupes_jeu()["esperance"])
+    policy.train()
+    pertes = []
+    for _ in range(int(getattr(cfg, "esperance_passes", 2))):
+        ordre = rng.permutation(len(y))
+        for d0 in range(0, len(ordre), 512):
+            b = ordre[d0:d0 + 512]
+            les = policy.jeu(T(observations(Xn, tt[b], et[b], int(cfg.lookback))))[8]
+            ar = torch.arange(len(b), device=device)
+            p = les[ar, T(sens[b], torch.long), T(ii[b], torch.long), T(jj[b], torch.long)]
+            mu, lv = p[:, 0], p[:, 1].clamp(-8.0, 6.0)
+            perte = 0.5 * (lv + (T(y[b]) - mu) ** 2 * torch.exp(-lv)).mean()
+            opt.zero_grad(set_to_none=True)
+            perte.backward()
+            torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
+            opt.step()
+            pertes.append(float(perte.detach()))
+    policy.eval()
+    return {"perte": float(np.mean(pertes)), "n": int(len(y))}
+
+
+def mesure_esperance(coups) -> Tuple[float, float]:
+    """(correlation de rang entre la moyenne predite et le resultat reel en
+    multiples du risque, mise de base moyenne en %) sur des coups du jeu."""
+    c = [q for q in coups if len(q) > 23]
+    if len(c) < 20:
+        return float("nan"), float("nan")
+    c = np.asarray([q[:24] for q in c], np.float64)
+    prevue = c[:, 8] * c[:, 15]
+    reel = c[:, 10] / np.maximum(prevue, 1e-12)
+    rho = pd.Series(c[:, 21]).corr(pd.Series(reel), method="spearman")
+    return float(rho), float(100 * np.mean(c[:, 23]))
 
 
 def plafond_serie_noire(cfg) -> float:
@@ -2315,6 +2427,9 @@ def ecrit_trades_csv(path: str, coups, temps, cfg: JeuConfig, *, epoch: int, pha
         "drawdown_entree": c[:, 18] if c.shape[1] > 18 else 0.0,
         "allocation_budget": c[:, 19] if c.shape[1] > 19 else 1.0,
         "thermostat_confiance": c[:, 20] if c.shape[1] > 20 else 1.0,
+        "esperance_moyenne": c[:, 21] if c.shape[1] > 23 else np.nan,
+        "esperance_ecart": c[:, 22] if c.shape[1] > 23 else np.nan,
+        "mise_base_pct": 100 * c[:, 23] if c.shape[1] > 23 else np.nan,
         "equite_apres_usd": np.maximum(0.0, c[:, 11] + c[:, 10]),
         "score_R": c[:, 5],
     })
@@ -2877,6 +2992,7 @@ def entraine_deploiement_continu(cfg, d, X, y_ex, toutes, o, h, l, c, sp, atr,
                              R1, D1, S1, fin, cfg, device, explore=True,
                              collecte=True, rangs=rangs_ex, marge=marge)
         stats = maj_ppo(policy, optims, avantages(tr, cfg), X_final, cfg, device, rng)
+        entraine_esperance(policy, optims, tr, X_final, R1, cfg, device, rng)
         print(f"DEPLOY ENSEMBLE PPO {numero:02d}/{len(fragments):02d}  "
               f"{len(jours)} parties  kl {stats['kl']:+.4f}  v {stats['v']:.4f}", flush=True)
 
@@ -3074,6 +3190,8 @@ def main_blocs(cfg: JeuConfig) -> int:
                 mois_on = bool(getattr(cfg, "note_mise_mois", False))
                 st = maj_ppo(policy, optims, avantages(tr, cfg), Xk, cfg, device, rng,
                              mode="signal" if mois_on else "tout")
+                # LA TETE D'ESPERANCE apprend le vrai resultat des coups joues.
+                es = entraine_esperance(policy, optims, tr, Xk, R1, cfg, device, rng)
                 if mois_on:
                     # LES MOIS : seules les tetes de mise apprennent. Voir
                     # `note_mise_mois`.
@@ -3088,6 +3206,7 @@ def main_blocs(cfg: JeuConfig) -> int:
                         am = avantage_mois(trm, suivi, cfg)
                         maj_ppo(policy, optims, avantages(trm, cfg), Xk, cfg, device, rng,
                                 mode="mise", adv_mise_externe=am)
+                        es = entraine_esperance(policy, optims, trm, Xk, R1, cfg, device, rng) or es
                         fins = suivi.get("final", np.zeros(0))
                         print(f"  mois  {len(fins)} mois de {cfg.mois_jours} jours, {len(cpm)} coups : "
                               f"compte final median {np.median(fins):.0f} $, "
@@ -3113,6 +3232,10 @@ def main_blocs(cfg: JeuConfig) -> int:
             etat = {"modele": policy.state_dict(), "config": asdict(cfg), "epoch": epoch,
                     "bloc": k + 1, "pipeline": pipeline_ref}
             torch.save(etat, f"last_{cfg.prefixe}{suffixe}.pth")
+            if bool(getattr(cfg, "apprendre_esperance", False)):
+                rho, base = mesure_esperance(cv)
+                print(f"  esperance  correlation prediction / resultat en validation {rho:+.3f}  |  "
+                      f"mise de base moyenne {base:.2f} % du compte", flush=True)
             if bool(getattr(cfg, "serie_noire", False)):
                 # LA SERIE NOIRE, remesuree sur cette validation pour la
                 # suite ; le checkpoint garde celle avec laquelle il a joue.

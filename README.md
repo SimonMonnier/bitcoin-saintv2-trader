@@ -83,6 +83,15 @@ descend jamais sous zéro (`jeu_rollout.py`, `jeu_compte.py`).
   les mises qui l'ont construite (run m5_21) ;
 - un **mur** empêche les têtes de mise de modifier le tronc, donc le signal.
 
+**La tête d'espérance** (run m5_26) — une neuvième tête prédit, pour chaque
+trade possible, son résultat moyen et sa dispersion en multiples du risque.
+Elle apprend sur le vrai résultat des trades joués, derrière le mur. Sa
+prédiction donne la **mise de base** du trade : la moitié de la mise de Kelly,
+moyenne / (moyenne² + variance). Les quatre têtes de mise ajustent autour de
+cette base (lot ×0,25 à ×2, allocation et confiance ×0,5 à ×1,5) ; la tête
+de risque reste un plafond. Le journal affiche à chaque epoch la corrélation
+entre sa prédiction et le résultat réel en validation.
+
 **La série noire** — avant chaque trade, le risque ne dépasse jamais ce que
 la pire série de pertes du modèle laisse survivre : si les N prochains trades
 perdaient tous, le compte ne perdrait pas plus de 50 %. Risque maximal par
@@ -210,7 +219,8 @@ les têtes de mise en ont besoin. Les runs fournissent toujours les prix.
 | m5_22 | sortie en deux temps, lot minimum 0,02 | bloc 1, epochs 5-9 : win rate 64-68 %, profit factor 1,02-1,07, mise réelle 0,5 % du compte |
 | m5_23 | porte 0,90, objectif proche choisi par le modèle | bloc 1, frais pleins : +0,64 à +1,12 $/jour, PF 1,08-1,16, win rate 73-76 %, pire baisse −6 à −14 % |
 | m5_24 | 13 paires d'objectifs, mois joués avec le signal réel | arrêté : le modèle s'est jeté sur « 4 ATR en une fois », win rate de 69 % à 27 % en 3 epochs |
-| m5_25 | 12 paires (sans « 4 ATR en une fois ») | en cours |
+| m5_25 | 12 paires (sans « 4 ATR en une fois ») | bloc 1, epochs 2-9 : +0,32 à +2,50 $/jour, win rate 63-73 %, pire baisse −6 à −20 %, mise réelle 0,3 à 1 % |
+| m5_26 | tête d'espérance (mise de base demi-Kelly prédite) | en cours |
 
 Ce que les mesures ont établi :
 - le signal du BTC M5 vient du flux Binance, de l'écart Coinbase, du
