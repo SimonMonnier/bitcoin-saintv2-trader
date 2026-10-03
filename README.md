@@ -199,12 +199,28 @@ Le moteur (`kairos_m5_live.py`) :
 - reconstruit les mêmes 40 colonnes que le jeu, en direct : bougies et flux
   Binance (`flux_live.py`), Coinbase, financement ;
 - décide à la clôture de chaque bougie M5, avec les mêmes règles que le jeu :
-  10 jetons par jour UTC, vie de 3 R, porte de l'expert, mise choisie par le
-  modèle et bornée par la marge et le lot du courtier ;
+  10 jetons par jour UTC, vie de 3 R, porte de l'expert à 0,90 ;
+- recalcule à chaque bougie le rang de l'expert (les deux modèles LightGBM du
+  pipeline final, fenêtre de 2 000 bougies) : il sert à la porte et à la
+  **conviction** ;
+- calcule la mise avec **la même fonction que le jeu** (`volume_conviction`) :
+  compte × 1 % × têtes de mise (×0,5 à ×1,5) × conviction, bornée par la
+  série noire (remesurée sur les vrais trades), la tête de risque, la marge
+  et le lot minimum de 0,02. Chaque ordre affiche le détail de sa mise ;
 - passe ses ordres dans MT5 sur le symbole BTCUSD de Vantage. **Il refuse tout
   compte qui n'est pas un compte démo.**
 
 Le run visé est fixé dans `LiveConfig.kairos_prefixe` (`kairos_live.py`).
+
+**Mettre un modèle final en live :**
+1. attendre la fin des 10 blocs : le run écrit
+   `deploy_<run>_ensemble_validation_ddsafe.pth` et son pipeline (ou les
+   reconstruire depuis les blocs : `python jeu_kairos.py --rebuild-deploy-ensemble`) ;
+2. `python kairos_live.py --check` : refuse un modèle incomplet (10 folds,
+   pipeline final, deux experts, tête de conviction et médiane des folds) et
+   affiche son résumé (folds, mise de base, série noire, conviction par tranche) ;
+3. lancer `python kairos_live.py` hors de Claude Code (double-clic ou terminal) :
+   un processus lancé depuis une session Claude s'arrête avec elle.
 
 ## 5. Installation et commandes
 

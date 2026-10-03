@@ -2110,6 +2110,41 @@ def multiplicateur_budget(cfg, k, u, z) -> float:
     return float(np.clip(m, 0.5, 1.5))
 
 
+def volume_conviction(cfg, solde, perte_par_lot, k, u, z, conviction=1.0) -> float:
+    """Le volume voulu (en lots, avant arrondi et bornes) : le solde x la
+    mise de base (`mise_budget`) x le multiplicateur des quatre tetes de mise
+    (`multiplicateur_budget`) x celui de la conviction, divise par la perte
+    d'un lot au stop. LA MEME FONCTION sert au jeu (`jeu_rollout.py`) et au
+    live (`kairos_m5_live.py`) : les deux ne peuvent pas diverger."""
+    return (float(solde) * float(cfg.mise_budget) * multiplicateur_budget(cfg, k, u, z)
+            * float(conviction) / max(float(perte_par_lot), 1e-12))
+
+
+def resume_deploy(ck) -> list:
+    """Les lignes qui resument un checkpoint de modele final avant le live :
+    folds, mise de base, serie noire, conviction par tranche de rang."""
+    c = ck.get("config", {})
+    lignes = [f"folds : " + ", ".join(f"{x.get('bloc')} (epoch {x.get('epoch')})" for x in ck.get("folds", [])),
+              f"mise de base {100 * float(c.get('mise_budget', 0.01)):.2f} % du compte au stop, "
+              f"lot minimum {c.get('lot_min')}, porte de l'expert {c.get('porte_rang_expert')}"]
+    cs = JeuConfig(**{k: v for k, v in c.items() if k in ("serie_noire", "serie_noire_n", "serie_noire_k",
+                                                          "serie_noire_perte_max")})
+    lignes.append(f"serie noire : {cs.serie_noire_n} pertes d'affilee, perte reelle x{cs.serie_noire_k:.2f} "
+                  f"-> risque max {100 * plafond_serie_noire(cs):.1f} % par coup")
+    med = ck.get("conviction_mediane_folds")
+    if c.get("tete_conviction"):
+        if not med:
+            lignes.append("conviction : ABSENTE du checkpoint")
+        else:
+            r = np.concatenate([np.linspace(0.90, 0.99, 91), np.linspace(0.9905, 0.999, 18)])
+            rr, m = np.concatenate([r, r]), np.asarray(med, np.float64)
+            t = lambda a, z: float(np.mean(m[(rr >= a) & (rr < z)]))
+            lignes.append(f"conviction (mediane des folds) : x{t(0.0, 0.98):.2f} (rang < 0.98) / "
+                          f"x{t(0.98, 0.99):.2f} (0.98-0.99) / x{t(0.99, 1.01):.2f} (>= 0.99), "
+                          f"de x{m.min():.2f} a x{m.max():.2f}")
+    return lignes
+
+
 def index_budget(cfg) -> int:
     """La place de la mise de base dans un coup du jeu (le multiplicateur suit)."""
     return index_dejavu_meteo(cfg) + (2 if bool(getattr(cfg, "apprendre_dejavu_meteo", False)) else 0)

@@ -104,6 +104,18 @@ def verifie_deploy_kairos(prefixe: str) -> tuple:
         pipe = json.load(fh)
     if pipe.get("meta", {}).get("type") != "deploiement_ensemble_10_folds":
         raise ValueError(f"Pipeline deploy invalide ou non final : {pipeline}")
+    # LA TETE DE CONVICTION : ses poids, sa norme et la mediane des folds
+    # qu'elle a copiee doivent etre la (voir `copie_conviction`).
+    if ck["config"].get("tete_conviction"):
+        cles = [k for k in ck["modele"] if k.startswith("reseau_conviction.")]
+        norme = ck["modele"].get("conviction_norme")
+        if not cles or norme is None or not bool(torch.isfinite(norme)) or float(norme) <= 0:
+            raise ValueError(f"Tete de conviction absente ou invalide dans {checkpoint}")
+        if not ck.get("conviction_mediane_folds"):
+            raise ValueError(f"Conviction des folds absente de {checkpoint} : modele final d'avant le run m5_31")
+    if len(pipe.get("boosters") or []) != 2:
+        # l'expert est indispensable : la porte et la conviction lisent son rang
+        raise ValueError(f"Experts LightGBM (achat, vente) absents du pipeline {pipeline}")
     return checkpoint, pipeline
 
 
@@ -117,6 +129,10 @@ def main_kairos_m5() -> int:
         return 2
     if "--check" in sys.argv:
         print(f"[KAIROS M5] DEPLOY pret : {checkpoint} | {pipeline}")
+        import jeu_kairos as J
+        ck = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        for ligne in J.resume_deploy(ck):
+            print(f"[KAIROS M5]   {ligne}")
         return 0
     if "--console" not in sys.argv:
         gui = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kairos_gui.py")

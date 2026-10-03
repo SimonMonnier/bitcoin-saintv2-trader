@@ -415,12 +415,19 @@ class MoteurKairosM5:
             mult = (float(self.cfg.multiplicateurs_lot[signal["lot_niveau"]])
                     * float(self.cfg.multiplicateurs_allocation[signal["allocation_niveau"]])
                     * float(self.cfg.multiplicateurs_confiance[signal["confiance_niveau"]]))
+            voulu = float(ai.equity) * signal["mise_base"] * mult / perte_lot
             if (bool(getattr(self.cfg, "budget_baisse", False))
                     or bool(getattr(self.policy, "tete_conviction", False))):
-                mult = J.multiplicateur_budget(self.cfg, signal["lot_niveau"],
-                                               signal["allocation_niveau"], signal["confiance_niveau"])
-                mult *= float(signal.get("conviction", 1.0))
-            voulu = float(ai.equity) * signal["mise_base"] * mult / perte_lot
+                # LA MEME FORMULE QUE LE JEU (`volume_conviction`)
+                mt = J.multiplicateur_budget(self.cfg, signal["lot_niveau"],
+                                             signal["allocation_niveau"], signal["confiance_niveau"])
+                cv = float(signal.get("conviction", 1.0))
+                voulu = J.volume_conviction(self.cfg, float(ai.equity), perte_lot, signal["lot_niveau"],
+                                            signal["allocation_niveau"], signal["confiance_niveau"], cv)
+                print(f"[KAIROS M5] mise : base {100 * float(self.cfg.mise_budget):.2f} % x tetes {mt:.2f} "
+                      f"x conviction {cv:.2f} = {100 * float(self.cfg.mise_budget) * mt * cv:.2f} % du compte "
+                      f"-> {voulu:.3f} lot voulu, plafond {plaf:.2f} lot (marge, tete de risque, serie noire "
+                      f"{100 * J.plafond_serie_noire(self.serie_noire_live()):.1f} %)")
             voulu = np.floor(voulu / info.volume_step + 1e-10) * info.volume_step
             vol = float(min(plaf, max(vmin, voulu)))
         req = {"action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": float(vol),

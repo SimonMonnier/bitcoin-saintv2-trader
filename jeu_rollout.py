@@ -332,8 +332,8 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
                     # LA MISE DE BASE (budget de baisse) x le multiplicateur
                     # des tetes de mise, dans les bornes dures.
                     mb = J.multiplicateur_budget(cfg, k[q], u[q], z[q])
-                    voulu = soldes[s] * float(cfg.mise_budget) * mb * float(mconv[q]) / max(
-                        float(atr[tc]) * cfg.sl_atr[j[q]] * cfg.contrat, 1e-12)
+                    voulu = J.volume_conviction(cfg, soldes[s], float(atr[tc]) * cfg.sl_atr[j[q]] * cfg.contrat,
+                                                k[q], u[q], z[q], float(mconv[q]))
                     voulu = np.floor(voulu / cfg.pas_lot + 1e-10) * cfg.pas_lot
                     lot = float(min(maximum[q], max(cfg.lot_min, voulu)))
                 risque = lot * cfg.contrat * float(atr[tc]) * cfg.sl_atr[j[q]]

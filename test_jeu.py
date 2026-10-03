@@ -7,6 +7,8 @@ import sys
 from dataclasses import replace
 
 import inspect
+import dataclasses
+import io
 import numpy as np
 import torch
 
@@ -958,6 +960,27 @@ verifie("l'eleve reproduit la mediane des folds a quelques % pres",
 verifie("la passe finale ne la reapprend plus",
         "entraine_conviction(policy, optims, tr, R1, rangs_ex" not in
         inspect.getsource(J.entraine_deploiement_continu))
+
+print("\n22. LE LIVE ALIGNE")
+_c22 = J.JeuConfig()
+_v = J.volume_conviction(_c22, 1000.0, 300.0, 19, 4, 4, 3.0)
+verifie("une seule formule du lot : solde x 1 % x tetes x conviction / perte d'un lot au stop",
+        abs(_v - 1000.0 * 0.01 * J.multiplicateur_budget(_c22, 19, 4, 4) * 3.0 / 300.0) < 1e-12,
+        f"{_v:.4f} lot")
+import inspect as _insp
+import jeu_rollout as _JR
+import kairos_live as _KL
+verifie("le jeu et le live appellent la meme formule",
+        "J.volume_conviction(" in _insp.getsource(_JR.joue)
+        and "J.volume_conviction(" in io.open("kairos_m5_live.py", encoding="utf-8").read())
+_ck = {"config": {**dataclasses.asdict(_c22), "serie_noire_n": 8, "serie_noire_k": 1.1},
+       "folds": [{"bloc": b, "epoch": 9} for b in range(1, 11)],
+       "conviction_mediane_folds": ([0.6] * 91 + [4.0] * 18) * 2}
+_res = J.resume_deploy(_ck)
+verifie("le resume du modele final : folds, mise de base, serie noire, conviction par tranche",
+        any("mise de base 1.00 %" in x for x in _res) and any("serie noire : 8 pertes" in x for x in _res)
+        and any("conviction (mediane des folds)" in x and "de x0.60 a x4.00" in x for x in _res),
+        " | ".join(_res))
 
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)
