@@ -57,10 +57,10 @@
 #   powershell -ExecutionPolicy Bypass -File veille_fenetre.ps1
 #   powershell -ExecutionPolicy Bypass -File veille_fenetre.ps1 -Detail
 
-#   powershell -ExecutionPolicy Bypass -File veille_fenetre.ps1 -Journal training_conviction.log
+#   powershell -ExecutionPolicy Bypass -File veille_fenetre.ps1 -Journal training_conviction_continue.log
 #   (un second run lance en parallele, avec son propre journal - 2026-09-28)
 
-param([switch]$Detail, [string]$Journal = 'training_conviction.log')
+param([switch]$Detail, [string]$Journal = 'training_conviction_continue.log')
 
 $journal = Join-Path $PSScriptRoot $Journal
 $titre = if ($Detail) { 'KAIROS - veille (detail)' } else { 'KAIROS - veille' }

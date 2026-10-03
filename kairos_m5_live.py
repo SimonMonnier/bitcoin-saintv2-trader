@@ -341,10 +341,9 @@ class MoteurKairosM5:
         if base is not None and les is None and getattr(self.policy, "tete_conviction", False):
             rang = float(fe[t, 2 + sens])
             with torch.no_grad():
-                lcv = self.policy.conviction(torch.from_numpy(
-                    J.entrees_conviction(np.array([rang]), np.array([sens]))).to(self.device))
-            conviction = float(self.cfg.conviction_multiplicateurs[int(lcv[0].argmax().cpu())])
-            print(f"[KAIROS M5] conviction de l'expert {rang:.4f} -> mise x{conviction:g}")
+                conviction = float(self.policy.conviction(torch.from_numpy(
+                    J.entrees_conviction(np.array([rang]), np.array([sens]))).to(self.device))[0].cpu())
+            print(f"[KAIROS M5] conviction de l'expert {rang:.4f} -> mise x{conviction:.2f}")
         # Le jeu applique ce plancher avant de construire TP et SL.
         atr = float(J.atr_effectif(np.array([d["atr_14"].iloc[t]]),
                                    np.array([d["close"].iloc[t]]), self.cfg)[0])

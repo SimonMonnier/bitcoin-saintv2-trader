@@ -256,8 +256,8 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
             if avec_conviction:
                 sn = sens.cpu().numpy()
                 rconv = np.asarray(rangs)[tt, sn]
-                lcv = policy.conviction(torch.from_numpy(J.entrees_conviction(rconv, sn)).to(device))
-                mconv = np.asarray(cfg.conviction_multiplicateurs, float)[J._choix(lcv, em, gen).cpu().numpy()]
+                mconv = policy.conviction(torch.from_numpy(J.entrees_conviction(rconv, sn)).to(device)
+                                          ).float().cpu().numpy().astype(float)
             if les is not None or avec_budget:
                 # LA TETE D'ESPERANCE OU LE BUDGET DE BAISSE : l'allocation et
                 # la confiance deviennent des multiplicateurs de la mise de

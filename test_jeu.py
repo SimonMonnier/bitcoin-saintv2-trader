@@ -871,9 +871,9 @@ verifie("jamais au-dela du plafond de la serie noire",
 
 print("\n20. LA TETE DE CONVICTION")
 _c20 = J.JeuConfig()
-verifie("par defaut : tete de conviction, x0.5 a x4, mise de base fixe 1 %",
-        _c20.tete_conviction and _c20.conviction_multiplicateurs == (0.5, 1.0, 1.5, 2.0, 3.0, 4.0)
-        and _c20.mise_budget == 0.01 and not _c20.budget_baisse)
+verifie("par defaut : conviction continue de x0.1 a x25, demi-Kelly, mise de base fixe 1 %",
+        _c20.tete_conviction and _c20.conviction_min == 0.1 and _c20.conviction_max == 25.0
+        and _c20.conviction_kelly == 0.5 and _c20.mise_budget == 0.01 and not _c20.budget_baisse)
 _e = J.entrees_conviction(np.array([0.90, 0.95, 0.99, 0.999]), np.array([0, 0, 1, 1]))
 verifie("l'entree : la conviction monte avec le rang, le sens a part",
         _e.shape == (4, 2) and np.all(np.diff(_e[:, 0]) > 0) and abs(_e[1, 0]) < 1e-6
@@ -886,8 +886,14 @@ verifie("une cinquieme tete de mise, son groupe a part, disjoint des autres",
         and len({id(q) for v in _g20.values() for q in v}) == sum(len(v) for v in _g20.values()))
 with torch.no_grad():
     _l = _p20.conviction(torch.from_numpy(_e))
-verifie("au depart elle choisit x1 partout",
-        all(_c20.conviction_multiplicateurs[int(k)] == 1.0 for k in _l.argmax(-1)))
+    _p20.reseau_conviction[-1].bias.fill_(50.0)
+    _lh = _p20.conviction(torch.from_numpy(_e))
+    _p20.reseau_conviction[-1].bias.fill_(-50.0)
+    _lb = _p20.conviction(torch.from_numpy(_e))
+    _p20.reseau_conviction[-1].bias.fill_(0.0)
+verifie("au depart elle mise x1 partout ; jamais hors de [x0.1, x25]",
+        torch.allclose(_l, torch.ones_like(_l), atol=1e-5) and float(_lh.max()) <= 25.0 + 1e-3
+        and float(_lb.min()) >= 0.1 - 1e-5, f"{_l.tolist()} {float(_lh.max()):.2f} {float(_lb.min()):.3f}")
 _x20 = torch.randn(2, _c20.lookback, len(J.colonnes_jeu(_c20)) + _c20.n_expert + J.n_etat(_c20))
 _s20 = _p20.jeu(_x20)
 (sum(q.sum() for q in _s20)).backward()
@@ -905,7 +911,8 @@ _o = J.optimiseurs(_p20, _c20)
 for _ in range(40):
     _st = J.entraine_conviction(_p20, _o, _tr, _R, _rangs, _c20, "cpu", _rg)
 verifie("elle apprend a miser plus quand la conviction est forte, moins sinon, a budget moyen ~1",
-        _st["mult_haut"] >= 2.0 and _st["mult_bas"] <= 1.0 and 0.7 <= _st["mult_moyen"] <= 1.3,
+        _st["mult_haut"] >= 2.0 and _st["mult_bas"] <= 1.0 and 0.7 <= _st["mult_moyen"] <= 1.3
+        and _st["mult_haut"] < 25.0,
         f"x{_st['mult_bas']:.2f} / x{_st['mult_haut']:.2f}, moyenne x{_st['mult_moyen']:.2f}, "
         f"lambda {_st['lambda']:+.3f}")
 _R2 = np.zeros((_N, 2, 1, 1))
