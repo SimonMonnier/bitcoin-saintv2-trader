@@ -40,7 +40,8 @@ et 1 bps à la sortie, swap de −20 %/an sur les achats.
 
 **La sortie en deux temps** — le menu des objectifs est fait de paires
 (objectif proche, objectif final) : 1 ou 2 ATR en une fois, ou 0,5 / 1 puis
-2 ATR, 0,5 / 1 / 1,5 puis 4 ATR, 1 / 1,5 puis 8 ATR. Le modèle choisit sa
+2 ATR, 0,5 / 1 / 1,5 / 2 puis 4 ATR, 0,5 / 1 / 1,5 / 2 puis 8 ATR, ou 4 ATR
+en une fois (13 paires). Le modèle choisit sa
 paire. La moitié du trade sort à l'objectif proche ; le stop de l'autre moitié remonte
 alors au prix d'entrée, **spread et glissement de sortie compris** (plus
 1 bps), et elle court vers l'objectif choisi. Un trade qui touche l'objectif
@@ -75,7 +76,8 @@ descend jamais sous zéro (`jeu_rollout.py`, `jeu_compte.py`).
   noté sur le gain de chaque trade rapporté à 1 % du compte ;
 - les quatre têtes de mise apprennent sur des **mois entiers** (12 mois de
   30 journées d'affilée par epoch, sur un seul compte, positions et solde
-  gardés d'un jour à l'autre). Chaque décision de mise est notée sur la
+  gardés d'un jour à l'autre) ; le signal y joue ses meilleures décisions, seules
+  les têtes de mise explorent. Chaque décision de mise est notée sur la
   **croissance du compte depuis cette décision jusqu'à la fin du mois**
   (logarithme du solde, la règle de Kelly) : une ruine note très mal toutes
   les mises qui l'ont construite (run m5_21) ;
@@ -206,7 +208,8 @@ les têtes de mise en ont besoin. Les runs fournissent toujours les prix.
 | m5_20 | deux notes séparées, sauvegarde sous −50 % | bloc 1 : sain jusqu'à l'epoch 11 (+1,41 $/jour, −31 %), puis comptes vidés après l'epoch 15 |
 | m5_21 | note du mois et série noire | win rate tombé à 20 % (objectif à 6-8 ATR, stop à 1 ATR), sans compte vidé |
 | m5_22 | sortie en deux temps, lot minimum 0,02 | bloc 1, epochs 5-9 : win rate 64-68 %, profit factor 1,02-1,07, mise réelle 0,5 % du compte |
-| m5_23 | porte 0,90, objectif proche choisi par le modèle | en cours |
+| m5_23 | porte 0,90, objectif proche choisi par le modèle | bloc 1, frais pleins : +0,64 à +1,12 $/jour, PF 1,08-1,16, win rate 73-76 %, pire baisse −6 à −14 % |
+| m5_24 | 13 paires d'objectifs, mois joués avec le signal réel | en cours |
 
 Ce que les mesures ont établi :
 - le signal du BTC M5 vient du flux Binance, de l'écart Coinbase, du

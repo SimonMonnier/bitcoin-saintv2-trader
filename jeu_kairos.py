@@ -189,7 +189,10 @@ class JeuConfig:
     # voir `porte_rang_expert` et `tp1_par_objectif`. Le run m5_22 : prefixe
     # kairos_jeu_m5_22_deux_temps, porte 0.85, tp_atr (1, 2, 4, 8),
     # tp1_par_objectif ().
-    prefixe: str = "kairos_jeu_m5_23_porte90_tp1"
+    # QUATRE PAIRES D'OBJECTIFS DE PLUS (run m5_24) : voir `tp1_par_objectif`.
+    # Le run m5_23 : prefixe kairos_jeu_m5_23_porte90_tp1, les neuf premieres
+    # paires.
+    prefixe: str = "kairos_jeu_m5_24_paires"
     # Reproduction demandee du run M5_03, avant les corrections de deroulement
     # et de compte introduites dans la version 2.
     # La version 2 rejoue l'equite, la marge et les positions ouvertes : elle
@@ -450,6 +453,14 @@ class JeuConfig:
     # qui l'ont construite. Le signal (entree, objectif, stop, valeur)
     # n'apprend que sur les journees, comme avant, et ne voit pas cette note.
     note_mise_mois: bool = True
+    # LE SIGNAL EN MODE REEL PENDANT LES MOIS — 2026-10-03 (run m5_24). Au run
+    # m5_23, les mois etaient joues en exploration : le signal tirait ses
+    # coups au hasard selon ses probabilites, bien plus faibles que ses
+    # meilleures decisions (validation, live). Les tetes de mise y voyaient un
+    # avantage presque nul et misaient au plus petit (0.5-0.7 % du compte par
+    # coup, lot minimum dans la plupart des cas). Avec True, le signal joue
+    # sa meilleure decision et seules les tetes de mise explorent.
+    mois_signal_reel: bool = True
     mois_jours: int = 30
     mois_par_epoch: int = 12
     # LA SERIE NOIRE — 2026-10-03 (run m5_21), demande du proprietaire.
@@ -479,7 +490,8 @@ class JeuConfig:
     # LE MENU DES OBJECTIFS DEPUIS LE RUN m5_23 : chaque choix est une paire
     # (objectif proche, objectif final), voir `tp1_par_objectif`. `tp_atr`
     # porte l'objectif final de chaque choix.
-    tp_atr: Tuple[float, ...] = (1.0, 2.0, 2.0, 2.0, 4.0, 4.0, 4.0, 8.0, 8.0)
+    tp_atr: Tuple[float, ...] = (1.0, 2.0, 2.0, 2.0, 4.0, 4.0, 4.0, 8.0, 8.0,
+                                 4.0, 4.0, 8.0, 8.0)
     sl_atr: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
     # LE PLANCHER DE VOLATILITE DES BARRIERES — 2026-09-26, run
     # kairos_jeu_btc01. L'ATR M1 du BTC tombe a 2 bps dans les 10 % de
@@ -521,8 +533,14 @@ class JeuConfig:
     # objectif proche et son objectif final :
     #   1 en une fois, 2 en une fois, 0.5 puis 2, 1 puis 2, 0.5 puis 4,
     #   1 puis 4, 1.5 puis 4, 1 puis 8, 1.5 puis 8 (en ATR).
+    # QUATRE PAIRES DE PLUS LE 2026-10-03 (run m5_24), demande du proprietaire :
+    # « les profits sont trop faibles ». 4 en une fois, 2 puis 4, 0.5 puis 8,
+    # 2 puis 8. Les neuf premieres paires gardent leur place. Le run m5_23
+    # (bloc 1, epochs 11-18, couts pleins) : +0.64 a +1.12 $/jour, PF 1.08 a
+    # 1.16, win rate 73-76 %, mise reelle 0.5-0.7 % du compte.
     # Vide = `tp1_atr` pour tous les objectifs plus lointains (run m5_22).
-    tp1_par_objectif: Tuple[float, ...] = (0.0, 0.0, 0.5, 1.0, 0.5, 1.0, 1.5, 1.0, 1.5)
+    tp1_par_objectif: Tuple[float, ...] = (0.0, 0.0, 0.5, 1.0, 0.5, 1.0, 1.5, 1.0, 1.5,
+                                           0.0, 2.0, 0.5, 2.0)
     # EN BOUGIES : 32 bougies M15, huit heures. EN H1 : 72 bougies, trois jours.
     # EN M5 : 96 bougies, huit heures (comme le M15).
     horizon_max: int = 96
@@ -1410,14 +1428,15 @@ def _joue_historique(policy, jours: np.ndarray, Xn, R, D, S, fin_valide: int,
 # ======================================================================
 def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
          gen=None, collecte=False, rangs=None, marge=None, prix=None, atr=None,
-         chainer=False, groupes=None, suivi=None):
+         chainer=False, groupes=None, suivi=None, explore_mise=None):
     if int(getattr(cfg, "jeu_version", 1)) < 2:
         return _joue_historique(policy, jours, Xn, R, D, S, fin_valide, cfg,
                                device, explore, gen, collecte, rangs, marge)
     from jeu_rollout import joue as joue_continu
     return joue_continu(policy, jours, Xn, R, D, S, fin_valide, cfg, device,
                         explore, gen, collecte, rangs, marge, prix, atr,
-                        chainer=chainer, groupes=groupes, suivi=suivi)
+                        chainer=chainer, groupes=groupes, suivi=suivi,
+                        explore_mise=explore_mise)
 
 
 def avantages(trans, cfg: JeuConfig):
@@ -3055,7 +3074,9 @@ def main_blocs(cfg: JeuConfig) -> int:
                     if len(jm):
                         suivi = {}
                         _sm, cpm, trm = joue(policy, jm, Xk, Rf, Df, Sf, fin_tr, cfg, device,
-                                             explore=True, collecte=True, rangs=rangs_ex,
+                                             explore=not bool(getattr(cfg, "mois_signal_reel", False)),
+                                             explore_mise=True,
+                                             collecte=True, rangs=rangs_ex,
                                              marge=marge, chainer=True, groupes=gm, suivi=suivi)
                         am = avantage_mois(trm, suivi, cfg)
                         maj_ppo(policy, optims, avantages(trm, cfg), Xk, cfg, device, rng,

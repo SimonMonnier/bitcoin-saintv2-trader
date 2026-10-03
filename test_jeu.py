@@ -748,9 +748,11 @@ verifie("sans le stop remonte, le meme coup en une fois finit perdant",
 
 print("\n16. LA PORTE A 0.90 ET L'OBJECTIF PROCHE CHOISI")
 _c16 = J.JeuConfig()
-verifie("par defaut : porte 0.90, neuf objectifs (proche, final)",
-        _c16.porte_rang_expert == 0.90 and len(_c16.tp_atr) == len(_c16.tp1_par_objectif) == 9
-        and [J.tp1_objectif(_c16, i) for i in range(9)] == [0, 0, 0.5, 1, 0.5, 1, 1.5, 1, 1.5])
+verifie("par defaut : porte 0.90, treize objectifs (proche, final)",
+        _c16.porte_rang_expert == 0.90 and len(_c16.tp_atr) == len(_c16.tp1_par_objectif) == 13
+        and [J.tp1_objectif(_c16, i) for i in range(13)]
+        == [0, 0, 0.5, 1, 0.5, 1, 1.5, 1, 1.5, 0, 2, 0.5, 2]
+        and list(_c16.tp_atr[9:]) == [4, 4, 8, 8])
 _c16s = replace(_c16, horizon_max=8, swap_achat_bps_jour=0.0, swap_vente_bps_jour=0.0)
 _p0b = 10000 * (1 + 2e-4 + _c16s.glissement_entree_bps / 1e4)
 # monte a +0.7 ATR puis retombe au stop de 2 ATR
@@ -762,7 +764,7 @@ verifie("objectif proche a 0.5 ATR touche puis retour : gagnant ; a 1 ATR non to
 verifie("les choix en une fois ne sont pas coupes",
         int(_S16[0, 0, 1, 1]) in (1, 2) and int(_S16[0, 0, 0, 1]) in (0, 1, 2))
 _pol16 = J.PolitiqueJeu(_c16)
-verifie("la tete d'objectif a neuf choix", _pol16.tete_objectif.out_features == 9)
+verifie("la tete d'objectif a treize choix", _pol16.tete_objectif.out_features == 13)
 
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)

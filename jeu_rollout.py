@@ -13,11 +13,14 @@ import torch
 
 def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
          gen=None, collecte=False, rangs=None, marge=None, prix=None, atr=None,
-         chainer=False, groupes=None, suivi=None):
+         chainer=False, groupes=None, suivi=None, explore_mise=None):
     """`chainer` : en collecte, les journees d'un meme groupe (`groupes`, un
     identifiant par partie) se suivent sur UN compte, comme en evaluation :
     c'est la collecte des MOIS (voir `note_mise_mois`). `suivi` (dict) recoit
-    alors chaque decision de mise et le solde de fin de chaque chaine."""
+    alors chaque decision de mise et le solde de fin de chaque chaine.
+    `explore_mise` : le tirage des seules tetes de mise (lot, risque,
+    allocation, confiance) ; None = comme `explore`. Les mois jouent le
+    signal en mode reel et n'explorent que la mise (`mois_signal_reel`)."""
     import jeu_kairos as J
     from jeu_compte import taille_position
 
@@ -231,9 +234,10 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
             ll = llo[ar, sens] if llo is not None else None
             lr = lri[ar, sens] if lri is not None else None
             la = lal[ar, sens] if lal is not None else None
-            u = J._choix(la, explore, gen) if la is not None else torch.zeros_like(i)
+            em = explore if explore_mise is None else explore_mise
+            u = J._choix(la, em, gen) if la is not None else torch.zeros_like(i)
             lc = lco[ar, sens] if lco is not None else None
-            z = J._choix(lc, explore, gen) if lc is not None else torch.zeros_like(i)
+            z = J._choix(lc, em, gen) if lc is not None else torch.zeros_like(i)
             allocation = (np.asarray(getattr(cfg, "niveaux_allocation_pct", (100.0,)), dtype=float) /
                           100.0)
             budget = allocation[u.cpu().numpy()] if la is not None else np.ones(len(ix))
@@ -246,7 +250,7 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
                 masque_risque = (plafonds_np[np.arange(len(ix)), j.cpu().numpy()] * budget[:, None]
                                   >= cfg.lot_min)
                 lr = lr.masked_fill(~torch.as_tensor(masque_risque, device=device), J._NEG)
-                h = J._choix(lr, explore, gen)
+                h = J._choix(lr, em, gen)
             else:
                 h = torch.zeros_like(i)
             maximum = (np.asarray(plafonds_lots)[np.arange(len(ix)), j.cpu().numpy(),
@@ -266,7 +270,7 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
                                            for m in maximum[valide]])
                 grille[valide] = np.floor(grille[valide] / cfg.pas_lot + 1e-10) * cfg.pas_lot
                 grille[valide, 0], grille[valide, -1] = cfg.lot_min, maximum[valide]
-            k = J._choix(ll, explore, gen) if ll is not None else torch.zeros_like(i)
+            k = J._choix(ll, em, gen) if ll is not None else torch.zeros_like(i)
             lp = [torch.log_softmax(lg, -1).gather(1, ac[:, None]).squeeze(1).cpu().numpy()
                   for lg, ac in ((le, a), (lt, i), (ls, j))]
             if ll is not None:
