@@ -207,7 +207,10 @@ class JeuConfig:
     # mise_budget 0.005, tete_conviction False.
     # LA CONVICTION CONTINUE (run m5_30) : un multiplicateur libre au lieu du
     # menu x0.5 a x4 du run m5_29 (prefixe kairos_jeu_m5_29_conviction).
-    prefixe: str = "kairos_jeu_m5_30_conviction_continue"
+    # LA CONVICTION DU MODELE FINAL COPIEE DES FOLDS (run m5_31) : voir
+    # `copie_conviction`. Le run m5_30 (prefixe
+    # kairos_jeu_m5_30_conviction_continue) la reapprenait sur l'expert final.
+    prefixe: str = "kairos_jeu_m5_31_conviction_folds"
     # Reproduction demandee du run M5_03, avant les corrections de deroulement
     # et de compte introduites dans la version 2.
     # La version 2 rejoue l'equite, la marge et les positions ouvertes : elle
@@ -1990,6 +1993,41 @@ def entraine_conviction(policy, optims, trans, R, rangs, cfg, device, rng) -> Di
     return out
 
 
+def courbe_conviction(policy, device):
+    """(rangs, sens, multiplicateurs) : la conviction d'un modele sur une
+    grille de rangs de l'expert (0.90 a 0.999), pour les deux sens."""
+    r = np.concatenate([np.linspace(0.90, 0.99, 91), np.linspace(0.9905, 0.999, 18)])
+    rr, ss = np.concatenate([r, r]), np.r_[np.zeros(len(r), np.int64), np.ones(len(r), np.int64)]
+    with torch.no_grad():
+        m = policy.conviction(torch.from_numpy(entrees_conviction(rr, ss)).to(device))
+    return rr, ss, m.float().cpu().numpy().astype(np.float64)
+
+
+def copie_conviction(policy, rr, ss, cible, device, pas: int = 1500) -> float:
+    """La tete de conviction du MODELE FINAL apprend a reproduire `cible` (la
+    mediane des dix folds sur la grille de `courbe_conviction`), en log ;
+    rend l'ecart final (rapport moyen, en %).
+
+    POURQUOI, 2026-10-03 (run m5_31) : l'expert du modele final est appris
+    sur tout l'historique puis predit ce meme historique (`expert_deploiement`).
+    Ses rangs y « voient » les resultats : reapprise dessus, la tete croirait
+    qu'un rang de 0.99 gagne presque a coup sur, et miserait beaucoup trop en
+    live, ou les rangs redeviennent honnetes. Les dix folds, eux, ont appris
+    sur des rangs que leur expert n'avait pas vus."""
+    c = torch.from_numpy(entrees_conviction(rr, ss)).to(device)
+    y = torch.as_tensor(np.log(np.clip(cible, 1e-3, None)), dtype=torch.float32, device=device)
+    params = list(policy.reseau_conviction.parameters())
+    opt = torch.optim.Adam(params, lr=3e-3)
+    for _ in range(int(pas)):
+        perte = ((torch.log(policy.conviction(c)) - y) ** 2).mean()
+        opt.zero_grad(set_to_none=True)
+        perte.backward()
+        opt.step()
+    with torch.no_grad():
+        ecart = (torch.log(policy.conviction(c)) - y).abs().mean()
+    return float(100.0 * (math.exp(float(ecart)) - 1.0))
+
+
 def index_conviction(cfg) -> int:
     """La place du multiplicateur de conviction dans un coup du jeu (le rang
     de l'expert suit)."""
@@ -3427,6 +3465,7 @@ def entraine_deploiement_continu(cfg, d, X, y_ex, toutes, o, h, l, c, sp, atr,
 
     fin = np.full(N, N, np.int64)
     paquets = []
+    courbes_conviction = []
     for candidat in candidats:
         bloc = int(candidat["bloc"])
         chemin_pipe = f"pipeline_{cfg.prefixe}_bloc{bloc}.json"
@@ -3443,6 +3482,9 @@ def entraine_deploiement_continu(cfg, d, X, y_ex, toutes, o, h, l, c, sp, atr,
         professeur = PolitiqueJeu(cfg).to(device)
         etat_prof = torch.load(candidat["path"], map_location=device, weights_only=False)
         professeur.load_state_dict(etat_prof["modele"])
+        if getattr(professeur, "tete_conviction", False):
+            rr_c, ss_c, m_c = courbe_conviction(professeur, device)
+            courbes_conviction.append(m_c)
         gen = torch.Generator(device=device)
         gen.manual_seed(int(cfg.graine) + bloc)
         fin_validation = np.full(N, va1, np.int64)
@@ -3467,6 +3509,16 @@ def entraine_deploiement_continu(cfg, d, X, y_ex, toutes, o, h, l, c, sp, atr,
     etats_prof = [[(int(t_), e_) for t_, e_ in zip(p["t"], p["etat"])] for p in paquets]
     entraine_dejavu_meteo(policy, optims, etats_prof, X_final, M_final, cfg, device, rng)
     distille_ensemble_folds(policy, optims, paquets, X_final, cfg, device, rng)
+    # LA CONVICTION DU MODELE FINAL : la mediane des dix folds, copiee, puis
+    # plus apprise. Voir `copie_conviction`.
+    conviction_mediane = None
+    if getattr(policy, "tete_conviction", False) and courbes_conviction:
+        conviction_mediane = np.median(np.stack(courbes_conviction), 0)
+        ecart = copie_conviction(policy, rr_c, ss_c, conviction_mediane, device)
+        _tr = lambda a, z: float(np.mean(conviction_mediane[(rr_c >= a) & (rr_c < z)]))
+        print(f"  conviction du modele final : mediane de {len(courbes_conviction)} folds, "
+              f"x{_tr(0.0, 0.98):.2f} (rang < 0.98) / x{_tr(0.98, 0.99):.2f} (0.98-0.99) / "
+              f"x{_tr(0.99, 1.01):.2f} (>= 0.99) ; copiee a {ecart:.1f} % pres", flush=True)
 
     # Une passe PPO qui couvre toutes les journees : contrairement a l'ancien
     # curriculum, aucun regime final ni fold n'a de privilege.
@@ -3479,7 +3531,6 @@ def entraine_deploiement_continu(cfg, d, X, y_ex, toutes, o, h, l, c, sp, atr,
         stats = maj_ppo(policy, optims, avantages(tr, cfg), X_final, cfg, device, rng)
         entraine_esperance(policy, optims, tr, X_final, R1, cfg, device, rng)
         entraine_dejavu_meteo(policy, optims, tr, X_final, M_final, cfg, device, rng)
-        entraine_conviction(policy, optims, tr, R1, rangs_ex, cfg, device, rng)
         print(f"DEPLOY ENSEMBLE PPO {numero:02d}/{len(fragments):02d}  "
               f"{len(jours)} parties  kl {stats['kl']:+.4f}  v {stats['v']:.4f}", flush=True)
 
@@ -3487,6 +3538,8 @@ def entraine_deploiement_continu(cfg, d, X, y_ex, toutes, o, h, l, c, sp, atr,
             "type": "deploiement_ensemble_10_folds", "pipeline": pipeline_ref,
             "folds": [{"bloc": int(x["bloc"]), "epoch": int(x["epoch"])} for x in candidats],
             "distillation": "10_professeurs_sur_leur_validation",
+            "conviction_mediane_folds": (None if conviction_mediane is None
+                                         else [float(x) for x in conviction_mediane]),
             "ppo": "une_passe_complete_toutes_les_parties"}
     path = f"deploy_{cfg.prefixe}_ensemble_validation_ddsafe.pth"
     torch.save(etat, path)

@@ -137,7 +137,12 @@ un menu de ×0,5 à ×4). Elle apprend sur chaque trade joué la croissance
 exacte qu'aurait donnée n'importe quel multiplicateur, en demi-Kelly, sans
 tirage ; un prix du risque ajusté
 en continu garde le multiplicateur moyen à 1 : pour quadrupler un trade, elle
-doit miser moins ailleurs. La mise de base est fixe (1 %, le R du jeu) ; le
+doit miser moins ailleurs. Dans le modèle final, elle ne réapprend pas :
+l'expert final est appris sur tout l'historique et ses rangs y « voient » les
+résultats ; elle copie donc la médiane des dix têtes des folds, apprises sur
+des rangs honnêtes, puis ne bouge plus (run m5_31). En live, l'expert est
+rechargé avec le pipeline du modèle final et son rang recalculé à chaque
+bougie. La mise de base est fixe (1 %, le R du jeu) ; le
 budget de baisse (m5_28) est coupé. La veille affiche, par tranche de rang,
 le multiplicateur choisi et le profit factor en validation.
 
@@ -273,7 +278,8 @@ les têtes de mise en ont besoin. Les runs fournissent toujours les prix.
 | m5_27 | têtes du déjà-vu et météo, entrées des têtes de mise | tests blocs 1-3 : +2,35 / +1,59 / +2,68 $/jour (PF 1,28 / 1,15 / 1,33) ; aucune pente stable par tranche ; arrêté au bloc 4 (validation sans aucun trade) |
 | m5_28 | budget de baisse : mise de base mesurée en validation (pire baisse 30 % une fois sur 10) | bloc 1, epochs 11-21 : +0,36 $/jour moyen en validation contre +0,12 au m5_27, pires baisses −8 à −37 % ; arrêté |
 | m5_29 | tête de conviction : multiplicateur ×0,5 à ×4 appris sur le rang de l'expert, budget moyen constant | arrêté au bloc 1 (erreur pendant les mois), remplacé par la version continue |
-| m5_30 | conviction continue : multiplicateur libre ×0,1 à ×25, demi-Kelly, budget moyen constant | en cours |
+| m5_30 | conviction continue : multiplicateur libre ×0,1 à ×25, demi-Kelly, budget moyen constant | arrêté aux premières epochs : le modèle final réapprenait la conviction sur l'expert final |
+| m5_31 | conviction continue, celle du modèle final copiée de la médiane des 10 folds | en cours |
 
 Ce que les mesures ont établi :
 - le signal du BTC M5 vient du flux Binance, de l'écart Coinbase, du

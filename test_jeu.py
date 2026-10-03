@@ -6,6 +6,7 @@
 import sys
 from dataclasses import replace
 
+import inspect
 import numpy as np
 import torch
 
@@ -924,6 +925,23 @@ for _ in range(40):
 verifie("si la conviction ne dit rien, elle ne double pas les coups forts",
         abs(_st2["mult_haut"] - _st2["mult_bas"]) <= 1.0 and 0.7 <= _st2["mult_moyen"] <= 1.3,
         f"x{_st2['mult_bas']:.2f} / x{_st2['mult_haut']:.2f}, moyenne x{_st2['mult_moyen']:.2f}")
+
+print("\n21. LA CONVICTION DU MODELE FINAL, COPIEE DES FOLDS")
+_rr, _ss, _m1 = J.courbe_conviction(_p20, "cpu")
+verifie("la courbe d'un fold : deux sens, rangs de 0.90 a 0.999, croissante pour un fold appris",
+        len(_rr) == len(_ss) == len(_m1) == 218 and _rr.min() == 0.90 and abs(_rr.max() - 0.999) < 1e-9
+        and _m1[(_rr >= 0.995) & (_ss == 0)].mean() > _m1[(_rr < 0.95) & (_ss == 0)].mean(),
+        f"x{_m1[(_rr < 0.95) & (_ss == 0)].mean():.2f} -> x{_m1[(_rr >= 0.995) & (_ss == 0)].mean():.2f}")
+_med = np.median(np.stack([_m1, np.ones_like(_m1), _m1 * 1.1]), 0)
+torch.manual_seed(1)
+_el = J.PolitiqueJeu(_c20)
+_ec = J.copie_conviction(_el, _rr, _ss, _med, "cpu")
+_m2 = J.courbe_conviction(_el, "cpu")[2]
+verifie("l'eleve reproduit la mediane des folds a quelques % pres",
+        _ec < 10.0 and np.allclose(np.log(_m2), np.log(_med), atol=0.25), f"ecart {_ec:.1f} %")
+verifie("la passe finale ne la reapprend plus",
+        "entraine_conviction(policy, optims, tr, R1, rangs_ex" not in
+        inspect.getsource(J.entraine_deploiement_continu))
 
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)
