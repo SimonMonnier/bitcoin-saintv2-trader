@@ -110,6 +110,22 @@ trades de validation par tranche de chaque tête (du plus familier au plus
 nouveau, du plus calme au plus agité), la mise moyenne par tranche, et la
 corrélation entre la météo prévue et le mouvement réel.
 
+**Le budget de baisse** (run m5_28) — les têtes d'espérance, du déjà-vu et
+météo ont cherché *quels* trades méritent une plus grosse mise : aucune n'a
+trouvé de règle stable d'un bloc à l'autre. Ce qui est stable, c'est l'avantage
+moyen du signal. Après chaque validation, ses trades sont rejoués 200 fois, les
+journées dans le désordre, à chaque mise possible ; la **mise de base** est la
+plus forte pour laquelle la pire baisse ne dépasse **30 %** qu'une fois sur
+10. Si le signal perd en moyenne, elle tombe à 0,1 %. Elle sert à l'epoch
+suivante, au test (celle du modèle gardé), au modèle final (médiane des dix
+folds) et au live. Les quatre têtes de mise choisissent un multiplicateur de
+×0,5 à ×1,5 autour d'elle ; série noire, marge et lot minimum restent des
+bornes. Mesure sur les trades du m5_27, mise choisie en validation : le test
+rejoué donne +7 178 $ (bloc 1, mise 1,15 %), +797 $ (bloc 2, 1,05 %) et
++7 122 $ (bloc 3, 2,25 %) contre +781, +524 et +888 $ joués, pires baisses
+−17,6 / −18,9 / −20,4 % ; au bloc 4, où le signal perdait, la mise serait
+restée à 0,1 %.
+
 **La série noire** — avant chaque trade, le risque ne dépasse jamais ce que
 la pire série de pertes du modèle laisse survivre : si les N prochains trades
 perdaient tous, le compte ne perdrait pas plus de 50 %. Risque maximal par
@@ -239,7 +255,8 @@ les têtes de mise en ont besoin. Les runs fournissent toujours les prix.
 | m5_24 | 13 paires d'objectifs, mois joués avec le signal réel | arrêté : le modèle s'est jeté sur « 4 ATR en une fois », win rate de 69 % à 27 % en 3 epochs |
 | m5_25 | 12 paires (sans « 4 ATR en une fois ») | bloc 1, epochs 2-9 : +0,32 à +2,50 $/jour, win rate 63-73 %, pire baisse −6 à −20 %, mise réelle 0,3 à 1 % |
 | m5_26 | tête d'espérance (mise de base demi-Kelly prédite) | bloc 1, epochs 1-17 : meilleur +2,53 $/jour (PF 1,25, epoch 16) ; corrélation prédiction / résultat entre −0,11 et +0,23 : arrêté |
-| m5_27 | têtes du déjà-vu et météo, entrées des têtes de mise | en cours |
+| m5_27 | têtes du déjà-vu et météo, entrées des têtes de mise | tests blocs 1-3 : +2,35 / +1,59 / +2,68 $/jour (PF 1,28 / 1,15 / 1,33) ; aucune pente stable par tranche ; arrêté au bloc 4 (validation sans aucun trade) |
+| m5_28 | budget de baisse : mise de base mesurée en validation (pire baisse 30 % une fois sur 10) | en cours |
 
 Ce que les mesures ont établi :
 - le signal du BTC M5 vient du flux Binance, de l'écart Coinbase, du

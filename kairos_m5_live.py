@@ -329,6 +329,11 @@ class MoteurKairosM5:
         if les is not None:
             pe = les[0, sens, tp, sl].float().cpu().numpy()
             base = float(J.fraction_esperance(pe[0], pe[1], self.cfg))
+        elif (bool(getattr(self.cfg, "budget_baisse", False)) and llo is not None
+              and lal is not None and lco is not None):
+            # LE BUDGET DE BAISSE : la mise de base mesuree en validation,
+            # gardee dans la configuration du modele final.
+            base = float(self.cfg.mise_budget)
         # Le jeu applique ce plancher avant de construire TP et SL.
         atr = float(J.atr_effectif(np.array([d["atr_14"].iloc[t]]),
                                    np.array([d["close"].iloc[t]]), self.cfg)[0])
@@ -400,6 +405,9 @@ class MoteurKairosM5:
             mult = (float(self.cfg.multiplicateurs_lot[signal["lot_niveau"]])
                     * float(self.cfg.multiplicateurs_allocation[signal["allocation_niveau"]])
                     * float(self.cfg.multiplicateurs_confiance[signal["confiance_niveau"]]))
+            if bool(getattr(self.cfg, "budget_baisse", False)):
+                mult = J.multiplicateur_budget(self.cfg, signal["lot_niveau"],
+                                               signal["allocation_niveau"], signal["confiance_niveau"])
             voulu = float(ai.equity) * signal["mise_base"] * mult / perte_lot
             voulu = np.floor(voulu / info.volume_step + 1e-10) * info.volume_step
             vol = float(min(plaf, max(vmin, voulu)))

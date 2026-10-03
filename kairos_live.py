@@ -33,7 +33,7 @@ class LiveConfig:
     # Le run dont on trade le modele final : deploy_<prefixe>_ensemble_validation_ddsafe.pth
     # et pipeline_<prefixe>_deploy_ensemble_validation_ddsafe.json, ecrits par
     # `jeu_kairos.py` a la fin des dix blocs (ou `--rebuild-deploy-ensemble`).
-    kairos_prefixe: str = "kairos_jeu_m5_27_dejavu_meteo"
+    kairos_prefixe: str = "kairos_jeu_m5_28_budget_baisse"
     kairos_bloc: int = 1
     # Fuseau de l'horloge des graphiques Vantage/MT5 (EEST l'ete, EET l'hiver).
     kairos_tz_mt5: str = "Europe/Helsinki"

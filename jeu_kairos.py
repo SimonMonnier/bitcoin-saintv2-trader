@@ -199,7 +199,10 @@ class JeuConfig:
     # LES TETES DU DEJA-VU ET METEO (run m5_27) : voir `apprendre_dejavu_meteo`.
     # Le run m5_26 : prefixe kairos_jeu_m5_26_esperance, apprendre_esperance
     # True, apprendre_dejavu_meteo False.
-    prefixe: str = "kairos_jeu_m5_27_dejavu_meteo"
+    # LE BUDGET DE BAISSE (run m5_28) : voir `budget_baisse`. Le run m5_27 :
+    # prefixe kairos_jeu_m5_27_dejavu_meteo, apprendre_dejavu_meteo True,
+    # budget_baisse False.
+    prefixe: str = "kairos_jeu_m5_28_budget_baisse"
     # Reproduction demandee du run M5_03, avant les corrections de deroulement
     # et de compte introduites dans la version 2.
     # La version 2 rejoue l'equite, la marge et les positions ouvertes : elle
@@ -451,10 +454,12 @@ class JeuConfig:
     # signal lui-meme ne fait qu'a peine. Voir `apprendre_dejavu_meteo`.
     apprendre_esperance: bool = False
     kelly_fraction: float = 0.5
+    # x0.25 a x2, x0.5 a x1.5 au run m5_26 (esperance) ; depuis le run m5_28,
+    # ceux du budget de baisse.
     multiplicateurs_lot: Tuple[float, ...] = tuple(
-        float(x) for x in np.round(np.geomspace(0.25, 2.0, 20), 4))
-    multiplicateurs_allocation: Tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5)
-    multiplicateurs_confiance: Tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5)
+        float(x) for x in np.round(np.geomspace(0.5, 1.5, 20), 4))
+    multiplicateurs_allocation: Tuple[float, ...] = (0.8, 0.9, 1.0, 1.1, 1.2)
+    multiplicateurs_confiance: Tuple[float, ...] = (0.8, 0.9, 1.0, 1.1, 1.2)
     esperance_passes: int = 2
     # LES TETES DU DEJA-VU ET METEO — 2026-10-03 (run m5_27), demande du
     # proprietaire : « invente un truc avec des nouvelles tetes ». La tete
@@ -481,9 +486,43 @@ class JeuConfig:
     # ENTREES de plus des quatre tetes de mise, qui apprennent avec la note du
     # mois a en tirer des mises plus grosses ou plus petites. La veille affiche
     # le profit factor des coups de validation par tranche de chaque tete.
-    apprendre_dejavu_meteo: bool = True
+    #
+    # COUPEES LE 2026-10-03 (run m5_28), demande du proprietaire. Au run m5_27
+    # (blocs 1 a 3), elles prevoyaient bien leur cible — meteo correlee a
+    # +0.35 / +0.50 au mouvement reel en validation — mais aucune ne triait les
+    # coups : la tranche qui payait le mieux changeait de bloc en bloc
+    # (deja-vu : les plus nouveaux aux blocs 1 et 2, les plus familiers au
+    # bloc 3 ; meteo : les jours calmes au bloc 1, agites au bloc 2), et les
+    # tetes de mise misaient pareil dans toutes les tranches.
+    apprendre_dejavu_meteo: bool = False
     dejavu_meteo_passes: int = 2
     dejavu_meteo_etats: int = 16384
+    # LE BUDGET DE BAISSE — 2026-10-03 (run m5_28), demande du proprietaire :
+    # « invente autre chose qui marche cette fois ». Trois tetes ont cherche
+    # QUELS coups meritent plus (esperance, deja-vu, meteo) : aucune n'a
+    # trouve de regle stable. Ce qui est stable, c'est l'avantage MOYEN du
+    # signal. La mesure du 2026-10-03 sur les coups du run m5_27 : le meme
+    # signal, rejoue au test a mise FIXE, rapporte bien plus que la mise
+    # apprise, parce que les tetes de mise collaient au lot minimum (mediane
+    # 0.31 a 0.77 % du compte) ; elles montaient aussi parfois a 3 % sur un
+    # signal perdant (bloc 4, validation -96 %).
+    #
+    # La regle : apres chaque validation, ses coups sont rejoues
+    # `budget_baisse_tirages` fois, les journees dans le desordre, a chaque
+    # mise possible. La MISE DE BASE est la plus forte pour laquelle la pire
+    # baisse ne depasse `budget_baisse_pct` qu'une fois sur 10
+    # (`budget_baisse_quantile`). Elle sert a l'epoch suivante, au test (celle
+    # du modele garde), au modele final (la mediane des dix folds) et au live.
+    # Quand le signal perd en validation, la mise tombe d'elle-meme au minimum.
+    # Les quatre tetes de mise restent : elles choisissent un multiplicateur
+    # (lot x0.5 a x1.5, allocation et confiance x0.8 a x1.2, produit borne a
+    # [0.5, 1.5]) et la mesure rejoue leurs vrais multiplicateurs. La serie
+    # noire, la tete de risque, la marge et le lot minimum restent des bornes.
+    budget_baisse: bool = True
+    budget_baisse_pct: float = 0.30
+    budget_baisse_quantile: float = 0.10
+    budget_baisse_tirages: int = 200
+    mise_budget: float = 0.005
     # DEUX NOTES SEPAREES — 2026-10-02 (run m5_20), demande du proprietaire :
     # garder le signal d'achat et de vente, et la prise de risque au-dela de
     # 1 %, sans que le compte finisse ruine. Au run m5_19, une seule note (le
@@ -1802,6 +1841,58 @@ def mesure_dejavu_meteo(coups, cfg, meteo=None) -> Dict[str, object]:
     return out
 
 
+def multiplicateur_budget(cfg, k, u, z) -> float:
+    """Le multiplicateur des tetes de lot, d'allocation et de confiance autour
+    de la mise de base, borne a [0.5, 1.5]. Voir `budget_baisse`."""
+    m = (float(cfg.multiplicateurs_lot[int(k)]) * float(cfg.multiplicateurs_allocation[int(u)])
+         * float(cfg.multiplicateurs_confiance[int(z)]))
+    return float(np.clip(m, 0.5, 1.5))
+
+
+def index_budget(cfg) -> int:
+    """La place de la mise de base dans un coup du jeu (le multiplicateur suit)."""
+    return index_dejavu_meteo(cfg) + (2 if bool(getattr(cfg, "apprendre_dejavu_meteo", False)) else 0)
+
+
+def mesure_budget_baisse(coups, cfg) -> Tuple[float, Dict[str, object]]:
+    """La mise de base que supportent ces coups : la plus forte (en part du
+    compte risquee au stop) pour laquelle, en rejouant les coups
+    `budget_baisse_tirages` fois, journees dans le desordre, la pire baisse ne
+    depasse `budget_baisse_pct` qu'une fois sur 10. Les multiplicateurs reels
+    des tetes de mise sont rejoues. Au plus le plafond de la serie noire (et
+    5 %) ; au moins 0.1 %, et 0.1 % si les coups perdent en moyenne. Voir
+    `budget_baisse`."""
+    if len(coups) < 30:
+        return float(cfg.mise_budget), {}
+    c = np.asarray(coups, dtype=np.float64)
+    c = c[np.argsort(c[:, 1], kind="stable")]
+    R = c[:, 10] / np.maximum(c[:, 8] * c[:, 15] * float(cfg.contrat), 1e-12)
+    ib = index_budget(cfg)
+    m = c[:, ib + 1] if c.shape[1] > ib + 1 else np.ones(len(c))
+    parts = c[:, 0].astype(np.int64)
+    u = np.unique(parts)
+    idx = [np.flatnonzero(parts == p) for p in u]
+    plaf = min(plafond_serie_noire(cfg), 0.05)
+    grille = np.round(np.arange(0.001, plaf + 1e-9, 0.0005), 4)
+    if not len(grille):
+        grille = np.array([0.001])
+    rng = np.random.default_rng(int(cfg.graine) + len(c))
+    pires = []
+    for _ in range(int(cfg.budget_baisse_tirages)):
+        o = np.concatenate([idx[i] for i in rng.permutation(len(u))])
+        le = np.cumsum(np.log(np.maximum(1.0 + grille[:, None] * (m[o] * R[o])[None, :], 1e-6)), 1)
+        le = np.concatenate([np.zeros((len(grille), 1)), le], 1)
+        pires.append(np.exp(-(np.maximum.accumulate(le, 1) - le).max(1)) - 1.0)
+    q = np.quantile(np.asarray(pires), float(cfg.budget_baisse_quantile), axis=0)
+    ok = q >= -float(cfg.budget_baisse_pct)
+    # un signal qui perd en moyenne ne merite aucune mise, meme supportable
+    ok &= float(np.mean(m * R)) > 0.0
+    f = float(grille[ok].max()) if ok.any() else float(grille[0])
+    return f, {"n": int(len(c)), "r_moyen": float(R.mean()), "mult_moyen": float(m.mean()),
+               "plafond": float(plaf), "baisse_a_f": float(q[np.flatnonzero(grille == f)[0]]),
+               "baisse_1pct": float(q[np.argmin(np.abs(grille - 0.01))])}
+
+
 def plafond_serie_noire(cfg) -> float:
     """La part du compte qu'un coup peut risquer au plus. Voir `serie_noire`.
     1.0 (aucune limite) si la regle est coupee."""
@@ -2629,9 +2720,17 @@ def ecrit_trades_csv(path: str, coups, temps, cfg: JeuConfig, *, epoch: int, pha
         "esperance_ecart": c[:, 22] if c.shape[1] > 23 else np.nan,
         "mise_base_pct": 100 * c[:, 23] if c.shape[1] > 23 else np.nan,
         "dejavu_log_erreur": (c[:, index_dejavu_meteo(cfg)]
-                              if c.shape[1] > index_dejavu_meteo(cfg) + 1 else np.nan),
+                              if getattr(cfg, "apprendre_dejavu_meteo", False)
+                              and c.shape[1] > index_dejavu_meteo(cfg) + 1 else np.nan),
         "meteo_log_amplitude_bps": (c[:, index_dejavu_meteo(cfg) + 1]
-                                    if c.shape[1] > index_dejavu_meteo(cfg) + 1 else np.nan),
+                                    if getattr(cfg, "apprendre_dejavu_meteo", False)
+                                    and c.shape[1] > index_dejavu_meteo(cfg) + 1 else np.nan),
+        "mise_budget_pct": (100 * c[:, index_budget(cfg)]
+                            if getattr(cfg, "budget_baisse", False)
+                            and c.shape[1] > index_budget(cfg) + 1 else np.nan),
+        "multiplicateur_mise": (c[:, index_budget(cfg) + 1]
+                                if getattr(cfg, "budget_baisse", False)
+                                and c.shape[1] > index_budget(cfg) + 1 else np.nan),
         "equite_apres_usd": np.maximum(0.0, c[:, 11] + c[:, 10]),
         "score_R": c[:, 5],
     })
@@ -3234,6 +3333,15 @@ def config_serie_noire_folds(cfg, candidats):
     print(f"  serie noire du modele final : {cfg.serie_noire_n} pertes d'affilee, "
           f"perte reelle x{cfg.serie_noire_k:.2f} -> risque max {100 * plafond_serie_noire(cfg):.1f} %",
           flush=True)
+    if bool(getattr(cfg, "budget_baisse", False)):
+        # LE BUDGET DE BAISSE du modele final : la mediane des dix folds.
+        fs = [float(torch.load(x["path"], map_location="cpu", weights_only=False)
+                    .get("config", {}).get("mise_budget", cfg.mise_budget))
+              for x in candidats if os.path.isfile(x["path"])]
+        if fs:
+            cfg = replace(cfg, mise_budget=float(np.median(fs)))
+            print(f"  budget de baisse du modele final : mise de base {100 * cfg.mise_budget:.2f} % "
+                  f"(mediane des folds, de {100 * min(fs):.2f} a {100 * max(fs):.2f} %)", flush=True)
     return cfg
 
 
@@ -3371,7 +3479,8 @@ def main_blocs(cfg: JeuConfig) -> int:
               flush=True)
         # LA SERIE NOIRE repart de sa valeur prudente a chaque bloc.
         cfg = replace(cfg, serie_noire_n=cfg_depart.serie_noire_n,
-                      serie_noire_k=cfg_depart.serie_noire_k)
+                      serie_noire_k=cfg_depart.serie_noire_k,
+                      mise_budget=cfg_depart.mise_budget)
         policy = PolitiqueJeu(cfg).to(device)
         optims = optimiseurs(policy, cfg)
         pos = coups_expert_predits(j_tr, pred, D1, fin_tr, cfg)
@@ -3474,6 +3583,18 @@ def main_blocs(cfg: JeuConfig) -> int:
                 print(f"  serie noire  pire serie {n_obs} pertes d'affilee, perte reelle "
                       f"jusqu'a {k_obs:.2f} fois le stop -> risque max par coup "
                       f"{100 * avant:.1f} % -> {100 * plafond_serie_noire(cfg):.1f} %", flush=True)
+            if bool(getattr(cfg, "budget_baisse", False)) and len(cv):
+                # LE BUDGET DE BAISSE, remesure sur cette validation pour la
+                # suite ; le checkpoint garde celui avec lequel il a joue.
+                f_b, mb = mesure_budget_baisse(cv, cfg)
+                if mb:
+                    print(f"  budget  validation rejouee {cfg.budget_baisse_tirages} fois, journees melangees : "
+                          f"mise de base {100 * cfg.mise_budget:.2f} % -> {100 * f_b:.2f} % "
+                          f"(pire baisse 1 fois sur 10 : {100 * mb['baisse_a_f']:+.0f} % a cette mise, "
+                          f"{100 * mb['baisse_1pct']:+.0f} % a 1 %)  |  R moyen {mb['r_moyen']:+.4f}  |  "
+                          f"multiplicateur des tetes {mb['mult_moyen']:.2f}  |  plafond {100 * mb['plafond']:.1f} %",
+                          flush=True)
+                    cfg = replace(cfg, mise_budget=f_b)
             # une validation sans coup n'a ni gain ni baisse (`bilan`)
             profit_jour = bv.get("total_dollars", 0.0) / max(bv["parties"], 1)
             assez = bv["coups"] >= cfg.min_coups_val
@@ -3512,7 +3633,8 @@ def main_blocs(cfg: JeuConfig) -> int:
         policy.load_state_dict(etat_src["modele"])
         # Le test joue avec la serie noire du modele garde (mesuree avant lui).
         cfg = replace(cfg, serie_noire_n=int(etat_src["config"].get("serie_noire_n", cfg.serie_noire_n)),
-                      serie_noire_k=float(etat_src["config"].get("serie_noire_k", cfg.serie_noire_k)))
+                      serie_noire_k=float(etat_src["config"].get("serie_noire_k", cfg.serie_noire_k)),
+                      mise_budget=float(etat_src["config"].get("mise_budget", cfg.mise_budget)))
         gen = torch.Generator(device=device)
         gen.manual_seed(cfg.graine)
         s_t, c_t, tr_t = joue(policy, j_te, Xk, R1, D1, S1, te1, cfg, device,

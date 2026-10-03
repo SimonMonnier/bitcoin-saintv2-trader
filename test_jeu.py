@@ -769,9 +769,8 @@ verifie("la tete d'objectif a douze choix", _pol16.tete_objectif.out_features ==
 
 print("\n17. LA TETE D'ESPERANCE")
 _c17 = replace(J.JeuConfig(), apprendre_esperance=True, apprendre_dejavu_meteo=False)
-verifie("la tete d'esperance du run m5_26 : demi-Kelly, x0.25 a x2 ; coupee par defaut depuis le m5_27",
+verifie("la tete d'esperance du run m5_26 : demi-Kelly ; coupee par defaut depuis le m5_27",
         _c17.kelly_fraction == 0.5 and not J.JeuConfig().apprendre_esperance
-        and abs(_c17.multiplicateurs_lot[0] - 0.25) < 1e-9 and abs(_c17.multiplicateurs_lot[-1] - 2.0) < 1e-9
         and len(_c17.multiplicateurs_lot) == _c17.niveaux_lot)
 _f = J.fraction_esperance(np.array([0.1, -0.2, 0.3]), np.log(np.array([1.0, 1.0, 0.5])), _c17)
 verifie("la mise de base : demi-Kelly = 0.5 x moyenne / (moyenne^2 + variance), jamais negative",
@@ -791,9 +790,9 @@ verifie("le mur : la tete d'esperance apprend sans toucher le tronc (le signal)"
         _gt == 0.0 and _ge > 0.0, f"{_gt} {_ge}")
 
 print("\n18. LES TETES DU DEJA-VU ET METEO")
-_c18 = J.JeuConfig()
-verifie("par defaut : deja-vu et meteo, sans esperance", _c18.apprendre_dejavu_meteo
-        and not _c18.apprendre_esperance)
+_c18 = replace(J.JeuConfig(), apprendre_dejavu_meteo=True)
+verifie("le deja-vu et la meteo du run m5_27 : coupes par defaut depuis le m5_28",
+        not J.JeuConfig().apprendre_dejavu_meteo and not _c18.apprendre_esperance)
 _h = np.array([10, 11, 12, 13, 14, 15], float)
 _l = _h - 1
 _m = J.cible_meteo(_h, _l, _h, replace(_c18, horizon_max=2))
@@ -834,6 +833,40 @@ _md = J.mesure_dejavu_meteo(_coups, _c18, np.arange(60, dtype=float))
 verifie("la mesure : cinq tranches par tete, profit factor et mise",
         len(_md["dejavu"]["pf"]) == 5 and len(_md["meteo"]["mise"]) == 5 and _md["n"] == 50
         and abs(_md["dejavu"]["mise"][0] - 0.1) < 1e-9, str(_md["dejavu"]))
+
+print("\n19. LE BUDGET DE BAISSE")
+_c19 = replace(J.JeuConfig(), serie_noire_n=10, serie_noire_k=1.0)
+verifie("par defaut : budget de baisse a 30 % une fois sur 10, mise de depart 0.5 %",
+        _c19.budget_baisse and _c19.budget_baisse_pct == 0.30 and _c19.budget_baisse_quantile == 0.10
+        and _c19.mise_budget == 0.005 and len(_c19.multiplicateurs_lot) == _c19.niveaux_lot)
+verifie("le multiplicateur des tetes : de x0.5 a x1.5, borne",
+        J.multiplicateur_budget(_c19, 0, 0, 0) == 0.5 and J.multiplicateur_budget(_c19, 19, 4, 4) == 1.5
+        and abs(J.multiplicateur_budget(_c19, 0, 4, 4) - 0.72) < 1e-9)
+
+
+def _coups19(R, m=1.0):
+    # 40 journees de 5 coups ; un coup = (partie, entree, ..., lot 8, pnl 10, solde 11, distance 15, ...)
+    out = []
+    for n_, r_ in enumerate(R):
+        q = [n_ // 5, n_, 0, 0, 0, 0.0, 1, 0, 0.1, 1.0, 10.0 * r_ * 0.1 / 0.1, 1000.0, 0, 0, 0, 100.0,
+             0, 1, 0, 1, 1, 0.005, m]
+        q[10] = r_ * 0.1 * 100.0
+        out.append(tuple(q))
+    return out
+
+
+_rg = np.random.default_rng(1)
+_Rbon = np.where(_rg.random(200) < 0.6, 0.8, -1.0)
+_Rmauvais = np.where(_rg.random(200) < 0.4, 0.8, -1.0)
+_fb, _mb = J.mesure_budget_baisse(_coups19(_Rbon), _c19)
+_fm, _mm = J.mesure_budget_baisse(_coups19(_Rmauvais), _c19)
+verifie("un signal gagnant supporte une mise plus forte qu'un signal perdant, qui tombe au minimum",
+        _fb > _fm and _fm == 0.001 and _mb["baisse_a_f"] >= -0.30 and abs(_mb["r_moyen"] - _Rbon.mean()) < 1e-9,
+        f"{100 * _fb:.2f} % / {100 * _fm:.2f} %")
+_f2, _ = J.mesure_budget_baisse(_coups19(_Rbon, m=1.5), _c19)
+verifie("des multiplicateurs plus forts font baisser la mise de base", _f2 < _fb, f"{100 * _f2:.2f} %")
+verifie("jamais au-dela du plafond de la serie noire",
+        J.mesure_budget_baisse(_coups19(np.full(200, 0.5)), _c19)[0] <= J.plafond_serie_noire(_c19) + 1e-9)
 
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)

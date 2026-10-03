@@ -245,9 +245,13 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
             confiance = (np.asarray(getattr(cfg, "niveaux_confiance_pct", (100.0,)), dtype=float) /
                           100.0)
             budget *= confiance[z.cpu().numpy()] if lc is not None else 1.0
-            if les is not None:
-                # LA TETE D'ESPERANCE : l'allocation et la confiance deviennent
-                # des multiplicateurs de la mise de base, plus des plafonds.
+            # LE BUDGET DE BAISSE. Voir `budget_baisse`.
+            avec_budget = (les is None and bool(getattr(cfg, "budget_baisse", False))
+                           and ll is not None and la is not None and lc is not None)
+            if les is not None or avec_budget:
+                # LA TETE D'ESPERANCE OU LE BUDGET DE BAISSE : l'allocation et
+                # la confiance deviennent des multiplicateurs de la mise de
+                # base, plus des plafonds.
                 budget = np.ones(len(ix))
             masque_risque = np.ones((len(ix), 1), dtype=bool)
             if lr is not None:
@@ -314,6 +318,14 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
                         float(atr[tc]) * cfg.sl_atr[j[q]] * cfg.contrat, 1e-12)
                     voulu = np.floor(voulu / cfg.pas_lot + 1e-10) * cfg.pas_lot
                     lot = float(min(maximum[q], max(cfg.lot_min, voulu)))
+                elif avec_budget:
+                    # LA MISE DE BASE (budget de baisse) x le multiplicateur
+                    # des tetes de mise, dans les bornes dures.
+                    mb = J.multiplicateur_budget(cfg, k[q], u[q], z[q])
+                    voulu = soldes[s] * float(cfg.mise_budget) * mb / max(
+                        float(atr[tc]) * cfg.sl_atr[j[q]] * cfg.contrat, 1e-12)
+                    voulu = np.floor(voulu / cfg.pas_lot + 1e-10) * cfg.pas_lot
+                    lot = float(min(maximum[q], max(cfg.lot_min, voulu)))
                 risque = lot * cfg.contrat * float(atr[tc]) * cfg.sl_atr[j[q]]
                 nominal = soldes[s] * cfg.risque_pct / 100.0
                 # Un gap ne peut pas faire descendre la simulation sous zero.
@@ -335,7 +347,8 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
                                float(confiance[z[q]] if lc is not None else 1.0))
                              + ((float(pe[q, 0]), float(np.exp(0.5 * np.clip(pe[q, 1], -8, 6))),
                                  float(base[q])) if les is not None else ())
-                             + ((float(prev[q, 0]), float(prev[q, 1])) if prev is not None else ()))
+                             + ((float(prev[q, 0]), float(prev[q, 1])) if prev is not None else ())
+                             + ((float(cfg.mise_budget), float(mb)) if avec_budget else ()))
                 ouverts[s].append((tc + duree, r_pondere, pnl,
                                    marge_requise, float(v[q])))
                 scores[g] += r_pondere
