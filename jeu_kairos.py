@@ -3463,9 +3463,10 @@ def main_blocs(cfg: JeuConfig) -> int:
                 rho, base = mesure_esperance(cv)
                 print(f"  esperance  correlation prediction / resultat en validation {rho:+.3f}  |  "
                       f"mise de base moyenne {base:.2f} % du compte", flush=True)
-            if bool(getattr(cfg, "serie_noire", False)):
+            if bool(getattr(cfg, "serie_noire", False)) and len(cv):
                 # LA SERIE NOIRE, remesuree sur cette validation pour la
                 # suite ; le checkpoint garde celle avec laquelle il a joue.
+                # Une validation sans coup ne mesure rien : la regle reste.
                 n_obs, k_obs = mesure_serie_noire(cv, cfg)
                 avant = plafond_serie_noire(cfg)
                 cfg = replace(cfg, serie_noire_n=max(int(cfg.serie_noire_n_min), n_obs),
@@ -3473,10 +3474,11 @@ def main_blocs(cfg: JeuConfig) -> int:
                 print(f"  serie noire  pire serie {n_obs} pertes d'affilee, perte reelle "
                       f"jusqu'a {k_obs:.2f} fois le stop -> risque max par coup "
                       f"{100 * avant:.1f} % -> {100 * plafond_serie_noire(cfg):.1f} %", flush=True)
-            profit_jour = bv["total_dollars"] / max(bv["parties"], 1)
+            # une validation sans coup n'a ni gain ni baisse (`bilan`)
+            profit_jour = bv.get("total_dollars", 0.0) / max(bv["parties"], 1)
             assez = bv["coups"] >= cfg.min_coups_val
             # SANS RUINE : voir `dd_max_sauvegarde`.
-            sans_ruine = bv["dd_pct"] >= -float(getattr(cfg, "dd_max_sauvegarde", 1.0))
+            sans_ruine = bv.get("dd_pct", 0.0) >= -float(getattr(cfg, "dd_max_sauvegarde", 1.0))
             admissible = assez and sans_ruine
             sauve = admissible and profit_jour > record_profit
             sauve_r = assez and bv["score"] > record_r
@@ -3488,7 +3490,7 @@ def main_blocs(cfg: JeuConfig) -> int:
             else:
                 raison = (f"{bv['coups']} coups, il en faut {cfg.min_coups_val}"
                           if not assez else
-                          f"pire baisse {100 * bv['dd_pct']:+.1f} %, au-dela de la limite de "
+                          f"pire baisse {100 * bv.get('dd_pct', 0.0):+.1f} %, au-dela de la limite de "
                           f"-{100 * float(cfg.dd_max_sauvegarde):.0f} %"
                           if not sans_ruine else
                           f"{profit_jour:+.2f}$/jour ne bat pas {record_profit:+.2f}$")
