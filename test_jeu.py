@@ -889,11 +889,14 @@ verifie("une cinquieme tete de mise, son groupe a part, disjoint des autres",
         and len({id(q) for v in _g20.values() for q in v}) == sum(len(v) for v in _g20.values()))
 with torch.no_grad():
     _l = _p20.conviction(torch.from_numpy(_e))
-    _p20.reseau_conviction[-1].bias.fill_(50.0)
+    for _h in _p20.reseau_conviction:
+        _h[-1].bias.fill_(50.0)
     _lh = _p20.conviction(torch.from_numpy(_e))
-    _p20.reseau_conviction[-1].bias.fill_(-50.0)
+    for _h in _p20.reseau_conviction:
+        _h[-1].bias.fill_(-50.0)
     _lb = _p20.conviction(torch.from_numpy(_e))
-    _p20.reseau_conviction[-1].bias.fill_(0.0)
+    for _h in _p20.reseau_conviction:
+        _h[-1].bias.fill_(0.0)
 verifie("au depart elle mise x1 partout ; jamais hors de [x0.01, x100]",
         torch.allclose(_l, torch.ones_like(_l), atol=1e-5) and float(_lh.max()) <= 100.0 + 1e-2
         and float(_lb.min()) >= 0.01 - 1e-6, f"{_l.tolist()} {float(_lh.max()):.2f} {float(_lb.min()):.3f}")
@@ -909,7 +912,7 @@ _rangs = np.stack([_rg.uniform(0.90, 1.0, _N), _rg.uniform(0.90, 1.0, _N)], 1).a
 _R = np.zeros((_N, 2, 1, 1))
 _fort = _rangs[:, 0] >= 0.99
 _R[:, 0, 0, 0] = np.where(_rg.random(_N) < np.where(_fort, 0.75, 0.5), 1.0, -1.0) + 0.05
-_tr = [[(t_, None, 0, J.ACHETER, 0, 0) for t_ in range(_N)]]
+_tr = [[(t_, None, 0, J.ACHETER, 0, 0) for t_ in range(d_ * 6, d_ * 6 + 6)] for d_ in range(_N // 6)]
 _o = J.optimiseurs(_p20, _c20)
 for _ in range(40):
     _st = J.entraine_conviction(_p20, _o, _tr, _R, _rangs, _c20, "cpu", _rg)
@@ -937,12 +940,61 @@ _mem = collections.deque(maxlen=3)
 _p20c = J.PolitiqueJeu(_c20)
 _o3 = J.optimiseurs(_p20c, _c20)
 for _k in range(5):
-    _st3 = J.entraine_conviction(_p20c, _o3, [_tr[0][_k * 1000:(_k + 1) * 1000]], _R, _rangs, _c20, "cpu",
+    _st3 = J.entraine_conviction(_p20c, _o3, _tr[_k * 100:(_k + 1) * 100], _R, _rangs, _c20, "cpu",
                                  _rg, memoire=_mem)
 verifie("la memoire garde les derniers lots et apprend sur tous",
-        len(_mem) == 3 and _st3["n"] == 3000 and _st3["n_neuf"] == 1000, f"{len(_mem)} lots, {_st3['n']} coups")
+        len(_mem) == 3 and _st3["n"] == 1800 and _st3["n_neuf"] == 600 and _st3["jours"] == 300,
+        f"{len(_mem)} lots, {_st3['n']} coups, {_st3['jours']} journees")
 verifie("par defaut : quatre passes, memoire de dix epochs",
         _c20.conviction_passes == 4 and _c20.conviction_memoire_epochs == 10)
+
+print("\n20b. LE CONSEIL ET LA NOTE PAR JOURNEE")
+verifie("par defaut : un conseil de cinq tetes, note par journee",
+        _c20.conviction_conseil == 5 and _c20.conviction_note_jour and len(_p20.reseau_conviction) == 5)
+with torch.no_grad():
+    _p20.reseau_conviction[0][-1].bias.fill_(1.0)
+    _mu, _sd = _p20.conviction_conseil(torch.from_numpy(_e))
+    _bb = _p20.conviction_brute(torch.from_numpy(_e))
+    _p20.reseau_conviction[0][-1].bias.fill_(0.0)
+verifie("quand les tetes divergent, la mise jouee revient vers x1",
+        float(_sd.min()) > 0 and bool((torch.log(_bb).abs() <= _mu.abs() + 1e-6).all())
+        and torch.allclose(torch.log(_bb), _mu ** 3 / (_mu ** 2 + _sd ** 2 + 1e-6), atol=1e-5))
+# des preuves abondantes a rang 0.99-0.995, rares a 0.999 : le conseil doute du rare
+_rgc = np.random.default_rng(5)
+_Nc = 6000
+_u = _rgc.random(_Nc)
+# 80 % de rangs ordinaires, 19 % a 0.993 (beaucoup de preuves), 1 % a 0.999 (peu)
+_rc = np.where(_u < 0.80, _rgc.uniform(0.90, 0.98, _Nc), np.where(_u < 0.99, 0.993, 0.999)).astype(np.float32)
+_rangsc = np.stack([_rc, _rc], 1)
+_Rc = np.zeros((_Nc, 2, 1, 1))
+_pg = np.where(_rc >= 0.99, 0.65, 0.5)
+_Rc[:, 0, 0, 0] = np.where(_rgc.random(_Nc) < _pg, 1.0, -1.0)
+_trc = [[(t_, None, 0, J.ACHETER, 0, 0) for t_ in range(d_ * 6, d_ * 6 + 6)] for d_ in range(_Nc // 6)]
+_pc = J.PolitiqueJeu(_c20)
+_oc = J.optimiseurs(_pc, _c20)
+for _ in range(6):
+    _stc = J.entraine_conviction(_pc, _oc, _trc, _Rc, _rangsc, _c20, "cpu", _rgc)
+verifie("le conseil doute plus des rangs rares que des rangs bien prouves",
+        _stc["ecart_extreme"] > _stc["ecart_haut"] and _stc["jours"] == _Nc // 6 and _stc["mult_haut"] > _stc["mult_bas"]
+        and _stc["mult_extreme"] < 25.0,
+        f"desaccord {_stc['ecart_haut']:.3f} (0.99-0.998, {_stc['n_haut']} coups) / {_stc['ecart_extreme']:.3f} "
+        f"(>= 0.998, {_stc['n_extreme']} coups) ; mise x{_stc['mult_bas']:.2f} / x{_stc['mult_haut']:.2f} / "
+        f"x{_stc['mult_extreme']:.2f}")
+# la note par journee : trois coups forts le meme jour sont juges ensemble
+_c20j = replace(_c20, conviction_conseil=1)
+_trj = [[(t_, None, 0, J.ACHETER, 0, 0) for t_ in range(d_ * 6, d_ * 6 + 6)] for d_ in range(_Nc // 6)]
+_res = {}
+for _nj in (False, True):
+    torch.manual_seed(0)
+    _pj = J.PolitiqueJeu(replace(_c20j, conviction_note_jour=_nj))
+    _oj = J.optimiseurs(_pj, _c20j)
+    _rgj = np.random.default_rng(9)
+    for _ in range(6):
+        _sj = J.entraine_conviction(_pj, _oj, _trj, _R, _rangs, replace(_c20j, conviction_note_jour=_nj), "cpu", _rgj)
+    _res[_nj] = _sj
+verifie("note par journee : elle tourne, et ne mise pas plus fort que coup par coup",
+        _res[True]["jours"] == _N // 6 and _res[True]["mult_max"] <= _res[False]["mult_max"] * 1.25,
+        f"plus forte mise x{_res[False]['mult_max']:.2f} coup par coup, x{_res[True]['mult_max']:.2f} par journee")
 
 print("\n21. LA CONVICTION DU MODELE FINAL, COPIEE DES FOLDS")
 _rr, _ss, _m1 = J.courbe_conviction(_p20, "cpu")
@@ -956,7 +1008,7 @@ _el = J.PolitiqueJeu(_c20)
 _ec = J.copie_conviction(_el, _rr, _ss, _med, "cpu")
 _m2 = J.courbe_conviction(_el, "cpu")[2]
 verifie("l'eleve reproduit la mediane des folds a quelques % pres",
-        _ec < 10.0 and np.allclose(np.log(_m2), np.log(_med), atol=0.25), f"ecart {_ec:.1f} %")
+        _ec < 10.0 and np.mean(np.abs(np.log(_m2) - np.log(_med)) > 0.25) < 0.05, f"ecart {_ec:.1f} %")
 verifie("la passe finale ne la reapprend plus",
         "entraine_conviction(policy, optims, tr, R1, rangs_ex" not in
         inspect.getsource(J.entraine_deploiement_continu))

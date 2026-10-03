@@ -147,7 +147,13 @@ bougie. Depuis le run m5_32, elle apprend sur une **mémoire** des trades des
 et son multiplicateur est **divisé par sa moyenne** : elle ne décide plus que
 la répartition du risque entre les trades, jamais son niveau. Au m5_31, elle
 plafonnait à ×2,4 sur les trades sûrs faute d'apprentissage, et son niveau
-oscillait de ×0,7 à ×2,5. La mise de base est fixe (1 %, le R du jeu) ; le
+oscillait de ×0,7 à ×2,5. Depuis le run m5_33 : un **conseil de 5 têtes**,
+chacune apprise sur ses propres journées ; la mise jouée est leur avis commun
+ramené vers ×1 selon leur désaccord (peu de preuves → mise normale), et la
+tête est **notée par journée** (les trades d'un même jour comptent ensemble).
+Au m5_32, 59 trades du test du bloc 1 avaient risqué plus de 5 % du compte
+(jusqu'à 12 %), presque tous à des rangs extrêmes et en grappes. La mise de
+base est fixe (1 %, le R du jeu) ; le
 budget de baisse (m5_28) est coupé. La veille affiche, par tranche de rang,
 le multiplicateur choisi et le profit factor en validation.
 
@@ -301,7 +307,8 @@ les têtes de mise en ont besoin. Les runs fournissent toujours les prix.
 | m5_29 | tête de conviction : multiplicateur ×0,5 à ×4 appris sur le rang de l'expert, budget moyen constant | arrêté au bloc 1 (erreur pendant les mois), remplacé par la version continue |
 | m5_30 | conviction continue : multiplicateur libre ×0,1 à ×25, demi-Kelly, budget moyen constant | arrêté aux premières epochs : le modèle final réapprenait la conviction sur l'expert final |
 | m5_31 | conviction continue, celle du modèle final copiée de la médiane des 10 folds | bloc 1 : validation +1,72 $/jour moyen à frais pleins, test **+6,39 $/jour** (+2 120,83 $, PF 1,40, win rate 76 %, pire baisse −13,2 %) ; arrêté au bloc 2 pour le m5_32 |
-| m5_32 | conviction avec mémoire de 10 epochs, 4 passes, niveau fixe (divisé par la moyenne) | en cours |
+| m5_32 | conviction avec mémoire de 10 epochs, 4 passes, niveau fixe (divisé par la moyenne) | bloc 1 : meilleure validation +9,02 $/jour ; test +4,64 $/jour (+1 541,63 $, PF 1,29), pire baisse −36,1 % (59 trades au-dessus de 5 % du compte) ; arrêté |
+| m5_33 | conseil de 5 têtes (mise ramenée vers ×1 selon le désaccord), note par journée | en cours |
 
 Ce que les mesures ont établi :
 - le signal du BTC M5 vient du flux Binance, de l'écart Coinbase, du

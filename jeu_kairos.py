@@ -215,7 +215,10 @@ class JeuConfig:
     # `conviction_memoire_epochs`. Le run m5_31 : prefixe
     # kairos_jeu_m5_31_conviction_folds, conviction_passes 2, sans memoire,
     # niveau tenu par un prix du risque.
-    prefixe: str = "kairos_jeu_m5_32_conviction_memoire"
+    # LE CONSEIL DES TETES ET LA NOTE PAR JOURNEE (run m5_33) : voir
+    # `conviction_conseil`. Le run m5_32 : prefixe
+    # kairos_jeu_m5_32_conviction_memoire, une seule tete notee coup par coup.
+    prefixe: str = "kairos_jeu_m5_33_conseil_journee"
     # Reproduction demandee du run M5_03, avant les corrections de deroulement
     # et de compte introduites dans la version 2.
     # La version 2 rejoue l'equite, la marge et les positions ouvertes : elle
@@ -605,6 +608,29 @@ class JeuConfig:
     #    prix du risque, plus d'oscillation.
     conviction_passes: int = 4
     conviction_memoire_epochs: int = 10
+    # LE CONSEIL ET LA JOURNEE — 2026-10-03 (run m5_33), demande du
+    # proprietaire : pas de plafond dur, autre chose. Au test du bloc 1 du
+    # run m5_32 (+4.64 $/jour, pire baisse -36 %), 59 coups ont risque plus
+    # de 5 % du compte (jusqu'a 12 %). Ils gagnaient en moyenne (R +0.141),
+    # mais : presque tous a des rangs extremes de l'expert (mediane 0.9985,
+    # mises x6 a x10), la ou la memoire a le moins de coups ; et en grappes
+    # (12 journees avec 2 ou 3 de ces coups).
+    # 1. LE CONSEIL : `conviction_conseil` tetes, chacune apprise sur SES
+    #    journees de la memoire, sans recouvrement (chaque journee est donnee
+    #    a une seule tete, au hasard, a son entree en memoire) : leurs erreurs
+    #    sont independantes, leur desaccord mesure le manque de preuves. La mise jouee est
+    #    leur avis commun RAMENE VERS x1 selon leur desaccord : en log,
+    #    moyenne x moyenne^2 / (moyenne^2 + ecart^2). Ou les preuves abondent,
+    #    elles s'accordent et la mise est pleine ; ou elles sont rares, elles
+    #    divergent et la mise revient vers la mise normale (ni x10, ni x0.01).
+    #    Elle s'ecarte de x1 d'elle-meme quand la memoire grossit.
+    # 2. LA NOTE PAR JOURNEE (`conviction_note_jour`) : la croissance comptee
+    #    sur la journee entiere, toutes ses mises additionnees,
+    #    log(1 + mise x somme(m x R)). Trois coups a x6 le meme jour sont
+    #    juges ensemble, comme ils gagnent ou perdent souvent ensemble.
+    # Aucune limite fixe : un coup isole, bien prouve, peut etre mise x10.
+    conviction_conseil: int = 5
+    conviction_note_jour: bool = True
     # DEUX NOTES SEPAREES — 2026-10-02 (run m5_20), demande du proprietaire :
     # garder le signal d'achat et de vente, et la prise de risque au-dela de
     # 1 %, sans que le compte finisse ruine. Au run m5_19, une seule note (le
@@ -1018,10 +1044,14 @@ class PolitiqueJeu(SAINTPolicySingleHead):
                                 and all(bool(getattr(cfg, f"apprendre_{n}", False))
                                         for n in ("lot", "risque", "allocation", "confiance")))
         if self.tete_conviction:
-            self.reseau_conviction = nn.Sequential(nn.Linear(2, 32), nn.GELU(), nn.Linear(32, 32),
-                                                   nn.GELU(), nn.Linear(32, 1))
-            nn.init.zeros_(self.reseau_conviction[-1].weight)
-            nn.init.zeros_(self.reseau_conviction[-1].bias)
+            # LE CONSEIL : plusieurs tetes identiques, voir `conviction_conseil`
+            def _tete_conviction():
+                t_ = nn.Sequential(nn.Linear(2, 32), nn.GELU(), nn.Linear(32, 32), nn.GELU(), nn.Linear(32, 1))
+                nn.init.zeros_(t_[-1].weight)
+                nn.init.zeros_(t_[-1].bias)
+                return t_
+            self.reseau_conviction = nn.ModuleList(
+                [_tete_conviction() for _ in range(max(1, int(getattr(cfg, "conviction_conseil", 1))))])
             # log(multiplicateur) = centre + demi-largeur x tanh(sortie + decalage) :
             # borne en douceur a [min, max], et x1 pour une sortie nulle
             lo, hi = math.log(float(cfg.conviction_min)), math.log(float(cfg.conviction_max))
@@ -1079,11 +1109,24 @@ class PolitiqueJeu(SAINTPolicySingleHead):
         sortie = torch.stack([t(lec(z)) for lec, t in zip(lecteurs, tetes)], 1)
         return sortie[torch.arange(len(k), device=z.device), k]
 
+    def conviction_tete(self, c: torch.Tensor, k: int) -> torch.Tensor:
+        """(B,) : le multiplicateur brut de la tete `k` du conseil, de
+        x`conviction_min` a x`conviction_max`."""
+        g = self.reseau_conviction[k](c).squeeze(-1)
+        return torch.exp(self._conv_c + self._conv_h * torch.tanh(g + self._conv_d))
+
+    def conviction_conseil(self, c: torch.Tensor):
+        """((B,), (B,)) : la moyenne et l'ecart des log-multiplicateurs des
+        tetes du conseil. Voir `conviction_conseil`."""
+        lm = torch.stack([torch.log(self.conviction_tete(c, k)) for k in range(len(self.reseau_conviction))])
+        return lm.mean(0), (lm.std(0, unbiased=False) if len(lm) > 1 else torch.zeros_like(lm[0]))
+
     def conviction_brute(self, c: torch.Tensor) -> torch.Tensor:
         """(B,) : le multiplicateur de conviction avant division par sa
-        moyenne, de x`conviction_min` a x`conviction_max`."""
-        g = self.reseau_conviction(c).squeeze(-1)
-        return torch.exp(self._conv_c + self._conv_h * torch.tanh(g + self._conv_d))
+        moyenne : l'avis du conseil ramene vers x1 selon son desaccord,
+        exp(moyenne x moyenne^2 / (moyenne^2 + ecart^2)) en log."""
+        mu, sd = self.conviction_conseil(c)
+        return torch.exp(mu * mu * mu / (mu * mu + sd * sd + 1e-6))
 
     def conviction(self, c: torch.Tensor) -> torch.Tensor:
         """(B,) : le multiplicateur de conviction joue, a partir de
@@ -1967,72 +2010,111 @@ def entrees_conviction(rang, sens) -> np.ndarray:
 
 def entraine_conviction(policy, optims, trans, R, rangs, cfg, device, rng,
                         memoire=None) -> Dict[str, object]:
-    """La tete de conviction apprend sur les coups joues.
+    """Le conseil des tetes de conviction apprend sur les coups joues.
 
     Pour chaque coup, l'issue R (cout plein) ne depend pas de la mise : la
     croissance du compte qu'aurait donnee n'importe quel multiplicateur m est
-    connue. La tete monte la pente de k x log(1 + mise x m x R / k) / mise
-    (k = `conviction_kelly` : demi-Kelly), ou m est son multiplicateur divise
-    par sa moyenne sur le lot : le risque moyen reste celui de la mise de
-    base, elle n'en decide que la repartition. `memoire` (une file) garde
-    les coups des dernieres epochs ; elle apprend sur tous. Ensuite, sa
-    moyenne sur ces coups devient `conviction_norme`. Seul le groupe
-    « conviction » apprend. Voir `tete_conviction`."""
+    connue. Chaque tete du conseil apprend sur son propre tirage avec remise
+    des JOURNEES de la memoire, et monte la pente de
+    k x log(1 + mise x somme(m x R) / k) / mise, la somme courant sur les
+    coups d'une meme journee (`conviction_note_jour` ; sinon coup par coup),
+    k = `conviction_kelly` (demi-Kelly), m etant divise par sa moyenne sur le
+    lot : le risque moyen reste celui de la mise de base. `memoire` (une file)
+    garde les coups des dernieres epochs. Ensuite, la moyenne de la mise
+    jouee (borne basse du conseil) sur ces coups devient `conviction_norme`.
+    Seul le groupe « conviction » apprend. Voir `tete_conviction` et
+    `conviction_conseil`."""
     if not getattr(policy, "tete_conviction", False) or "conviction" not in optims or rangs is None:
         return {}
-    lignes = [x for ep in (trans or []) for x in ep if x[3] != ATTENDRE]
-    if len(lignes) >= 1:
-        tt = np.asarray([x[0] for x in lignes], np.int64)
-        sens = (np.asarray([x[3] for x in lignes]) == VENDRE).astype(np.int64)
-        ii = np.asarray([x[4] for x in lignes], np.int64)
-        jj = np.asarray([x[5] for x in lignes], np.int64)
-        y = np.asarray(R[tt, sens, ii, jj], np.float64)
-        ok = np.isfinite(y)
-        neuf = (np.asarray(rangs)[tt[ok], sens[ok]].astype(np.float64), sens[ok], np.clip(y[ok], -3.0, 10.0))
-    else:
-        neuf = (np.zeros(0), np.zeros(0, np.int64), np.zeros(0))
+    rg_, sn_, y_, gp_ = [], [], [], []
+    for g_, ep in enumerate(trans or []):
+        for x in ep:
+            if x[3] == ATTENDRE:
+                continue
+            s_ = int(x[3] == VENDRE)
+            v = float(R[x[0], s_, x[4], x[5]])
+            if np.isfinite(v):
+                rg_.append(float(np.asarray(rangs)[x[0], s_]))
+                sn_.append(s_)
+                y_.append(float(np.clip(v, -3.0, 10.0)))
+                gp_.append(g_)
+    gp_ = np.asarray(gp_, np.int64)
+    # chaque journee est confiee a une seule tete du conseil, une fois pour toutes
+    K = len(policy.reseau_conviction)
+    tete_jour = rng.integers(0, K, int(gp_.max()) + 1 if len(gp_) else 0)
+    neuf = (np.asarray(rg_, np.float64), np.asarray(sn_, np.int64), np.asarray(y_, np.float64),
+            gp_, tete_jour[gp_] if len(gp_) else np.zeros(0, np.int64))
     if memoire is not None:
         memoire.append(neuf)
-        lots = list(memoire)
-    else:
-        lots = [neuf]
+    lots = list(memoire) if memoire is not None else [neuf]
     rang = np.concatenate([q[0] for q in lots])
     sens = np.concatenate([q[1] for q in lots])
     y = np.concatenate([q[2] for q in lots])
+    tete = np.concatenate([q[4] for q in lots])
     if len(y) < 64:
         return {}
+    # des journees numerotees de 0 a G-1, contigues
+    gp, base = [], 0
+    for q in lots:
+        if len(q[3]):
+            _, inv = np.unique(q[3], return_inverse=True)
+            gp.append(inv + base)
+            base += int(inv.max()) + 1
+    gp = np.concatenate(gp)
+    if not bool(getattr(cfg, "conviction_note_jour", True)):
+        gp = np.arange(len(y))
+    ordre_j = np.argsort(gp, kind="stable")
+    rang, sens, y, gp, tete = rang[ordre_j], sens[ordre_j], y[ordre_j], gp[ordre_j], tete[ordre_j]
+    G = int(gp.max()) + 1
+    debut = np.searchsorted(gp, np.arange(G))
+    nb = np.bincount(gp, minlength=G)
+    tete_g = tete[debut]                       # la tete de chaque journee
     c = entrees_conviction(rang, sens)
     f = float(cfg.mise_budget)
     k = float(getattr(cfg, "conviction_kelly", 0.5))
     T = lambda z, dt=torch.float32: torch.as_tensor(z, dtype=dt, device=device)
+    C, Y = T(c), T(y)
     opt = optims["conviction"]
     params = list(policy.groupes_jeu()["conviction"])
     pertes = []
-    for _ in range(int(getattr(cfg, "conviction_passes", 4))):
-        ordre = rng.permutation(len(y))
-        for d0 in range(0, len(ordre) - 63, 512):
-            b = ordre[d0:d0 + 512]
-            mb = policy.conviction_brute(T(c[b]))
-            m = mb / mb.mean()
-            u = k * torch.log(torch.clamp(1.0 + f * m * T(y[b]) / k, min=1e-6)) / f
-            # le niveau brut reste pres de 1, loin des bornes de la tete
-            perte = -u.mean() + 0.01 * torch.log(mb.mean()) ** 2
-            opt.zero_grad(set_to_none=True)
-            perte.backward()
-            torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
-            opt.step()
-            pertes.append(float(perte.detach()))
+    par_lot = max(16, int(np.ceil(512 / max(float(nb.mean()), 1.0))))
+    for t_ in range(len(policy.reseau_conviction)):
+        for _ in range(int(getattr(cfg, "conviction_passes", 4))):
+            siennes = np.flatnonzero(tete_g == t_) if len(policy.reseau_conviction) > 1 else np.arange(G)
+            tirage = rng.permutation(siennes)       # les journees de cette tete seule
+            for d0 in range(0, len(tirage), par_lot):
+                gs = tirage[d0:d0 + par_lot]
+                if len(gs) < 4:
+                    continue
+                idx = np.concatenate([np.arange(debut[g], debut[g] + nb[g]) for g in gs])
+                jour = T(np.repeat(np.arange(len(gs)), nb[gs]), torch.long)
+                ib = T(idx, torch.long)
+                mb = policy.conviction_tete(C[ib], t_)
+                m = mb / mb.mean()
+                somme = torch.zeros(len(gs), device=device).index_add(0, jour, f * m * Y[ib])
+                u = k * torch.log(torch.clamp(1.0 + somme / k, min=1e-6)) / f
+                # le niveau brut reste pres de 1, loin des bornes de la tete
+                perte = -u.mean() + 0.01 * torch.log(mb.mean()) ** 2
+                opt.zero_grad(set_to_none=True)
+                perte.backward()
+                torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
+                opt.step()
+                pertes.append(float(perte.detach()))
     with torch.no_grad():
-        mb = policy.conviction_brute(T(c)).cpu().numpy().astype(np.float64)
+        mu, sd = policy.conviction_conseil(C)
+        mb = policy.conviction_brute(C).cpu().numpy().astype(np.float64)
+        sd = sd.cpu().numpy().astype(np.float64)
         policy.conviction_norme.fill_(float(mb.mean()))
     m = mb / mb.mean()
     out = {"perte": float(np.mean(pertes)) if pertes else float("nan"), "n": int(len(y)),
-           "n_neuf": int(len(neuf[2])), "norme": float(mb.mean()),
+           "n_neuf": int(len(neuf[2])), "jours": G, "norme": float(mb.mean()),
            "mult_moyen": float(m.mean()), "mult_max": float(m.max())}
-    for nom, a, z in (("bas", 0.0, 0.98), ("milieu", 0.98, 0.99), ("haut", 0.99, 1.01)):
+    for nom, a, z in (("bas", 0.0, 0.98), ("milieu", 0.98, 0.99), ("haut", 0.99, 0.998), ("extreme", 0.998, 1.01)):
         m_ = (rang >= a) & (rang < z)
         out["mult_" + nom] = float(m[m_].mean()) if m_.any() else float("nan")
         out["R_" + nom] = float(y[m_].mean()) if m_.any() else float("nan")
+        out["ecart_" + nom] = float(sd[m_].mean()) if m_.any() else float("nan")
+        out["n_" + nom] = int(m_.sum())
     return out
 
 
@@ -2066,8 +2148,12 @@ def copie_conviction(policy, rr, ss, cible, device, pas: int = 1500) -> float:
     policy.conviction_norme.fill_(float(np.exp(-(lc.max() + lc.min()) / 2.0)))
     params = list(policy.reseau_conviction.parameters())
     opt = torch.optim.Adam(params, lr=3e-3)
+    yb = y + float(np.log(float(policy.conviction_norme)))
     for _ in range(int(pas)):
-        perte = ((torch.log(policy.conviction(c)) - y) ** 2).mean()
+        # chaque tete du conseil apprend la cible (une formule commune ne
+        # donnerait aucune pente a des tetes identiques)
+        perte = sum(((torch.log(policy.conviction_tete(c, t_)) - yb) ** 2).mean()
+                    for t_ in range(len(policy.reseau_conviction)))
         opt.zero_grad(set_to_none=True)
         perte.backward()
         opt.step()
@@ -2093,7 +2179,9 @@ def mesure_conviction(coups, cfg) -> Dict[str, object]:
     c = np.asarray([q[:ic + 2] for q in c], np.float64)
     R = c[:, 10] / np.maximum(c[:, 8] * c[:, 15] * float(cfg.contrat), 1e-12)
     m, rang = c[:, ic], c[:, ic + 1]
-    out = {"n": int(len(c)), "mult_moyen": float(m.mean())}
+    mise = c[:, 8] * c[:, 15] * float(cfg.contrat) / np.maximum(c[:, 11], 1e-12)
+    out = {"n": int(len(c)), "mult_moyen": float(m.mean()),
+           "part_5pct": float(100 * np.mean(mise > 0.05)), "mise_max": float(100 * mise.max())}
     for nom, a, z in (("bas", 0.0, 0.98), ("milieu", 0.98, 0.99), ("haut", 0.99, 1.01)):
         k = (rang >= a) & (rang < z)
         g, p_ = R[k][R[k] > 0].sum(), -R[k][R[k] < 0].sum()
@@ -3882,13 +3970,16 @@ def main_blocs(cfg: JeuConfig) -> int:
                     _t = lambda q: f"x{q[0]:.2f} PF {q[1]:.2f} ({q[2]:.0f} %)"
                     print(f"  conviction  validation, rang de l'expert < 0.98 : {_t(mc_['bas'])}  |  "
                           f"0.98-0.99 : {_t(mc_['milieu'])}  |  >= 0.99 : {_t(mc_['haut'])}  |  "
-                          f"multiplicateur moyen x{mc_['mult_moyen']:.2f}", flush=True)
+                          f"multiplicateur moyen x{mc_['mult_moyen']:.2f}  |  {mc_['part_5pct']:.1f} % des coups "
+                          f"au-dessus de 5 % du compte, le plus gros {mc_['mise_max']:.1f} %", flush=True)
                 if cvc:
-                    print(f"  conviction  apprise sur {cvc['n']} coups d'entrainement en memoire "
-                          f"({cvc['n_neuf']} nouveaux) : mise "
-                          f"x{cvc['mult_bas']:.2f} / x{cvc['mult_milieu']:.2f} / x{cvc['mult_haut']:.2f} "
-                          f"(R moyen {cvc['R_bas']:+.3f} / {cvc['R_milieu']:+.3f} / {cvc['R_haut']:+.3f})  |  "
-                          f"moyenne x{cvc['mult_moyen']:.2f}, plus forte x{cvc['mult_max']:.2f}", flush=True)
+                    print(f"  conviction  conseil appris sur {cvc['n']} coups en memoire ({cvc['n_neuf']} nouveaux, "
+                          f"{cvc['jours']} journees), rangs < 0.98 / 0.98-0.99 / 0.99-0.998 / >= 0.998 : mise "
+                          f"x{cvc['mult_bas']:.2f} / x{cvc['mult_milieu']:.2f} / x{cvc['mult_haut']:.2f} / "
+                          f"x{cvc['mult_extreme']:.2f}  |  R moyen {cvc['R_bas']:+.3f} / {cvc['R_milieu']:+.3f} / "
+                          f"{cvc['R_haut']:+.3f} / {cvc['R_extreme']:+.3f}  |  desaccord {cvc['ecart_bas']:.2f} / "
+                          f"{cvc['ecart_milieu']:.2f} / {cvc['ecart_haut']:.2f} / {cvc['ecart_extreme']:.2f} "
+                          f"({cvc['n_extreme']} coups >= 0.998)  |  plus forte x{cvc['mult_max']:.2f}", flush=True)
             if getattr(policy, "apprendre_dejavu_meteo", False):
                 md = mesure_dejavu_meteo(cv, cfg, M1)
                 if md:
