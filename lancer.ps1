@@ -34,8 +34,8 @@ if (-not (Test-Path -LiteralPath $python)) {
     exit 1
 }
 
-$journal = Join-Path $PSScriptRoot 'training_esperance.log'
-$prefixe = 'kairos_jeu_m5_26_esperance'
+$journal = Join-Path $PSScriptRoot 'training_dejavu_meteo.log'
+$prefixe = 'kairos_jeu_m5_27_dejavu_meteo'
 # LE JEU DEPUIS LE 2026-09-26 : `jeu_kairos.py` remplace `training.py`.
 $script = 'jeu_kairos.py'
 
@@ -122,7 +122,7 @@ $env:PYTHONIOENCODING = 'utf-8'
 $cmd = "`$env:PYTHONUNBUFFERED='1'; `$env:PYTHONIOENCODING='utf-8'; " +
        "Write-Host '  entrainement en cours - la lecture se fait dans la veille' -ForegroundColor Green; " +
        "Write-Host '  NE PAS FERMER cette fenetre' -ForegroundColor Yellow; " +
-       "cmd /c '$python $script > training_esperance.log 2>&1'"
+       "cmd /c '$python $script > training_dejavu_meteo.log 2>&1'"
 # SANS GUILLEMETS INTERIEURS, et le journal en chemin RELATIF - 2026-09-26.
 # La version precedente citait l'interpreteur et le journal : PowerShell 5.1
 # a retire ces guillemets en passant la commande a `cmd`, et le chemin du
@@ -143,7 +143,7 @@ foreach ($v in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
     Stop-Process -Id $v.ProcessId -Force -ErrorAction SilentlyContinue
 }
 Start-Sleep -Seconds 3
-Start-Process powershell -ArgumentList '-NoExit','-ExecutionPolicy','Bypass','-File','veille_fenetre.ps1','-Journal','training_esperance.log' `
+Start-Process powershell -ArgumentList '-NoExit','-ExecutionPolicy','Bypass','-File','veille_fenetre.ps1','-Journal','training_dejavu_meteo.log' `
     -WorkingDirectory $PSScriptRoot
 Write-Host '  veille ouverte dans sa fenetre' -ForegroundColor Green
 

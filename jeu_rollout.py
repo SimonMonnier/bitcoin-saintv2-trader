@@ -289,6 +289,10 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
         if les is not None:
             pe = les[torch.arange(len(ix), device=device), sens, i, j].float().cpu().numpy()
             base = J.fraction_esperance(pe[:, 0], pe[:, 1], cfg)
+        # LE DEJA-VU ET LA METEO de chaque etat, pour le journal des coups.
+        prev = None
+        if getattr(policy, "apprendre_dejavu_meteo", False):
+            prev = np.stack([q.float().cpu().numpy() for q in policy.dernieres_previsions], 1)
         a, sens, i, j, k, h, u, z, v = [q.cpu().numpy() for q in (a, sens, i, j, k, h, u, z, v)]
         for q, s in enumerate(ix):
             g, tc = int(gg[q]), int(tt[q])
@@ -330,7 +334,8 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
                                float(budget[q]),
                                float(confiance[z[q]] if lc is not None else 1.0))
                              + ((float(pe[q, 0]), float(np.exp(0.5 * np.clip(pe[q, 1], -8, 6))),
-                                 float(base[q])) if les is not None else ()))
+                                 float(base[q])) if les is not None else ())
+                             + ((float(prev[q, 0]), float(prev[q, 1])) if prev is not None else ()))
                 ouverts[s].append((tc + duree, r_pondere, pnl,
                                    marge_requise, float(v[q])))
                 scores[g] += r_pondere

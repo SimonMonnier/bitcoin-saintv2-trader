@@ -768,9 +768,9 @@ _pol16 = J.PolitiqueJeu(_c16)
 verifie("la tete d'objectif a douze choix", _pol16.tete_objectif.out_features == 12)
 
 print("\n17. LA TETE D'ESPERANCE")
-_c17 = J.JeuConfig()
-verifie("par defaut : tete d'esperance, demi-Kelly, multiplicateurs de x0.25 a x2",
-        _c17.apprendre_esperance and _c17.kelly_fraction == 0.5
+_c17 = replace(J.JeuConfig(), apprendre_esperance=True, apprendre_dejavu_meteo=False)
+verifie("la tete d'esperance du run m5_26 : demi-Kelly, x0.25 a x2 ; coupee par defaut depuis le m5_27",
+        _c17.kelly_fraction == 0.5 and not J.JeuConfig().apprendre_esperance
         and abs(_c17.multiplicateurs_lot[0] - 0.25) < 1e-9 and abs(_c17.multiplicateurs_lot[-1] - 2.0) < 1e-9
         and len(_c17.multiplicateurs_lot) == _c17.niveaux_lot)
 _f = J.fraction_esperance(np.array([0.1, -0.2, 0.3]), np.log(np.array([1.0, 1.0, 0.5])), _c17)
@@ -789,6 +789,51 @@ _gt = sum(float(q.grad.abs().sum()) for q in _p17.groupes_jeu()["tronc"] if q.gr
 _ge = sum(float(q.grad.abs().sum()) for q in _p17.groupes_jeu()["esperance"] if q.grad is not None)
 verifie("le mur : la tete d'esperance apprend sans toucher le tronc (le signal)",
         _gt == 0.0 and _ge > 0.0, f"{_gt} {_ge}")
+
+print("\n18. LES TETES DU DEJA-VU ET METEO")
+_c18 = J.JeuConfig()
+verifie("par defaut : deja-vu et meteo, sans esperance", _c18.apprendre_dejavu_meteo
+        and not _c18.apprendre_esperance)
+_h = np.array([10, 11, 12, 13, 14, 15], float)
+_l = _h - 1
+_m = J.cible_meteo(_h, _l, _h, replace(_c18, horizon_max=2))
+verifie("la cible meteo : amplitude des 2 bougies suivantes en log de bps, NaN a la fin",
+        abs(_m[0] - np.log((12 - 10) / 10 * 1e4)) < 1e-4 and abs(_m[3] - np.log((15 - 13) / 13 * 1e4)) < 1e-4
+        and np.isnan(_m[4]) and np.isnan(_m[5]), str(np.round(_m, 3)))
+torch.manual_seed(0)
+_p18 = J.PolitiqueJeu(_c18)
+_p18.eval()
+_x18 = torch.randn(3, _c18.lookback, len(J.colonnes_jeu(_c18)) + _c18.n_expert + J.n_etat(_c18))
+_s18 = _p18.jeu(_x18)
+verifie("huit sorties ; les tetes de mise lisent deux entrees de plus ; previsions gardees",
+        len(_s18) == 8 and _p18.lecteur_lot[0].in_features == _p18.dim_lecture + 3
+        and _p18.lecteur_objectif[0].in_features == _p18.dim_lecture + 1
+        and tuple(_p18.dernieres_previsions[0].shape) == (3,))
+_g18 = _p18.groupes_jeu()
+verifie("deux groupes de plus, disjoints des autres",
+        "dejavu" in _g18 and "meteo" in _g18
+        and len({id(q) for v in _g18.values() for q in v}) == sum(len(v) for v in _g18.values()))
+_mse, _met = _p18.previsions(_p18._lecture_tronc(_x18), _x18)
+(_mse.sum() + _met.sum()).backward()
+_gt = sum(float(q.grad.abs().sum()) for q in _g18["tronc"] if q.grad is not None)
+_gd = sum(float(q.grad.abs().sum()) for n in ("dejavu", "meteo") for q in _g18[n] if q.grad is not None)
+verifie("le mur : les deux tetes apprennent sans toucher le tronc (le signal)", _gt == 0.0 and _gd > 0.0,
+        f"{_gt} {_gd}")
+_p18.zero_grad(set_to_none=True)
+_s18 = _p18.jeu(_x18)
+(_s18[4].sum() + _s18[5].sum() + _s18[6].sum() + _s18[7].sum()).backward()
+_gd = sum(float(q.grad.abs().sum()) for n in ("dejavu", "meteo") for q in _g18[n] if q.grad is not None)
+_gm = sum(float(q.grad.abs().sum()) for q in _g18["lot"] if q.grad is not None)
+verifie("la note des mises ne remonte pas dans les deux tetes", _gd == 0.0 and _gm > 0.0, f"{_gd} {_gm}")
+_c18m = replace(_c18, apprendre_lot=False)
+verifie("sans les quatre tetes de mise, pas de deja-vu ni de meteo",
+        not J.PolitiqueJeu(_c18m).apprendre_dejavu_meteo)
+_coups = [tuple([0, t_, 0, 0, 0, 0.0, 1, 0, 0.1, 1.0, (1.0 if t_ % 3 else -1.0), 1000.0, 0, 0, 0, 10.0,
+                 0, 1, 0, 1, 1]) + (float(t_ % 5), float(t_ % 7)) for t_ in range(50)]
+_md = J.mesure_dejavu_meteo(_coups, _c18, np.arange(60, dtype=float))
+verifie("la mesure : cinq tranches par tete, profit factor et mise",
+        len(_md["dejavu"]["pf"]) == 5 and len(_md["meteo"]["mise"]) == 5 and _md["n"] == 50
+        and abs(_md["dejavu"]["mise"][0] - 0.1) < 1e-9, str(_md["dejavu"]))
 
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)

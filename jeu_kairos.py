@@ -196,7 +196,10 @@ class JeuConfig:
     # prefixe kairos_jeu_m5_24_paires, treize paires.
     # LA TETE D'ESPERANCE (run m5_26) : voir `apprendre_esperance`. Le run
     # m5_25 : prefixe kairos_jeu_m5_25_paires12, apprendre_esperance False.
-    prefixe: str = "kairos_jeu_m5_26_esperance"
+    # LES TETES DU DEJA-VU ET METEO (run m5_27) : voir `apprendre_dejavu_meteo`.
+    # Le run m5_26 : prefixe kairos_jeu_m5_26_esperance, apprendre_esperance
+    # True, apprendre_dejavu_meteo False.
+    prefixe: str = "kairos_jeu_m5_27_dejavu_meteo"
     # Reproduction demandee du run M5_03, avant les corrections de deroulement
     # et de compte introduites dans la version 2.
     # La version 2 rejoue l'equite, la marge et les positions ouvertes : elle
@@ -440,13 +443,47 @@ class JeuConfig:
     # et la confiance aussi (`multiplicateurs_allocation`, `..._confiance`), la
     # tete de risque reste un plafond. Serie noire, marge et lot minimum
     # restent des bornes dures.
-    apprendre_esperance: bool = True
+    #
+    # COUPEE LE 2026-10-03 (run m5_27), demande du proprietaire. Au run m5_26,
+    # bloc 1, la correlation de rang entre sa prediction et le resultat reel en
+    # validation est passee de +0.23 (epoch 2) a -0.11 (epoch 7) : elle
+    # predisait le resultat du coup, c'est-a-dire la direction, ce que le
+    # signal lui-meme ne fait qu'a peine. Voir `apprendre_dejavu_meteo`.
+    apprendre_esperance: bool = False
     kelly_fraction: float = 0.5
     multiplicateurs_lot: Tuple[float, ...] = tuple(
         float(x) for x in np.round(np.geomspace(0.25, 2.0, 20), 4))
     multiplicateurs_allocation: Tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5)
     multiplicateurs_confiance: Tuple[float, ...] = (0.5, 0.75, 1.0, 1.25, 1.5)
     esperance_passes: int = 2
+    # LES TETES DU DEJA-VU ET METEO — 2026-10-03 (run m5_27), demande du
+    # proprietaire : « invente un truc avec des nouvelles tetes ». La tete
+    # d'esperance predisait le resultat du coup et a echoue. Ces deux tetes ne
+    # predisent pas la direction : elles predisent ce qui se prevoit.
+    #
+    # LE DEJA-VU : « ce marche, je l'ai deja vu ? ». La tete reconstitue la
+    # bougie que le modele regarde (ses features de marche et d'expert) a partir
+    # du seul resume qu'en garde le tronc. Sur un marche semblable a
+    # l'entrainement elle y arrive ; sur un marche jamais vu elle se trompe :
+    # son erreur (en log) mesure la nouveaute. Le jeu H1 l'a montre : +447 $ au
+    # fold 1, -441 et -173 $ aux folds 2 et 3, le modele perd quand le marche
+    # change de nature.
+    #
+    # LA METEO : de combien le cours va bouger dans les `horizon_max` bougies
+    # qui suivent (plus haut moins plus bas, en log de bps), quel que soit le
+    # sens. La volatilite vient par vagues : c'est ce qui se prevoit le mieux.
+    # Le cout Vantage est fixe en bps, le mouvement grandit avec elle : les
+    # jours agites, il ne pese presque plus rien.
+    #
+    # Les deux tetes sont DERRIERE LE MUR : elles lisent le tronc detache et
+    # apprennent par leur seule cible (`entraine_dejavu_meteo`), sans toucher
+    # le signal ni sa note. Leurs predictions, normalisees, deviennent deux
+    # ENTREES de plus des quatre tetes de mise, qui apprennent avec la note du
+    # mois a en tirer des mises plus grosses ou plus petites. La veille affiche
+    # le profit factor des coups de validation par tranche de chaque tete.
+    apprendre_dejavu_meteo: bool = True
+    dejavu_meteo_passes: int = 2
+    dejavu_meteo_etats: int = 16384
     # DEUX NOTES SEPAREES — 2026-10-02 (run m5_20), demande du proprietaire :
     # garder le signal d'achat et de vente, et la prise de risque au-dela de
     # 1 %, sans que le compte finisse ruine. Au run m5_19, une seule note (le
@@ -797,9 +834,19 @@ class PolitiqueJeu(SAINTPolicySingleHead):
             mlp_dim=cfg.mlp_dim, lecture="colonnes", dropout=0.05, ff_mult=2,
             max_len=cfg.lookback, n_actions=N_ACTIONS, n_ref=0)
         dl = self.dim_lecture
+        # LES TETES DU DEJA-VU ET METEO. Voir `apprendre_dejavu_meteo`. Elles
+        # ne servent qu'avec les quatre tetes de mise, dont elles nourrissent
+        # l'entree, et sur un seul marche.
+        _marches = tuple(getattr(cfg, "marches", ()))
+        self.apprendre_dejavu_meteo = (
+            bool(getattr(cfg, "apprendre_dejavu_meteo", False))
+            and not (len(_marches) > 1 and getattr(cfg, "tetes_par_marche", False))
+            and all(bool(getattr(cfg, f"apprendre_{n}", False))
+                    for n in ("lot", "risque", "allocation", "confiance")))
+        n_prev = 2 if self.apprendre_dejavu_meteo else 0
 
-        def _lecteur():
-            return nn.Sequential(nn.Linear(dl + 1, cfg.mlp_dim), nn.GELU(),
+        def _lecteur(extra=0):
+            return nn.Sequential(nn.Linear(dl + 1 + extra, cfg.mlp_dim), nn.GELU(),
                                  nn.Linear(cfg.mlp_dim, 64), nn.GELU())
         self.lecteur_objectif = _lecteur()
         self.tete_objectif = nn.Linear(64, len(cfg.tp_atr))
@@ -807,19 +854,19 @@ class PolitiqueJeu(SAINTPolicySingleHead):
         self.tete_stop = nn.Linear(64, len(cfg.sl_atr))
         self.apprendre_lot = bool(getattr(cfg, "apprendre_lot", False))
         if self.apprendre_lot:
-            self.lecteur_lot = _lecteur()
+            self.lecteur_lot = _lecteur(n_prev)
             self.tete_lot = nn.Linear(64, int(cfg.niveaux_lot))
         self.apprendre_risque = bool(getattr(cfg, "apprendre_risque", False))
         if self.apprendre_risque:
-            self.lecteur_risque = _lecteur()
+            self.lecteur_risque = _lecteur(n_prev)
             self.tete_risque = nn.Linear(64, len(cfg.niveaux_risque_pct))
         self.apprendre_allocation = bool(getattr(cfg, "apprendre_allocation", False))
         if self.apprendre_allocation:
-            self.lecteur_allocation = _lecteur()
+            self.lecteur_allocation = _lecteur(n_prev)
             self.tete_allocation = nn.Linear(64, len(cfg.niveaux_allocation_pct))
         self.apprendre_confiance = bool(getattr(cfg, "apprendre_confiance", False))
         if self.apprendre_confiance:
-            self.lecteur_confiance = _lecteur()
+            self.lecteur_confiance = _lecteur(n_prev)
             self.tete_confiance = nn.Linear(64, len(cfg.niveaux_confiance_pct))
         # LA TETE D'ESPERANCE. Voir `apprendre_esperance`.
         # Elle ne sert qu'avec les quatre tetes de mise, qu'elle remet au centre.
@@ -832,6 +879,17 @@ class PolitiqueJeu(SAINTPolicySingleHead):
             self.tete_esperance = nn.Linear(64, 2 * self.k_objectifs * self.k_stops)
             nn.init.zeros_(self.tete_esperance.weight)
             nn.init.zeros_(self.tete_esperance.bias)
+        if self.apprendre_dejavu_meteo:
+            # elles lisent le tronc seul, sans le sens
+            def _lecteur_nu():
+                return nn.Sequential(nn.Linear(dl, cfg.mlp_dim), nn.GELU(),
+                                     nn.Linear(cfg.mlp_dim, 64), nn.GELU())
+            self.n_vu = len(colonnes_jeu(cfg)) + int(cfg.n_expert)
+            self.lecteur_dejavu, self.tete_dejavu = _lecteur_nu(), nn.Linear(64, self.n_vu)
+            self.lecteur_meteo, self.tete_meteo = _lecteur_nu(), nn.Linear(64, 1)
+            # moyenne et ecart du deja-vu, puis de la meteo, sur l'entrainement ;
+            # le dernier vaut 1 une fois mesures. Ils voyagent avec le modele.
+            self.register_buffer("norme_previsions", torch.tensor([0.0, 1.0, 0.0, 1.0, 0.0]))
         # LE MUR des tetes de mise. Voir `mur_mise`.
         self.mur_mise = bool(getattr(cfg, "mur_mise", False))
         for m in list(self.lecteur_objectif) + list(self.lecteur_stop):
@@ -881,6 +939,26 @@ class PolitiqueJeu(SAINTPolicySingleHead):
         sortie = torch.stack([t(lec(z)) for lec, t in zip(lecteurs, tetes)], 1)
         return sortie[torch.arange(len(k), device=z.device), k]
 
+    def previsions(self, zn: torch.Tensor, x: torch.Tensor):
+        """(erreur de reconstitution (B,), meteo predite (B,)) a partir du
+        tronc DETACHE. Voir `apprendre_dejavu_meteo`."""
+        zd = zn.detach()
+        rec = self.tete_dejavu(self.lecteur_dejavu(zd))
+        mse = ((rec - x[:, -1, :self.n_vu]) ** 2).mean(-1)
+        met = self.tete_meteo(self.lecteur_meteo(zd)).squeeze(-1)
+        return mse, met
+
+    def entrees_mise(self, zn: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """(B, 2) : le deja-vu et la meteo normalises, tels que les lisent les
+        tetes de mise. Ils sont aussi gardes dans `dernieres_previsions` (deja-vu
+        en log, meteo en log de bps) pour le journal des coups et le live."""
+        with torch.no_grad():
+            mse, met = self.previsions(zn, x)
+            vu = torch.log(mse + 1e-6)
+            self.dernieres_previsions = (vu, met)
+            pn = self.norme_previsions
+            return torch.stack([(vu - pn[0]) / pn[1], (met - pn[2]) / pn[3]], -1).clamp(-5.0, 5.0)
+
     def jeu(self, x: torch.Tensor):
         """(logits d'entree (B,3), valeur (B,), objectif (B,2,K), stop (B,2,K)).
 
@@ -927,22 +1005,27 @@ class PolitiqueJeu(SAINTPolicySingleHead):
         un = torch.ones_like(la)
         zl, zs = torch.cat([zn, un], -1), torch.cat([zn, -un], -1)
         zlm, zsm = (zl.detach(), zs.detach()) if self.mur_mise else (zl, zs)
+        # les tetes de mise lisent en plus le deja-vu et la meteo
+        zlq, zsq = zlm, zsm
+        if self.apprendre_dejavu_meteo:
+            f = self.entrees_mise(zn, x)
+            zlq, zsq = torch.cat([zlm, f], -1), torch.cat([zsm, f], -1)
         ltp = torch.stack([self.tete_objectif(self.lecteur_objectif(zl)),
                            self.tete_objectif(self.lecteur_objectif(zs))], 1)
         lsl = torch.stack([self.tete_stop(self.lecteur_stop(zl)),
                            self.tete_stop(self.lecteur_stop(zs))], 1)
         if self.apprendre_lot:
-            llo = torch.stack([self.tete_lot(self.lecteur_lot(zlm)),
-                               self.tete_lot(self.lecteur_lot(zsm))], 1)
+            llo = torch.stack([self.tete_lot(self.lecteur_lot(zlq)),
+                               self.tete_lot(self.lecteur_lot(zsq))], 1)
             if self.apprendre_risque:
-                lri = torch.stack([self.tete_risque(self.lecteur_risque(zlm)),
-                                   self.tete_risque(self.lecteur_risque(zsm))], 1)
+                lri = torch.stack([self.tete_risque(self.lecteur_risque(zlq)),
+                                   self.tete_risque(self.lecteur_risque(zsq))], 1)
                 if self.apprendre_allocation:
-                    lal = torch.stack([self.tete_allocation(self.lecteur_allocation(zlm)),
-                                       self.tete_allocation(self.lecteur_allocation(zsm))], 1)
+                    lal = torch.stack([self.tete_allocation(self.lecteur_allocation(zlq)),
+                                       self.tete_allocation(self.lecteur_allocation(zsq))], 1)
                     if self.apprendre_confiance:
-                        lco = torch.stack([self.tete_confiance(self.lecteur_confiance(zlm)),
-                                           self.tete_confiance(self.lecteur_confiance(zsm))], 1)
+                        lco = torch.stack([self.tete_confiance(self.lecteur_confiance(zlq)),
+                                           self.tete_confiance(self.lecteur_confiance(zsq))], 1)
                         if self.apprendre_esperance:
                             # (B, sens, objectif, stop, [moyenne, log-variance])
                             les = torch.stack([self.tete_esperance(self.lecteur_esperance(zlm)),
@@ -986,6 +1069,9 @@ class PolitiqueJeu(SAINTPolicySingleHead):
             **({"confiance": _p(self.lecteur_confiance, self.tete_confiance)} if self.apprendre_confiance else {}),
             **({"esperance": _p(self.lecteur_esperance, self.tete_esperance)}
                if getattr(self, "apprendre_esperance", False) else {}),
+            **({"dejavu": _p(self.lecteur_dejavu, self.tete_dejavu),
+                "meteo": _p(self.lecteur_meteo, self.tete_meteo)}
+               if getattr(self, "apprendre_dejavu_meteo", False) else {}),
             "valeur": _p(self.mlp, self.critic),
             "tronc": _p(self.embed, self.col_emb, *self.blocks, self.norm)
                      + [self.cls],
@@ -1602,6 +1688,118 @@ def mesure_esperance(coups) -> Tuple[float, float]:
     reel = c[:, 10] / np.maximum(prevue, 1e-12)
     rho = pd.Series(c[:, 21]).corr(pd.Series(reel), method="spearman")
     return float(rho), float(100 * np.mean(c[:, 23]))
+
+
+def cible_meteo(h, l, c, cfg) -> np.ndarray:
+    """La cible de la tete meteo : log de l'amplitude (plus haut moins plus
+    bas) des `horizon_max` bougies qui suivent, en bps du cours. NaN la ou
+    l'avenir manque. Voir `apprendre_dejavu_meteo`."""
+    H = int(cfg.horizon_max)
+    hi = pd.Series(np.asarray(h, np.float64)).rolling(H, min_periods=H).max().shift(-H).to_numpy()
+    lo = pd.Series(np.asarray(l, np.float64)).rolling(H, min_periods=H).min().shift(-H).to_numpy()
+    amp = (hi - lo) / np.asarray(c, np.float64) * 1e4
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.log(np.maximum(amp, 1e-3)).astype(np.float32)
+
+
+def entraine_dejavu_meteo(policy, optims, trans, Xn, meteo, cfg, device, rng) -> Dict[str, float]:
+    """Les tetes du deja-vu et meteo apprennent sur les etats d'entrainement.
+
+    Deja-vu : reconstituer la bougie regardee (erreur quadratique). Meteo :
+    l'amplitude a venir (`cible_meteo`, erreur quadratique). Le tronc est lu
+    sans gradient ; seuls les groupes « dejavu » et « meteo » apprennent.
+    Ensuite, la normalisation que lisent les tetes de mise est remesuree sur
+    ces etats (moyenne glissante). Voir `apprendre_dejavu_meteo`."""
+    if not getattr(policy, "apprendre_dejavu_meteo", False) or "dejavu" not in optims:
+        return {}
+    lignes = [x for ep in (trans or []) for x in ep]
+    if len(lignes) < 64:
+        return {}
+    pick = rng.choice(len(lignes), size=min(len(lignes), int(cfg.dejavu_meteo_etats)), replace=False)
+    tt = np.asarray([lignes[k][0] for k in pick], np.int64)
+    et = np.stack([lignes[k][1] for k in pick]).astype(np.float32)
+    ym = np.asarray(meteo[tt], np.float32)
+    okm = np.isfinite(ym)
+    if float(policy.norme_previsions[4]) < 0.5 and okm.any():
+        # la meteo part du mouvement moyen, pas de zero (sa cible vaut ~6)
+        with torch.no_grad():
+            policy.tete_meteo.bias.fill_(float(ym[okm].mean()))
+    ym = np.nan_to_num(ym)
+    T = lambda z, dt=torch.float32: torch.as_tensor(z, dtype=dt, device=device)
+    noms = ("dejavu", "meteo")
+    params = [q for n in noms for q in policy.groupes_jeu()[n]]
+    policy.eval()   # le tronc est seulement lu : pas de dropout
+    pv, pm = [], []
+    for _ in range(int(getattr(cfg, "dejavu_meteo_passes", 2))):
+        ordre = rng.permutation(len(tt))
+        for d0 in range(0, len(ordre), 512):
+            b = ordre[d0:d0 + 512]
+            x = T(observations(Xn, tt[b], et[b], int(cfg.lookback)))
+            with torch.no_grad():
+                zn = policy._lecture_tronc(x)
+            mse, met = policy.previsions(zn, x)
+            perte_vu = mse.mean()
+            m = T(okm[b], torch.bool)
+            perte_met = ((met - T(ym[b])) ** 2)[m].mean() if bool(m.any()) else met.sum() * 0.0
+            for n in noms:
+                optims[n].zero_grad(set_to_none=True)
+            (perte_vu + perte_met).backward()
+            torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
+            for n in noms:
+                optims[n].step()
+            pv.append(float(perte_vu.detach()))
+            pm.append(float(perte_met.detach()))
+    # la normalisation des entrees des tetes de mise
+    vus, mets = [], []
+    with torch.no_grad():
+        for d0 in range(0, len(tt), 1024):
+            x = T(observations(Xn, tt[d0:d0 + 1024], et[d0:d0 + 1024], int(cfg.lookback)))
+            mse, met = policy.previsions(policy._lecture_tronc(x), x)
+            vus.append(torch.log(mse + 1e-6).cpu().numpy())
+            mets.append(met.cpu().numpy())
+    vus, mets = np.concatenate(vus), np.concatenate(mets)
+    neuf = torch.tensor([vus.mean(), vus.std() + 1e-6, mets.mean(), mets.std() + 1e-6, 1.0],
+                        dtype=policy.norme_previsions.dtype, device=policy.norme_previsions.device)
+    if float(policy.norme_previsions[4]) > 0.5:
+        neuf = 0.7 * policy.norme_previsions + 0.3 * neuf
+    policy.norme_previsions.copy_(neuf)
+    var = float(np.var(ym[okm])) if okm.any() else float("nan")
+    return {"perte_vu": float(np.mean(pv)), "perte_meteo": float(np.mean(pm)),
+            "r2_meteo": 1.0 - float(np.mean(pm[-max(1, len(pm) // 2):])) / max(var, 1e-9),
+            "n": int(len(tt))}
+
+
+def index_dejavu_meteo(cfg) -> int:
+    """La place du deja-vu dans un coup du jeu (la meteo suit)."""
+    return 24 if bool(getattr(cfg, "apprendre_esperance", False)) else 21
+
+
+def mesure_dejavu_meteo(coups, cfg, meteo=None) -> Dict[str, object]:
+    """Sur des coups du jeu : le profit factor, la mise et le nombre de coups
+    par quintile du deja-vu (du plus familier au plus nouveau) et de la meteo
+    (du plus calme au plus agite), plus la correlation de rang entre la meteo
+    predite et l'amplitude reelle qui a suivi (`meteo`)."""
+    i0 = index_dejavu_meteo(cfg)
+    c = [q for q in coups if len(q) > i0 + 1]
+    if len(c) < 25:
+        return {}
+    c = np.asarray([q[:i0 + 2] for q in c], np.float64)
+    r = c[:, 10] / np.maximum(c[:, 8] * c[:, 15], 1e-12)
+    mise = 100 * c[:, 8] * c[:, 15] / np.maximum(c[:, 11], 1e-12)
+    out = {"n": int(len(c))}
+    for nom, col in (("dejavu", c[:, i0]), ("meteo", c[:, i0 + 1])):
+        pf, mi = [], []
+        for part in np.array_split(np.argsort(col, kind="stable"), 5):
+            g, p = r[part][r[part] > 0].sum(), -r[part][r[part] < 0].sum()
+            pf.append(float(g / p) if p > 0 else float("inf"))
+            mi.append(float(mise[part].mean()))
+        out[nom] = {"pf": pf, "mise": mi}
+    if meteo is not None:
+        reel = np.asarray(meteo, np.float64)[c[:, 1].astype(np.int64)]
+        ok = np.isfinite(reel)
+        out["rho_meteo"] = (float(pd.Series(c[ok, i0 + 1]).corr(pd.Series(reel[ok]), method="spearman"))
+                            if ok.sum() > 10 else float("nan"))
+    return out
 
 
 def plafond_serie_noire(cfg) -> float:
@@ -2430,6 +2628,10 @@ def ecrit_trades_csv(path: str, coups, temps, cfg: JeuConfig, *, epoch: int, pha
         "esperance_moyenne": c[:, 21] if c.shape[1] > 23 else np.nan,
         "esperance_ecart": c[:, 22] if c.shape[1] > 23 else np.nan,
         "mise_base_pct": 100 * c[:, 23] if c.shape[1] > 23 else np.nan,
+        "dejavu_log_erreur": (c[:, index_dejavu_meteo(cfg)]
+                              if c.shape[1] > index_dejavu_meteo(cfg) + 1 else np.nan),
+        "meteo_log_amplitude_bps": (c[:, index_dejavu_meteo(cfg) + 1]
+                                    if c.shape[1] > index_dejavu_meteo(cfg) + 1 else np.nan),
         "equite_apres_usd": np.maximum(0.0, c[:, 11] + c[:, 10]),
         "score_R": c[:, 5],
     })
@@ -2981,6 +3183,11 @@ def entraine_deploiement_continu(cfg, d, X, y_ex, toutes, o, h, l, c, sp, atr,
     optims = optimiseurs(policy, cfg)
     pos = coups_expert_predits(toutes, pred, D1, fin, cfg)
     imite_expert(policy, optims, pos, toutes, X_final, fin, cfg, device, rng)
+    # LES TETES DU DEJA-VU ET METEO de l'eleve apprennent avant qu'il n'imite
+    # les mises des professeurs, puis a chaque passe PPO.
+    M_final = cible_meteo(h, l, c, cfg)
+    etats_prof = [[(int(t_), e_) for t_, e_ in zip(p["t"], p["etat"])] for p in paquets]
+    entraine_dejavu_meteo(policy, optims, etats_prof, X_final, M_final, cfg, device, rng)
     distille_ensemble_folds(policy, optims, paquets, X_final, cfg, device, rng)
 
     # Une passe PPO qui couvre toutes les journees : contrairement a l'ancien
@@ -2993,6 +3200,7 @@ def entraine_deploiement_continu(cfg, d, X, y_ex, toutes, o, h, l, c, sp, atr,
                              collecte=True, rangs=rangs_ex, marge=marge)
         stats = maj_ppo(policy, optims, avantages(tr, cfg), X_final, cfg, device, rng)
         entraine_esperance(policy, optims, tr, X_final, R1, cfg, device, rng)
+        entraine_dejavu_meteo(policy, optims, tr, X_final, M_final, cfg, device, rng)
         print(f"DEPLOY ENSEMBLE PPO {numero:02d}/{len(fragments):02d}  "
               f"{len(jours)} parties  kl {stats['kl']:+.4f}  v {stats['v']:.4f}", flush=True)
 
@@ -3106,6 +3314,7 @@ def main_blocs(cfg: JeuConfig) -> int:
     marge = fraction_marge(c, atr, cfg)
     R0, D0, S0 = table_coups(o, h, l, sp, atr, cfg, 0.0)
     R1, D1, S1 = table_coups(o, h, l, sp, atr, cfg, 1.0)
+    M1 = cible_meteo(h, l, c, cfg)
     y_ex = cibles_expert(R1, cfg)
     toutes = parties(d["time"], 0, N, cfg)
     purge = purge_barres(cfg)
@@ -3178,6 +3387,7 @@ def main_blocs(cfg: JeuConfig) -> int:
             t_ep = time.time()
             frac = min(1.0, max(0.0, (epoch - 1) / cfg.rampe_cout)) if cfg.rampe_cout > 0 else 1.0
             st = None
+            dm = {}
             if epoch >= 1:
                 Rf, Df, Sf = table_a_cout(frac, (R0, D0, S0), (R1, D1, S1),
                                          lambda f: table_coups(o, h, l, sp, atr, cfg, f))
@@ -3192,6 +3402,8 @@ def main_blocs(cfg: JeuConfig) -> int:
                              mode="signal" if mois_on else "tout")
                 # LA TETE D'ESPERANCE apprend le vrai resultat des coups joues.
                 es = entraine_esperance(policy, optims, tr, Xk, R1, cfg, device, rng)
+                # LES TETES DU DEJA-VU ET METEO, sur les etats de ces journees.
+                dm = entraine_dejavu_meteo(policy, optims, tr, Xk, M1, cfg, device, rng)
                 if mois_on:
                     # LES MOIS : seules les tetes de mise apprennent. Voir
                     # `note_mise_mois`.
@@ -3232,6 +3444,21 @@ def main_blocs(cfg: JeuConfig) -> int:
             etat = {"modele": policy.state_dict(), "config": asdict(cfg), "epoch": epoch,
                     "bloc": k + 1, "pipeline": pipeline_ref}
             torch.save(etat, f"last_{cfg.prefixe}{suffixe}.pth")
+            if getattr(policy, "apprendre_dejavu_meteo", False):
+                md = mesure_dejavu_meteo(cv, cfg, M1)
+                if md:
+                    _f = lambda v: "  ".join("inf" if not np.isfinite(x) else f"{x:.2f}" for x in v)
+                    appris = (f"erreur d'apprentissage {dm['perte_vu']:.3f}"
+                              if epoch >= 1 and dm else "pas encore appris")
+                    print(f"  deja-vu  PF par tranche, du plus familier au plus nouveau : "
+                          f"{_f(md['dejavu']['pf'])}  |  mise {_f(md['dejavu']['mise'])} %  |  "
+                          f"{appris}", flush=True)
+                    appris = (f"R2 a l'entrainement {dm['r2_meteo']:+.2f}"
+                              if epoch >= 1 and dm else "pas encore appris")
+                    print(f"  meteo  PF par tranche, du plus calme au plus agite : "
+                          f"{_f(md['meteo']['pf'])}  |  mise {_f(md['meteo']['mise'])} %  |  "
+                          f"prevision / mouvement reel en validation {md['rho_meteo']:+.2f}  |  "
+                          f"{appris}", flush=True)
             if bool(getattr(cfg, "apprendre_esperance", False)):
                 rho, base = mesure_esperance(cv)
                 print(f"  esperance  correlation prediction / resultat en validation {rho:+.3f}  |  "

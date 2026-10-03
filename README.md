@@ -92,6 +92,24 @@ cette base (lot ×0,25 à ×2, allocation et confiance ×0,5 à ×1,5) ; la têt
 de risque reste un plafond. Le journal affiche à chaque epoch la corrélation
 entre sa prédiction et le résultat réel en validation.
 
+**Les têtes du déjà-vu et météo** (run m5_27) — la tête d'espérance prédisait
+le résultat du trade, donc la direction : sa corrélation avec le résultat réel
+est restée entre −0,11 et +0,23, elle est coupée. Deux têtes la remplacent, qui
+prédisent ce qui se prévoit :
+- le **déjà-vu** reconstitue la bougie regardée à partir du seul résumé du
+  tronc ; son erreur mesure la nouveauté du marché (un marché jamais vu est mal
+  reconstitué) ;
+- la **météo** prédit l'amplitude du cours (plus haut moins plus bas) sur les
+  96 bougies suivantes, quel que soit le sens : la volatilité vient par vagues,
+  et le coût Vantage, fixe en bps, ne pèse presque plus rien les jours agités.
+
+Elles sont derrière le mur et apprennent par leur seule cible : le signal et
+sa note ne changent pas. Leurs prédictions deviennent deux entrées de plus des
+quatre têtes de mise. Le journal affiche à chaque epoch le profit factor des
+trades de validation par tranche de chaque tête (du plus familier au plus
+nouveau, du plus calme au plus agité), la mise moyenne par tranche, et la
+corrélation entre la météo prévue et le mouvement réel.
+
 **La série noire** — avant chaque trade, le risque ne dépasse jamais ce que
 la pire série de pertes du modèle laisse survivre : si les N prochains trades
 perdaient tous, le compte ne perdrait pas plus de 50 %. Risque maximal par
@@ -220,7 +238,8 @@ les têtes de mise en ont besoin. Les runs fournissent toujours les prix.
 | m5_23 | porte 0,90, objectif proche choisi par le modèle | bloc 1, frais pleins : +0,64 à +1,12 $/jour, PF 1,08-1,16, win rate 73-76 %, pire baisse −6 à −14 % |
 | m5_24 | 13 paires d'objectifs, mois joués avec le signal réel | arrêté : le modèle s'est jeté sur « 4 ATR en une fois », win rate de 69 % à 27 % en 3 epochs |
 | m5_25 | 12 paires (sans « 4 ATR en une fois ») | bloc 1, epochs 2-9 : +0,32 à +2,50 $/jour, win rate 63-73 %, pire baisse −6 à −20 %, mise réelle 0,3 à 1 % |
-| m5_26 | tête d'espérance (mise de base demi-Kelly prédite) | en cours |
+| m5_26 | tête d'espérance (mise de base demi-Kelly prédite) | bloc 1, epochs 1-17 : meilleur +2,53 $/jour (PF 1,25, epoch 16) ; corrélation prédiction / résultat entre −0,11 et +0,23 : arrêté |
+| m5_27 | têtes du déjà-vu et météo, entrées des têtes de mise | en cours |
 
 Ce que les mesures ont établi :
 - le signal du BTC M5 vient du flux Binance, de l'écart Coinbase, du

@@ -318,6 +318,12 @@ class MoteurKairosM5:
         risque_niveau = int(lri[0, sens].argmax().cpu()) if lri is not None else None
         allocation_niveau = int(lal[0, sens].argmax().cpu()) if lal is not None else None
         confiance_niveau = int(lco[0, sens].argmax().cpu()) if lco is not None else None
+        # LE DEJA-VU ET LA METEO : les tetes de mise les ont deja lus dans
+        # `jeu` ; ils sont affiches pour suivre ce que voit le modele.
+        if getattr(self.policy, "apprendre_dejavu_meteo", False):
+            vu, met = (float(q[0].cpu()) for q in self.policy.dernieres_previsions)
+            print(f"[KAIROS M5] deja-vu {vu:+.2f} (log de l'erreur, plus haut = plus nouveau)  |  "
+                  f"meteo {np.exp(met):.0f} bps d'amplitude prevue sur {self.cfg.horizon_max} bougies")
         # LA MISE DE BASE de la tete d'esperance, comme le jeu.
         base = None
         if les is not None:
