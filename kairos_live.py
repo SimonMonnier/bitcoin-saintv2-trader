@@ -33,7 +33,7 @@ class LiveConfig:
     # Le run dont on trade le modele final : deploy_<prefixe>_ensemble_validation_ddsafe.pth
     # et pipeline_<prefixe>_deploy_ensemble_validation_ddsafe.json, ecrits par
     # `jeu_kairos.py` a la fin des dix blocs (ou `--rebuild-deploy-ensemble`).
-    kairos_prefixe: str = "kairos_jeu_m5_33_conseil_journee"
+    kairos_prefixe: str = "kairos_jeu_m5_34_retour_m5_31"
     kairos_bloc: int = 1
     # Fuseau de l'horloge des graphiques Vantage/MT5 (EEST l'ete, EET l'hiver).
     kairos_tz_mt5: str = "Europe/Helsinki"
@@ -108,8 +108,8 @@ def verifie_deploy_kairos(prefixe: str) -> tuple:
     # qu'elle a copiee doivent etre la (voir `copie_conviction`).
     if ck["config"].get("tete_conviction"):
         cles = [k for k in ck["modele"] if k.startswith("reseau_conviction.")]
-        norme = ck["modele"].get("conviction_norme")
-        if not cles or norme is None or not bool(torch.isfinite(norme)) or float(norme) <= 0:
+        norme = ck["modele"].get("conviction_norme", torch.tensor(1.0))
+        if not cles or not bool(torch.isfinite(norme)) or float(norme) <= 0:
             raise ValueError(f"Tete de conviction absente ou invalide dans {checkpoint}")
         if not ck.get("conviction_mediane_folds"):
             raise ValueError(f"Conviction des folds absente de {checkpoint} : modele final d'avant le run m5_31")

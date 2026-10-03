@@ -308,7 +308,8 @@ les têtes de mise en ont besoin. Les runs fournissent toujours les prix.
 | m5_30 | conviction continue : multiplicateur libre ×0,1 à ×25, demi-Kelly, budget moyen constant | arrêté aux premières epochs : le modèle final réapprenait la conviction sur l'expert final |
 | m5_31 | conviction continue, celle du modèle final copiée de la médiane des 10 folds | bloc 1 : validation +1,72 $/jour moyen à frais pleins, test **+6,39 $/jour** (+2 120,83 $, PF 1,40, win rate 76 %, pire baisse −13,2 %) ; arrêté au bloc 2 pour le m5_32 |
 | m5_32 | conviction avec mémoire de 10 epochs, 4 passes, niveau fixe (divisé par la moyenne) | bloc 1 : meilleure validation +9,02 $/jour ; test +4,64 $/jour (+1 541,63 $, PF 1,29), pire baisse −36,1 % (59 trades au-dessus de 5 % du compte) ; arrêté |
-| m5_33 | conseil de 5 têtes (mise ramenée vers ×1 selon le désaccord), note par journée | en cours |
+| m5_33 | conseil de 5 têtes (mise ramenée vers ×1 selon le désaccord), note par journée | arrêté à l'epoch 2 du bloc 1 |
+| m5_34 | retour au code du m5_31 (le meilleur test du bloc 1 : +6,39 $/jour, pire baisse −13,2 %) | en cours |
 
 Ce que les mesures ont établi :
 - le signal du BTC M5 vient du flux Binance, de l'écart Coinbase, du
