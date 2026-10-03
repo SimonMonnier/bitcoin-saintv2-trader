@@ -202,7 +202,10 @@ class JeuConfig:
     # LE BUDGET DE BAISSE (run m5_28) : voir `budget_baisse`. Le run m5_27 :
     # prefixe kairos_jeu_m5_27_dejavu_meteo, apprendre_dejavu_meteo True,
     # budget_baisse False.
-    prefixe: str = "kairos_jeu_m5_28_budget_baisse"
+    # LA TETE DE CONVICTION (run m5_29) : voir `tete_conviction`. Le run
+    # m5_28 : prefixe kairos_jeu_m5_28_budget_baisse, budget_baisse True,
+    # mise_budget 0.005, tete_conviction False.
+    prefixe: str = "kairos_jeu_m5_29_conviction"
     # Reproduction demandee du run M5_03, avant les corrections de deroulement
     # et de compte introduites dans la version 2.
     # La version 2 rejoue l'equite, la marge et les positions ouvertes : elle
@@ -518,11 +521,50 @@ class JeuConfig:
     # (lot x0.5 a x1.5, allocation et confiance x0.8 a x1.2, produit borne a
     # [0.5, 1.5]) et la mesure rejoue leurs vrais multiplicateurs. La serie
     # noire, la tete de risque, la marge et le lot minimum restent des bornes.
-    budget_baisse: bool = True
+    #
+    # COUPE LE 2026-10-03 (run m5_29), demande du proprietaire : une mise tiree
+    # des resultats passes n'est pas ce qu'il veut. `mise_budget` reste la
+    # mise de base, fixe : 1 % du compte risque au stop, le R du jeu.
+    budget_baisse: bool = False
     budget_baisse_pct: float = 0.30
     budget_baisse_quantile: float = 0.10
     budget_baisse_tirages: int = 200
-    mise_budget: float = 0.005
+    mise_budget: float = 0.01
+    # LA TETE DE CONVICTION — 2026-10-03 (run m5_29), demande du proprietaire :
+    # « je veux que ce signal soit exploite par les tetes de mise, qu'elles
+    # gerent elles-memes le moment ou elles doublent, triplent, quadruplent ».
+    #
+    # LE SIGNAL. Mesure du 2026-10-03 sur les coups du run m5_27 : quand le
+    # rang glissant de l'expert (sa note du moment parmi les 7 derniers jours)
+    # depasse 0.99, le coup paie mieux dans les 3 blocs de validation (PF 1.06
+    # / 1.20 / 1.14 contre 1.02 / 1.06 / 0.97) et dans les 3 tests (1.32 /
+    # 1.60 / 1.58 contre 1.28 / 1.05 / 1.37), 22 mois sur 33 en validation.
+    # Les tetes de mise avaient ce rang dans leur entree, noye parmi des
+    # centaines d'autres chiffres, et la note du mois, trop bruitee, ne le
+    # leur a jamais appris.
+    #
+    # LA TETE. Une cinquieme tete de mise, petite, qui ne lit QUE la conviction
+    # de l'expert (le rang du sens choisi) et le sens. Elle choisit un
+    # multiplicateur de la mise (`conviction_multiplicateurs`, x0.5 a x4), en
+    # plus des quatre autres tetes. Elle ne peut pas apprendre le bruit du
+    # tronc qui a perdu la tete d'esperance : elle n'en lit rien.
+    #
+    # SON APPRENTISSAGE (`entraine_conviction`). La taille de la mise ne change
+    # pas l'issue du coup : on connait donc EXACTEMENT ce qu'aurait donne
+    # chaque multiplicateur sur chaque coup joue, log(1 + mise x m x R). La
+    # tete apprend sur tous les multiplicateurs a la fois, sur chaque coup,
+    # sans tirage : le bruit qui a noye la note du mois disparait.
+    # LE BUDGET CONSTANT. Sans contrainte, la tete miserait le maximum partout
+    # (les coups d'entrainement gagnent). Un prix du risque `lambda`, ajuste
+    # en continu, maintient le multiplicateur MOYEN a 1 : pour quadrupler un
+    # coup, elle doit miser moins sur d'autres. Elle apprend OU mettre le
+    # risque, pas combien en prendre. Serie noire, marge, tete de risque et
+    # lot minimum restent des bornes.
+    tete_conviction: bool = True
+    conviction_multiplicateurs: Tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0)
+    conviction_passes: int = 2
+    conviction_entropie: float = 0.01
+    conviction_pas_lambda: float = 0.01
     # DEUX NOTES SEPAREES — 2026-10-02 (run m5_20), demande du proprietaire :
     # garder le signal d'achat et de vente, et la prise de risque au-dela de
     # 1 %, sans que le compte finisse ruine. Au run m5_19, une seule note (le
@@ -929,6 +971,23 @@ class PolitiqueJeu(SAINTPolicySingleHead):
             # moyenne et ecart du deja-vu, puis de la meteo, sur l'entrainement ;
             # le dernier vaut 1 une fois mesures. Ils voyagent avec le modele.
             self.register_buffer("norme_previsions", torch.tensor([0.0, 1.0, 0.0, 1.0, 0.0]))
+        # LA TETE DE CONVICTION. Voir `tete_conviction`. Elle ne lit que la
+        # conviction de l'expert et le sens ; au depart elle choisit x1.
+        self.tete_conviction = (bool(getattr(cfg, "tete_conviction", False))
+                                and not (len(_marches) > 1 and getattr(cfg, "tetes_par_marche", False))
+                                and all(bool(getattr(cfg, f"apprendre_{n}", False))
+                                        for n in ("lot", "risque", "allocation", "confiance")))
+        if self.tete_conviction:
+            mc = tuple(cfg.conviction_multiplicateurs)
+            self.reseau_conviction = nn.Sequential(nn.Linear(2, 32), nn.GELU(), nn.Linear(32, 32),
+                                                   nn.GELU(), nn.Linear(32, len(mc)))
+            nn.init.zeros_(self.reseau_conviction[-1].weight)
+            with torch.no_grad():
+                self.reseau_conviction[-1].bias.zero_()
+                self.reseau_conviction[-1].bias[int(np.argmin(np.abs(np.asarray(mc) - 1.0)))] = 3.0
+            # le prix du risque (en R) et s'il a ete pose : ils voyagent avec le modele
+            self.register_buffer("conviction_lambda", torch.tensor(0.0))
+            self.register_buffer("conviction_pret", torch.tensor(0.0))
         # LE MUR des tetes de mise. Voir `mur_mise`.
         self.mur_mise = bool(getattr(cfg, "mur_mise", False))
         for m in list(self.lecteur_objectif) + list(self.lecteur_stop):
@@ -977,6 +1036,11 @@ class PolitiqueJeu(SAINTPolicySingleHead):
     def _par_marche(k, lecteurs, tetes, z):
         sortie = torch.stack([t(lec(z)) for lec, t in zip(lecteurs, tetes)], 1)
         return sortie[torch.arange(len(k), device=z.device), k]
+
+    def conviction(self, c: torch.Tensor) -> torch.Tensor:
+        """(B, K) : les logits du multiplicateur de conviction, a partir de
+        `entrees_conviction`. Voir `tete_conviction`."""
+        return self.reseau_conviction(c)
 
     def previsions(self, zn: torch.Tensor, x: torch.Tensor):
         """(erreur de reconstitution (B,), meteo predite (B,)) a partir du
@@ -1111,6 +1175,8 @@ class PolitiqueJeu(SAINTPolicySingleHead):
             **({"dejavu": _p(self.lecteur_dejavu, self.tete_dejavu),
                 "meteo": _p(self.lecteur_meteo, self.tete_meteo)}
                if getattr(self, "apprendre_dejavu_meteo", False) else {}),
+            **({"conviction": _p(self.reseau_conviction)}
+               if getattr(self, "tete_conviction", False) else {}),
             "valeur": _p(self.mlp, self.critic),
             "tronc": _p(self.embed, self.col_emb, *self.blocks, self.norm)
                      + [self.cls],
@@ -1841,6 +1907,105 @@ def mesure_dejavu_meteo(coups, cfg, meteo=None) -> Dict[str, object]:
     return out
 
 
+def entrees_conviction(rang, sens) -> np.ndarray:
+    """(B, 2) : la conviction de l'expert pour le sens choisi (son rang
+    glissant, en logit centre : 0.95 -> 0, 0.99 -> +0.8, 0.999 -> +2) et le
+    sens (+1 achat, -1 vente). Voir `tete_conviction`."""
+    r = np.clip(np.asarray(rang, np.float64), 0.5, 0.999)
+    z = (np.log(r / (1.0 - r)) - np.log(19.0)) / 2.0
+    return np.stack([z, np.where(np.asarray(sens) == 1, -1.0, 1.0)], -1).astype(np.float32)
+
+
+def entraine_conviction(policy, optims, trans, R, rangs, cfg, device, rng) -> Dict[str, object]:
+    """La tete de conviction apprend sur les coups joues.
+
+    Pour chaque coup, l'issue R (cout plein) ne depend pas de la mise : la
+    croissance du compte qu'aurait donnee chaque multiplicateur m est connue,
+    log(1 + mise x m x R). La tete maximise son esperance sous sa propre
+    politique, moins un prix du risque `lambda` x (m - 1), avec un peu
+    d'entropie. Apres chaque lot, `lambda` monte si le multiplicateur moyen
+    depasse 1 et baisse sinon : le risque moyen reste celui de la mise de
+    base. Seul le groupe « conviction » apprend. Voir `tete_conviction`."""
+    if not getattr(policy, "tete_conviction", False) or "conviction" not in optims or rangs is None:
+        return {}
+    lignes = [x for ep in (trans or []) for x in ep if x[3] != ATTENDRE]
+    if len(lignes) < 64:
+        return {}
+    tt = np.asarray([x[0] for x in lignes], np.int64)
+    sens = (np.asarray([x[3] for x in lignes]) == VENDRE).astype(np.int64)
+    ii = np.asarray([x[4] for x in lignes], np.int64)
+    jj = np.asarray([x[5] for x in lignes], np.int64)
+    y = np.asarray(R[tt, sens, ii, jj], np.float64)
+    ok = np.isfinite(y)
+    tt, sens, y = tt[ok], sens[ok], np.clip(y[ok], -3.0, 10.0)
+    rang = np.asarray(rangs)[tt, sens]
+    c = entrees_conviction(rang, sens)
+    mc = np.asarray(cfg.conviction_multiplicateurs, np.float64)
+    f = float(cfg.mise_budget)
+    U = np.log(np.maximum(1.0 + f * mc[None, :] * y[:, None], 1e-6)) / f
+    T = lambda z, dt=torch.float32: torch.as_tensor(z, dtype=dt, device=device)
+    M = T(mc)
+    lam = policy.conviction_lambda
+    if float(policy.conviction_pret) < 0.5:
+        lam.fill_(float(np.mean(y)))
+        policy.conviction_pret.fill_(1.0)
+    opt = optims["conviction"]
+    params = list(policy.groupes_jeu()["conviction"])
+    pertes = []
+    for _ in range(int(getattr(cfg, "conviction_passes", 2))):
+        ordre = rng.permutation(len(y))
+        for d0 in range(0, len(ordre), 512):
+            b = ordre[d0:d0 + 512]
+            lp = torch.log_softmax(policy.conviction(T(c[b])), -1)
+            p = lp.exp()
+            u = T(U[b]) - lam * (M - 1.0)
+            perte = -(p * u).sum(-1).mean() + float(cfg.conviction_entropie) * (p * lp).sum(-1).mean()
+            opt.zero_grad(set_to_none=True)
+            perte.backward()
+            torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
+            opt.step()
+            with torch.no_grad():
+                lam += float(cfg.conviction_pas_lambda) * ((p * M).sum(-1).mean() - 1.0)
+            pertes.append(float(perte.detach()))
+    with torch.no_grad():
+        p = torch.softmax(policy.conviction(T(c)), -1)
+        moyen = float((p * M).sum(-1).mean())
+        choisi = mc[p.argmax(-1).cpu().numpy()]
+    out = {"perte": float(np.mean(pertes)), "n": int(len(y)), "lambda": float(lam),
+           "mult_moyen": moyen, "choisi_moyen": float(choisi.mean())}
+    for nom, a, z in (("bas", 0.0, 0.98), ("milieu", 0.98, 0.99), ("haut", 0.99, 1.01)):
+        m_ = (rang >= a) & (rang < z)
+        out["mult_" + nom] = float(choisi[m_].mean()) if m_.any() else float("nan")
+        out["R_" + nom] = float(y[m_].mean()) if m_.any() else float("nan")
+    return out
+
+
+def index_conviction(cfg) -> int:
+    """La place du multiplicateur de conviction dans un coup du jeu (le rang
+    de l'expert suit)."""
+    return index_budget(cfg) + 2
+
+
+def mesure_conviction(coups, cfg) -> Dict[str, object]:
+    """Sur des coups du jeu : multiplicateur de conviction moyen, profit
+    factor et part des coups, par tranche du rang de l'expert (< 0.98,
+    0.98 - 0.99, >= 0.99)."""
+    ic = index_conviction(cfg)
+    c = [q for q in coups if len(q) > ic + 1]
+    if len(c) < 20:
+        return {}
+    c = np.asarray([q[:ic + 2] for q in c], np.float64)
+    R = c[:, 10] / np.maximum(c[:, 8] * c[:, 15] * float(cfg.contrat), 1e-12)
+    m, rang = c[:, ic], c[:, ic + 1]
+    out = {"n": int(len(c)), "mult_moyen": float(m.mean())}
+    for nom, a, z in (("bas", 0.0, 0.98), ("milieu", 0.98, 0.99), ("haut", 0.99, 1.01)):
+        k = (rang >= a) & (rang < z)
+        g, p_ = R[k][R[k] > 0].sum(), -R[k][R[k] < 0].sum()
+        out[nom] = (float(m[k].mean()) if k.any() else float("nan"),
+                    float(g / p_) if p_ > 0 else float("nan"), float(100 * k.mean()))
+    return out
+
+
 def multiplicateur_budget(cfg, k, u, z) -> float:
     """Le multiplicateur des tetes de lot, d'allocation et de confiance autour
     de la mise de base, borne a [0.5, 1.5]. Voir `budget_baisse`."""
@@ -1869,6 +2034,8 @@ def mesure_budget_baisse(coups, cfg) -> Tuple[float, Dict[str, object]]:
     R = c[:, 10] / np.maximum(c[:, 8] * c[:, 15] * float(cfg.contrat), 1e-12)
     ib = index_budget(cfg)
     m = c[:, ib + 1] if c.shape[1] > ib + 1 else np.ones(len(c))
+    if c.shape[1] > ib + 3:
+        m = m * c[:, ib + 2]   # le multiplicateur de conviction
     parts = c[:, 0].astype(np.int64)
     u = np.unique(parts)
     idx = [np.flatnonzero(parts == p) for p in u]
@@ -2726,11 +2893,13 @@ def ecrit_trades_csv(path: str, coups, temps, cfg: JeuConfig, *, epoch: int, pha
                                     if getattr(cfg, "apprendre_dejavu_meteo", False)
                                     and c.shape[1] > index_dejavu_meteo(cfg) + 1 else np.nan),
         "mise_budget_pct": (100 * c[:, index_budget(cfg)]
-                            if getattr(cfg, "budget_baisse", False)
-                            and c.shape[1] > index_budget(cfg) + 1 else np.nan),
+                            if c.shape[1] > index_budget(cfg) + 1 else np.nan),
         "multiplicateur_mise": (c[:, index_budget(cfg) + 1]
-                                if getattr(cfg, "budget_baisse", False)
-                                and c.shape[1] > index_budget(cfg) + 1 else np.nan),
+                                if c.shape[1] > index_budget(cfg) + 1 else np.nan),
+        "multiplicateur_conviction": (c[:, index_conviction(cfg)]
+                                      if c.shape[1] > index_conviction(cfg) + 1 else np.nan),
+        "rang_expert": (c[:, index_conviction(cfg) + 1]
+                        if c.shape[1] > index_conviction(cfg) + 1 else np.nan),
         "equite_apres_usd": np.maximum(0.0, c[:, 11] + c[:, 10]),
         "score_R": c[:, 5],
     })
@@ -3300,6 +3469,7 @@ def entraine_deploiement_continu(cfg, d, X, y_ex, toutes, o, h, l, c, sp, atr,
         stats = maj_ppo(policy, optims, avantages(tr, cfg), X_final, cfg, device, rng)
         entraine_esperance(policy, optims, tr, X_final, R1, cfg, device, rng)
         entraine_dejavu_meteo(policy, optims, tr, X_final, M_final, cfg, device, rng)
+        entraine_conviction(policy, optims, tr, R1, rangs_ex, cfg, device, rng)
         print(f"DEPLOY ENSEMBLE PPO {numero:02d}/{len(fragments):02d}  "
               f"{len(jours)} parties  kl {stats['kl']:+.4f}  v {stats['v']:.4f}", flush=True)
 
@@ -3496,7 +3666,7 @@ def main_blocs(cfg: JeuConfig) -> int:
             t_ep = time.time()
             frac = min(1.0, max(0.0, (epoch - 1) / cfg.rampe_cout)) if cfg.rampe_cout > 0 else 1.0
             st = None
-            dm = {}
+            dm, cvc = {}, {}
             if epoch >= 1:
                 Rf, Df, Sf = table_a_cout(frac, (R0, D0, S0), (R1, D1, S1),
                                          lambda f: table_coups(o, h, l, sp, atr, cfg, f))
@@ -3513,6 +3683,8 @@ def main_blocs(cfg: JeuConfig) -> int:
                 es = entraine_esperance(policy, optims, tr, Xk, R1, cfg, device, rng)
                 # LES TETES DU DEJA-VU ET METEO, sur les etats de ces journees.
                 dm = entraine_dejavu_meteo(policy, optims, tr, Xk, M1, cfg, device, rng)
+                # LA TETE DE CONVICTION, sur les coups de ces journees.
+                cvc = entraine_conviction(policy, optims, tr, R1, rangs_ex, cfg, device, rng)
                 if mois_on:
                     # LES MOIS : seules les tetes de mise apprennent. Voir
                     # `note_mise_mois`.
@@ -3528,6 +3700,7 @@ def main_blocs(cfg: JeuConfig) -> int:
                         maj_ppo(policy, optims, avantages(trm, cfg), Xk, cfg, device, rng,
                                 mode="mise", adv_mise_externe=am)
                         es = entraine_esperance(policy, optims, trm, Xk, R1, cfg, device, rng) or es
+                        cvc = entraine_conviction(policy, optims, trm, R1, rangs_ex, cfg, device, rng) or cvc
                         fins = suivi.get("final", np.zeros(0))
                         print(f"  mois  {len(fins)} mois de {cfg.mois_jours} jours, {len(cpm)} coups : "
                               f"compte final median {np.median(fins):.0f} $, "
@@ -3553,6 +3726,18 @@ def main_blocs(cfg: JeuConfig) -> int:
             etat = {"modele": policy.state_dict(), "config": asdict(cfg), "epoch": epoch,
                     "bloc": k + 1, "pipeline": pipeline_ref}
             torch.save(etat, f"last_{cfg.prefixe}{suffixe}.pth")
+            if getattr(policy, "tete_conviction", False):
+                mc_ = mesure_conviction(cv, cfg)
+                if mc_:
+                    _t = lambda q: f"x{q[0]:.2f} PF {q[1]:.2f} ({q[2]:.0f} %)"
+                    print(f"  conviction  validation, rang de l'expert < 0.98 : {_t(mc_['bas'])}  |  "
+                          f"0.98-0.99 : {_t(mc_['milieu'])}  |  >= 0.99 : {_t(mc_['haut'])}  |  "
+                          f"multiplicateur moyen x{mc_['mult_moyen']:.2f}", flush=True)
+                if cvc:
+                    print(f"  conviction  apprise sur {cvc['n']} coups d'entrainement : choisit "
+                          f"x{cvc['mult_bas']:.2f} / x{cvc['mult_milieu']:.2f} / x{cvc['mult_haut']:.2f} "
+                          f"(R moyen {cvc['R_bas']:+.3f} / {cvc['R_milieu']:+.3f} / {cvc['R_haut']:+.3f})  |  "
+                          f"prix du risque {cvc['lambda']:+.3f} R  |  moyenne x{cvc['mult_moyen']:.2f}", flush=True)
             if getattr(policy, "apprendre_dejavu_meteo", False):
                 md = mesure_dejavu_meteo(cv, cfg, M1)
                 if md:

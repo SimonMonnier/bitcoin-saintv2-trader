@@ -835,10 +835,11 @@ verifie("la mesure : cinq tranches par tete, profit factor et mise",
         and abs(_md["dejavu"]["mise"][0] - 0.1) < 1e-9, str(_md["dejavu"]))
 
 print("\n19. LE BUDGET DE BAISSE")
-_c19 = replace(J.JeuConfig(), serie_noire_n=10, serie_noire_k=1.0)
-verifie("par defaut : budget de baisse a 30 % une fois sur 10, mise de depart 0.5 %",
-        _c19.budget_baisse and _c19.budget_baisse_pct == 0.30 and _c19.budget_baisse_quantile == 0.10
-        and _c19.mise_budget == 0.005 and len(_c19.multiplicateurs_lot) == _c19.niveaux_lot)
+_c19 = replace(J.JeuConfig(), serie_noire_n=10, serie_noire_k=1.0, budget_baisse=True, mise_budget=0.005)
+verifie("le budget de baisse du run m5_28 : 30 % une fois sur 10 ; coupe par defaut depuis le m5_29",
+        _c19.budget_baisse_pct == 0.30 and _c19.budget_baisse_quantile == 0.10
+        and not J.JeuConfig().budget_baisse and J.JeuConfig().mise_budget == 0.01
+        and len(_c19.multiplicateurs_lot) == _c19.niveaux_lot)
 verifie("le multiplicateur des tetes : de x0.5 a x1.5, borne",
         J.multiplicateur_budget(_c19, 0, 0, 0) == 0.5 and J.multiplicateur_budget(_c19, 19, 4, 4) == 1.5
         and abs(J.multiplicateur_budget(_c19, 0, 4, 4) - 0.72) < 1e-9)
@@ -867,6 +868,55 @@ _f2, _ = J.mesure_budget_baisse(_coups19(_Rbon, m=1.5), _c19)
 verifie("des multiplicateurs plus forts font baisser la mise de base", _f2 < _fb, f"{100 * _f2:.2f} %")
 verifie("jamais au-dela du plafond de la serie noire",
         J.mesure_budget_baisse(_coups19(np.full(200, 0.5)), _c19)[0] <= J.plafond_serie_noire(_c19) + 1e-9)
+
+print("\n20. LA TETE DE CONVICTION")
+_c20 = J.JeuConfig()
+verifie("par defaut : tete de conviction, x0.5 a x4, mise de base fixe 1 %",
+        _c20.tete_conviction and _c20.conviction_multiplicateurs == (0.5, 1.0, 1.5, 2.0, 3.0, 4.0)
+        and _c20.mise_budget == 0.01 and not _c20.budget_baisse)
+_e = J.entrees_conviction(np.array([0.90, 0.95, 0.99, 0.999]), np.array([0, 0, 1, 1]))
+verifie("l'entree : la conviction monte avec le rang, le sens a part",
+        _e.shape == (4, 2) and np.all(np.diff(_e[:, 0]) > 0) and abs(_e[1, 0]) < 1e-6
+        and list(_e[:, 1]) == [1, 1, -1, -1], str(np.round(_e, 2)))
+torch.manual_seed(0)
+_p20 = J.PolitiqueJeu(_c20)
+_g20 = _p20.groupes_jeu()
+verifie("une cinquieme tete de mise, son groupe a part, disjoint des autres",
+        _p20.tete_conviction and "conviction" in _g20
+        and len({id(q) for v in _g20.values() for q in v}) == sum(len(v) for v in _g20.values()))
+with torch.no_grad():
+    _l = _p20.conviction(torch.from_numpy(_e))
+verifie("au depart elle choisit x1 partout",
+        all(_c20.conviction_multiplicateurs[int(k)] == 1.0 for k in _l.argmax(-1)))
+_x20 = torch.randn(2, _c20.lookback, len(J.colonnes_jeu(_c20)) + _c20.n_expert + J.n_etat(_c20))
+_s20 = _p20.jeu(_x20)
+(sum(q.sum() for q in _s20)).backward()
+verifie("le PPO ne la touche pas (elle apprend par sa seule note)",
+        all(q.grad is None for q in _g20["conviction"]))
+# un monde ou les coups a forte conviction gagnent, les autres non
+_rg = np.random.default_rng(3)
+_N = 6000
+_rangs = np.stack([_rg.uniform(0.90, 1.0, _N), _rg.uniform(0.90, 1.0, _N)], 1).astype(np.float32)
+_R = np.zeros((_N, 2, 1, 1))
+_fort = _rangs[:, 0] >= 0.99
+_R[:, 0, 0, 0] = np.where(_rg.random(_N) < np.where(_fort, 0.75, 0.5), 1.0, -1.0) + 0.05
+_tr = [[(t_, None, 0, J.ACHETER, 0, 0) for t_ in range(_N)]]
+_o = J.optimiseurs(_p20, _c20)
+for _ in range(40):
+    _st = J.entraine_conviction(_p20, _o, _tr, _R, _rangs, _c20, "cpu", _rg)
+verifie("elle apprend a miser plus quand la conviction est forte, moins sinon, a budget moyen ~1",
+        _st["mult_haut"] >= 2.0 and _st["mult_bas"] <= 1.0 and 0.7 <= _st["mult_moyen"] <= 1.3,
+        f"x{_st['mult_bas']:.2f} / x{_st['mult_haut']:.2f}, moyenne x{_st['mult_moyen']:.2f}, "
+        f"lambda {_st['lambda']:+.3f}")
+_R2 = np.zeros((_N, 2, 1, 1))
+_R2[:, 0, 0, 0] = np.where(_rg.random(_N) < 0.55, 1.0, -1.0)
+_p20b = J.PolitiqueJeu(_c20)
+_o2 = J.optimiseurs(_p20b, _c20)
+for _ in range(40):
+    _st2 = J.entraine_conviction(_p20b, _o2, _tr, _R2, _rangs, _c20, "cpu", _rg)
+verifie("si la conviction ne dit rien, elle ne double pas les coups forts",
+        abs(_st2["mult_haut"] - _st2["mult_bas"]) <= 1.0 and 0.7 <= _st2["mult_moyen"] <= 1.3,
+        f"x{_st2['mult_bas']:.2f} / x{_st2['mult_haut']:.2f}, moyenne x{_st2['mult_moyen']:.2f}")
 
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)

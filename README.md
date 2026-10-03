@@ -126,6 +126,19 @@ rejoué donne +7 178 $ (bloc 1, mise 1,15 %), +797 $ (bloc 2, 1,05 %) et
 −17,6 / −18,9 / −20,4 % ; au bloc 4, où le signal perdait, la mise serait
 restée à 0,1 %.
 
+**La tête de conviction** (run m5_29) — un signal qui dit « mise plus » a été
+trouvé dans les trades du m5_27 : quand le rang glissant de l'expert dépasse
+0,99, le trade paie mieux dans les 3 blocs de validation (PF 1,06 / 1,20 /
+1,14 contre 1,02 / 1,06 / 0,97) et dans les 3 tests (1,32 / 1,60 / 1,58
+contre 1,28 / 1,05 / 1,37). Une cinquième tête de mise, petite, ne lit que
+cette conviction et le sens, et choisit un multiplicateur de ×0,5 à ×4. Elle
+apprend sur chaque trade joué la croissance exacte qu'aurait donnée chaque
+multiplicateur, log(1 + mise × m × R), sans tirage ; un prix du risque ajusté
+en continu garde le multiplicateur moyen à 1 : pour quadrupler un trade, elle
+doit miser moins ailleurs. La mise de base est fixe (1 %, le R du jeu) ; le
+budget de baisse (m5_28) est coupé. La veille affiche, par tranche de rang,
+le multiplicateur choisi et le profit factor en validation.
+
 **La série noire** — avant chaque trade, le risque ne dépasse jamais ce que
 la pire série de pertes du modèle laisse survivre : si les N prochains trades
 perdaient tous, le compte ne perdrait pas plus de 50 %. Risque maximal par
@@ -256,7 +269,8 @@ les têtes de mise en ont besoin. Les runs fournissent toujours les prix.
 | m5_25 | 12 paires (sans « 4 ATR en une fois ») | bloc 1, epochs 2-9 : +0,32 à +2,50 $/jour, win rate 63-73 %, pire baisse −6 à −20 %, mise réelle 0,3 à 1 % |
 | m5_26 | tête d'espérance (mise de base demi-Kelly prédite) | bloc 1, epochs 1-17 : meilleur +2,53 $/jour (PF 1,25, epoch 16) ; corrélation prédiction / résultat entre −0,11 et +0,23 : arrêté |
 | m5_27 | têtes du déjà-vu et météo, entrées des têtes de mise | tests blocs 1-3 : +2,35 / +1,59 / +2,68 $/jour (PF 1,28 / 1,15 / 1,33) ; aucune pente stable par tranche ; arrêté au bloc 4 (validation sans aucun trade) |
-| m5_28 | budget de baisse : mise de base mesurée en validation (pire baisse 30 % une fois sur 10) | en cours |
+| m5_28 | budget de baisse : mise de base mesurée en validation (pire baisse 30 % une fois sur 10) | bloc 1, epochs 11-21 : +0,36 $/jour moyen en validation contre +0,12 au m5_27, pires baisses −8 à −37 % ; arrêté |
+| m5_29 | tête de conviction : multiplicateur ×0,5 à ×4 appris sur le rang de l'expert, budget moyen constant | en cours |
 
 Ce que les mesures ont établi :
 - le signal du BTC M5 vient du flux Binance, de l'écart Coinbase, du

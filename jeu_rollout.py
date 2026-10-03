@@ -246,8 +246,18 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
                           100.0)
             budget *= confiance[z.cpu().numpy()] if lc is not None else 1.0
             # LE BUDGET DE BAISSE. Voir `budget_baisse`.
-            avec_budget = (les is None and bool(getattr(cfg, "budget_baisse", False))
+            avec_budget = (les is None and (bool(getattr(cfg, "budget_baisse", False))
+                                            or bool(getattr(policy, "tete_conviction", False)))
                            and ll is not None and la is not None and lc is not None)
+            # LA TETE DE CONVICTION. Voir `tete_conviction`.
+            avec_conviction = avec_budget and bool(getattr(policy, "tete_conviction", False)) \
+                and rangs is not None
+            mconv = np.ones(len(ix))
+            if avec_conviction:
+                sn = sens.cpu().numpy()
+                rconv = np.asarray(rangs)[tt, sn]
+                lcv = policy.conviction(torch.from_numpy(J.entrees_conviction(rconv, sn)).to(device))
+                mconv = np.asarray(cfg.conviction_multiplicateurs, float)[J._choix(lcv, em, gen).cpu().numpy()]
             if les is not None or avec_budget:
                 # LA TETE D'ESPERANCE OU LE BUDGET DE BAISSE : l'allocation et
                 # la confiance deviennent des multiplicateurs de la mise de
@@ -322,7 +332,7 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
                     # LA MISE DE BASE (budget de baisse) x le multiplicateur
                     # des tetes de mise, dans les bornes dures.
                     mb = J.multiplicateur_budget(cfg, k[q], u[q], z[q])
-                    voulu = soldes[s] * float(cfg.mise_budget) * mb / max(
+                    voulu = soldes[s] * float(cfg.mise_budget) * mb * float(mconv[q]) / max(
                         float(atr[tc]) * cfg.sl_atr[j[q]] * cfg.contrat, 1e-12)
                     voulu = np.floor(voulu / cfg.pas_lot + 1e-10) * cfg.pas_lot
                     lot = float(min(maximum[q], max(cfg.lot_min, voulu)))
@@ -348,7 +358,8 @@ def joue(policy, jours, Xn, R, D, S, fin_valide, cfg, device, explore,
                              + ((float(pe[q, 0]), float(np.exp(0.5 * np.clip(pe[q, 1], -8, 6))),
                                  float(base[q])) if les is not None else ())
                              + ((float(prev[q, 0]), float(prev[q, 1])) if prev is not None else ())
-                             + ((float(cfg.mise_budget), float(mb)) if avec_budget else ()))
+                             + ((float(cfg.mise_budget), float(mb)) if avec_budget else ())
+                             + ((float(mconv[q]), float(rconv[q])) if avec_conviction else ()))
                 ouverts[s].append((tc + duree, r_pondere, pnl,
                                    marge_requise, float(v[q])))
                 scores[g] += r_pondere

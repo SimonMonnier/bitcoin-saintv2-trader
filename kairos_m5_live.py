@@ -329,11 +329,22 @@ class MoteurKairosM5:
         if les is not None:
             pe = les[0, sens, tp, sl].float().cpu().numpy()
             base = float(J.fraction_esperance(pe[0], pe[1], self.cfg))
-        elif (bool(getattr(self.cfg, "budget_baisse", False)) and llo is not None
-              and lal is not None and lco is not None):
+        elif ((bool(getattr(self.cfg, "budget_baisse", False))
+               or bool(getattr(self.policy, "tete_conviction", False)))
+              and llo is not None and lal is not None and lco is not None):
             # LE BUDGET DE BAISSE : la mise de base mesuree en validation,
             # gardee dans la configuration du modele final.
             base = float(self.cfg.mise_budget)
+        # LA TETE DE CONVICTION, comme le jeu : la conviction de l'expert pour
+        # ce sens choisit le multiplicateur.
+        conviction = 1.0
+        if base is not None and les is None and getattr(self.policy, "tete_conviction", False):
+            rang = float(fe[t, 2 + sens])
+            with torch.no_grad():
+                lcv = self.policy.conviction(torch.from_numpy(
+                    J.entrees_conviction(np.array([rang]), np.array([sens]))).to(self.device))
+            conviction = float(self.cfg.conviction_multiplicateurs[int(lcv[0].argmax().cpu())])
+            print(f"[KAIROS M5] conviction de l'expert {rang:.4f} -> mise x{conviction:g}")
         # Le jeu applique ce plancher avant de construire TP et SL.
         atr = float(J.atr_effectif(np.array([d["atr_14"].iloc[t]]),
                                    np.array([d["close"].iloc[t]]), self.cfg)[0])
@@ -341,7 +352,7 @@ class MoteurKairosM5:
                 "atr": atr, "lot_niveau": lot_niveau, "risque_niveau": risque_niveau,
                 "allocation_niveau": allocation_niveau,
                 "confiance_niveau": confiance_niveau, "valeur": float(valeur[0].cpu()),
-                "mise_base": base,
+                "mise_base": base, "conviction": conviction,
                 "gouverneur_echelle": float(echelle), "drawdown": float(dd_courant)}
 
     def execute_demo(self, signal):
@@ -405,9 +416,11 @@ class MoteurKairosM5:
             mult = (float(self.cfg.multiplicateurs_lot[signal["lot_niveau"]])
                     * float(self.cfg.multiplicateurs_allocation[signal["allocation_niveau"]])
                     * float(self.cfg.multiplicateurs_confiance[signal["confiance_niveau"]]))
-            if bool(getattr(self.cfg, "budget_baisse", False)):
+            if (bool(getattr(self.cfg, "budget_baisse", False))
+                    or bool(getattr(self.policy, "tete_conviction", False))):
                 mult = J.multiplicateur_budget(self.cfg, signal["lot_niveau"],
                                                signal["allocation_niveau"], signal["confiance_niveau"])
+                mult *= float(signal.get("conviction", 1.0))
             voulu = float(ai.equity) * signal["mise_base"] * mult / perte_lot
             voulu = np.floor(voulu / info.volume_step + 1e-10) * info.volume_step
             vol = float(min(plaf, max(vmin, voulu)))
