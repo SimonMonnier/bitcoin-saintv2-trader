@@ -40,8 +40,8 @@ et 1 bps à la sortie, swap de −20 %/an sur les achats.
 
 **La sortie en deux temps** — le menu des objectifs est fait de paires
 (objectif proche, objectif final) : 1 ou 2 ATR en une fois, ou 0,5 / 1 puis
-2 ATR, 0,5 / 1 / 1,5 / 2 puis 4 ATR, 0,5 / 1 / 1,5 / 2 puis 8 ATR, ou 4 ATR
-en une fois (13 paires). Le modèle choisit sa
+2 ATR, 0,5 / 1 / 1,5 / 2 puis 4 ATR, 0,5 / 1 / 1,5 / 2 puis 8 ATR (12 paires ;
+tout objectif au-delà de 2 ATR est coupé en deux). Le modèle choisit sa
 paire. La moitié du trade sort à l'objectif proche ; le stop de l'autre moitié remonte
 alors au prix d'entrée, **spread et glissement de sortie compris** (plus
 1 bps), et elle court vers l'objectif choisi. Un trade qui touche l'objectif
@@ -209,7 +209,8 @@ les têtes de mise en ont besoin. Les runs fournissent toujours les prix.
 | m5_21 | note du mois et série noire | win rate tombé à 20 % (objectif à 6-8 ATR, stop à 1 ATR), sans compte vidé |
 | m5_22 | sortie en deux temps, lot minimum 0,02 | bloc 1, epochs 5-9 : win rate 64-68 %, profit factor 1,02-1,07, mise réelle 0,5 % du compte |
 | m5_23 | porte 0,90, objectif proche choisi par le modèle | bloc 1, frais pleins : +0,64 à +1,12 $/jour, PF 1,08-1,16, win rate 73-76 %, pire baisse −6 à −14 % |
-| m5_24 | 13 paires d'objectifs, mois joués avec le signal réel | en cours |
+| m5_24 | 13 paires d'objectifs, mois joués avec le signal réel | arrêté : le modèle s'est jeté sur « 4 ATR en une fois », win rate de 69 % à 27 % en 3 epochs |
+| m5_25 | 12 paires (sans « 4 ATR en une fois ») | en cours |
 
 Ce que les mesures ont établi :
 - le signal du BTC M5 vient du flux Binance, de l'écart Coinbase, du

@@ -192,7 +192,9 @@ class JeuConfig:
     # QUATRE PAIRES D'OBJECTIFS DE PLUS (run m5_24) : voir `tp1_par_objectif`.
     # Le run m5_23 : prefixe kairos_jeu_m5_23_porte90_tp1, les neuf premieres
     # paires.
-    prefixe: str = "kairos_jeu_m5_24_paires"
+    # DOUZE PAIRES, SANS « 4 ATR EN UNE FOIS » (run m5_25). Le run m5_24 :
+    # prefixe kairos_jeu_m5_24_paires, treize paires.
+    prefixe: str = "kairos_jeu_m5_25_paires12"
     # Reproduction demandee du run M5_03, avant les corrections de deroulement
     # et de compte introduites dans la version 2.
     # La version 2 rejoue l'equite, la marge et les positions ouvertes : elle
@@ -491,7 +493,7 @@ class JeuConfig:
     # (objectif proche, objectif final), voir `tp1_par_objectif`. `tp_atr`
     # porte l'objectif final de chaque choix.
     tp_atr: Tuple[float, ...] = (1.0, 2.0, 2.0, 2.0, 4.0, 4.0, 4.0, 8.0, 8.0,
-                                 4.0, 4.0, 8.0, 8.0)
+                                 4.0, 8.0, 8.0)
     sl_atr: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
     # LE PLANCHER DE VOLATILITE DES BARRIERES — 2026-09-26, run
     # kairos_jeu_btc01. L'ATR M1 du BTC tombe a 2 bps dans les 10 % de
@@ -539,8 +541,13 @@ class JeuConfig:
     # (bloc 1, epochs 11-18, couts pleins) : +0.64 a +1.12 $/jour, PF 1.08 a
     # 1.16, win rate 73-76 %, mise reelle 0.5-0.7 % du compte.
     # Vide = `tp1_atr` pour tous les objectifs plus lointains (run m5_22).
+    # « 4 EN UNE FOIS » RETIREE LE 2026-10-03 (run m5_25), demande du
+    # proprietaire : au run m5_24, le modele s'y est jete (41 puis 68 puis
+    # 76 % des coups, stop serre a 1 ATR) et le win rate est tombe de 69 a
+    # 27 % en trois epochs — la derive du run m5_21. Sans sortie en deux
+    # temps, un coup qui monte puis redescend finit au stop.
     tp1_par_objectif: Tuple[float, ...] = (0.0, 0.0, 0.5, 1.0, 0.5, 1.0, 1.5, 1.0, 1.5,
-                                           0.0, 2.0, 0.5, 2.0)
+                                           2.0, 0.5, 2.0)
     # EN BOUGIES : 32 bougies M15, huit heures. EN H1 : 72 bougies, trois jours.
     # EN M5 : 96 bougies, huit heures (comme le M15).
     horizon_max: int = 96
