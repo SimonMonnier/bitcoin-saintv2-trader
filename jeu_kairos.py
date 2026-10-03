@@ -84,6 +84,7 @@ from __future__ import annotations
 
 import copy
 import json
+import collections
 import math
 import os
 import sys
@@ -210,7 +211,11 @@ class JeuConfig:
     # LA CONVICTION DU MODELE FINAL COPIEE DES FOLDS (run m5_31) : voir
     # `copie_conviction`. Le run m5_30 (prefixe
     # kairos_jeu_m5_30_conviction_continue) la reapprenait sur l'expert final.
-    prefixe: str = "kairos_jeu_m5_31_conviction_folds"
+    # LA CONVICTION AVEC MEMOIRE ET NIVEAU FIXE (run m5_32) : voir
+    # `conviction_memoire_epochs`. Le run m5_31 : prefixe
+    # kairos_jeu_m5_31_conviction_folds, conviction_passes 2, sans memoire,
+    # niveau tenu par un prix du risque.
+    prefixe: str = "kairos_jeu_m5_32_conviction_memoire"
     # Reproduction demandee du run M5_03, avant les corrections de deroulement
     # et de compte introduites dans la version 2.
     # La version 2 rejoue l'equite, la marge et les positions ouvertes : elle
@@ -575,11 +580,31 @@ class JeuConfig:
     # risque, pas combien en prendre. Serie noire, marge, tete de risque et
     # lot minimum restent des bornes.
     tete_conviction: bool = True
-    conviction_min: float = 0.1
-    conviction_max: float = 25.0
+    # x0.1 a x25 au run m5_31 ; depuis le run m5_32 le multiplicateur joue
+    # est divise par sa moyenne : les bornes ne limitent plus que l'ECART
+    # entre le coup le moins et le plus mise (x10 000 au plus).
+    conviction_min: float = 0.01
+    conviction_max: float = 100.0
     conviction_kelly: float = 0.5
-    conviction_passes: int = 2
-    conviction_pas_lambda: float = 0.01
+    # LA MEMOIRE, PLUS DE PAS, LE NIVEAU FIXE — 2026-10-03 (run m5_32),
+    # demande du proprietaire : « pourquoi la tete ne mise pas plus que
+    # x2.44 ». Au run m5_31 (bloc 1), elle montait encore quand le modele a
+    # ete garde (x1.07 a l'epoch 2, x2.53 a l'epoch 23), pour une cible
+    # calculee d'environ x4 : chaque epoch ne lui donnait que ~2 200 coups
+    # (250 a forte conviction, autant de bruit que d'ecart) et une vingtaine
+    # de pas, et son niveau oscillait (x2.5 a l'epoch 23, x0.7 a l'epoch 33)
+    # parce que le prix du risque courait apres le signal.
+    # 1. LA MEMOIRE : elle apprend sur les coups des `conviction_memoire_epochs`
+    #    dernieres epochs du bloc, pas sur la seule epoch en cours. Elle ne
+    #    lit que la conviction et le sens : un coup d'il y a cinq epochs reste
+    #    un exemple valable.
+    # 2. PLUS DE PAS : `conviction_passes` passes sur toute la memoire.
+    # 3. LE NIVEAU FIXE : son multiplicateur est divise par sa moyenne sur les
+    #    coups (`conviction_norme`, gardee avec le modele). Elle ne decide que
+    #    la REPARTITION du risque entre les coups, jamais son niveau : plus de
+    #    prix du risque, plus d'oscillation.
+    conviction_passes: int = 4
+    conviction_memoire_epochs: int = 10
     # DEUX NOTES SEPAREES — 2026-10-02 (run m5_20), demande du proprietaire :
     # garder le signal d'achat et de vente, et la prise de risque au-dela de
     # 1 %, sans que le compte finisse ruine. Au run m5_19, une seule note (le
@@ -1002,9 +1027,9 @@ class PolitiqueJeu(SAINTPolicySingleHead):
             lo, hi = math.log(float(cfg.conviction_min)), math.log(float(cfg.conviction_max))
             self._conv_c, self._conv_h = (lo + hi) / 2.0, (hi - lo) / 2.0
             self._conv_d = math.atanh(-self._conv_c / self._conv_h)
-            # le prix du risque (en R) et s'il a ete pose : ils voyagent avec le modele
-            self.register_buffer("conviction_lambda", torch.tensor(0.0))
-            self.register_buffer("conviction_pret", torch.tensor(0.0))
+            # la moyenne de son multiplicateur brut sur les coups : il est divise
+            # par elle (niveau fixe, voir `conviction_memoire_epochs`)
+            self.register_buffer("conviction_norme", torch.tensor(1.0))
         # LE MUR des tetes de mise. Voir `mur_mise`.
         self.mur_mise = bool(getattr(cfg, "mur_mise", False))
         for m in list(self.lecteur_objectif) + list(self.lecteur_stop):
@@ -1054,11 +1079,17 @@ class PolitiqueJeu(SAINTPolicySingleHead):
         sortie = torch.stack([t(lec(z)) for lec, t in zip(lecteurs, tetes)], 1)
         return sortie[torch.arange(len(k), device=z.device), k]
 
-    def conviction(self, c: torch.Tensor) -> torch.Tensor:
-        """(B,) : le multiplicateur de conviction, continu, a partir de
-        `entrees_conviction`. Voir `tete_conviction`."""
+    def conviction_brute(self, c: torch.Tensor) -> torch.Tensor:
+        """(B,) : le multiplicateur de conviction avant division par sa
+        moyenne, de x`conviction_min` a x`conviction_max`."""
         g = self.reseau_conviction(c).squeeze(-1)
         return torch.exp(self._conv_c + self._conv_h * torch.tanh(g + self._conv_d))
+
+    def conviction(self, c: torch.Tensor) -> torch.Tensor:
+        """(B,) : le multiplicateur de conviction joue, a partir de
+        `entrees_conviction` : le brut divise par sa moyenne sur les coups
+        (`conviction_norme`). Voir `tete_conviction`."""
+        return self.conviction_brute(c) / self.conviction_norme
 
     def previsions(self, zn: torch.Tensor, x: torch.Tensor):
         """(erreur de reconstitution (B,), meteo predite (B,)) a partir du
@@ -1934,57 +1965,69 @@ def entrees_conviction(rang, sens) -> np.ndarray:
     return np.stack([z, np.where(np.asarray(sens) == 1, -1.0, 1.0)], -1).astype(np.float32)
 
 
-def entraine_conviction(policy, optims, trans, R, rangs, cfg, device, rng) -> Dict[str, object]:
+def entraine_conviction(policy, optims, trans, R, rangs, cfg, device, rng,
+                        memoire=None) -> Dict[str, object]:
     """La tete de conviction apprend sur les coups joues.
 
     Pour chaque coup, l'issue R (cout plein) ne depend pas de la mise : la
     croissance du compte qu'aurait donnee n'importe quel multiplicateur m est
     connue. La tete monte la pente de k x log(1 + mise x m x R / k) / mise
-    (k = `conviction_kelly` : demi-Kelly), moins un prix du risque `lambda`
-    x (m - 1). Apres chaque lot, `lambda` monte si le multiplicateur moyen
-    depasse 1 et baisse sinon : le risque moyen reste celui de la mise de
-    base. Seul le groupe « conviction » apprend. Voir `tete_conviction`."""
+    (k = `conviction_kelly` : demi-Kelly), ou m est son multiplicateur divise
+    par sa moyenne sur le lot : le risque moyen reste celui de la mise de
+    base, elle n'en decide que la repartition. `memoire` (une file) garde
+    les coups des dernieres epochs ; elle apprend sur tous. Ensuite, sa
+    moyenne sur ces coups devient `conviction_norme`. Seul le groupe
+    « conviction » apprend. Voir `tete_conviction`."""
     if not getattr(policy, "tete_conviction", False) or "conviction" not in optims or rangs is None:
         return {}
     lignes = [x for ep in (trans or []) for x in ep if x[3] != ATTENDRE]
-    if len(lignes) < 64:
+    if len(lignes) >= 1:
+        tt = np.asarray([x[0] for x in lignes], np.int64)
+        sens = (np.asarray([x[3] for x in lignes]) == VENDRE).astype(np.int64)
+        ii = np.asarray([x[4] for x in lignes], np.int64)
+        jj = np.asarray([x[5] for x in lignes], np.int64)
+        y = np.asarray(R[tt, sens, ii, jj], np.float64)
+        ok = np.isfinite(y)
+        neuf = (np.asarray(rangs)[tt[ok], sens[ok]].astype(np.float64), sens[ok], np.clip(y[ok], -3.0, 10.0))
+    else:
+        neuf = (np.zeros(0), np.zeros(0, np.int64), np.zeros(0))
+    if memoire is not None:
+        memoire.append(neuf)
+        lots = list(memoire)
+    else:
+        lots = [neuf]
+    rang = np.concatenate([q[0] for q in lots])
+    sens = np.concatenate([q[1] for q in lots])
+    y = np.concatenate([q[2] for q in lots])
+    if len(y) < 64:
         return {}
-    tt = np.asarray([x[0] for x in lignes], np.int64)
-    sens = (np.asarray([x[3] for x in lignes]) == VENDRE).astype(np.int64)
-    ii = np.asarray([x[4] for x in lignes], np.int64)
-    jj = np.asarray([x[5] for x in lignes], np.int64)
-    y = np.asarray(R[tt, sens, ii, jj], np.float64)
-    ok = np.isfinite(y)
-    tt, sens, y = tt[ok], sens[ok], np.clip(y[ok], -3.0, 10.0)
-    rang = np.asarray(rangs)[tt, sens]
     c = entrees_conviction(rang, sens)
     f = float(cfg.mise_budget)
     k = float(getattr(cfg, "conviction_kelly", 0.5))
     T = lambda z, dt=torch.float32: torch.as_tensor(z, dtype=dt, device=device)
-    lam = policy.conviction_lambda
-    if float(policy.conviction_pret) < 0.5:
-        lam.fill_(float(np.mean(y)))
-        policy.conviction_pret.fill_(1.0)
     opt = optims["conviction"]
     params = list(policy.groupes_jeu()["conviction"])
     pertes = []
-    for _ in range(int(getattr(cfg, "conviction_passes", 2))):
+    for _ in range(int(getattr(cfg, "conviction_passes", 4))):
         ordre = rng.permutation(len(y))
-        for d0 in range(0, len(ordre), 512):
+        for d0 in range(0, len(ordre) - 63, 512):
             b = ordre[d0:d0 + 512]
-            m = policy.conviction(T(c[b]))
-            u = k * torch.log(torch.clamp(1.0 + f * m * T(y[b]) / k, min=1e-6)) / f - lam * (m - 1.0)
-            perte = -u.mean()
+            mb = policy.conviction_brute(T(c[b]))
+            m = mb / mb.mean()
+            u = k * torch.log(torch.clamp(1.0 + f * m * T(y[b]) / k, min=1e-6)) / f
+            # le niveau brut reste pres de 1, loin des bornes de la tete
+            perte = -u.mean() + 0.01 * torch.log(mb.mean()) ** 2
             opt.zero_grad(set_to_none=True)
             perte.backward()
             torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
             opt.step()
-            with torch.no_grad():
-                lam += float(cfg.conviction_pas_lambda) * (m.mean() - 1.0)
             pertes.append(float(perte.detach()))
     with torch.no_grad():
-        m = policy.conviction(T(c)).cpu().numpy().astype(np.float64)
-    out = {"perte": float(np.mean(pertes)), "n": int(len(y)), "lambda": float(lam),
+        mb = policy.conviction_brute(T(c)).cpu().numpy().astype(np.float64)
+        policy.conviction_norme.fill_(float(mb.mean()))
+    m = mb / mb.mean()
+    out = {"perte": float(np.mean(pertes)) if pertes else float("nan"), "n": int(len(y)),
+           "n_neuf": int(len(neuf[2])), "norme": float(mb.mean()),
            "mult_moyen": float(m.mean()), "mult_max": float(m.max())}
     for nom, a, z in (("bas", 0.0, 0.98), ("milieu", 0.98, 0.99), ("haut", 0.99, 1.01)):
         m_ = (rang >= a) & (rang < z)
@@ -2015,7 +2058,12 @@ def copie_conviction(policy, rr, ss, cible, device, pas: int = 1500) -> float:
     live, ou les rangs redeviennent honnetes. Les dix folds, eux, ont appris
     sur des rangs que leur expert n'avait pas vus."""
     c = torch.from_numpy(entrees_conviction(rr, ss)).to(device)
-    y = torch.as_tensor(np.log(np.clip(cible, 1e-3, None)), dtype=torch.float32, device=device)
+    lc = np.log(np.clip(cible, 1e-4, None))
+    y = torch.as_tensor(lc, dtype=torch.float32, device=device)
+    # la cible est le multiplicateur joue (deja divise par sa moyenne) : la
+    # norme de l'eleve centre sa sortie brute entre ses bornes (sur le milieu
+    # de l'ecart, pas sur la moyenne : la plupart des points peuvent etre bas)
+    policy.conviction_norme.fill_(float(np.exp(-(lc.max() + lc.min()) / 2.0)))
     params = list(policy.reseau_conviction.parameters())
     opt = torch.optim.Adam(params, lr=3e-3)
     for _ in range(int(pas)):
@@ -3716,6 +3764,8 @@ def main_blocs(cfg: JeuConfig) -> int:
                       mise_budget=cfg_depart.mise_budget)
         policy = PolitiqueJeu(cfg).to(device)
         optims = optimiseurs(policy, cfg)
+        # LA MEMOIRE DE LA CONVICTION : deux lots par epoch (journees et mois).
+        memoire_conviction = collections.deque(maxlen=2 * int(getattr(cfg, "conviction_memoire_epochs", 10)))
         pos = coups_expert_predits(j_tr, pred, D1, fin_tr, cfg)
         imite_expert(policy, optims, pos, j_tr, Xk, fin_tr, cfg, device, rng)
         suffixe = f"_bloc{k + 1}"
@@ -3747,7 +3797,8 @@ def main_blocs(cfg: JeuConfig) -> int:
                 # LES TETES DU DEJA-VU ET METEO, sur les etats de ces journees.
                 dm = entraine_dejavu_meteo(policy, optims, tr, Xk, M1, cfg, device, rng)
                 # LA TETE DE CONVICTION, sur les coups de ces journees.
-                cvc = entraine_conviction(policy, optims, tr, R1, rangs_ex, cfg, device, rng)
+                cvc = entraine_conviction(policy, optims, tr, R1, rangs_ex, cfg, device, rng,
+                                          memoire=memoire_conviction)
                 if mois_on:
                     # LES MOIS : seules les tetes de mise apprennent. Voir
                     # `note_mise_mois`.
@@ -3763,7 +3814,8 @@ def main_blocs(cfg: JeuConfig) -> int:
                         maj_ppo(policy, optims, avantages(trm, cfg), Xk, cfg, device, rng,
                                 mode="mise", adv_mise_externe=am)
                         es = entraine_esperance(policy, optims, trm, Xk, R1, cfg, device, rng) or es
-                        cvc = entraine_conviction(policy, optims, trm, R1, rangs_ex, cfg, device, rng) or cvc
+                        cvc = entraine_conviction(policy, optims, trm, R1, rangs_ex, cfg, device, rng,
+                                                  memoire=memoire_conviction) or cvc
                         fins = suivi.get("final", np.zeros(0))
                         print(f"  mois  {len(fins)} mois de {cfg.mois_jours} jours, {len(cpm)} coups : "
                               f"compte final median {np.median(fins):.0f} $, "
@@ -3797,11 +3849,11 @@ def main_blocs(cfg: JeuConfig) -> int:
                           f"0.98-0.99 : {_t(mc_['milieu'])}  |  >= 0.99 : {_t(mc_['haut'])}  |  "
                           f"multiplicateur moyen x{mc_['mult_moyen']:.2f}", flush=True)
                 if cvc:
-                    print(f"  conviction  apprise sur {cvc['n']} coups d'entrainement : choisit "
+                    print(f"  conviction  apprise sur {cvc['n']} coups d'entrainement en memoire "
+                          f"({cvc['n_neuf']} nouveaux) : mise "
                           f"x{cvc['mult_bas']:.2f} / x{cvc['mult_milieu']:.2f} / x{cvc['mult_haut']:.2f} "
                           f"(R moyen {cvc['R_bas']:+.3f} / {cvc['R_milieu']:+.3f} / {cvc['R_haut']:+.3f})  |  "
-                          f"prix du risque {cvc['lambda']:+.3f} R  |  moyenne x{cvc['mult_moyen']:.2f}, "
-                          f"plus forte x{cvc['mult_max']:.2f}", flush=True)
+                          f"moyenne x{cvc['mult_moyen']:.2f}, plus forte x{cvc['mult_max']:.2f}", flush=True)
             if getattr(policy, "apprendre_dejavu_meteo", False):
                 md = mesure_dejavu_meteo(cv, cfg, M1)
                 if md:

@@ -142,7 +142,12 @@ l'expert final est appris sur tout l'historique et ses rangs y « voient » les
 résultats ; elle copie donc la médiane des dix têtes des folds, apprises sur
 des rangs honnêtes, puis ne bouge plus (run m5_31). En live, l'expert est
 rechargé avec le pipeline du modèle final et son rang recalculé à chaque
-bougie. La mise de base est fixe (1 %, le R du jeu) ; le
+bougie. Depuis le run m5_32, elle apprend sur une **mémoire** des trades des
+10 dernières epochs (et non plus de la seule epoch en cours), avec 4 passes,
+et son multiplicateur est **divisé par sa moyenne** : elle ne décide plus que
+la répartition du risque entre les trades, jamais son niveau. Au m5_31, elle
+plafonnait à ×2,4 sur les trades sûrs faute d'apprentissage, et son niveau
+oscillait de ×0,7 à ×2,5. La mise de base est fixe (1 %, le R du jeu) ; le
 budget de baisse (m5_28) est coupé. La veille affiche, par tranche de rang,
 le multiplicateur choisi et le profit factor en validation.
 
@@ -279,7 +284,8 @@ les têtes de mise en ont besoin. Les runs fournissent toujours les prix.
 | m5_28 | budget de baisse : mise de base mesurée en validation (pire baisse 30 % une fois sur 10) | bloc 1, epochs 11-21 : +0,36 $/jour moyen en validation contre +0,12 au m5_27, pires baisses −8 à −37 % ; arrêté |
 | m5_29 | tête de conviction : multiplicateur ×0,5 à ×4 appris sur le rang de l'expert, budget moyen constant | arrêté au bloc 1 (erreur pendant les mois), remplacé par la version continue |
 | m5_30 | conviction continue : multiplicateur libre ×0,1 à ×25, demi-Kelly, budget moyen constant | arrêté aux premières epochs : le modèle final réapprenait la conviction sur l'expert final |
-| m5_31 | conviction continue, celle du modèle final copiée de la médiane des 10 folds | en cours |
+| m5_31 | conviction continue, celle du modèle final copiée de la médiane des 10 folds | bloc 1 : validation +1,72 $/jour moyen à frais pleins, test **+6,39 $/jour** (+2 120,83 $, PF 1,40, win rate 76 %, pire baisse −13,2 %) ; arrêté au bloc 2 pour le m5_32 |
+| m5_32 | conviction avec mémoire de 10 epochs, 4 passes, niveau fixe (divisé par la moyenne) | en cours |
 
 Ce que les mesures ont établi :
 - le signal du BTC M5 vient du flux Binance, de l'écart Coinbase, du

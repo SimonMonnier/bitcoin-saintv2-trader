@@ -872,8 +872,8 @@ verifie("jamais au-dela du plafond de la serie noire",
 
 print("\n20. LA TETE DE CONVICTION")
 _c20 = J.JeuConfig()
-verifie("par defaut : conviction continue de x0.1 a x25, demi-Kelly, mise de base fixe 1 %",
-        _c20.tete_conviction and _c20.conviction_min == 0.1 and _c20.conviction_max == 25.0
+verifie("par defaut : conviction continue de x0.01 a x100, demi-Kelly, mise de base fixe 1 %",
+        _c20.tete_conviction and _c20.conviction_min == 0.01 and _c20.conviction_max == 100.0
         and _c20.conviction_kelly == 0.5 and _c20.mise_budget == 0.01 and not _c20.budget_baisse)
 _e = J.entrees_conviction(np.array([0.90, 0.95, 0.99, 0.999]), np.array([0, 0, 1, 1]))
 verifie("l'entree : la conviction monte avec le rang, le sens a part",
@@ -892,9 +892,9 @@ with torch.no_grad():
     _p20.reseau_conviction[-1].bias.fill_(-50.0)
     _lb = _p20.conviction(torch.from_numpy(_e))
     _p20.reseau_conviction[-1].bias.fill_(0.0)
-verifie("au depart elle mise x1 partout ; jamais hors de [x0.1, x25]",
-        torch.allclose(_l, torch.ones_like(_l), atol=1e-5) and float(_lh.max()) <= 25.0 + 1e-3
-        and float(_lb.min()) >= 0.1 - 1e-5, f"{_l.tolist()} {float(_lh.max()):.2f} {float(_lb.min()):.3f}")
+verifie("au depart elle mise x1 partout ; jamais hors de [x0.01, x100]",
+        torch.allclose(_l, torch.ones_like(_l), atol=1e-5) and float(_lh.max()) <= 100.0 + 1e-2
+        and float(_lb.min()) >= 0.01 - 1e-6, f"{_l.tolist()} {float(_lh.max()):.2f} {float(_lb.min()):.3f}")
 _x20 = torch.randn(2, _c20.lookback, len(J.colonnes_jeu(_c20)) + _c20.n_expert + J.n_etat(_c20))
 _s20 = _p20.jeu(_x20)
 (sum(q.sum() for q in _s20)).backward()
@@ -913,9 +913,13 @@ for _ in range(40):
     _st = J.entraine_conviction(_p20, _o, _tr, _R, _rangs, _c20, "cpu", _rg)
 verifie("elle apprend a miser plus quand la conviction est forte, moins sinon, a budget moyen ~1",
         _st["mult_haut"] >= 2.0 and _st["mult_bas"] <= 1.0 and 0.7 <= _st["mult_moyen"] <= 1.3
-        and _st["mult_haut"] < 25.0,
+        and _st["mult_haut"] < 100.0,
         f"x{_st['mult_bas']:.2f} / x{_st['mult_haut']:.2f}, moyenne x{_st['mult_moyen']:.2f}, "
-        f"lambda {_st['lambda']:+.3f}")
+        f"norme {_st['norme']:.2f}")
+with torch.no_grad():
+    _mj = _p20.conviction(torch.from_numpy(J.entrees_conviction(_rangs[:, 0], np.zeros(_N, int))))
+verifie("le multiplicateur joue est divise par sa moyenne : x1 en moyenne sur les coups",
+        abs(float(_mj.mean()) - 1.0) < 0.02, f"x{float(_mj.mean()):.3f}")
 _R2 = np.zeros((_N, 2, 1, 1))
 _R2[:, 0, 0, 0] = np.where(_rg.random(_N) < 0.55, 1.0, -1.0)
 _p20b = J.PolitiqueJeu(_c20)
@@ -925,6 +929,18 @@ for _ in range(40):
 verifie("si la conviction ne dit rien, elle ne double pas les coups forts",
         abs(_st2["mult_haut"] - _st2["mult_bas"]) <= 1.0 and 0.7 <= _st2["mult_moyen"] <= 1.3,
         f"x{_st2['mult_bas']:.2f} / x{_st2['mult_haut']:.2f}, moyenne x{_st2['mult_moyen']:.2f}")
+
+import collections
+_mem = collections.deque(maxlen=3)
+_p20c = J.PolitiqueJeu(_c20)
+_o3 = J.optimiseurs(_p20c, _c20)
+for _k in range(5):
+    _st3 = J.entraine_conviction(_p20c, _o3, [_tr[0][_k * 1000:(_k + 1) * 1000]], _R, _rangs, _c20, "cpu",
+                                 _rg, memoire=_mem)
+verifie("la memoire garde les derniers lots et apprend sur tous",
+        len(_mem) == 3 and _st3["n"] == 3000 and _st3["n_neuf"] == 1000, f"{len(_mem)} lots, {_st3['n']} coups")
+verifie("par defaut : quatre passes, memoire de dix epochs",
+        _c20.conviction_passes == 4 and _c20.conviction_memoire_epochs == 10)
 
 print("\n21. LA CONVICTION DU MODELE FINAL, COPIEE DES FOLDS")
 _rr, _ss, _m1 = J.courbe_conviction(_p20, "cpu")
