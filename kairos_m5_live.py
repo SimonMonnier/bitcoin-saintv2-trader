@@ -248,10 +248,14 @@ class MoteurKairosM5:
         # du jour (`jeu_rollout.py`) : 25 % des coups de validation du run
         # m5_20 entraient dans les 8 h avant minuit. Corrige le 2026-10-03 :
         # le live les bloquait encore.
+        # Les bougies qui restent dans la partie sont une entree du modele dans
+        # les deux versions (`jeu_rollout.py` : fin de la partie - bougie) ;
+        # seule la version 1 refuse d'entrer pres de minuit. Corrige le
+        # 2026-10-04 : le calcul etait reste dans le seul cas version 1.
+        barre_jour = horodatage.hour * (60 // self.cfg.minutes_par_barre) + \
+                      horodatage.minute // self.cfg.minutes_par_barre
+        reste_barres = self.cfg.barres_par_partie - barre_jour
         if int(getattr(self.cfg, "jeu_version", 1)) < 2:
-            barre_jour = horodatage.hour * (60 // self.cfg.minutes_par_barre) + \
-                          horodatage.minute // self.cfg.minutes_par_barre
-            reste_barres = self.cfg.barres_par_partie - barre_jour
             if reste_barres <= self.cfg.horizon_max + 1:
                 return None
         st = self.pipe["normalisation_marche"]
