@@ -143,7 +143,8 @@ foreach ($v in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
     Stop-Process -Id $v.ProcessId -Force -ErrorAction SilentlyContinue
 }
 Start-Sleep -Seconds 3
-Start-Process powershell -ArgumentList '-NoExit','-ExecutionPolicy','Bypass','-File','veille_fenetre.ps1','-Journal','training_retour_m5_31.log' `
+# Dans la console classique (conhost) : Windows Terminal dessine avec le GPU, occupe par l'entrainement.
+Start-Process conhost.exe -ArgumentList 'powershell.exe','-NoExit','-ExecutionPolicy','Bypass','-File','veille_fenetre.ps1','-Journal','training_retour_m5_31.log' `
     -WorkingDirectory $PSScriptRoot
 Write-Host '  veille ouverte dans sa fenetre' -ForegroundColor Green
 
