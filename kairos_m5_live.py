@@ -311,7 +311,7 @@ class MoteurKairosM5:
         cloture_mt5 = cloture.tz_localize("UTC").tz_convert(
             ZoneInfo(getattr(self.live_cfg, "kairos_tz_mt5", "Europe/Helsinki")))
         if a == 2:
-            print(f"[KAIROS M5] HOLD — bougie MT5 {cloture_mt5:%H:%M} "
+            print(f"[KAIROS M5] HOLD - bougie MT5 {cloture_mt5:%H:%M} "
                   f"(cloturee, ouverte {cloture_mt5 - pd.Timedelta(minutes=self.cfg.minutes_par_barre):%H:%M}), "
                   f"rang {fe[t,2]:.3f}/{fe[t,3]:.3f}")
             return None

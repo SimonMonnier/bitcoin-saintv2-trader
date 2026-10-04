@@ -24,6 +24,12 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
+# PyTorch Windows n'a pas le noyau « flash attention » : il le dit a chaque
+# lancement, et PowerShell affiche cet avertissement en rouge comme une
+# erreur. Le calcul est identique (noyau standard) ; on le fait taire.
+import warnings
+warnings.filterwarnings("ignore", message=".*flash attention.*")
+
 
 # ============================================================
 # CONSTANTES
