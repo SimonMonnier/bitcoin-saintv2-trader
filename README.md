@@ -216,7 +216,7 @@ Le moteur (`kairos_m5_live.py`) :
 - passe ses ordres dans MT5 sur le symbole BTCUSD de Vantage. **Il refuse tout
   compte qui n'est pas un compte démo.**
 
-Le run visé est fixé dans `LiveConfig.kairos_prefixe` (`kairos_live.py`).
+Le run visé est fixé dans `LiveConfig.kairos_prefixe` (`kairos_live.py`) : `kairos_jeu_m5_34_retour_m5_31`.
 
 **Mettre un modèle final en live :**
 1. attendre la fin des 10 blocs : le run écrit
@@ -309,7 +309,7 @@ les têtes de mise en ont besoin. Les runs fournissent toujours les prix.
 | m5_31 | conviction continue, celle du modèle final copiée de la médiane des 10 folds | bloc 1 : validation +1,72 $/jour moyen à frais pleins, test **+6,39 $/jour** (+2 120,83 $, PF 1,40, win rate 76 %, pire baisse −13,2 %) ; arrêté au bloc 2 pour le m5_32 |
 | m5_32 | conviction avec mémoire de 10 epochs, 4 passes, niveau fixe (divisé par la moyenne) | bloc 1 : meilleure validation +9,02 $/jour ; test +4,64 $/jour (+1 541,63 $, PF 1,29), pire baisse −36,1 % (59 trades au-dessus de 5 % du compte) ; arrêté |
 | m5_33 | conseil de 5 têtes (mise ramenée vers ×1 selon le désaccord), note par journée | arrêté à l'epoch 2 du bloc 1 |
-| m5_34 | retour au code du m5_31 (le meilleur test du bloc 1 : +6,39 $/jour, pire baisse −13,2 %) | en cours |
+| m5_34 | retour au code du m5_31 | **10 blocs : 9 gagnants, +5 052,26 $, 16 524 trades, PF global 1,10** ; seul perdant le bloc 9 (nov. 2024-oct. 2025, −336,40 $, pire baisse −66 %) ; bloc 10 (le plus récent) +278,94 $ ; modèle final prêt (`kairos_live.py --check` OK), conviction ×1,10 / ×1,24 / ×1,33 |
 
 Ce que les mesures ont établi :
 - le signal du BTC M5 vient du flux Binance, de l'écart Coinbase, du
