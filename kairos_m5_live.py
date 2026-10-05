@@ -218,10 +218,38 @@ class MoteurKairosM5:
         self.policy.to(self.device)
         print(f"[KAIROS M5] deploy ensemble des 10 folds, epoch {ck.get('epoch')} charge.")
 
+    def _coinbase_complet(self, debut, fin):
+        """Coinbase sur TOUT l'historique du live, garde en memoire : au
+        premier appel par tranches de 295 bougies (la limite de l'API), puis
+        seulement les nouvelles bougies.
+
+        POURQUOI, 2026-10-04 : le live ne chargeait que les 295 dernieres
+        bougies. Le rang de l'expert compare la bougie du moment aux 2 000
+        precedentes : 1 700 etaient calculees SANS la prime Coinbase, la
+        bougie du moment AVEC, alors que dans le jeu toutes l'ont. Mesure sur
+        les 244 premieres bougies du live : porte d'achat ouverte 0 % du
+        temps, de vente 41 % ; fenetre coherente : 1 % et 23 %."""
+        cb = getattr(self, "_cb", None)
+        neuf = cb is None or cb.empty or cb["time"].min() > pd.Timestamp(debut) + pd.Timedelta(hours=1)
+        t = pd.Timestamp(debut) if neuf else cb["time"].max() - pd.Timedelta(minutes=10)
+        morceaux = [] if neuf else [cb]
+        while t < pd.Timestamp(fin):
+            u = min(t + pd.Timedelta(minutes=5 * 295), pd.Timestamp(fin))
+            q = _coinbase(t, u)
+            if q is not None and len(q):
+                morceaux.append(q)
+            t = u
+            time.sleep(0.15)
+        if not morceaux:
+            return cb
+        cb = pd.concat(morceaux).drop_duplicates("time", keep="last").sort_values("time")
+        self._cb = cb[cb["time"] >= pd.Timestamp(debut) - pd.Timedelta(days=1)].reset_index(drop=True)
+        return self._cb
+
     def _donnees(self):
         brut = self.hist.actualise().copy()
-        # Coinbase limite cette granularite a 300 bougies par requete.
-        cb = _coinbase(brut["time"].iloc[-295], brut["time"].iloc[-1] + pd.Timedelta(minutes=5))
+        # Coinbase sur toute la fenetre, comme le jeu. Voir `_coinbase_complet`.
+        cb = self._coinbase_complet(brut["time"].iloc[0], brut["time"].iloc[-1] + pd.Timedelta(minutes=5))
         f = PM5.features(brut, cb, _funding(), PH.profil_spread())
         f[PM5.FEATURE_COLS_M5] = f[PM5.FEATURE_COLS_M5].replace([np.inf, -np.inf], np.nan).fillna(0.0)
         return f
