@@ -34,8 +34,8 @@ if (-not (Test-Path -LiteralPath $python)) {
     exit 1
 }
 
-$journal = Join-Path $PSScriptRoot 'training_retour_m5_31.log'
-$prefixe = 'kairos_jeu_m5_34_retour_m5_31'
+$journal = Join-Path $PSScriptRoot 'training_born_tronc.log'
+$prefixe = 'kairos_jeu_m5_35_born_tronc'
 # LE JEU DEPUIS LE 2026-09-26 : `jeu_kairos.py` remplace `training.py`.
 $script = 'jeu_kairos.py'
 
@@ -122,7 +122,7 @@ $env:PYTHONIOENCODING = 'utf-8'
 $cmd = "`$env:PYTHONUNBUFFERED='1'; `$env:PYTHONIOENCODING='utf-8'; " +
        "Write-Host '  entrainement en cours - la lecture se fait dans la veille' -ForegroundColor Green; " +
        "Write-Host '  NE PAS FERMER cette fenetre' -ForegroundColor Yellow; " +
-       "cmd /c '$python $script > training_retour_m5_31.log 2>&1'"
+       "cmd /c '$python $script > training_born_tronc.log 2>&1'"
 # SANS GUILLEMETS INTERIEURS, et le journal en chemin RELATIF - 2026-09-26.
 # La version precedente citait l'interpreteur et le journal : PowerShell 5.1
 # a retire ces guillemets en passant la commande a `cmd`, et le chemin du
@@ -144,7 +144,7 @@ foreach ($v in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
 }
 Start-Sleep -Seconds 3
 # Dans la console classique (conhost) : Windows Terminal dessine avec le GPU, occupe par l'entrainement.
-Start-Process conhost.exe -ArgumentList 'powershell.exe','-NoExit','-ExecutionPolicy','Bypass','-File','veille_fenetre.ps1','-Journal','training_retour_m5_31.log' `
+Start-Process conhost.exe -ArgumentList 'powershell.exe','-NoExit','-ExecutionPolicy','Bypass','-File','veille_fenetre.ps1','-Journal','training_born_tronc.log' `
     -WorkingDirectory $PSScriptRoot
 Write-Host '  veille ouverte dans sa fenetre' -ForegroundColor Green
 

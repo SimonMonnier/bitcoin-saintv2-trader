@@ -10,6 +10,7 @@ import inspect
 import dataclasses
 import io
 import numpy as np
+import pandas as pd
 import torch
 
 import jeu_kairos as J
@@ -111,7 +112,7 @@ cfgj = replace(J.JeuConfig(), horizon_max=10, jetons=3, lookback=4, n_expert=0,
                # LE JEU HISTORIQUE (version 1) : sans les tetes de mise ni
                # l'etat du compte, ajoutes par defaut depuis le run m5_12.
                apprendre_lot=False, apprendre_risque=False, apprendre_allocation=False,
-               apprendre_confiance=False, observe_compte=False, observe_calibration=False,
+               apprendre_confiance=False, tete_born=False, observe_compte=False, observe_calibration=False,
                note_mise_separee=False, mur_mise=False, sortie_deux_temps=False,
                lot_min=0.01, tp_atr=(1.0, 2.0, 4.0, 8.0), tp1_par_objectif=())
 pol = J.PolitiqueJeu(cfgj)
@@ -452,7 +453,7 @@ cmh = replace(J.JeuConfig(), marches=tuple(PMH.MARCHES), cache=PMH.SORTIE,
               expert_pas_neg=1, porte_rang_expert=0.90,
               # le multi H1 historique : sans les tetes de mise ni l'etat du compte
               apprendre_lot=False, apprendre_risque=False, apprendre_allocation=False,
-              apprendre_confiance=False, observe_compte=False, observe_calibration=False,
+              apprendre_confiance=False, tete_born=False, observe_compte=False, observe_calibration=False,
               sortie_deux_temps=False, lot_min=0.01, tp_atr=(1.0, 2.0, 4.0, 8.0),
               tp1_par_objectif=())
 import prepare_btc_m5 as P5
@@ -965,6 +966,38 @@ verifie("le resume du modele final : folds, mise de base, serie noire, convictio
         any("mise de base 1.00 %" in x for x in _res) and any("serie noire : 8 pertes" in x for x in _res)
         and any("conviction (mediane des folds)" in x and "de x0.60 a x4.00" in x for x in _res),
         " | ".join(_res))
+
+print("\n23. LA TETE DE BORN, EXERCICE DU TRONC")
+_c23 = J.JeuConfig()
+verifie("par defaut : tete de Born, exercice du tronc", _c23.tete_born and _c23.born_pas > 0)
+torch.manual_seed(0)
+_p23 = J.PolitiqueJeu(_c23)
+_g23 = _p23.groupes_jeu()
+verifie("son groupe a part, disjoint des autres", "born" in _g23
+        and len({id(q) for v in _g23.values() for q in v}) == sum(len(v) for v in _g23.values()))
+_N23 = 400
+_nf = len(J.colonnes_jeu(_c23)) + _c23.n_expert
+_X23 = np.random.default_rng(0).standard_normal((_N23, _nf)).astype(np.float32)
+_R23 = np.random.default_rng(1).standard_normal((_N23, 2, len(_c23.tp_atr), len(_c23.sl_atr))).astype(np.float32) * 0.1
+_reste = np.full(_N23, 100.0)
+with torch.no_grad():
+    _x = torch.as_tensor(J.observations(_X23, np.array([10, 20]), J.etat_jeu(np.full(2, 10), np.zeros(2), np.full(2, 100.0), _c23), _c23.lookback))
+    _pb = _p23.tete_born(_p23._lecture_tronc(_x))
+verifie("97 probabilites de Born qui somment a 1",
+        tuple(_pb.shape) == (2, 2 * len(_c23.tp_atr) * len(_c23.sl_atr) + 1) and torch.allclose(_pb.sum(1), torch.ones(2), atol=1e-5))
+_o23 = J.optimiseurs(_p23, replace(_c23, born_pas=3, born_lot=32))
+_avant = {k_: [q.detach().clone() for q in v] for k_, v in _g23.items()}
+_st23 = J.entraine_born(_p23, _o23, _X23, _R23, np.arange(10, _N23), _reste, replace(_c23, born_pas=3, born_lot=32), "cpu",
+                        np.random.default_rng(2))
+_bouge = {k_: any(not torch.equal(a, q) for a, q in zip(_avant[k_], v)) for k_, v in _g23.items()}
+verifie("l'exercice ne forme que la tete de Born et le tronc ; aucune decision du PPO",
+        _bouge["born"] and _bouge["tronc"] and not any(_bouge[k_] for k_ in _bouge if k_ not in ("born", "tronc")),
+        str({k_: v for k_, v in _bouge.items() if v}))
+_mb23 = J.mesure_born(_p23, _X23, _R23, np.arange(10, _N23), _reste, _c23, "cpu", np.random.default_rng(3), n=200)
+verifie("la mesure en validation : gain espere, part des coups, resultat du meilleur coup",
+        {"gain", "hasard", "part", "r_meilleur"} <= set(_mb23) and np.isfinite(_st23["gain"]))
+_rp = J.reste_de_partie(pd.Series(pd.to_datetime(["2026-10-05 00:00", "2026-10-05 23:55"])), _c23)
+verifie("les bougies restantes de la journee", list(_rp) == [288.0, 1.0], str(_rp))
 
 print(f"\n{N_OK}/{N_OK + N_KO} OK")
 raise SystemExit(1 if N_KO else 0)

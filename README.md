@@ -157,6 +157,18 @@ base est fixe (1 %, le R du jeu) ; le
 budget de baisse (m5_28) est coupé. La veille affiche, par tranche de rang,
 le multiplicateur choisi et le profit factor en validation.
 
+**La tête de Born, exercice du tronc** (run m5_35) — un état quantique sur les
+97 actions (96 trades du menu + attendre) : amplitudes complexes de trois
+registres intriqués (sens, paire d'objectifs, stop), probabilités de Born.
+Elle **ne trade pas** : à chaque epoch, sur des bougies d'entraînement, elle
+maximise le gain espéré de sa mesure sur les 96 trades possibles, dont le
+résultat réel est connu (la table du jeu, coût plein), et **le tronc apprend
+avec elle**. Le PPO garde toutes ses décisions, prises sur un tronc qui a
+appris à voir toutes les opportunités. Posée sur les troncs figés du m5_34,
+sans les former, ses propres trades ne tenaient pas au test (4 blocs sur 10) ;
+seul compte ici ce que le tronc y gagne pour le PPO. La veille affiche son gain
+espéré à l'entraînement et en validation.
+
 **La série noire** — avant chaque trade, le risque ne dépasse jamais ce que
 la pire série de pertes du modèle laisse survivre : si les N prochains trades
 perdaient tous, le compte ne perdrait pas plus de 50 %. Risque maximal par
@@ -310,6 +322,7 @@ les têtes de mise en ont besoin. Les runs fournissent toujours les prix.
 | m5_32 | conviction avec mémoire de 10 epochs, 4 passes, niveau fixe (divisé par la moyenne) | bloc 1 : meilleure validation +9,02 $/jour ; test +4,64 $/jour (+1 541,63 $, PF 1,29), pire baisse −36,1 % (59 trades au-dessus de 5 % du compte) ; arrêté |
 | m5_33 | conseil de 5 têtes (mise ramenée vers ×1 selon le désaccord), note par journée | arrêté à l'epoch 2 du bloc 1 |
 | m5_34 | retour au code du m5_31 | **10 blocs : 9 gagnants, +5 052,26 $, 16 524 trades, PF global 1,10** ; seul perdant le bloc 9 (nov. 2024-oct. 2025, −336,40 $, pire baisse −66 %) ; bloc 10 (le plus récent) +278,94 $ ; modèle final prêt (`kairos_live.py --check` OK), conviction ×1,10 / ×1,24 / ×1,33 |
+| m5_35 | m5_34 + tête de Born comme exercice du tronc (elle ne trade pas) | en cours |
 
 Ce que les mesures ont établi :
 - le signal du BTC M5 vient du flux Binance, de l'écart Coinbase, du

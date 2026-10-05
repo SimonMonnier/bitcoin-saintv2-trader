@@ -57,10 +57,10 @@
 #   powershell -ExecutionPolicy Bypass -File veille_fenetre.ps1
 #   powershell -ExecutionPolicy Bypass -File veille_fenetre.ps1 -Detail
 
-#   powershell -ExecutionPolicy Bypass -File veille_fenetre.ps1 -Journal training_retour_m5_31.log
+#   powershell -ExecutionPolicy Bypass -File veille_fenetre.ps1 -Journal training_born_tronc.log
 #   (un second run lance en parallele, avec son propre journal - 2026-09-28)
 
-param([switch]$Detail, [string]$Journal = 'training_retour_m5_31.log')
+param([switch]$Detail, [string]$Journal = 'training_born_tronc.log')
 
 $journal = Join-Path $PSScriptRoot $Journal
 $titre = if ($Detail) { 'KAIROS - veille (detail)' } else { 'KAIROS - veille' }
@@ -134,10 +134,10 @@ Write-Host ''
 # entre deux. Une epoch dure cinq minutes ; la fenetre restait donc muette
 # cinq minutes d'affilee, ce qui est indistinguable d'une fenetre cassee.
 # Une veille qui ne dit pas « je travaille » ne sert a rien.
-$essentiel = '^(EPOCH |  (PnL|train |sens |tenue |sommet du tri|sommet \d+ min|critere net|sauvegarde |evolution )|  phase  (PPO (entree|sortie)|marge entree|avantage brut|cout entrainement)|\[COLLECTE\]|SORTIE |CIBLE |          (une seule|AUCUN plafond|SHORT)|  (non )?retenu|  garde |  . NEW BEST|  . REFUSE|    a battu|  expert |  reprend |  bilan |TEST fold \d+ bilan |FIN |=== |--- Fold |  bloc |  blocs gagnants|  tous les blocs|  mois |  serie noire |  sorties |  esperance |  deja-vu |  meteo |  budget |  conviction |  RESUME |Traceback|.*Error)'
+$essentiel = '^(EPOCH |  (PnL|train |sens |tenue |sommet du tri|sommet \d+ min|critere net|sauvegarde |evolution )|  phase  (PPO (entree|sortie)|marge entree|avantage brut|cout entrainement)|\[COLLECTE\]|SORTIE |CIBLE |          (une seule|AUCUN plafond|SHORT)|  (non )?retenu|  garde |  . NEW BEST|  . REFUSE|    a battu|  expert |  reprend |  bilan |TEST fold \d+ bilan |FIN |=== |--- Fold |  bloc |  blocs gagnants|  tous les blocs|  mois |  serie noire |  sorties |  esperance |  deja-vu |  meteo |  budget |  conviction |  born |  RESUME |Traceback|.*Error)'
 
 # LE DETAIL : tout le reste — diagnostics, phases du reseau, cadence.
-$detaille = '^(EPOCH |  (PnL|point mort|classement|sommet du tri|sommet \d+ min|vs |sens |actions |entrees |critere net|sauvegarde |evolution |dimension|train |tenue |phase |cadence |\. |temps :)|\[COLLECTE\]|          SHORT|  (non )?retenu|  garde |  . NEW BEST|  jeu |  bilan |TEST fold \d+ bilan |  expert |  reprend |  (normalisation|table des coups|modele|regles|un R) |TEST |FIN |=== |--- Fold |  bloc |  blocs gagnants|  tous les blocs|  mois |  serie noire |  sorties |  esperance |  deja-vu |  meteo |  budget |  conviction |  RESUME |Traceback|.*Error)'
+$detaille = '^(EPOCH |  (PnL|point mort|classement|sommet du tri|sommet \d+ min|vs |sens |actions |entrees |critere net|sauvegarde |evolution |dimension|train |tenue |phase |cadence |\. |temps :)|\[COLLECTE\]|          SHORT|  (non )?retenu|  garde |  . NEW BEST|  jeu |  bilan |TEST fold \d+ bilan |  expert |  reprend |  (normalisation|table des coups|modele|regles|un R) |TEST |FIN |=== |--- Fold |  bloc |  blocs gagnants|  tous les blocs|  mois |  serie noire |  sorties |  esperance |  deja-vu |  meteo |  budget |  conviction |  born |  RESUME |Traceback|.*Error)'
 
 $garde = if ($Detail) { $detaille } else { $essentiel }
 $ansi = [regex]"$([char]27)\[[0-9;]*m"

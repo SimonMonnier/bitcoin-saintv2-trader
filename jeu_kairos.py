@@ -215,7 +215,9 @@ class JeuConfig:
     # pire baisse -36 %) et m5_33 (conseil de cinq tetes, note par journee)
     # sont annules ; leur code reste dans l'historique git (f23a576, 1d296c0).
     # Meme code que le m5_31, sous un autre nom pour garder ses fichiers.
-    prefixe: str = "kairos_jeu_m5_34_retour_m5_31"
+    # LA TETE DE BORN, EXERCICE DU TRONC (run m5_35) : voir `tete_born`. Le
+    # run m5_34 : prefixe kairos_jeu_m5_34_retour_m5_31, tete_born False.
+    prefixe: str = "kairos_jeu_m5_35_born_tronc"
     # Reproduction demandee du run M5_03, avant les corrections de deroulement
     # et de compte introduites dans la version 2.
     # La version 2 rejoue l'equite, la marge et les positions ouvertes : elle
@@ -585,6 +587,34 @@ class JeuConfig:
     conviction_kelly: float = 0.5
     conviction_passes: int = 2
     conviction_pas_lambda: float = 0.01
+    # LA TETE DE BORN, EXERCICE DU TRONC — 2026-10-05 (run m5_35), demande du
+    # proprietaire : « invente quelque chose de quantique pour ameliorer le
+    # PPO avec une nouvelle tete, afin de trouver les meilleurs trades ».
+    #
+    # Un etat quantique sur les 97 actions (96 coups du menu + attendre) :
+    # amplitudes complexes de trois registres intriques — sens, paire
+    # d'objectifs, stop —, psi(s, i, j) = A[s] x B[s, i] x C[s, j] + D[s, i, j],
+    # probabilites de Born |psi|^2. Les coups qui partagent un objectif ou un
+    # stop interferent : ce qu'elle apprend sur l'un sert aux autres.
+    #
+    # ELLE NE TRADE PAS. Elle est un EXERCICE pour le tronc : a chaque epoch,
+    # sur des bougies des jours d'entrainement, elle maximise le gain espere
+    # de sa mesure, sum_a p_a R_a, ou R_a est le resultat REEL, cout plein, de
+    # chacun des 96 coups possibles (la table du jeu). Le tronc apprend avec
+    # elle (groupes « born » et « tronc ») : environ cent fois plus
+    # d'information par bougie que le seul coup tire par le PPO. Le PPO garde
+    # toutes ses decisions et sa note ; il les prend sur un tronc qui a appris
+    # a voir toutes les opportunites.
+    #
+    # Mesure du 2026-10-05 sur les troncs FIGES du m5_34 (10 blocs) : posee
+    # sur le tronc sans le former, ses propres coups ne tenaient pas au test
+    # (4 blocs sur 10 au seuil choisi en validation, a plat sur 2022-2026).
+    # Ici elle ne decide rien : seul compte ce que le tronc y gagne pour le PPO.
+    tete_born: bool = True
+    born_pas: int = 60
+    born_lot: int = 1024
+    born_coef: float = 1.0
+    born_entropie: float = 0.002
     # DEUX NOTES SEPAREES — 2026-10-02 (run m5_20), demande du proprietaire :
     # garder le signal d'achat et de vente, et la prise de risque au-dela de
     # 1 %, sans que le compte finisse ruine. Au run m5_19, une seule note (le
@@ -922,6 +952,36 @@ def colonnes_jeu(cfg: "JeuConfig") -> list:
 # ======================================================================
 # LE MODELE — le SAINT du run, deux tetes de barrieres en plus
 # ======================================================================
+class TeteBorn(nn.Module):
+    """L'etat quantique des 97 actions. Voir `tete_born`."""
+
+    def __init__(self, dl, n_tp, n_sl):
+        super().__init__()
+        self.f = nn.Sequential(nn.Linear(dl, 128), nn.GELU())
+        self.n_tp, self.n_sl = n_tp, n_sl
+        self.A = nn.Linear(128, 2 * 2)                       # registre du sens (re, im)
+        self.B = nn.Linear(128, 2 * n_tp * 2)                # registre de l'objectif
+        self.C = nn.Linear(128, 2 * n_sl * 2)                # registre du stop
+        self.D = nn.Linear(128, 2 * n_tp * n_sl * 2)         # intrication
+        self.Wt = nn.Linear(128, 2)                          # attendre
+        nn.init.zeros_(self.D.weight)
+        nn.init.zeros_(self.D.bias)
+
+    def forward(self, z):
+        """(B, 2 x n_tp x n_sl + 1) : probabilites de Born ; la derniere est
+        « attendre ». L'ordre des coups est celui de la table du jeu."""
+        h = self.f(z)
+        cx = lambda t: torch.complex(t[..., 0], t[..., 1])
+        A = cx(self.A(h).view(-1, 2, 2))
+        B = cx(self.B(h).view(-1, 2, self.n_tp, 2))
+        C = cx(self.C(h).view(-1, 2, self.n_sl, 2))
+        D = cx(self.D(h).view(-1, 2, self.n_tp, self.n_sl, 2))
+        psi = A[:, :, None, None] * B[:, :, :, None] * C[:, :, None, :] + 0.3 * D
+        w = cx(self.Wt(h).view(-1, 1, 2))
+        a2 = torch.cat([psi.reshape(len(z), -1).abs() ** 2, w.abs().view(-1, 1) ** 2 + 1e-6], 1)
+        return a2 / a2.sum(1, keepdim=True)
+
+
 class PolitiqueJeu(SAINTPolicySingleHead):
     """Le tronc et les tetes d'achat et de vente du run PPO ; les tetes de
     coupure des gains et des pertes choisissent desormais l'objectif et le
@@ -1010,6 +1070,11 @@ class PolitiqueJeu(SAINTPolicySingleHead):
             # le prix du risque (en R) et s'il a ete pose : ils voyagent avec le modele
             self.register_buffer("conviction_lambda", torch.tensor(0.0))
             self.register_buffer("conviction_pret", torch.tensor(0.0))
+        # LA TETE DE BORN, exercice du tronc. Voir `tete_born`.
+        self.tete_born_on = (bool(getattr(cfg, "tete_born", False))
+                             and not (len(_marches) > 1 and getattr(cfg, "tetes_par_marche", False)))
+        if self.tete_born_on:
+            self.tete_born = TeteBorn(dl, len(cfg.tp_atr), len(cfg.sl_atr))
         # LE MUR des tetes de mise. Voir `mur_mise`.
         self.mur_mise = bool(getattr(cfg, "mur_mise", False))
         for m in list(self.lecteur_objectif) + list(self.lecteur_stop):
@@ -1198,6 +1263,7 @@ class PolitiqueJeu(SAINTPolicySingleHead):
             **({"dejavu": _p(self.lecteur_dejavu, self.tete_dejavu),
                 "meteo": _p(self.lecteur_meteo, self.tete_meteo)}
                if getattr(self, "apprendre_dejavu_meteo", False) else {}),
+            **({"born": _p(self.tete_born)} if getattr(self, "tete_born_on", False) else {}),
             **({"conviction": _p(self.reseau_conviction)}
                if getattr(self, "tete_conviction", False) else {}),
             "valeur": _p(self.mlp, self.critic),
@@ -1996,6 +2062,72 @@ def entraine_conviction(policy, optims, trans, R, rangs, cfg, device, rng) -> Di
         out["mult_" + nom] = float(m[m_].mean()) if m_.any() else float("nan")
         out["R_" + nom] = float(y[m_].mean()) if m_.any() else float("nan")
     return out
+
+
+def reste_de_partie(temps, cfg) -> np.ndarray:
+    """(N,) : les bougies qui restent dans la journee a chaque bougie."""
+    t = pd.to_datetime(pd.Series(temps)).reset_index(drop=True)
+    barre = (t.dt.hour.to_numpy() * 60 + t.dt.minute.to_numpy()) // int(cfg.minutes_par_barre)
+    return (cfg.barres_par_partie - barre).astype(np.float64)
+
+
+def entraine_born(policy, optims, Xk, R, idx, reste, cfg, device, rng) -> Dict[str, float]:
+    """L'exercice du tronc par la tete de Born : sur `born_pas` lots de
+    `born_lot` bougies tirees dans `idx`, maximise le gain espere de la
+    mesure, sum_a p_a R_a (R : la table du jeu, cout plein), plus un peu
+    d'entropie. Seuls les groupes « born » et « tronc » apprennent. Voir
+    `tete_born`."""
+    if not getattr(policy, "tete_born_on", False) or "born" not in optims or not len(idx):
+        return {}
+    Rf = R.reshape(len(R), -1)
+    T = lambda z, dt=torch.float32: torch.as_tensor(z, dtype=dt, device=device)
+    noms = ("born", "tronc")
+    params = [q for n in noms for q in policy.groupes_jeu()[n]]
+    policy.eval()   # le dropout du tronc reste coupe, comme pour le PPO
+    gains = []
+    na = Rf.shape[1]
+    for _ in range(int(cfg.born_pas)):
+        t = rng.choice(idx, int(cfg.born_lot))
+        et = etat_jeu(np.full(len(t), cfg.jetons), np.zeros(len(t)), reste[t], cfg)
+        x = T(observations(Xk, t, et, int(cfg.lookback)))
+        p = policy.tete_born(policy._lecture_tronc(x))
+        gain = (p[:, :na] * T(np.nan_to_num(Rf[t]))).sum(1).mean()
+        ent = -(p * torch.log(p + 1e-9)).sum(1).mean()
+        perte = -float(cfg.born_coef) * gain - float(cfg.born_entropie) * ent
+        for o in optims.values():
+            o.zero_grad(set_to_none=True)
+        perte.backward()
+        torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
+        for n in noms:
+            optims[n].step()
+        gains.append(float(gain.detach()))
+    return {"gain": float(np.mean(gains)), "hasard": float(np.nanmean(Rf[rng.choice(idx, 20000)])),
+            "n": int(cfg.born_pas) * int(cfg.born_lot)}
+
+
+@torch.no_grad()
+def mesure_born(policy, Xk, R, idx, reste, cfg, device, rng, n=20000) -> Dict[str, float]:
+    """Sur des bougies de `idx` (la validation) : le gain espere de la mesure
+    de Born, et le resultat reel de son coup le plus probable quand elle le
+    prefere a l'attente."""
+    if not getattr(policy, "tete_born_on", False) or not len(idx):
+        return {}
+    Rf = R.reshape(len(R), -1)
+    t = np.sort(rng.choice(idx, min(n, len(idx)), replace=False))
+    policy.eval()
+    ps = []
+    for a in range(0, len(t), 4096):
+        tt = t[a:a + 4096]
+        et = etat_jeu(np.full(len(tt), cfg.jetons), np.zeros(len(tt)), reste[tt], cfg)
+        x = torch.as_tensor(observations(Xk, tt, et, int(cfg.lookback)), device=device)
+        ps.append(policy.tete_born(policy._lecture_tronc(x)).float().cpu().numpy())
+    P = np.concatenate(ps)
+    na = Rf.shape[1]
+    meil = P[:, :na].argmax(1)
+    pris = P[np.arange(len(P)), meil] > P[:, na]
+    r = Rf[t, meil]
+    return {"gain": float((P[:, :na] * np.nan_to_num(Rf[t])).sum(1).mean()), "hasard": float(np.nanmean(Rf[t])),
+            "part": float(pris.mean()), "r_meilleur": float(r[pris].mean()) if pris.any() else float("nan")}
 
 
 def courbe_conviction(policy, device):
@@ -3564,6 +3696,9 @@ def entraine_deploiement_continu(cfg, d, X, y_ex, toutes, o, h, l, c, sp, atr,
     # curriculum, aucun regime final ni fold n'a de privilege.
     marge_d = max(240 // int(cfg.minutes_par_barre), cfg.barres_par_partie // 6)
     fragments = np.array_split(toutes, max(1, int(np.ceil(len(toutes) / cfg.parties_par_epoch))))
+    # LA TETE DE BORN, exercice du tronc de l'eleve aussi. Voir `tete_born`.
+    born_tout = np.flatnonzero(np.isfinite(R1.reshape(N, -1)).all(1) & (np.arange(N) > int(cfg.lookback) + 1))
+    reste_d = reste_de_partie(d["time"], cfg)
     for numero, jours in enumerate(fragments, 1):
         _sc, _cp, tr = joue(policy, departs_tires(jours, rng, marge_d), X_final,
                              R1, D1, S1, fin, cfg, device, explore=True,
@@ -3571,6 +3706,7 @@ def entraine_deploiement_continu(cfg, d, X, y_ex, toutes, o, h, l, c, sp, atr,
         stats = maj_ppo(policy, optims, avantages(tr, cfg), X_final, cfg, device, rng)
         entraine_esperance(policy, optims, tr, X_final, R1, cfg, device, rng)
         entraine_dejavu_meteo(policy, optims, tr, X_final, M_final, cfg, device, rng)
+        entraine_born(policy, optims, X_final, R1, born_tout, reste_d, cfg, device, rng)
         print(f"DEPLOY ENSEMBLE PPO {numero:02d}/{len(fragments):02d}  "
               f"{len(jours)} parties  kl {stats['kl']:+.4f}  v {stats['v']:.4f}", flush=True)
 
@@ -3704,12 +3840,18 @@ def main_blocs(cfg: JeuConfig) -> int:
           f"zone tampon {purge} bougies autour du test et de la validation", flush=True)
     tests = []
     cfg_depart = cfg
+    born_fini = np.isfinite(R1.reshape(N, -1)).all(1)
+    reste_partie = reste_de_partie(d["time"], cfg)
     candidats_deploiement = []
     transitions_oof = []
     for k in range(cfg.n_blocs):
         if seul and k + 1 != seul:
             continue
         permis, (te0, te1), (va0, va1) = masque_blocs(N, cfg.n_blocs, k, purge)
+        # LA TETE DE BORN : ses bougies d'exercice (entrainement) et de mesure
+        # (validation). Voir `tete_born`.
+        born_app = np.flatnonzero(permis & born_fini & (np.arange(N) > int(cfg.lookback) + 1))
+        born_val = np.arange(va0, va1)[born_fini[va0:va1]]
         fin_tr = prochain_exclu(permis)
         dedans = lambda a0, a1: np.array([w for w in toutes if w[0] >= a0 and w[1] <= a1],
                                          np.int64).reshape(-1, 2)
@@ -3769,7 +3911,7 @@ def main_blocs(cfg: JeuConfig) -> int:
             t_ep = time.time()
             frac = min(1.0, max(0.0, (epoch - 1) / cfg.rampe_cout)) if cfg.rampe_cout > 0 else 1.0
             st = None
-            dm, cvc = {}, {}
+            dm, cvc, bn = {}, {}, {}
             if epoch >= 1:
                 Rf, Df, Sf = table_a_cout(frac, (R0, D0, S0), (R1, D1, S1),
                                          lambda f: table_coups(o, h, l, sp, atr, cfg, f))
@@ -3788,6 +3930,8 @@ def main_blocs(cfg: JeuConfig) -> int:
                 dm = entraine_dejavu_meteo(policy, optims, tr, Xk, M1, cfg, device, rng)
                 # LA TETE DE CONVICTION, sur les coups de ces journees.
                 cvc = entraine_conviction(policy, optims, tr, R1, rangs_ex, cfg, device, rng)
+                # LA TETE DE BORN, exercice du tronc. Voir `tete_born`.
+                bn = entraine_born(policy, optims, Xk, R1, born_app, reste_partie, cfg, device, rng)
                 if mois_on:
                     # LES MOIS : seules les tetes de mise apprennent. Voir
                     # `note_mise_mois`.
@@ -3829,6 +3973,14 @@ def main_blocs(cfg: JeuConfig) -> int:
             etat = {"modele": policy.state_dict(), "config": asdict(cfg), "epoch": epoch,
                     "bloc": k + 1, "pipeline": pipeline_ref}
             torch.save(etat, f"last_{cfg.prefixe}{suffixe}.pth")
+            if getattr(policy, "tete_born_on", False):
+                mb_ = mesure_born(policy, Xk, R1, born_val, reste_partie, cfg, device, rng)
+                if mb_:
+                    appris = (f"exercice du tronc : gain espere {bn['gain']:+.4f} R (un coup au hasard "
+                              f"{bn['hasard']:+.4f}) sur {bn['n']} bougies d'entrainement  |  " if bn else "")
+                    print(f"  born  {appris}validation : gain espere {mb_['gain']:+.4f} R (hasard {mb_['hasard']:+.4f}), "
+                          f"prefere un coup a l'attente sur {100 * mb_['part']:.0f} % des bougies, ce coup rapporte "
+                          f"{mb_['r_meilleur']:+.4f} R", flush=True)
             if getattr(policy, "tete_conviction", False):
                 mc_ = mesure_conviction(cv, cfg)
                 if mc_:
